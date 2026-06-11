@@ -1,0 +1,43 @@
+[project]
+name = "llm-wiki-server"
+version = "0.1.0"
+description = "Server-oriented internal knowledge base inspired by llm_wiki."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "fastapi>=0.115.0",
+  "httpx>=0.28.0",
+  "minio>=7.2.8",
+  "openai>=1.54.0",
+  "psycopg[binary]>=3.2.3",
+  "pymupdf>=1.26.0",
+  "pydantic-settings>=2.6.1",
+  "pypdf>=5.0.1",
+  "python-docx>=1.1.2",
+  "python-multipart>=0.0.12",
+  "redis>=5.1.1",
+  "rq>=1.16.2",
+  "sqlalchemy>=2.0.36",
+  "trafilatura>=1.12.2",
+  "uvicorn[standard]>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

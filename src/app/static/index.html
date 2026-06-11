@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LLM Wiki Server</title>
+    <style>
+      :root {
+        --bg: #f3efe5;
+        --panel: #fff9ef;
+        --ink: #1b1d1f;
+        --muted: #6f675d;
+        --line: #d8cdbd;
+        --accent: #0b6e4f;
+        --accent-soft: #dff4eb;
+        --alert: #8f2d2d;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", "PingFang SC", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(11,110,79,.12), transparent 28%),
+          linear-gradient(135deg, #f5efe3, #efe6d6 45%, #f7f2ea);
+        color: var(--ink);
+      }
+      .shell {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .hero {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: 2fr 1fr;
+        margin-bottom: 24px;
+      }
+      .card {
+        background: rgba(255, 249, 239, 0.92);
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 20px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 14px 34px rgba(70, 54, 27, 0.08);
+      }
+      h1, h2 {
+        margin: 0 0 12px 0;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      }
+      label {
+        display: block;
+        margin: 12px 0 6px;
+        font-weight: 600;
+      }
+      input, textarea, button {
+        width: 100%;
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        font: inherit;
+      }
+      textarea { min-height: 120px; resize: vertical; }
+      button {
+        background: var(--accent);
+        color: white;
+        border: none;
+        font-weight: 700;
+        cursor: pointer;
+        margin-top: 14px;
+      }
+      button:hover { opacity: 0.95; }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 13px;
+        font-weight: 700;
+      }
+      ul {
+        padding-left: 18px;
+        color: var(--muted);
+      }
+      .result {
+        white-space: pre-wrap;
+        line-height: 1.7;
+      }
+      .danger {
+        color: var(--alert);
+      }
+      @media (max-width: 900px) {
+        .hero { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <div class="card">
+          <div class="badge">raw -> wiki -> schema</div>
+          <h1>LLM Wiki Server</h1>
+          <p>面向团队内部的知识编译服务。默认用本地 Ollama 做摄入与问答，高风险结论可再交给外部 API 做结构化复核。</p>
+        </div>
+        <div class="card">
+          <h2>入口</h2>
+          <ul>
+            <li><a href="/docs" target="_blank">OpenAPI Docs</a></li>
+            <li><a href="/wiki" target="_blank">Wiki Files</a></li>
+            <li><a href="/api/health" target="_blank">Health</a></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="card">
+          <h2>上传文档</h2>
+          <label for="projectSlug">Project Slug</label>
+          <input id="projectSlug" value="internal-research" />
+          <label for="projectName">Project Name</label>
+          <input id="projectName" value="Internal Research" />
+          <label for="fileInput">选择文件</label>
+          <input id="fileInput" type="file" />
+          <button id="uploadButton">开始摄入</button>
+          <p id="uploadStatus"></p>
+        </div>
+
+        <div class="card">
+          <h2>提问</h2>
+          <label for="queryProjectSlug">Project Slug</label>
+          <input id="queryProjectSlug" value="internal-research" />
+          <label for="questionInput">问题</label>
+          <textarea id="questionInput" placeholder="例如：这组论文中关于方法A与方法B的主要差异是什么？"></textarea>
+          <button id="queryButton">生成答案</button>
+          <div id="answerBox" class="result"></div>
+        </div>
+
+        <div class="card">
+          <h2>最近文档</h2>
+          <div id="documentsBox">加载中...</div>
+        </div>
+
+        <div class="card">
+          <h2>审核队列</h2>
+          <div id="reviewsBox">加载中...</div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      async function loadDocuments() {
+        const response = await fetch("/api/documents");
+        const data = await response.json();
+        const target = document.getElementById("documentsBox");
+        if (!Array.isArray(data) || data.length === 0) {
+          target.innerHTML = "<p>还没有文档。</p>";
+          return;
+        }
+        target.innerHTML = "<ul>" + data.slice(0, 8).map(item =>
+          `<li><strong>${item.title}</strong> <span class="badge">${item.status}</span></li>`
+        ).join("") + "</ul>";
+      }
+
+      async function loadReviews() {
+        const response = await fetch("/api/reviews");
+        const data = await response.json();
+        const target = document.getElementById("reviewsBox");
+        if (!Array.isArray(data) || data.length === 0) {
+          target.innerHTML = "<p>当前没有待审项。</p>";
+          return;
+        }
+        target.innerHTML = "<ul>" + data.slice(0, 8).map(item =>
+          `<li><strong>${item.title}</strong><br /><span class="danger">${item.severity}</span> ${item.detail}</li>`
+        ).join("") + "</ul>";
+      }
+
+      document.getElementById("uploadButton").addEventListener("click", async () => {
+        const file = document.getElementById("fileInput").files[0];
+        const projectSlug = document.getElementById("projectSlug").value;
+        const projectName = document.getElementById("projectName").value;
+        const status = document.getElementById("uploadStatus");
+        if (!file) {
+          status.textContent = "请先选择文件。";
+          return;
+        }
+        status.textContent = "正在上传...";
+        const form = new FormData();
+        form.append("file", file);
+        const response = await fetch(`/api/ingest/upload?project_slug=${encodeURIComponent(projectSlug)}&project_name=${encodeURIComponent(projectName)}`, {
+          method: "POST",
+          body: form
+        });
+        const data = await response.json();
+        status.textContent = `已提交，document_id=${data.document_id}，status=${data.status}`;
+        loadDocuments();
+        loadReviews();
+      });
+
+      document.getElementById("queryButton").addEventListener("click", async () => {
+        const box = document.getElementById("answerBox");
+        box.textContent = "正在生成...";
+        const payload = {
+          project_slug: document.getElementById("queryProjectSlug").value,
+          question: document.getElementById("questionInput").value,
+          save_answer: true
+        };
+        const response = await fetch("/api/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        box.textContent = `${data.answer_markdown}\n\nVerification: ${data.verification_status}`;
+      });
+
+      loadDocuments();
+      loadReviews();
+    </script>
+  </body>
+</html>
