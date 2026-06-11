@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/run}"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
+PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 PID_FILE="$RUN_DIR/worker.pid"
 LOG_FILE="$LOG_DIR/worker.log"
 
@@ -15,8 +16,8 @@ if [ ! -f "$ROOT_DIR/.env" ]; then
   exit 1
 fi
 
-if [ ! -f "$VENV_DIR/bin/activate" ]; then
-  echo "virtualenv not found: $VENV_DIR" >&2
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "python binary not found: $PYTHON_BIN" >&2
   exit 1
 fi
 
@@ -29,9 +30,8 @@ cd "$ROOT_DIR"
 set -a
 . "$ROOT_DIR/.env"
 set +a
-. "$VENV_DIR/bin/activate"
 
-nohup python -m app.workers.runner >>"$LOG_FILE" 2>&1 &
+nohup "$PYTHON_BIN" -m app.workers.runner >>"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 sleep 2
 

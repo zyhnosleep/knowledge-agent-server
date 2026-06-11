@@ -21,6 +21,11 @@ if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   exit 0
 fi
 
+if command -v curl >/dev/null 2>&1 && curl -fsS "http://$OLLAMA_HOST_VALUE/api/tags" >/dev/null 2>&1; then
+  echo "Ollama already reachable on $OLLAMA_HOST_VALUE"
+  exit 0
+fi
+
 export OLLAMA_HOST="$OLLAMA_HOST_VALUE"
 nohup "$OLLAMA_BIN" serve >>"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
@@ -28,6 +33,8 @@ sleep 2
 
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "Ollama started on $OLLAMA_HOST_VALUE"
+elif command -v curl >/dev/null 2>&1 && curl -fsS "http://$OLLAMA_HOST_VALUE/api/tags" >/dev/null 2>&1; then
+  echo "Ollama is reachable on $OLLAMA_HOST_VALUE"
 else
   echo "Ollama failed to start. Check $LOG_FILE" >&2
   exit 1

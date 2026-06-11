@@ -8,6 +8,7 @@ DATA_DIR="${REDIS_DATA_DIR:-$ROOT_DIR/data/redis}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 REDIS_BIND="${REDIS_BIND:-127.0.0.1}"
 REDIS_SERVER_BIN="${REDIS_SERVER_BIN:-$HOME/local/redis/bin/redis-server}"
+REDIS_CLI_BIN="${REDIS_CLI_BIN:-$HOME/local/redis/bin/redis-cli}"
 REDIS_CONFIG="$RUN_DIR/redis.conf"
 PID_FILE="$RUN_DIR/redis.pid"
 LOG_FILE="$LOG_DIR/redis.log"
@@ -19,8 +20,23 @@ if [ ! -x "$REDIS_SERVER_BIN" ]; then
   exit 1
 fi
 
+redis_ping() {
+  if [ -x "$REDIS_CLI_BIN" ]; then
+    "$REDIS_CLI_BIN" -h "$REDIS_BIND" -p "$REDIS_PORT" ping 2>/dev/null | grep -q '^PONG$'
+  elif command -v redis-cli >/dev/null 2>&1; then
+    redis-cli -h "$REDIS_BIND" -p "$REDIS_PORT" ping 2>/dev/null | grep -q '^PONG$'
+  else
+    return 1
+  fi
+}
+
 if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "Redis already running with PID $(cat "$PID_FILE")"
+  exit 0
+fi
+
+if redis_ping; then
+  echo "Redis already reachable on ${REDIS_BIND}:${REDIS_PORT}"
   exit 0
 fi
 
@@ -44,6 +60,8 @@ sleep 1
 
 if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
   echo "Redis started on ${REDIS_BIND}:${REDIS_PORT}"
+elif redis_ping; then
+  echo "Redis is reachable on ${REDIS_BIND}:${REDIS_PORT}"
 else
   echo "Redis failed to start. Check $LOG_FILE" >&2
   exit 1
