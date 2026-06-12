@@ -5,7 +5,8 @@ from app.db.session import Base
 from app.models.records import Document, DocumentChunk, Project, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import QueryService
+from app.services.search import QueryService, RetrievedContext
+from app.schemas.common import Citation
 
 
 class FakeOllama:
@@ -489,3 +490,73 @@ def test_build_answer_constraints_ablation_query() -> None:
     service = QueryService(db)
     constraints = service._build_answer_constraints("ablation studies 得出了什么结论？", [])
     assert "ablation" in constraints.lower()
+
+
+def test_rank_blocks_prioritizes_dataset_metric_table() -> None:
+    db = make_session()
+    service = QueryService(db)
+    blocks = [
+        "### Page 4\nTable 1: Domain KG evaluation\nOpenIE 6 Precision 42.05 Recall 1.94",
+        "### Page 8\nTable 5: Benchmark results\nOIE2016 F1 74.7 AUC 73.2\nNYT F1 88.8 AUC 87.3",
+    ]
+
+    ranked = service._rank_blocks("SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", blocks)
+
+    assert ranked[0][0].startswith("### Page 8")
+    assert "74.7" in ranked[0][0]
+
+
+def test_build_contexts_adds_component_facets() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/sac-kg",
+        title="SAC-KG",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/sac-kg.md",
+        markdown_content=(
+            "# SAC-KG\n\n"
+            "SAC-KG is a framework.\n\n"
+            "Generator extracts relations and tail entities.\n\n"
+            "Verifier corrects generation errors.\n\n"
+            "Pruner decides whether tail entities should grow."
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 3, "key_terms": ["SAC-KG", "Generator", "Verifier", "Pruner"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+    service = QueryService(db)
+    matches = service._search_wiki_pages("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？", "p1")
+
+    contexts = service._build_contexts("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？", "p1", matches)
+    prompt = "\n".join(context.prompt_text for context in contexts)
+
+    assert "Generator extracts" in prompt
+    assert "Verifier corrects" in prompt
+    assert "Pruner decides" in prompt
+
+
+def test_unsupported_answer_numbers_detects_numbers_missing_from_evidence() -> None:
+    db = make_session()
+    service = QueryService(db)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/sac-kg",
+                page_title="SAC-KG",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="OIE2016 F1 74.7 AUC 73.2",
+            ),
+            prompt_text="OIE2016 F1 74.7 AUC 73.2",
+            score=10.0,
+        )
+    ]
+
+    unsupported = service._unsupported_answer_numbers("OIE2016 F1=74.7, NYT F1=88.8", contexts, [0])
+
+    assert "88.8" in unsupported
+    assert "74.7" not in unsupported

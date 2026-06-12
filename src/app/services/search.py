@@ -22,6 +22,7 @@ WIKI_PRIMARY_SCORE_THRESHOLD = 6.0
 MIN_WIKI_OVERLAP_SCORE = 1
 MIN_CONTEXT_SCORE = 2.0
 CONTEXT_SCORE_RATIO = 0.35
+MAX_CONTEXTS = 8
 
 
 @dataclass
@@ -61,6 +62,10 @@ class QueryService:
                 answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
 
         chosen_indexes = answer_payload.citations or self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts))
+        chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
+        answer_payload = self._repair_unsupported_numeric_answer(question, index_context, contexts, answer_payload, chosen_indexes)
+        chosen_indexes = answer_payload.citations or self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts))
+        chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         citations = self._select_citations(contexts, chosen_indexes)
         if not self._needs_source_evidence(question):
             citations = self._prefer_wiki_citations(citations, page_matches, project.id)
@@ -165,6 +170,7 @@ class QueryService:
         contexts: list[RetrievedContext] = []
         matched_doc_ids: list[str] = []
         query_terms = self._tokenize(question)
+        query_facets = self._extract_query_facets(question)
         top_score = page_matches[0].score if page_matches else 0.0
         min_score = max(MIN_CONTEXT_SCORE, top_score * CONTEXT_SCORE_RATIO) if top_score else MIN_CONTEXT_SCORE
         is_figure_query = self._is_figure_query(question)
@@ -182,39 +188,44 @@ class QueryService:
             # instead of the page start.
             if is_figure_query:
                 figure_blocks = self._extract_figure_blocks(page_body)
-                for block in figure_blocks[:3]:
+                for block, block_score in self._rank_blocks(question, figure_blocks)[:4]:
                     contexts.append(
                         RetrievedContext(
                             citation=Citation(
                                 page_slug=page.slug,
                                 page_title=strip_upload_prefix(page.title),
                                 page_kind=page.kind,
-                                score=match.score + 2.0,  # boost figure blocks
+                                score=match.score + 2.0 + block_score,
                                 page_label=self._extract_page_label_from_block(block),
                                 excerpt=block[:280],
                             ),
                             prompt_text=block[:2000],
-                            score=match.score + 2.0,
+                            score=match.score + 2.0 + block_score,
                         )
                     )
 
             if is_table_query or is_metric_query:
                 table_blocks = self._extract_table_blocks(page_body)
-                for block in table_blocks[:3]:
+                for block, block_score in self._rank_blocks(question, table_blocks)[:5]:
                     contexts.append(
                         RetrievedContext(
                             citation=Citation(
                                 page_slug=page.slug,
                                 page_title=strip_upload_prefix(page.title),
                                 page_kind=page.kind,
-                                score=match.score + 2.0,  # boost table blocks
+                                score=match.score + 2.0 + block_score,
                                 page_label=self._extract_page_label_from_block(block),
                                 excerpt=block[:280],
                             ),
                             prompt_text=block[:2000],
-                            score=match.score + 2.0,
+                            score=match.score + 2.0 + block_score,
                         )
                     )
+
+            for facet in query_facets:
+                facet_context = self._context_for_facet(page, page_body, facet, query_terms)
+                if facet_context is not None:
+                    contexts.append(facet_context)
 
             # Always include the main page context (windowed around query terms).
             prompt_text = self._window_text(page_body, query_terms, max_chars=4000, question=question)
@@ -225,6 +236,7 @@ class QueryService:
                         page_title=strip_upload_prefix(page.title),
                         page_kind=page.kind,
                         score=match.score,
+                        page_label=self._extract_page_label_from_wiki_content(page_body, prompt_text),
                         excerpt=self._window_text(page_body, query_terms, max_chars=280, question=question),
                     ),
                     prompt_text=prompt_text,
@@ -234,11 +246,11 @@ class QueryService:
             matched_doc_ids.extend(page.source_document_ids)
 
         if self._should_use_wiki_only(question, page_matches):
-            return contexts
+            return self._finalize_contexts(contexts)
         if matched_doc_ids:
             contexts.extend(self._search_source_chunks(question, project_id, sorted(set(matched_doc_ids))))
         if contexts:
-            return contexts
+            return self._finalize_contexts(contexts)
         return self._search_source_chunks(question, project_id, [], limit=5)
 
     def _draft_answer(self, question: str, index_context: str | None, contexts: list[RetrievedContext]) -> QueryAnswerPayload:
@@ -273,7 +285,11 @@ class QueryService:
         prompt = "\n\n".join(
             [
                 f"Question: {question}",
-                "Answer using the retrieved wiki pages first, and use source evidence only when it adds precision. Return citation indexes that support the answer.",
+                (
+                    "Answer using the retrieved wiki pages first, and use source evidence only when it adds precision. "
+                    "If the question contains multiple entities, datasets, metrics, tables, figures, or components, "
+                    "answer each requested item explicitly. Return citation indexes that directly support each claim."
+                ),
                 constraints,
                 context_text,
             ]
@@ -323,7 +339,8 @@ class QueryService:
                     "IMPORTANT: The context includes Table data. "
                     "You MUST extract and report specific numbers/metrics from the tables. "
                     "Cite the table number (e.g., Table 2, Table 5) and page. "
-                    "Do NOT say metrics are 'not available' when tables are present in context."
+                    "Do NOT say metrics are 'not available' when tables are present in context. "
+                    "Every numeric metric in your answer MUST appear verbatim in one of the cited contexts."
                 )
             else:
                 parts.append(
@@ -351,7 +368,99 @@ class QueryService:
                 "Only report a dataset as a 'main dataset' if it was used for standardized evaluation."
             )
 
+        facets = self._extract_query_facets(question)
+        if facets:
+            parts.append(
+                "IMPORTANT: The question asks about these specific items: "
+                + ", ".join(facets)
+                + ". Address each item explicitly. If evidence for an item is missing, say so instead of answering only the first item."
+            )
+
+        parts.append(
+            "CRITICAL: Only report specific numbers, percentages, scores, F1, AUC, Precision, Recall, or dataset metrics "
+            "that appear verbatim in the provided context. If a number is not in the cited context, do not include it."
+        )
+
         return "\n".join(parts) if parts else ""
+
+    def _repair_unsupported_numeric_answer(
+        self,
+        question: str,
+        index_context: str | None,
+        contexts: list[RetrievedContext],
+        answer_payload: QueryAnswerPayload,
+        chosen_indexes: list[int],
+    ) -> QueryAnswerPayload:
+        unsupported = self._unsupported_answer_numbers(answer_payload.answer_markdown, contexts, chosen_indexes)
+        if not unsupported:
+            return answer_payload
+        supported_pairs = [(index, contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts)]
+        if not supported_pairs:
+            supported_pairs = list(enumerate(contexts[: min(3, len(contexts))]))
+        constrained_context = "\n\n".join(f"[{index}] {ctx.prompt_text}" for index, ctx in supported_pairs)
+        if index_context:
+            constrained_context = "Index overview:\n" + index_context + "\n\n" + constrained_context
+        fallback = QueryAnswerPayload(
+            answer_markdown=(
+                "The retrieved evidence did not support the specific numeric values in the first draft. "
+                "Please re-run the query after ingesting stronger table evidence."
+            ),
+            citations=list(range(len(supported_contexts))),
+            risk_level=answer_payload.risk_level,
+        )
+        prompt = "\n\n".join(
+            [
+                f"Question: {question}",
+                "The previous draft included unsupported numeric values: " + ", ".join(sorted(unsupported)),
+                "Rewrite the answer using ONLY the evidence below. Do not include any number unless it appears verbatim in the evidence. If a requested metric is absent, say it is absent from the retrieved materials.",
+                self._build_answer_constraints(question, supported_contexts),
+                constrained_context,
+            ]
+        )
+        repaired = safe_model_call(
+            lambda: self.ollama.generate_structured(
+                QueryAnswerPayload,
+                system_prompt="You repair answers by removing unsupported numeric claims and citing only provided evidence.",
+                user_prompt=prompt,
+            ),
+            fallback,
+        )
+        allowed_indexes = {index for index, _ in supported_pairs}
+        repaired.citations = [index for index in repaired.citations if index in allowed_indexes] or [index for index, _ in supported_pairs]
+        return QueryAnswerPayload(
+            answer_markdown=repaired.answer_markdown,
+            citations=repaired.citations,
+            risk_level=repaired.risk_level,
+        )
+
+    def _supported_citation_indexes(self, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
+        if not contexts:
+            return []
+        indexes = [index for index in chosen_indexes if 0 <= index < len(contexts)]
+        if not indexes:
+            indexes = list(range(min(2, len(contexts))))
+        unsupported = self._unsupported_answer_numbers(answer_markdown, contexts, indexes)
+        if not unsupported:
+            return indexes
+        numeric_context_indexes = [
+            index
+            for index, context in enumerate(contexts)
+            if any(number in context.prompt_text for number in self._answer_numbers(answer_markdown))
+        ]
+        return numeric_context_indexes or indexes
+
+    @classmethod
+    def _unsupported_answer_numbers(cls, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> set[str]:
+        numbers = cls._answer_numbers(answer_markdown)
+        if not numbers:
+            return set()
+        evidence = "\n".join(contexts[index].prompt_text for index in chosen_indexes if 0 <= index < len(contexts))
+        return {number for number in numbers if number not in evidence}
+
+    @staticmethod
+    def _answer_numbers(answer_markdown: str) -> set[str]:
+        numbers = set(re.findall(r"(?<![\w.])\d+(?:\.\d+)?%?(?![\w.])", answer_markdown))
+        return {number for number in numbers if len(number) > 1 or "." in number or number.endswith("%")}
 
     def _verify_answer(self, answer_markdown: str, contexts: list[RetrievedContext]) -> VerificationPayload:
         claims = [
@@ -631,6 +740,107 @@ class QueryService:
         start = max(0, end - max_chars)
         return text[start:end]
 
+    def _context_for_facet(self, page: WikiPage, page_body: str, facet: str, query_terms: set[str]) -> RetrievedContext | None:
+        lowered = page_body.lower()
+        position = lowered.find(facet.lower())
+        if position < 0:
+            return None
+        start = max(0, position - 500)
+        end = min(len(page_body), position + 1600)
+        excerpt = page_body[start:end]
+        score = 4.0 + min(len(query_terms & self._tokenize(excerpt)), 8)
+        return RetrievedContext(
+            citation=Citation(
+                page_slug=page.slug,
+                page_title=strip_upload_prefix(page.title),
+                page_kind=page.kind,
+                score=score,
+                page_label=self._extract_page_label_from_wiki_content(page_body, excerpt),
+                excerpt=excerpt[:280],
+            ),
+            prompt_text=excerpt,
+            score=score,
+        )
+
+    def _finalize_contexts(self, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+        sorted_contexts = sorted(contexts, key=lambda item: item.score, reverse=True)
+        finalized: list[RetrievedContext] = []
+        seen_keys: set[str] = set()
+        page_counts: dict[str, int] = {}
+        for context in sorted_contexts:
+            citation = context.citation
+            normalized_excerpt = re.sub(r"\s+", " ", citation.excerpt.strip())[:180]
+            key = f"{citation.page_slug or citation.document_id}:{citation.page_label}:{normalized_excerpt}"
+            if key in seen_keys:
+                continue
+            if citation.page_slug:
+                current_count = page_counts.get(citation.page_slug, 0)
+                if current_count >= 3:
+                    continue
+                page_counts[citation.page_slug] = current_count + 1
+            finalized.append(context)
+            seen_keys.add(key)
+            if len(finalized) >= MAX_CONTEXTS:
+                break
+        return finalized
+
+    def _rank_blocks(self, question: str, blocks: list[str]) -> list[tuple[str, float]]:
+        facets = [facet.lower() for facet in self._extract_query_facets(question)]
+        query_terms = self._tokenize(question)
+        ranked: list[tuple[str, float]] = []
+        for index, block in enumerate(blocks):
+            lowered = block.lower()
+            block_terms = self._tokenize(block)
+            score = float(len(query_terms & block_terms))
+            for facet in facets:
+                if facet and facet in lowered:
+                    score += 6.0
+            for anchor in self._query_priority_anchors(question)["figure_table"]:
+                if anchor.lower() in lowered:
+                    score += 6.0
+            for anchor in self._query_priority_anchors(question)["dataset"]:
+                if anchor.lower() in lowered:
+                    score += 8.0
+            if any(metric in lowered for metric in ("f1", "auc", "precision", "recall", "score", "指标")):
+                score += 2.0
+            if re.search(r"\d+(?:\.\d+)?", block):
+                score += 1.5
+            ranked.append((block, score - index * 0.01))
+        return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    @classmethod
+    def _extract_query_facets(cls, question: str) -> list[str]:
+        facets: list[str] = []
+        for anchor in cls._query_priority_anchors(question)["figure_table"]:
+            facets.append(anchor)
+        for anchor in cls._query_priority_anchors(question)["dataset"]:
+            facets.append(anchor)
+        for match in re.finditer(r"\b(Generator|Verifier|Pruner|Retriever|OpenIE\s*6|Stanford\s*OIE|DeepEx|PIVE|ChatGPT|GPT-4|LLaMA|Qwen)\b", question, re.IGNORECASE):
+            facets.append(match.group(0))
+        chinese_component_map = {
+            "生成器": "Generator",
+            "验证器": "Verifier",
+            "修剪器": "Pruner",
+            "裁剪器": "Pruner",
+            "检索器": "Retriever",
+            "数据集": "dataset",
+            "消融": "ablation",
+            "指标": "metric",
+        }
+        for marker, facet in chinese_component_map.items():
+            if marker in question:
+                facets.append(facet)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for facet in facets:
+            normalized = facet.strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            ordered.append(normalized)
+            seen.add(key)
+        return ordered
+
     @classmethod
     def _query_priority_anchors(cls, question: str) -> dict[str, list[str]]:
         if not question:
@@ -729,6 +939,19 @@ class QueryService:
         match = re.search(r"Page\s+(\d+)", block, re.IGNORECASE)
         if match:
             return match.group(1)
+        return None
+
+    @classmethod
+    def _extract_page_label_from_wiki_content(cls, markdown: str, excerpt: str) -> str | None:
+        if label := cls._extract_page_label_from_block(excerpt):
+            return label
+        position = markdown.find(excerpt[:80].strip()) if excerpt.strip() else -1
+        if position < 0:
+            return None
+        prefix = markdown[:position]
+        matches = list(re.finditer(r"(?:^|\n)(?:###?\s+)?Page\s+(\d+)", prefix, re.IGNORECASE))
+        if matches:
+            return matches[-1].group(1)
         return None
 
     # ---- End Figure / Table helpers ----
