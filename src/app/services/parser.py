@@ -131,20 +131,28 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
         logger.warning("MinerU exited with code %s: %s", completed.returncode, completed.stderr[-1200:])
         return None
 
-    content_path = _find_mineru_content_list(run_dir)
-    if content_path is None:
+    content_paths = _find_mineru_content_lists(run_dir)
+    if not content_paths:
         logger.warning("MinerU completed but no content_list JSON was found under %s.", run_dir)
         return None
 
-    try:
-        payload = json.loads(content_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to read MinerU output %s: %s", content_path, exc)
-        return None
+    content_path: Path | None = None
+    content_list: list[dict] = []
+    for candidate_path in content_paths:
+        try:
+            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read MinerU output %s: %s", candidate_path, exc)
+            continue
+        candidate_content = _normalize_mineru_content_list(payload)
+        if candidate_content:
+            content_path = candidate_path
+            content_list = candidate_content
+            break
+        logger.warning("MinerU output had no supported blocks: %s (%s)", candidate_path, _describe_mineru_payload(payload))
 
-    content_list = _normalize_mineru_content_list(payload)
-    if not content_list:
-        logger.warning("MinerU output was empty: %s", content_path)
+    if content_path is None or not content_list:
+        logger.warning("MinerU produced no usable structured content under %s.", run_dir)
         return None
 
     parsed = _mineru_content_to_parsed_doc(
@@ -168,25 +176,45 @@ def _resolve_mineru_binary(value: str) -> str | None:
 
 
 def _find_mineru_content_list(output_dir: Path) -> Path | None:
-    patterns = ("*content_list_v2.json", "*content_list.json", "content_list_v2.json", "content_list.json")
+    candidates = _find_mineru_content_lists(output_dir)
+    return candidates[0] if candidates else None
+
+
+def _find_mineru_content_lists(output_dir: Path) -> list[Path]:
+    patterns = ("*content_list_v2.json", "content_list_v2.json", "*content_list.json", "content_list.json")
     candidates: list[Path] = []
     for pattern in patterns:
         candidates.extend(output_dir.rglob(pattern))
     unique_candidates = list(dict.fromkeys(candidates))
-    if not unique_candidates:
-        return None
-    return max(unique_candidates, key=lambda item: item.stat().st_mtime)
+    return sorted(
+        unique_candidates,
+        key=lambda item: (0 if item.name.endswith("content_list_v2.json") else 1, -item.stat().st_mtime),
+    )
 
 
 def _normalize_mineru_content_list(payload: object) -> list[dict]:
     raw_items: list[dict] = []
     if isinstance(payload, list):
-        raw_items = [item for item in payload if isinstance(item, dict)]
+        for page_index, item in enumerate(payload):
+            if isinstance(item, dict):
+                raw_items.append(item)
+            elif isinstance(item, list):
+                for child in item:
+                    if isinstance(child, dict):
+                        merged = {"page_idx": page_index, **child}
+                        raw_items.append(merged)
     elif isinstance(payload, dict):
         for key in ("content_list", "content", "pages", "items"):
             value = payload.get(key)
             if isinstance(value, list):
-                raw_items = [item for item in value if isinstance(item, dict)]
+                for page_index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        raw_items.append(item)
+                    elif isinstance(item, list):
+                        for child in item:
+                            if isinstance(child, dict):
+                                merged = {"page_idx": page_index, **child}
+                                raw_items.append(merged)
                 break
 
     flattened: list[dict] = []
@@ -213,6 +241,21 @@ def _mineru_nested_items(item: dict) -> list[dict]:
     return []
 
 
+def _describe_mineru_payload(payload: object) -> str:
+    if isinstance(payload, list):
+        if not payload:
+            return "list(len=0)"
+        first = payload[0]
+        if isinstance(first, list):
+            return f"list(len={len(payload)}, first=list(len={len(first)}))"
+        if isinstance(first, dict):
+            return f"list(len={len(payload)}, first_keys={list(first)[:8]})"
+        return f"list(len={len(payload)}, first_type={type(first).__name__})"
+    if isinstance(payload, dict):
+        return f"dict(keys={list(payload)[:12]})"
+    return type(payload).__name__
+
+
 def _mineru_content_to_parsed_doc(
     *,
     path: Path,
@@ -237,33 +280,37 @@ def _mineru_content_to_parsed_doc(
         block_text = ""
         heading = f"mineru-page-{page_label}-{content_type}"
         if content_type in {"title", "heading"}:
-            block_text = _mineru_first_text(item, "text", "content", "md_content")
+            block_text = _mineru_first_text(item, "text", "title_content", "content", "md_content")
             if block_text:
                 stats["sections"] += 1
                 block_text = f"### {block_text}"
+        elif content_type == "paragraph":
+            block_text = _mineru_first_text(item, "text", "paragraph_content", "content", "md_content")
+            if block_text:
+                stats["sections"] += 1
         elif "table" in content_type:
             caption = _mineru_caption_text(item, "table_caption", "caption")
-            table_body = _mineru_first_text(item, "table_body", "table_html", "html", "text", "md_content")
+            table_body = _mineru_first_text(item, "table_body", "table_html", "table_content", "html", "text", "content", "md_content")
             table_markdown = _html_table_to_markdown(table_body) if "<table" in table_body.lower() else table_body
             block_text = "\n\n".join(part for part in (caption, table_markdown) if part)
             if block_text:
                 stats["tables"] += 1
                 tables.append({"page_label": page_label, "markdown": block_text})
         elif "equation" in content_type or "formula" in content_type:
-            formula = _mineru_first_text(item, "text", "latex", "content", "md_content")
+            formula = _mineru_first_text(item, "text", "latex", "math_content", "content", "md_content")
             if formula:
                 stats["formulas"] += 1
                 formulas.append({"page_label": page_label, "text": formula})
                 block_text = formula
         elif content_type in {"image", "figure"} or "image" in content_type or "figure" in content_type:
-            caption = _mineru_caption_text(item, "image_caption", "caption")
+            caption = _mineru_caption_text(item, "image_caption", "chart_caption", "caption", "content")
             image_path = _mineru_first_text(item, "img_path", "image_path", "path")
             block_text = caption or image_path
             if block_text:
                 stats["figures"] += 1
                 figures.append({"page_label": page_label, "note": block_text})
         else:
-            block_text = _mineru_first_text(item, "text", "content", "md_content")
+            block_text = _mineru_first_text(item, "text", "paragraph_content", "content", "md_content")
             if block_text:
                 stats["sections"] += 1
 
@@ -341,7 +388,7 @@ def _mineru_page_label(item: dict) -> str:
 
 def _mineru_first_text(item: dict, *keys: str) -> str:
     for key in keys:
-        value = item.get(key)
+        value = _mineru_lookup_value(item, key)
         text = _stringify_mineru_value(value)
         if text:
             return text
@@ -351,10 +398,19 @@ def _mineru_first_text(item: dict, *keys: str) -> str:
 def _mineru_caption_text(item: dict, *keys: str) -> str:
     parts: list[str] = []
     for key in keys:
-        text = _stringify_mineru_value(item.get(key))
+        text = _stringify_mineru_value(_mineru_lookup_value(item, key))
         if text:
             parts.append(text)
     return " ".join(parts).strip()
+
+
+def _mineru_lookup_value(item: dict, key: str) -> object:
+    if key in item:
+        return item.get(key)
+    content = item.get("content")
+    if isinstance(content, dict) and key in content:
+        return content.get(key)
+    return None
 
 
 def _stringify_mineru_value(value: object) -> str:
@@ -367,10 +423,24 @@ def _stringify_mineru_value(value: object) -> str:
     if isinstance(value, list):
         return " ".join(_stringify_mineru_value(item) for item in value).strip()
     if isinstance(value, dict):
-        for key in ("text", "content", "caption"):
+        for key in (
+            "text",
+            "content",
+            "title_content",
+            "paragraph_content",
+            "math_content",
+            "table_content",
+            "table_body",
+            "image_caption",
+            "chart_caption",
+            "caption",
+        ):
             text = _stringify_mineru_value(value.get(key))
             if text:
                 return text
+        children = value.get("children")
+        if isinstance(children, list):
+            return _stringify_mineru_value(children)
     return ""
 
 

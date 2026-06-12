@@ -161,3 +161,32 @@ def test_normalize_mineru_content_list_flattens_page_blocks() -> None:
     assert len(flattened) == 2
     assert flattened[0]["page_idx"] == 0
     assert flattened[1]["text"] == "Nested paragraph"
+
+
+def test_normalize_mineru_content_list_supports_v2_page_lists() -> None:
+    payload = [
+        [
+            {"type": "title", "content": {"title_content": "SAC-KG"}},
+            {"type": "paragraph", "content": {"paragraph_content": "The generator creates triples."}},
+        ],
+        [
+            {"type": "table", "content": {"table_content": "| Model | F1 |\n| --- | --- |\n| OpenIE6 | 42.05 |"}},
+            {"type": "equation", "content": {"math_content": "$F_1$"}},
+        ],
+    ]
+
+    flattened = parser._normalize_mineru_content_list(payload)
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=Path("paper.pdf"),
+        content_list=flattened,
+        page_count=2,
+    )
+
+    intelligence = parsed.metadata["document_intelligence"]
+    assert len(flattened) == 4
+    assert flattened[0]["page_idx"] == 0
+    assert flattened[2]["page_idx"] == 1
+    assert "SAC-KG" in parsed.text
+    assert "generator creates triples" in parsed.text
+    assert intelligence["tables"][0]["page_label"] == "2"
+    assert intelligence["formulas"][0]["text"] == "$F_1$"
