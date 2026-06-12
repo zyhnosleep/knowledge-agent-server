@@ -116,8 +116,15 @@ def test_parse_pdf_with_mineru_reads_content_list(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(parser.settings, "mineru_extra_args", "")
     monkeypatch.setattr(parser, "_resolve_mineru_binary", lambda value: "mineru")
 
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
     def fake_run(command, cwd, env, capture_output, text, timeout, check):
+        pdf_arg = Path(command[command.index("-p") + 1])
         output_dir = Path(command[command.index("-o") + 1])
+        assert pdf_arg.is_absolute()
+        assert output_dir.is_absolute()
+        assert cwd == str(pdf_path.parent.resolve())
         result_dir = output_dir / "paper" / "auto"
         result_dir.mkdir(parents=True)
         (result_dir / "paper_content_list_v2.json").write_text(
@@ -129,7 +136,7 @@ def test_parse_pdf_with_mineru_reads_content_list(monkeypatch, tmp_path) -> None
 
     monkeypatch.setattr(parser.subprocess, "run", fake_run)
 
-    parsed = parser._parse_pdf_with_mineru(tmp_path / "paper.pdf", page_count=1)
+    parsed = parser._parse_pdf_with_mineru(pdf_path, page_count=1)
 
     assert parsed is not None
     assert parsed.metadata["parser_mode"] == "pdf_mineru"

@@ -90,11 +90,16 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
         logger.info("MinerU is enabled but the CLI was not found: %s", settings.mineru_bin)
         return None
 
-    output_root = settings.mineru_output_dir or settings.cache_dir / "mineru"
-    run_dir = output_root / f"{slugify(path.stem) or 'document'}-{uuid4().hex[:8]}"
+    source_path = path.expanduser().resolve()
+    if not source_path.exists():
+        logger.warning("MinerU source PDF does not exist: %s", source_path)
+        return None
+
+    output_root = (settings.mineru_output_dir or settings.cache_dir / "mineru").expanduser().resolve()
+    run_dir = output_root / f"{slugify(source_path.stem) or 'document'}-{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    command = [mineru_bin, "-p", str(path), "-o", str(run_dir)]
+    command = [mineru_bin, "-p", str(source_path), "-o", str(run_dir)]
     if settings.mineru_backend:
         command.extend(["-b", settings.mineru_backend])
     if settings.mineru_extra_args:
@@ -108,7 +113,7 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
     try:
         completed = subprocess.run(
             command,
-            cwd=str(path.parent),
+            cwd=str(source_path.parent),
             env=env,
             capture_output=True,
             text=True,
@@ -143,7 +148,7 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
         return None
 
     parsed = _mineru_content_to_parsed_doc(
-        path=path,
+        path=source_path,
         content_list=content_list,
         page_count=page_count,
         output_dir=content_path.parent,
