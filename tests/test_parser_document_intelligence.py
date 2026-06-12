@@ -190,3 +190,30 @@ def test_normalize_mineru_content_list_supports_v2_page_lists() -> None:
     assert "generator creates triples" in parsed.text
     assert intelligence["tables"][0]["page_label"] == "2"
     assert intelligence["formulas"][0]["text"] == "$F_1$"
+
+
+def test_augment_mineru_parsed_doc_from_markdown_recovers_tables(tmp_path) -> None:
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "paper.pdf",
+        content_list=[{"type": "paragraph", "content": {"paragraph_content": "Ablation study is discussed."}, "page_idx": 4}],
+        page_count=5,
+    )
+    markdown_path = tmp_path / "paper.md"
+    markdown_path.write_text(
+        "\n".join(
+            [
+                "## Page 5",
+                "Table 2: Ablation results",
+                "| Variant | F1 | AUC |",
+                "| --- | --- | --- |",
+                "| SAC-KG w/o verifier | 68.1 | 70.2 |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parser._augment_mineru_parsed_doc_from_markdown(parsed, markdown_path)
+
+    tables = parsed.metadata["document_intelligence"]["tables"]
+    assert any("Table 2" in table["markdown"] for table in tables)
+    assert any("68.1" in chunk.text for chunk in parsed.chunks)

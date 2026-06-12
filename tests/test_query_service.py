@@ -587,3 +587,27 @@ def test_repair_unsupported_numeric_answer_uses_supported_pairs_without_name_err
 
     assert "88.8" not in repaired.answer_markdown
     assert repaired.citations == [0]
+
+
+def test_choose_citation_indexes_unions_payload_inferred_and_facets() -> None:
+    db = make_session()
+    service = QueryService(db)
+    contexts = [
+        RetrievedContext(citation=Citation(page_slug="s", page_title="S", page_kind="source_summary", score=1, excerpt="SAC-KG"), prompt_text="SAC-KG overview", score=1),
+        RetrievedContext(citation=Citation(page_slug="s", page_title="S", page_kind="source_summary", score=1, excerpt="Generator"), prompt_text="Generator extracts relations.", score=1),
+        RetrievedContext(citation=Citation(page_slug="s", page_title="S", page_kind="source_summary", score=1, excerpt="Verifier"), prompt_text="Verifier checks triples.", score=1),
+        RetrievedContext(citation=Citation(page_slug="s", page_title="S", page_kind="source_summary", score=1, excerpt="Pruner"), prompt_text="Pruner controls growth.", score=1),
+        RetrievedContext(citation=Citation(page_slug="s", page_title="S", page_kind="source_summary", score=1, excerpt="Table 2"), prompt_text="Table 2 reports ablation.", score=1),
+    ]
+    payload = QueryAnswerPayload(answer_markdown="Generator [1], Verifier [2], Pruner [3], Table 2 [4]", citations=[0], risk_level="normal")
+
+    indexes = service._choose_citation_indexes("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？请引用 Table 2。", payload, contexts)
+    renumbered = service._renumber_answer_citations(payload.answer_markdown, indexes)
+
+    assert indexes[:5] == [0, 1, 2, 3, 4]
+    assert "[4]" in renumbered
+
+
+def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:
+    assert not QueryService(make_session())._needs_source_evidence("论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
+    assert QueryService(make_session())._needs_source_evidence("请给出原文证据。")

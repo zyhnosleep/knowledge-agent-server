@@ -155,6 +155,7 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
         logger.warning("MinerU produced no usable structured content under %s.", run_dir)
         return None
 
+    markdown_path = _find_mineru_markdown(content_path.parent)
     parsed = _mineru_content_to_parsed_doc(
         path=source_path,
         content_list=content_list,
@@ -162,6 +163,8 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
         output_dir=content_path.parent,
         content_list_path=content_path,
     )
+    if markdown_path is not None:
+        _augment_mineru_parsed_doc_from_markdown(parsed, markdown_path)
     if not parsed.text.strip():
         logger.warning("MinerU output did not contain usable text; falling back.")
         return None
@@ -190,6 +193,17 @@ def _find_mineru_content_lists(output_dir: Path) -> list[Path]:
         unique_candidates,
         key=lambda item: (0 if item.name.endswith("content_list_v2.json") else 1, -item.stat().st_mtime),
     )
+
+
+def _find_mineru_markdown(output_dir: Path) -> Path | None:
+    candidates = [
+        path
+        for path in output_dir.rglob("*.md")
+        if not path.name.lower().endswith(("_origin.md", "_layout.md"))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
 def _normalize_mineru_content_list(payload: object) -> list[dict]:
@@ -372,6 +386,69 @@ def _mineru_content_to_parsed_doc(
         chunks=chunks or _fallback_chunks(full_text),
         metadata=metadata,
     )
+
+
+def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_path: Path) -> None:
+    try:
+        markdown = markdown_path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to read MinerU markdown output %s: %s", markdown_path, exc)
+        return
+    tables = _extract_tables_from_mineru_markdown(markdown)
+    intelligence = parsed.metadata.setdefault("document_intelligence", {})
+    intelligence["markdown_path"] = str(markdown_path)
+    existing_tables = intelligence.setdefault("tables", [])
+    existing_texts = {str(table.get("markdown") or "").strip() for table in existing_tables if isinstance(table, dict)}
+    for table in tables:
+        markdown_text = str(table.get("markdown") or "").strip()
+        if markdown_text and markdown_text not in existing_texts:
+            existing_tables.append(table)
+            existing_texts.add(markdown_text)
+            parsed.chunks.append(
+                ParsedChunk(
+                    ordinal=len(parsed.chunks),
+                    text=markdown_text[:4000],
+                    heading="mineru-markdown-table",
+                    page_label=table.get("page_label"),
+                )
+            )
+    if markdown.strip() and markdown.strip() not in parsed.text:
+        parsed.text = (parsed.text + "\n\n## MinerU Markdown\n\n" + markdown).strip()
+
+
+def _extract_tables_from_mineru_markdown(markdown: str) -> list[dict]:
+    tables: list[dict] = []
+    lines = markdown.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if "|" not in line:
+            index += 1
+            continue
+        if index + 1 >= len(lines) or not re.search(r"\|\s*:?-{3,}:?\s*(\||$)", lines[index + 1]):
+            index += 1
+            continue
+        start = index
+        while start > 0 and lines[start - 1].strip() and not lines[start - 1].startswith("#"):
+            if "|" in lines[start - 1]:
+                break
+            start -= 1
+        end = index + 2
+        while end < len(lines) and "|" in lines[end]:
+            end += 1
+        block = "\n".join(lines[start:end]).strip()
+        if block:
+            tables.append({"page_label": _page_label_from_markdown_context(lines[:start]), "markdown": block})
+        index = end
+    return tables
+
+
+def _page_label_from_markdown_context(lines: list[str]) -> str | None:
+    for line in reversed(lines[-20:]):
+        match = re.search(r"(?:Page|page)\s*(\d+)", line)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _mineru_page_label(item: dict) -> str:

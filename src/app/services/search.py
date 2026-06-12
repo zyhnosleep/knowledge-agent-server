@@ -61,15 +61,18 @@ class QueryService:
             if verification.notes:
                 answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
 
-        chosen_indexes = answer_payload.citations or self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts))
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         answer_payload = self._repair_unsupported_numeric_answer(question, index_context, contexts, answer_payload, chosen_indexes)
-        chosen_indexes = answer_payload.citations or self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts))
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         citations = self._select_citations(contexts, chosen_indexes)
         if not self._needs_source_evidence(question):
             citations = self._prefer_wiki_citations(citations, page_matches, project.id)
-        response = QueryResponse(answer_markdown=answer_payload.answer_markdown, citations=citations, verification_status=verification_status)
+        answer_markdown = self._renumber_answer_citations(answer_payload.answer_markdown, chosen_indexes)
+        if not citations:
+            answer_markdown = self._strip_answer_citation_markers(answer_markdown)
+        response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
 
         if save_answer:
             record = QuestionAnswer(
@@ -448,6 +451,46 @@ class QueryService:
             if any(number in context.prompt_text for number in self._answer_numbers(answer_markdown))
         ]
         return numeric_context_indexes or indexes
+
+    def _choose_citation_indexes(self, question: str, answer_payload: QueryAnswerPayload, contexts: list[RetrievedContext]) -> list[int]:
+        indexes: list[int] = []
+        for index in answer_payload.citations:
+            if 0 <= index < len(contexts) and index not in indexes:
+                indexes.append(index)
+        for index in self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts)):
+            if index not in indexes:
+                indexes.append(index)
+        for index in self._coverage_citation_indexes(question, contexts):
+            if index not in indexes:
+                indexes.append(index)
+        return indexes or list(range(min(2, len(contexts))))
+
+    def _coverage_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
+        indexes: list[int] = []
+        facets = self._extract_query_facets(question)
+        for facet in facets:
+            lowered_facet = facet.lower()
+            for index, context in enumerate(contexts):
+                if lowered_facet in context.prompt_text.lower():
+                    indexes.append(index)
+                    break
+        return indexes
+
+    @staticmethod
+    def _renumber_answer_citations(answer_markdown: str, selected_indexes: list[int]) -> str:
+        index_map = {context_index: output_index for output_index, context_index in enumerate(selected_indexes)}
+
+        def replace(match: re.Match[str]) -> str:
+            original = int(match.group(1))
+            if original not in index_map:
+                return ""
+            return f"[{index_map[original]}]"
+
+        return re.sub(r"\[(\d+)\]", replace, answer_markdown)
+
+    @staticmethod
+    def _strip_answer_citation_markers(answer_markdown: str) -> str:
+        return re.sub(r"\[(\d+)\]", "", answer_markdown)
 
     @classmethod
     def _unsupported_answer_numbers(cls, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> set[str]:
@@ -965,7 +1008,7 @@ class QueryService:
     @staticmethod
     def _needs_source_evidence(question: str) -> bool:
         lowered = question.lower()
-        markers = ("原文", "出处", "证据", "摘录", "引用", "quote", "quoted", "exact", "verbatim", "source")
+        markers = ("原文", "出处", "证据", "摘录", "quote", "quoted", "exact", "verbatim", "source")
         return any(marker in question or marker in lowered for marker in markers)
 
     def _should_use_wiki_only(self, question: str, page_matches: list[PageMatch]) -> bool:
