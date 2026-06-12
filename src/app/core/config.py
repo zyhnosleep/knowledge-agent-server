@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     document_intelligence_enabled: bool = Field(default=True, alias="DOCUMENT_INTELLIGENCE_ENABLED")
     pdf_render_dpi: int = Field(default=160, alias="PDF_RENDER_DPI")
     ocr_fallback_enabled: bool = Field(default=False, alias="OCR_FALLBACK_ENABLED")
+    mineru_enabled: bool = Field(default=False, alias="MINERU_ENABLED")
+    mineru_bin: str = Field(default="mineru", alias="MINERU_BIN")
+    mineru_backend: str = Field(default="pipeline", alias="MINERU_BACKEND")
+    mineru_model_source: str | None = Field(default=None, alias="MINERU_MODEL_SOURCE")
+    mineru_output_dir: Path | None = Field(default=None, alias="MINERU_OUTPUT_DIR")
+    mineru_timeout: int = Field(default=3600, alias="MINERU_TIMEOUT")
+    mineru_extra_args: str = Field(default="", alias="MINERU_EXTRA_ARGS")
 
     external_api_enabled: bool = Field(default=False, alias="EXTERNAL_API_ENABLED")
     external_api_base_url: str = Field(default="https://api.openai.com/v1", alias="EXTERNAL_API_BASE_URL")

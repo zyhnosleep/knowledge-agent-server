@@ -16,11 +16,12 @@
 - `md` / `txt`：当前最推荐，也最稳定
 - `html`：支持正文抽取
 - `docx`：支持段落文本提取
-- `pdf`：支持页面渲染 + 多模态文档理解 + 文本层融合，但**仍需服务器实机验收**
+- `pdf`：支持 MinerU 可选解析、页面渲染 + 多模态文档理解 + 文本层融合，但**仍需服务器实机验收**
 
 需要特别说明：
 
-- `pdf` 解析已经升级为“文本层质量检测 + 页面渲染 + 多模态逐页理解 + 结果融合”
+- `pdf` 解析已经升级为“可选 MinerU 结构化解析 + 文本层质量检测 + 页面渲染 + 多模态逐页理解 + 结果融合”
+- `MINERU_ENABLED=true` 时，系统会先调用本地 `mineru` CLI；失败时自动回退到现有多模态/Ollama 链路
 - 当 PDF 文本层质量高时，系统仍会优先保留原始文本精度
 - 当遇到扫描版 PDF、图片型 PDF、复杂双栏/表格/公式页时，会优先使用多模态页面理解增强结构保留
 - OCR 不是主链，只作为 fail-safe fallback 预留
@@ -61,6 +62,8 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
 pip install -e .
+# 如果需要启用 MinerU PDF 解析：
+# pip install -e ".[mineru]"
 chmod +x scripts/*.sh
 mkdir -p logs run
 ./scripts/start_redis.sh
@@ -96,9 +99,16 @@ OLLAMA_BATCH_MODEL=qwen3.6:27b
 OLLAMA_EMBEDDING_MODEL=qwen3-embedding:8b
 OLLAMA_VISION_MODEL=qwen3.6:27b
 OLLAMA_REQUEST_TIMEOUT=600
+OLLAMA_KEEP_ALIVE=5m
 DOCUMENT_INTELLIGENCE_ENABLED=true
 PDF_RENDER_DPI=160
 OCR_FALLBACK_ENABLED=false
+MINERU_ENABLED=false
+MINERU_BIN=mineru
+MINERU_BACKEND=pipeline
+MINERU_MODEL_SOURCE=modelscope
+MINERU_OUTPUT_DIR=./data/cache/mineru
+MINERU_TIMEOUT=3600
 MINIO_ENABLED=false
 EXTERNAL_API_ENABLED=false
 ```
@@ -123,7 +133,10 @@ EXTERNAL_API_ENABLED=false
 - `SQLite` 适合当前轻量协作和验证阶段，不适合高并发写入。
 - `EXTERNAL_API_ENABLED=false` 时，问答和摄入只走本地 Ollama。
 - `DOCUMENT_INTELLIGENCE_ENABLED=true` 时，PDF 会优先走页面渲染 + 多模态理解链路。
+- `MINERU_ENABLED=true` 时，PDF 会先走本地 MinerU CLI；MinerU 失败或未安装时会自动回退到现有 PDF 链路。
+- `OLLAMA_KEEP_ALIVE=5m` 用于避免 Ollama 长时间占用 3090 显存；大批量 MinerU 解析前可临时调成 `0`。
 - 更新到当前版本后，需要重新执行 `pip install -e .`，因为新增了 PDF 渲染依赖 `PyMuPDF`。
+- 如果启用 MinerU，需要执行 `pip install -e ".[mineru]"`，并确保服务器可运行 `mineru` 命令。
 - `QUEUE_JOB_TIMEOUT` 应明显大于 `OLLAMA_REQUEST_TIMEOUT`；PDF 和多模态摄入通常比 txt/md 慢很多。
 - 摄入等待期间可以用 `tail -f logs/worker.log` 看阶段日志，或用 `python scripts/watch_ingest_progress.py` 在终端显示动态进度条。
 

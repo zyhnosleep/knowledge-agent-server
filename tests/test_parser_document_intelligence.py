@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from app.services.ai import DocumentPagePayload
 from app.services import parser
@@ -66,3 +67,90 @@ def test_parse_pdf_with_document_intelligence_returns_none_when_rendering_unavai
     parsed = parser._parse_pdf_with_document_intelligence(Path("dummy.pdf"), ["患者诊断为高血压。"], 1)
 
     assert parsed is None
+
+
+def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
+    content_list = [
+        {"type": "title", "text": "SAC-KG", "page_idx": 0},
+        {"type": "text", "text": "SAC-KG introduces a generator, verifier, and pruner.", "page_idx": 0},
+        {
+            "type": "table",
+            "table_caption": ["Table 1: Main results"],
+            "table_body": "<table><tr><th>Model</th><th>F1</th></tr><tr><td>OpenIE6</td><td>42.05</td></tr></table>",
+            "page_idx": 0,
+        },
+        {"type": "interline_equation", "text": "$F_1 = 2PR / (P + R)$", "page_idx": 0},
+        {"type": "image", "image_caption": ["Figure 1 shows the SAC-KG workflow."], "page_idx": 1},
+    ]
+
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "knowledge-graph.pdf",
+        content_list=content_list,
+        page_count=2,
+    )
+
+    intelligence = parsed.metadata["document_intelligence"]
+    assert parsed.metadata["parser_mode"] == "pdf_mineru"
+    assert intelligence["engine"] == "mineru"
+    assert "| Model | F1 |" in intelligence["tables"][0]["markdown"]
+    assert intelligence["formulas"][0]["text"] == "$F_1 = 2PR / (P + R)$"
+    assert intelligence["figures"][0]["page_label"] == "2"
+    assert any(chunk.page_label == "1" and "OpenIE6" in chunk.text for chunk in parsed.chunks)
+
+
+def test_parse_pdf_with_mineru_returns_none_when_cli_missing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(parser.settings, "mineru_bin", "missing-mineru")
+    monkeypatch.setattr(parser, "_resolve_mineru_binary", lambda value: None)
+
+    parsed = parser._parse_pdf_with_mineru(tmp_path / "dummy.pdf", page_count=1)
+
+    assert parsed is None
+
+
+def test_parse_pdf_with_mineru_reads_content_list(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(parser.settings, "mineru_bin", "mineru")
+    monkeypatch.setattr(parser.settings, "mineru_backend", "pipeline")
+    monkeypatch.setattr(parser.settings, "mineru_model_source", "modelscope")
+    monkeypatch.setattr(parser.settings, "mineru_output_dir", tmp_path / "mineru-cache")
+    monkeypatch.setattr(parser.settings, "mineru_timeout", 30)
+    monkeypatch.setattr(parser.settings, "mineru_extra_args", "")
+    monkeypatch.setattr(parser, "_resolve_mineru_binary", lambda value: "mineru")
+
+    def fake_run(command, cwd, env, capture_output, text, timeout, check):
+        output_dir = Path(command[command.index("-o") + 1])
+        result_dir = output_dir / "paper" / "auto"
+        result_dir.mkdir(parents=True)
+        (result_dir / "paper_content_list_v2.json").write_text(
+            '[{"type":"text","text":"MinerU extracted this page.","page_idx":0}]',
+            encoding="utf-8",
+        )
+        assert env["MINERU_MODEL_SOURCE"] == "modelscope"
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(parser.subprocess, "run", fake_run)
+
+    parsed = parser._parse_pdf_with_mineru(tmp_path / "paper.pdf", page_count=1)
+
+    assert parsed is not None
+    assert parsed.metadata["parser_mode"] == "pdf_mineru"
+    assert "MinerU extracted this page." in parsed.text
+
+
+def test_normalize_mineru_content_list_flattens_page_blocks() -> None:
+    payload = {
+        "pages": [
+            {
+                "page_idx": 0,
+                "blocks": [
+                    {"type": "title", "text": "Nested title"},
+                    {"type": "text", "text": "Nested paragraph"},
+                ],
+            }
+        ]
+    }
+
+    flattened = parser._normalize_mineru_content_list(payload)
+
+    assert len(flattened) == 2
+    assert flattened[0]["page_idx"] == 0
+    assert flattened[1]["text"] == "Nested paragraph"

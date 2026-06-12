@@ -4,7 +4,15 @@ set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 RUN_DIR="${RUN_DIR:-$ROOT_DIR/run}"
+
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  . "$ROOT_DIR/.env"
+  set +a
+fi
+
 OLLAMA_HOST_VALUE="${OLLAMA_HOST_VALUE:-127.0.0.1:11435}"
+OLLAMA_KEEP_ALIVE_VALUE="${OLLAMA_KEEP_ALIVE_VALUE:-${OLLAMA_KEEP_ALIVE:-5m}}"
 OLLAMA_BIN="${OLLAMA_BIN:-$HOME/local/ollama/bin/ollama}"
 PID_FILE="$RUN_DIR/ollama.pid"
 LOG_FILE="$LOG_DIR/ollama.log"
@@ -27,6 +35,7 @@ if command -v curl >/dev/null 2>&1 && curl -fsS "http://$OLLAMA_HOST_VALUE/api/t
 fi
 
 export OLLAMA_HOST="$OLLAMA_HOST_VALUE"
+export OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE_VALUE"
 nohup "$OLLAMA_BIN" serve >>"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 sleep 2

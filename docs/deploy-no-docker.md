@@ -28,6 +28,8 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
 pip install -e .
+# 如果要启用 MinerU PDF 解析，再安装：
+# pip install -e ".[mineru]"
 chmod +x scripts/*.sh
 mkdir -p logs run data
 ```
@@ -66,9 +68,16 @@ OLLAMA_BATCH_MODEL=qwen3.6:27b
 OLLAMA_EMBEDDING_MODEL=qwen3-embedding:8b
 OLLAMA_VISION_MODEL=qwen3.6:27b
 OLLAMA_REQUEST_TIMEOUT=600
+OLLAMA_KEEP_ALIVE=5m
 DOCUMENT_INTELLIGENCE_ENABLED=true
 PDF_RENDER_DPI=160
 OCR_FALLBACK_ENABLED=false
+MINERU_ENABLED=false
+MINERU_BIN=mineru
+MINERU_BACKEND=pipeline
+MINERU_MODEL_SOURCE=modelscope
+MINERU_OUTPUT_DIR=./data/cache/mineru
+MINERU_TIMEOUT=3600
 MINIO_ENABLED=false
 EXTERNAL_API_ENABLED=false
 ```
@@ -80,7 +89,37 @@ EXTERNAL_API_ENABLED=false
 - `SQLite` 适合当前轻量协作，不适合高并发写入。
 - 所有命令示例和 `scripts/*.sh` 都按 POSIX `sh` 兼容方式编写，不使用 `source`。
 - 当前版本新增了 PDF 页面渲染依赖；更新代码后请重新执行一次 `pip install -e .`。
+- 如果启用 MinerU，请执行 `pip install -e ".[mineru]"`，并把 `MINERU_ENABLED=true` 写入 `.env`。
 - `QUEUE_JOB_TIMEOUT` 应明显大于 `OLLAMA_REQUEST_TIMEOUT`；如果 PDF 或多模态摄入很慢，可以继续把 `QUEUE_JOB_TIMEOUT` 调到 `7200`。
+
+### 可选：启用 MinerU PDF 解析
+
+服务器硬件如果有独立 GPU，推荐把 MinerU 作为 PDF 解析第一优先级：
+
+```sh
+cd ~/llm_wiki_server
+. .venv/bin/activate
+pip install -e ".[mineru]"
+```
+
+然后修改 `.env`：
+
+```dotenv
+MINERU_ENABLED=true
+MINERU_BIN=mineru
+MINERU_BACKEND=pipeline
+MINERU_MODEL_SOURCE=modelscope
+MINERU_OUTPUT_DIR=./data/cache/mineru
+MINERU_TIMEOUT=3600
+MINERU_EXTRA_ARGS=
+```
+
+说明：
+
+- MinerU 通过 CLI 子进程运行，解析成功后读取 `content_list_v2.json` / `content_list.json`。
+- MinerU 失败、超时或输出缺失时，会自动回退到现有 Ollama Vision PDF 链路。
+- 对 3090 24GB 这类单卡服务器，建议 MinerU 和 Ollama 顺序使用 GPU，不要同时跑大任务。
+- 大批量解析 PDF 前后可以用 `nvidia-smi` 查看显存占用。
 
 ## 3. 在用户目录准备 Redis
 
