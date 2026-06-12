@@ -79,12 +79,15 @@ FACT_VALUE_PATTERN = re.compile(
 )
 GROW_ENTITY_TYPES = {
     "condition",
+    "component",
+    "concept",
     "disease",
     "drug",
     "entity",
     "institution",
     "method",
     "model",
+    "module",
     "organization",
     "person",
     "procedure",
@@ -100,7 +103,7 @@ GENERIC_TRIPLE_EXAMPLES = [
     {"subject": "Clinical Finding", "predicate": "supports", "object_text": "diagnosis"},
     {"subject": "Project", "predicate": "documents", "object_text": "key recommendation"},
 ]
-HEAD_MAX_COUNT = 6
+HEAD_MAX_COUNT = 10
 HEAD_REPROMPT_ERROR_THRESHOLD = 3
 HEAD_SNIPPET_LIMIT = 6
 HEAD_CONTEXT_CHAR_BUDGET = 3600
@@ -1262,6 +1265,8 @@ class IngestionPipeline:
         if entity_type in PRUNE_ENTITY_TYPES or self._looks_like_transient_value(name):
             return GrowthDecision(name=name, item_type=item_type, decision="prune", reason="Transient date, dose, or numeric value.")
         if entity_type in GROW_ENTITY_TYPES:
+            if item_type == "tail" and claim_count <= 0:
+                return GrowthDecision(name=name, item_type=item_type, decision="keep", reason="Durable type but no verified claim supports a standalone tail page yet.")
             return GrowthDecision(name=name, item_type=item_type, decision="grow", reason="Durable entity type suitable for continued growth.")
         if item_type == "tail" and claim_count == 1 and len(name) > 36:
             return GrowthDecision(name=name, item_type=item_type, decision="keep", reason="Tail value is descriptive but may be too broad for its own page.")

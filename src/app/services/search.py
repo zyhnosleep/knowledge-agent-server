@@ -20,8 +20,8 @@ from app.services.wiki import WikiRenderer
 settings = get_settings()
 WIKI_PRIMARY_SCORE_THRESHOLD = 6.0
 MIN_WIKI_OVERLAP_SCORE = 1
-MIN_CONTEXT_SCORE = 2.0
-CONTEXT_SCORE_RATIO = 0.35
+MIN_CONTEXT_SCORE = 2.5
+CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
 
 
@@ -405,7 +405,7 @@ class QueryService:
                 "The retrieved evidence did not support the specific numeric values in the first draft. "
                 "Please re-run the query after ingesting stronger table evidence."
             ),
-            citations=list(range(len(supported_contexts))),
+            citations=[index for index, _ in supported_pairs],
             risk_level=answer_payload.risk_level,
         )
         prompt = "\n\n".join(
@@ -413,7 +413,7 @@ class QueryService:
                 f"Question: {question}",
                 "The previous draft included unsupported numeric values: " + ", ".join(sorted(unsupported)),
                 "Rewrite the answer using ONLY the evidence below. Do not include any number unless it appears verbatim in the evidence. If a requested metric is absent, say it is absent from the retrieved materials.",
-                self._build_answer_constraints(question, supported_contexts),
+                self._build_answer_constraints(question, [context for _, context in supported_pairs]),
                 constrained_context,
             ]
         )
@@ -459,7 +459,7 @@ class QueryService:
 
     @staticmethod
     def _answer_numbers(answer_markdown: str) -> set[str]:
-        numbers = set(re.findall(r"(?<![\w.])\d+(?:\.\d+)?%?(?![\w.])", answer_markdown))
+        numbers = set(re.findall(r"(?<![\w.])\d+(?:\.\d+)?%?(?!\w)", answer_markdown))
         return {number for number in numbers if len(number) > 1 or "." in number or number.endswith("%")}
 
     def _verify_answer(self, answer_markdown: str, contexts: list[RetrievedContext]) -> VerificationPayload:

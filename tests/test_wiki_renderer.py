@@ -80,3 +80,31 @@ def test_render_index_uses_slug_when_markdown_path_has_windows_separators(tmp_pa
 
     assert index_path == tmp_path / "index.md"
     assert "[Sample Doc](sources/sample-doc.md)" in index_path.read_text(encoding="utf-8")
+
+
+def test_render_document_summary_keeps_more_tables_and_figures() -> None:
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Doc",
+        file_name="doc.pdf",
+        sha256="x",
+        raw_path="raw/doc.pdf",
+        metadata_json={
+            "document_intelligence": {
+                "page_outputs": [{"page_label": str(i), "page_summary": f"Page {i}", "text_quality": "mineru"} for i in range(1, 14)],
+                "tables": [{"page_label": str(i), "markdown": f"Table {i} content"} for i in range(1, 10)],
+                "figures": [{"page_label": str(i), "note": f"Figure {i} note"} for i in range(1, 14)],
+            }
+        },
+    )
+    extraction = DocumentExtraction(title="Doc", summary="Summary body")
+    renderer = WikiRenderer(project)
+
+    _, markdown = renderer.render_document_summary(document, extraction)
+
+    assert "Table 8 content" in markdown
+    assert "Table 9 content" not in markdown
+    assert "Figure 12 note" in markdown
+    assert "Figure 13 note" not in markdown

@@ -560,3 +560,30 @@ def test_unsupported_answer_numbers_detects_numbers_missing_from_evidence() -> N
 
     assert "88.8" in unsupported
     assert "74.7" not in unsupported
+
+
+def test_repair_unsupported_numeric_answer_uses_supported_pairs_without_name_error() -> None:
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Only OIE2016 F1 74.7 is supported.", citations=[0], risk_level="normal")
+    service.ollama = fake_ollama
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/sac-kg",
+                page_title="SAC-KG",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="OIE2016 F1 74.7 AUC 73.2",
+            ),
+            prompt_text="OIE2016 F1 74.7 AUC 73.2",
+            score=10.0,
+        )
+    ]
+    draft = QueryAnswerPayload(answer_markdown="OIE2016 F1 74.7 and NYT F1 88.8.", citations=[0], risk_level="normal")
+
+    repaired = service._repair_unsupported_numeric_answer("OIE2016 和 NYT 指标是什么？", None, contexts, draft, [0])
+
+    assert "88.8" not in repaired.answer_markdown
+    assert repaired.citations == [0]

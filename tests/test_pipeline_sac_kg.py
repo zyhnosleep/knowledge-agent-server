@@ -162,6 +162,21 @@ def test_pruner_grows_durable_entities_and_prunes_transient_values() -> None:
     assert decisions["500mg"].decision == "prune"
 
 
+def test_pruner_grows_academic_concepts_but_keeps_unsupported_tails() -> None:
+    db = make_session()
+    pipeline = IngestionPipeline(db)
+
+    concept_decision = pipeline._rule_growth_decision({"name": "Generator", "entity_type": "concept", "claim_count": 1, "item_type": "head"})
+    component_decision = pipeline._rule_growth_decision({"name": "Verifier", "entity_type": "component", "claim_count": 1, "item_type": "head"})
+    module_decision = pipeline._rule_growth_decision({"name": "Pruner", "entity_type": "module", "claim_count": 1, "item_type": "head"})
+    unsupported_tail = pipeline._rule_growth_decision({"name": "Unverified Concept", "entity_type": "concept", "claim_count": 0, "item_type": "tail"})
+
+    assert concept_decision.decision == "grow"
+    assert component_decision.decision == "grow"
+    assert module_decision.decision == "grow"
+    assert unsupported_tail.decision == "keep"
+
+
 def test_head_context_retriever_prioritizes_relevant_snippets() -> None:
     db = make_session()
     pipeline = IngestionPipeline(db)

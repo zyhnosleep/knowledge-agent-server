@@ -117,7 +117,7 @@ class WikiRenderer:
 
         page_outputs = intelligence.get("page_outputs", [])
         if isinstance(page_outputs, list) and page_outputs:
-            for page in page_outputs[:8]:
+            for page in page_outputs[:12]:
                 page_label = str(page.get("page_label", "?"))
                 summary = str(page.get("page_summary") or "").strip()
                 quality = str(page.get("text_quality") or "unknown")
@@ -139,7 +139,7 @@ class WikiRenderer:
         tables = intelligence.get("tables", [])
         if isinstance(tables, list) and tables:
             sections.extend(["", "## Tables"])
-            for table in tables[:4]:
+            for table in tables[:8]:
                 page_label = table.get("page_label", "?")
                 markdown = str(table.get("markdown") or "").strip()
                 sections.append(f"### Page {page_label}")
@@ -156,7 +156,7 @@ class WikiRenderer:
         figures = intelligence.get("figures", [])
         if isinstance(figures, list) and figures:
             sections.extend(["", "## Figure Notes"])
-            for figure in figures[:6]:
+            for figure in figures[:12]:
                 page_label = figure.get("page_label", "?")
                 note = str(figure.get("note") or "").strip()
                 sections.append(f"- Page {page_label}: {note}")
