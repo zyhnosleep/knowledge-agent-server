@@ -845,6 +845,47 @@ def test_same_page_dedup_prefers_table_citation() -> None:
     assert any("Table 5" in citation.excerpt for citation in selected)
 
 
+def test_metric_extraction_repairs_mineru_flattened_table5_header_and_latex_row() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+        "| Model | OIE2016 | WEB | NYT | PENN |  |  |  |  |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+        "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+        "| $\\mathbf { S } \\mathbf { A } \\mathbf { C } \\mathbf { - } \\mathbf { K } \\mathbf { G } _ { \\mathrm { C h a t G P T } }$ | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
+    )
+    normalized = QueryService._extract_table_blocks("## Tables\n### Page 8\n" + table)[0]
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=normalized),
+            prompt_text=normalized,
+            score=1,
+        )
+    ]
+
+    metrics = service._extract_requested_metric_values("What are OIE2016 and NYT metrics?", contexts, [0])
+
+    values = {metric.dataset: metric.values for metric in metrics}
+    assert values["OIE2016"] == {"F1": "74.7", "AUC": "73.2"}
+    assert values["NYT"] == {"F1": "88.8", "AUC": "87.3"}
+    assert "SAC-KG ChatGPT" in normalized
+
+
+def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:
+    block = (
+        "Table 2: Ablation study.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| SAC-KG | 13.50 | 88.81 | 80.50 |  |\n"
+    )
+
+    normalized = QueryService._extract_table_blocks("## Tables\n### Page 5\n" + block)[0]
+
+    assert "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |" in normalized
+
+
 def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:
     assert not QueryService(make_session())._needs_source_evidence("论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
     assert QueryService(make_session())._needs_source_evidence("请给出原文证据。")

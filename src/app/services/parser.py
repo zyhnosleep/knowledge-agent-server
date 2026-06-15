@@ -19,6 +19,7 @@ from pypdf import PdfReader
 from app.core.config import get_settings
 from app.services.ai import DocumentPagePayload, OllamaClient, safe_model_call
 from app.services.filesystem import display_title_from_path, slugify
+from app.services.table_normalization import normalize_table_text
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -306,6 +307,7 @@ def _mineru_content_to_parsed_doc(
             caption = _mineru_caption_text(item, "table_caption", "caption")
             table_body = _mineru_first_text(item, "table_body", "table_html", "table_content", "html", "text", "content", "md_content")
             table_markdown = _html_table_to_markdown(table_body) if "<table" in table_body.lower() else table_body
+            table_markdown = normalize_table_text(table_markdown)
             block_text = "\n\n".join(part for part in (caption, table_markdown) if part)
             if block_text:
                 stats["tables"] += 1
@@ -401,7 +403,9 @@ def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_pa
     existing_texts = {str(table.get("markdown") or "").strip() for table in existing_tables if isinstance(table, dict)}
     for table in tables:
         markdown_text = str(table.get("markdown") or "").strip()
+        markdown_text = normalize_table_text(markdown_text)
         if markdown_text and markdown_text not in existing_texts:
+            table["markdown"] = markdown_text
             existing_tables.append(table)
             existing_texts.add(markdown_text)
             parsed.chunks.append(

@@ -16,6 +16,7 @@ from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_simi
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import slugify, strip_upload_prefix
 from app.services.wiki import WikiRenderer
+from app.services.table_normalization import normalize_table_text
 
 settings = get_settings()
 WIKI_PRIMARY_SCORE_THRESHOLD = 6.0
@@ -1443,11 +1444,12 @@ class QueryService:
             # Fallback: search for markdown tables.
             table_re = re.compile(r"(\|.+\|[\s\S]*?(?=\n\n|\Z))", re.MULTILINE)
             for match in table_re.finditer(markdown):
-                blocks.append(match.group(0).strip())
-        return blocks
+                blocks.append(normalize_table_text(match.group(0).strip()))
+        return [normalize_table_text(block) for block in blocks]
 
     @classmethod
     def _table_block_excerpt(cls, block: str, question: str = "", max_chars: int = 1200) -> str:
+        block = normalize_table_text(block)
         lines = [line.rstrip() for line in block.strip().splitlines() if line.strip()]
         if not lines:
             return block[:max_chars]

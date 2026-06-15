@@ -114,6 +114,33 @@ def test_html_table_to_markdown_expands_colspan_and_rowspan() -> None:
     assert "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |" in markdown
 
 
+def test_mineru_content_to_parsed_doc_normalizes_latex_table_cells(tmp_path) -> None:
+    content_list = [
+        {
+            "type": "table",
+            "table_caption": ["Table 5: Results"],
+            "table_body": (
+                "| Model | OIE2016 | WEB | NYT | PENN |  |  |  |  |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+                "| $\\mathbf { S } \\mathbf { A } \\mathbf { C } \\mathbf { - } \\mathbf { K } \\mathbf { G } _ { \\mathrm { C h a t G P T } }$ | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
+            ),
+            "page_idx": 7,
+        }
+    ]
+
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "knowledge-graph.pdf",
+        content_list=content_list,
+        page_count=8,
+    )
+
+    table = parsed.metadata["document_intelligence"]["tables"][0]["markdown"]
+    assert "SAC-KG ChatGPT" in table
+    assert "| Model | OIE2016 | OIE2016 | WEB | WEB | NYT | NYT | PENN | PENN |" in table
+    assert "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |" in table
+
+
 def test_parse_pdf_with_mineru_returns_none_when_cli_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(parser.settings, "mineru_bin", "missing-mineru")
     monkeypatch.setattr(parser, "_resolve_mineru_binary", lambda value: None)
