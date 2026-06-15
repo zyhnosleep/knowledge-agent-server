@@ -524,8 +524,30 @@ def _stringify_mineru_value(value: object) -> str:
 def _html_table_to_markdown(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     rows: list[list[str]] = []
-    for row in soup.find_all("tr"):
-        cells = [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+    rowspans: dict[tuple[int, int], str] = {}
+    for row_index, row in enumerate(soup.find_all("tr")):
+        cells: list[str] = []
+        column = 0
+
+        def apply_pending_spans() -> None:
+            nonlocal column
+            while (row_index, column) in rowspans:
+                cells.append(rowspans.pop((row_index, column)))
+                column += 1
+
+        apply_pending_spans()
+        for cell in row.find_all(["th", "td"]):
+            apply_pending_spans()
+            text = cell.get_text(" ", strip=True)
+            colspan = _html_span_value(cell.get("colspan"))
+            rowspan = _html_span_value(cell.get("rowspan"))
+            for offset in range(colspan):
+                cells.append(text)
+                if rowspan > 1:
+                    for span_row in range(1, rowspan):
+                        rowspans[(row_index + span_row, column + offset)] = text
+            column += colspan
+        apply_pending_spans()
         if cells:
             rows.append(cells)
     if not rows:
@@ -541,6 +563,14 @@ def _html_table_to_markdown(html: str) -> str:
     for row in normalized[1:]:
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
+
+
+def _html_span_value(value: object) -> int:
+    try:
+        parsed = int(str(value or "1"))
+    except ValueError:
+        return 1
+    return max(parsed, 1)
 
 
 def _page_label_sort_key(label: str) -> tuple[int, str]:

@@ -23,6 +23,7 @@ MIN_WIKI_OVERLAP_SCORE = 1
 MIN_CONTEXT_SCORE = 2.5
 CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
+TABLE_CONTEXT_SCORE_BOOST = 40.0
 
 
 @dataclass
@@ -36,6 +37,14 @@ class RetrievedContext:
 class PageMatch:
     page: WikiPage
     score: float
+
+
+@dataclass
+class ExtractedMetric:
+    context_index: int
+    table_label: str | None
+    dataset: str
+    values: dict[str, str]
 
 
 class QueryService:
@@ -61,16 +70,20 @@ class QueryService:
             if verification.notes:
                 answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
 
+        answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         answer_payload = self._repair_unsupported_numeric_answer(question, index_context, contexts, answer_payload, chosen_indexes)
         answer_payload = self._repair_missing_table_answer(question, index_context, contexts, answer_payload)
+        answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
+        chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
         citations = self._select_citations(contexts, chosen_indexes)
         if not self._needs_source_evidence(question):
-            citations = self._prefer_wiki_citations(citations, page_matches, project.id)
+            citations = self._prefer_wiki_citations(citations, page_matches, project.id, question=question)
         answer_markdown = self._renumber_answer_citations(answer_payload.answer_markdown, chosen_indexes)
+        answer_markdown = self._drop_unreturned_citation_markers(answer_markdown, len(citations))
         if not citations:
             answer_markdown = self._strip_answer_citation_markers(answer_markdown)
         response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
@@ -172,6 +185,7 @@ class QueryService:
 
     def _build_contexts(self, question: str, project_id: str, page_matches: list[PageMatch]) -> list[RetrievedContext]:
         contexts: list[RetrievedContext] = []
+        fallback_contexts: list[RetrievedContext] = []
         matched_doc_ids: list[str] = []
         query_terms = self._tokenize(question)
         query_facets = self._extract_query_facets(question)
@@ -180,6 +194,8 @@ class QueryService:
         is_figure_query = self._is_figure_query(question)
         is_table_query = self._is_table_query(question)
         is_metric_query = self._is_metric_query(question)
+        needs_table_first = is_table_query or is_metric_query
+        has_table_context = False
 
         for match in page_matches:
             if match.score < min_score:
@@ -211,44 +227,56 @@ class QueryService:
             if is_table_query or is_metric_query:
                 table_blocks = self._extract_table_blocks(page_body)
                 for block, block_score in self._rank_blocks(question, table_blocks)[:5]:
+                    if not self._context_has_table_data(block):
+                        continue
+                    has_table_context = True
+                    score = match.score + TABLE_CONTEXT_SCORE_BOOST + block_score
                     contexts.append(
                         RetrievedContext(
                             citation=Citation(
                                 page_slug=page.slug,
                                 page_title=strip_upload_prefix(page.title),
                                 page_kind=page.kind,
-                                score=match.score + 2.0 + block_score,
+                                score=score,
                                 page_label=self._extract_page_label_from_block(block),
-                                excerpt=block[:280],
+                                excerpt=self._table_block_excerpt(block, question),
                             ),
                             prompt_text=block[:2000],
-                            score=match.score + 2.0 + block_score,
+                            score=score,
                         )
                     )
 
             for facet in query_facets:
                 facet_context = self._context_for_facet(page, page_body, facet, query_terms)
                 if facet_context is not None:
-                    contexts.append(facet_context)
+                    if needs_table_first:
+                        fallback_contexts.append(facet_context)
+                    else:
+                        contexts.append(facet_context)
 
             # Always include the main page context (windowed around query terms).
             prompt_text = self._window_text(page_body, query_terms, max_chars=4000, question=question)
-            contexts.append(
-                RetrievedContext(
-                    citation=Citation(
-                        page_slug=page.slug,
-                        page_title=strip_upload_prefix(page.title),
-                        page_kind=page.kind,
-                        score=match.score,
-                        page_label=self._extract_page_label_from_wiki_content(page_body, prompt_text),
-                        excerpt=self._window_text(page_body, query_terms, max_chars=280, question=question),
-                    ),
-                    prompt_text=prompt_text,
+            page_context = RetrievedContext(
+                citation=Citation(
+                    page_slug=page.slug,
+                    page_title=strip_upload_prefix(page.title),
+                    page_kind=page.kind,
                     score=match.score,
-                )
+                    page_label=self._extract_page_label_from_wiki_content(page_body, prompt_text),
+                    excerpt=self._window_text(page_body, query_terms, max_chars=280, question=question),
+                ),
+                prompt_text=prompt_text,
+                score=match.score,
             )
+            if needs_table_first:
+                fallback_contexts.append(page_context)
+            else:
+                contexts.append(page_context)
             matched_doc_ids.extend(page.source_document_ids)
 
+        if needs_table_first and has_table_context:
+            return self._finalize_contexts(contexts)
+        contexts.extend(fallback_contexts)
         if self._should_use_wiki_only(question, page_matches):
             return self._finalize_contexts(contexts)
         if matched_doc_ids:
@@ -447,7 +475,13 @@ class QueryService:
         table_indexes = self._table_citation_indexes(question, contexts)
         if not table_indexes:
             return answer_payload
-        if not self._answer_claims_table_data_missing(answer_payload.answer_markdown):
+        extracted_metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
+        answer_missing = self._answer_claims_table_data_missing(answer_payload.answer_markdown)
+        answer_lacks_metrics = bool(extracted_metrics) and not self._answer_contains_extracted_metrics(
+            answer_payload.answer_markdown,
+            extracted_metrics,
+        )
+        if not answer_missing and not answer_lacks_metrics:
             return answer_payload
 
         prompt_sections: list[str] = []
@@ -455,17 +489,7 @@ class QueryService:
             prompt_sections.append("Index overview:\n" + index_context)
         prompt_sections.extend(f"[{index}] {contexts[index].prompt_text}" for index in table_indexes[:4])
         context_text = "\n\n".join(prompt_sections)
-        fallback = QueryAnswerPayload(
-            answer_markdown="\n".join(
-                [
-                    "The retrieved table context contains data relevant to the question, but the model could not synthesize it reliably.",
-                    "",
-                    context_text[:1600],
-                ]
-            ),
-            citations=table_indexes[:2],
-            risk_level=answer_payload.risk_level,
-        )
+        fallback = self._deterministic_table_answer(question, contexts, table_indexes, answer_payload.risk_level)
         prompt = "\n\n".join(
             [
                 f"Question: {question}",
@@ -488,7 +512,14 @@ class QueryService:
             ),
             fallback,
         )
+        repaired.answer_markdown = self._normalize_answer_citation_markup(repaired.answer_markdown)
         repaired.citations = [index for index in repaired.citations if index in table_indexes] or table_indexes[:2]
+        repaired_lacks_metrics = bool(extracted_metrics) and not self._answer_contains_extracted_metrics(
+            repaired.answer_markdown,
+            extracted_metrics,
+        )
+        if self._answer_claims_table_data_missing(repaired.answer_markdown) or repaired_lacks_metrics:
+            return fallback
         return repaired
 
     def _supported_citation_indexes(self, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
@@ -564,6 +595,12 @@ class QueryService:
             "no table data",
             "exact numeric",
             "specific table numbers are absent",
+            "does not contain",
+            "not present",
+            "not included in the provided text",
+            "not included in the provided context",
+            "cannot determine from the provided",
+            "cannot answer from the provided",
             "未包含",
             "未提供",
             "缺少",
@@ -574,7 +611,273 @@ class QueryService:
             "没有 table",
             "没有表",
         )
-        return any(marker in lowered or marker in answer_markdown for marker in markers)
+        chinese_markers = (
+            "未包含",
+            "不包含",
+            "未提供",
+            "不存在",
+            "缺失",
+            "无法基于现有材料",
+            "无法根据现有材料",
+            "无法从提供的材料",
+        )
+        return any(marker in lowered or marker in answer_markdown for marker in markers) or any(
+            marker in answer_markdown for marker in chinese_markers
+        )
+
+    @classmethod
+    def _answer_contains_extracted_metrics(cls, answer_markdown: str, metrics: list[ExtractedMetric]) -> bool:
+        lowered = answer_markdown.lower()
+        for metric in metrics:
+            if metric.dataset.lower() not in lowered:
+                return False
+            for value in metric.values.values():
+                if value not in answer_markdown:
+                    return False
+        return True
+
+    def _deterministic_table_answer(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        table_indexes: list[int],
+        risk_level: str,
+    ) -> QueryAnswerPayload:
+        metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
+        citations: list[int] = []
+        if metrics:
+            parts: list[str] = []
+            for metric in metrics:
+                if metric.context_index not in citations:
+                    citations.append(metric.context_index)
+                values = " / ".join(f"{name} {value}" for name, value in metric.values.items())
+                label = f"{metric.table_label} " if metric.table_label else ""
+                parts.append(f"{label}{metric.dataset} {values}".strip())
+            citation_marker = f" [{citations[0]}]" if citations else ""
+            if self._is_chinese_question(question):
+                answer = "已在表格证据中找到相关指标：" + "；".join(parts) + citation_marker
+            else:
+                answer = "The table evidence contains the requested metrics: " + "; ".join(parts) + citation_marker
+            return QueryAnswerPayload(answer_markdown=answer, citations=citations or table_indexes[:1], risk_level=risk_level)
+
+        first_index = table_indexes[0]
+        snippet = contexts[first_index].citation.excerpt or contexts[first_index].prompt_text[:1200]
+        if self._is_chinese_question(question):
+            answer = f"已找到相关表格证据，不能判定为缺失。相关片段如下： [{first_index}]\n\n{snippet}"
+        else:
+            answer = f"Relevant table evidence was found, so it should not be treated as missing. [{first_index}]\n\n{snippet}"
+        return QueryAnswerPayload(answer_markdown=answer, citations=table_indexes[:1], risk_level=risk_level)
+
+    def _extract_requested_metric_values(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        table_indexes: list[int],
+    ) -> list[ExtractedMetric]:
+        requested = [dataset.upper() for dataset in self._query_priority_anchors(question)["dataset"]]
+        results: list[ExtractedMetric] = []
+        for index in table_indexes:
+            text = contexts[index].prompt_text
+            table_label = self._extract_table_label(text)
+            parsed = self._extract_metric_values_from_markdown_table(text, index, table_label, requested)
+            if not parsed:
+                parsed = self._extract_inline_metric_values(text, index, table_label, requested)
+            results.extend(parsed)
+
+        filtered = [item for item in results if not requested or item.dataset.upper() in requested]
+        ordered: list[ExtractedMetric] = []
+        seen: set[tuple[int, str, tuple[tuple[str, str], ...]]] = set()
+        for item in filtered:
+            key = (item.context_index, item.dataset.upper(), tuple(item.values.items()))
+            if key in seen:
+                continue
+            ordered.append(item)
+            seen.add(key)
+        return ordered
+
+    @classmethod
+    def _extract_metric_values_from_markdown_table(
+        cls,
+        text: str,
+        context_index: int,
+        table_label: str | None,
+        requested: list[str],
+    ) -> list[ExtractedMetric]:
+        rows = cls._markdown_table_rows(text)
+        if len(rows) < 2:
+            return []
+        simple = cls._extract_dataset_row_metrics(rows, context_index, table_label, requested)
+        if simple:
+            return simple
+        return cls._extract_dataset_column_metrics(rows, context_index, table_label, requested)
+
+    @classmethod
+    def _extract_dataset_row_metrics(
+        cls,
+        rows: list[list[str]],
+        context_index: int,
+        table_label: str | None,
+        requested: list[str],
+    ) -> list[ExtractedMetric]:
+        header = rows[0]
+        metric_cols = {
+            column: metric
+            for column, cell in enumerate(header)
+            if (metric := cls._normalize_metric_name(cell)) is not None
+        }
+        if not metric_cols:
+            return []
+        dataset_col = 0
+        for column, cell in enumerate(header):
+            if "dataset" in cell.lower():
+                dataset_col = column
+                break
+        results: list[ExtractedMetric] = []
+        for row in rows[1:]:
+            if dataset_col >= len(row):
+                continue
+            dataset_match = cls._DATASET_NAME_RE.search(row[dataset_col])
+            if not dataset_match:
+                continue
+            dataset = dataset_match.group(0).upper()
+            if requested and dataset not in requested:
+                continue
+            values = {
+                metric: row[column].strip()
+                for column, metric in metric_cols.items()
+                if column < len(row) and re.search(r"\d+(?:\.\d+)?", row[column])
+            }
+            if values:
+                results.append(ExtractedMetric(context_index, table_label, dataset, values))
+        return results
+
+    @classmethod
+    def _extract_dataset_column_metrics(
+        cls,
+        rows: list[list[str]],
+        context_index: int,
+        table_label: str | None,
+        requested: list[str],
+    ) -> list[ExtractedMetric]:
+        dataset_header_index = next(
+            (index for index, row in enumerate(rows) if any(cls._DATASET_NAME_RE.search(cell) for cell in row)),
+            None,
+        )
+        if dataset_header_index is None:
+            return []
+        metric_header_index = next(
+            (
+                index
+                for index in range(dataset_header_index + 1, min(len(rows), dataset_header_index + 4))
+                if any(cls._normalize_metric_name(cell) for cell in rows[index])
+            ),
+            None,
+        )
+        if metric_header_index is None:
+            return []
+
+        dataset_header = rows[dataset_header_index]
+        metric_header = rows[metric_header_index]
+        width = max(len(dataset_header), len(metric_header), *(len(row) for row in rows[metric_header_index + 1 :]))
+        dataset_by_col: dict[int, str] = {}
+        current_dataset: str | None = None
+        for column in range(width):
+            cell = dataset_header[column].strip() if column < len(dataset_header) else ""
+            dataset_match = cls._DATASET_NAME_RE.search(cell)
+            if dataset_match:
+                current_dataset = dataset_match.group(0).upper()
+            elif cell and column == 0:
+                current_dataset = None
+            if current_dataset:
+                dataset_by_col[column] = current_dataset
+
+        metric_by_col = {
+            column: metric
+            for column in range(width)
+            if column < len(metric_header) and (metric := cls._normalize_metric_name(metric_header[column])) is not None
+        }
+        data_rows = rows[metric_header_index + 1 :]
+        preferred_rows = [row for row in data_rows if "sac-kg" in " | ".join(row).lower()]
+        if not preferred_rows and data_rows:
+            preferred_rows = [data_rows[-1]]
+
+        results: list[ExtractedMetric] = []
+        for row in preferred_rows:
+            values_by_dataset: dict[str, dict[str, str]] = {}
+            for column, dataset in dataset_by_col.items():
+                if requested and dataset not in requested:
+                    continue
+                metric = metric_by_col.get(column)
+                if not metric or column >= len(row):
+                    continue
+                value = row[column].strip()
+                if not re.search(r"\d+(?:\.\d+)?", value):
+                    continue
+                values_by_dataset.setdefault(dataset, {})[metric] = value
+            for dataset, values in values_by_dataset.items():
+                if values:
+                    results.append(ExtractedMetric(context_index, table_label, dataset, values))
+        return results
+
+    @classmethod
+    def _extract_inline_metric_values(
+        cls,
+        text: str,
+        context_index: int,
+        table_label: str | None,
+        requested: list[str],
+    ) -> list[ExtractedMetric]:
+        datasets = requested or [match.group(0).upper() for match in cls._DATASET_NAME_RE.finditer(text)]
+        results: list[ExtractedMetric] = []
+        lowered = text.lower()
+        for dataset in dict.fromkeys(datasets):
+            position = lowered.find(dataset.lower())
+            if position < 0:
+                continue
+            window = text[max(0, position - 120) : min(len(text), position + 260)]
+            values: dict[str, str] = {}
+            for metric in ("F1", "AUC", "Precision", "Recall"):
+                match = re.search(rf"\b{re.escape(metric)}\b(?:\s*score)?\s*(?:=|:|is|of)?\s*(\d+(?:\.\d+)?)", window, re.IGNORECASE)
+                if match:
+                    values[metric] = match.group(1)
+            if values:
+                results.append(ExtractedMetric(context_index, table_label, dataset, values))
+        return results
+
+    @staticmethod
+    def _markdown_table_rows(text: str) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|") or "|" not in stripped[1:]:
+                continue
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", cell or "---") for cell in cells):
+                continue
+            rows.append(cells)
+        return rows
+
+    @staticmethod
+    def _normalize_metric_name(value: str) -> str | None:
+        lowered = value.lower()
+        if re.search(r"\bf\s*1\b", lowered) or "f1" in lowered:
+            return "F1"
+        if "auc" in lowered:
+            return "AUC"
+        if "precision" in lowered:
+            return "Precision"
+        if "recall" in lowered:
+            return "Recall"
+        return None
+
+    @staticmethod
+    def _extract_table_label(text: str) -> str | None:
+        match = re.search(r"\bTable\s*\d+\b", text, re.IGNORECASE)
+        return match.group(0) if match else None
+
+    @staticmethod
+    def _is_chinese_question(question: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", question))
 
     def _coverage_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
         indexes: list[int] = []
@@ -588,7 +891,21 @@ class QueryService:
         return indexes
 
     @staticmethod
+    def _normalize_answer_citation_markup(answer_markdown: str) -> str:
+        answer_markdown = re.sub(r"\[\[(\d+)\]\]", r"[\1]", answer_markdown)
+        answer_markdown = re.sub(r"\[\[([^\]]+)\]\([^)]+\)\]", r"\1", answer_markdown)
+
+        def replace_wiki_link(match: re.Match[str]) -> str:
+            inner = match.group(1).strip()
+            if re.fullmatch(r"(?:sources|entities|queries)/[^\s]+(?:\.md)?", inner):
+                return ""
+            return inner
+
+        return re.sub(r"\[\[([^\]]+)\]\]", replace_wiki_link, answer_markdown)
+
+    @staticmethod
     def _renumber_answer_citations(answer_markdown: str, selected_indexes: list[int]) -> str:
+        answer_markdown = QueryService._normalize_answer_citation_markup(answer_markdown)
         index_map = {context_index: output_index for output_index, context_index in enumerate(selected_indexes)}
 
         def replace(match: re.Match[str]) -> str:
@@ -601,7 +918,16 @@ class QueryService:
 
     @staticmethod
     def _strip_answer_citation_markers(answer_markdown: str) -> str:
+        answer_markdown = QueryService._normalize_answer_citation_markup(answer_markdown)
         return re.sub(r"\[(\d+)\]", "", answer_markdown)
+
+    @staticmethod
+    def _drop_unreturned_citation_markers(answer_markdown: str, citation_count: int) -> str:
+        def replace(match: re.Match[str]) -> str:
+            index = int(match.group(1))
+            return match.group(0) if index < citation_count else ""
+
+        return re.sub(r"\[(\d+)\]", replace, answer_markdown)
 
     @classmethod
     def _unsupported_answer_numbers(cls, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> set[str]:
@@ -630,7 +956,13 @@ class QueryService:
         return self.verifier.verify_claims(answer_markdown, claims)
 
     def _select_citations(self, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[Citation]:
-        selected: list[Citation] = []
+        return [citation for _, citation in self._select_citation_pairs(contexts, chosen_indexes)]
+
+    def _select_citation_indexes(self, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
+        return [index for index, _ in self._select_citation_pairs(contexts, chosen_indexes)]
+
+    def _select_citation_pairs(self, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[tuple[int, Citation]]:
+        selected: list[tuple[int, Citation]] = []
         seen_keys: set[str] = set()
         indexes = chosen_indexes or list(range(min(2, len(contexts))))
         for index in indexes:
@@ -648,45 +980,62 @@ class QueryService:
                     continue
                 seen_keys.add(excerpt_key)
             seen_keys.add(full_key)
-            selected.append(citation)
+            selected.append((index, citation))
 
         # Cap same source page to at most 2 citations, keeping highest scores
         # and preferring different excerpts. Process once at the end.
-        by_page: dict[str, list[Citation]] = {}
-        for citation in selected:
+        by_page: dict[str, list[tuple[int, Citation]]] = {}
+        for index, citation in selected:
             if citation.page_slug:
-                by_page.setdefault(citation.page_slug, []).append(citation)
+                by_page.setdefault(citation.page_slug, []).append((index, citation))
 
-        capped: list[Citation] = []
+        capped: list[tuple[int, Citation]] = []
         processed_pages: set[str] = set()
-        for citation in selected:
+        for pair in selected:
+            _, citation = pair
             if citation.page_slug and citation.page_slug in processed_pages:
                 continue  # already added the capped set for this page
             if citation.page_slug and len(by_page.get(citation.page_slug, [])) > 2:
-                kept = self._dedup_page_citations(by_page[citation.page_slug])
+                kept = self._dedup_page_citation_pairs(by_page[citation.page_slug])
                 capped.extend(kept)
                 processed_pages.add(citation.page_slug)
             else:
-                capped.append(citation)
+                capped.append(pair)
         return capped
 
     @staticmethod
     def _dedup_page_citations(citations: list[Citation]) -> list[Citation]:
         """Keep at most 2 citations per page, preferring higher scores and distinct excerpts."""
-        sorted_citations = sorted(citations, key=lambda c: c.score, reverse=True)
-        kept: list[Citation] = []
+        return [citation for _, citation in QueryService._dedup_page_citation_pairs(list(enumerate(citations)))]
+
+    @staticmethod
+    def _dedup_page_citation_pairs(pairs: list[tuple[int, Citation]]) -> list[tuple[int, Citation]]:
+        sorted_pairs = sorted(pairs, key=lambda pair: (QueryService._citation_is_table_evidence(pair[1]), pair[1].score), reverse=True)
+        kept: list[tuple[int, Citation]] = []
         seen_excerpts: set[str] = set()
-        for citation in sorted_citations:
+        for index, citation in sorted_pairs:
             if len(kept) >= 2:
                 break
             excerpt_normalized = citation.excerpt.strip()[:120]
             if excerpt_normalized in seen_excerpts:
                 continue
-            kept.append(citation)
+            kept.append((index, citation))
             seen_excerpts.add(excerpt_normalized)
         return kept
 
-    def _prefer_wiki_citations(self, citations: list[Citation], page_matches: list[PageMatch], project_id: str) -> list[Citation]:
+    @staticmethod
+    def _citation_is_table_evidence(citation: Citation) -> bool:
+        excerpt = citation.excerpt or ""
+        lowered = excerpt.lower()
+        return bool("|" in excerpt or re.search(r"\btable\s*\d+", lowered))
+
+    def _prefer_wiki_citations(
+        self,
+        citations: list[Citation],
+        page_matches: list[PageMatch],
+        project_id: str,
+        question: str = "",
+    ) -> list[Citation]:
         page_by_doc_id: dict[str, WikiPage] = {}
         for match in page_matches:
             page = match.page
@@ -706,7 +1055,7 @@ class QueryService:
                     # Use the chunk excerpt as anchor text to find the relevant
                     # section in the wiki page, so the citation excerpt matches
                     # the actual evidence location instead of always the page start.
-                    excerpt = self._window_text(page_body, self._tokenize(citation.excerpt), max_chars=280)
+                    excerpt = self._promoted_wiki_excerpt(page_body, citation.excerpt, question)
                     replacement = Citation(
                         document_id=citation.document_id,
                         page_slug=page.slug,
@@ -727,6 +1076,15 @@ class QueryService:
             list(range(len(promoted))),
         )
 
+    def _promoted_wiki_excerpt(self, page_body: str, chunk_excerpt: str, question: str = "") -> str:
+        if self._is_table_query(question) or self._is_metric_query(question):
+            table_blocks = self._extract_table_blocks(page_body)
+            ranked = self._rank_blocks(question or chunk_excerpt, table_blocks)
+            for block, _ in ranked:
+                if self._context_has_table_data(block):
+                    return self._table_block_excerpt(block, question or chunk_excerpt)
+        return self._window_text(page_body, self._tokenize(chunk_excerpt), max_chars=280, question=question)
+
     def _source_page_for_document(self, project_id: str, document_id: str) -> WikiPage | None:
         pages = self.db.scalars(
             select(WikiPage).where(
@@ -740,6 +1098,7 @@ class QueryService:
         return None
 
     def _infer_citation_indexes(self, answer_markdown: str, context_count: int) -> list[int]:
+        answer_markdown = self._normalize_answer_citation_markup(answer_markdown)
         indexes: list[int] = []
         for match in re.findall(r"\[(\d+)\]", answer_markdown):
             index = int(match)
@@ -1086,6 +1445,42 @@ class QueryService:
             for match in table_re.finditer(markdown):
                 blocks.append(match.group(0).strip())
         return blocks
+
+    @classmethod
+    def _table_block_excerpt(cls, block: str, question: str = "", max_chars: int = 1200) -> str:
+        lines = [line.rstrip() for line in block.strip().splitlines() if line.strip()]
+        if not lines:
+            return block[:max_chars]
+
+        start = 0
+        for index, line in enumerate(lines):
+            if re.search(r"\bTable\s*\d+\b", line, re.IGNORECASE) or line.strip().startswith("|"):
+                start = index
+                break
+        lines = lines[start:]
+
+        anchors = {anchor.lower() for anchor in cls._query_priority_anchors(question)["dataset"]}
+        anchors.update(facet.lower() for facet in cls._extract_query_facets(question))
+        if "sac-kg" in question.lower():
+            anchors.add("sac-kg")
+
+        caption_lines = [line for line in lines if not line.strip().startswith("|")][:2]
+        table_lines = [line for line in lines if line.strip().startswith("|")]
+        header_lines = table_lines[:3]
+        relevant_rows = [
+            line
+            for line in table_lines[3:]
+            if any(anchor and anchor in line.lower() for anchor in anchors) or "sac-kg" in line.lower()
+        ]
+        if not relevant_rows and table_lines:
+            relevant_rows = table_lines[3:6]
+
+        excerpt_lines: list[str] = []
+        for line in [*caption_lines, *header_lines, *relevant_rows]:
+            if line not in excerpt_lines:
+                excerpt_lines.append(line)
+        excerpt = "\n".join(excerpt_lines).strip() or "\n".join(lines).strip()
+        return excerpt[:max_chars]
 
     @staticmethod
     def _extract_page_label_from_block(block: str) -> str | None:

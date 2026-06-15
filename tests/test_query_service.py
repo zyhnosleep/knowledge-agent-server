@@ -678,6 +678,173 @@ def test_choose_citation_indexes_unions_payload_inferred_and_facets() -> None:
     assert "[4]" in renumbered
 
 
+def test_build_contexts_table_first_skips_summary_and_raw_when_table_exists() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Knowledge graph", file_name="kg.pdf", sha256="abc", raw_path="raw/kg.pdf", status="ready")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Summary\nThis summary mentions OIE2016 but has no metrics.\n\n"
+            "## Tables\n### Page 8\n"
+            "Table 5: Benchmark results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
+        ),
+        source_document_ids=["d1"],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["OIE2016", "NYT", "Table 5"]},
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="Raw source chunk should not be used when table context exists.",
+        page_label="8",
+        embedding=None,
+    )
+    db.add_all([project, document, wiki_page, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    matches = service._search_wiki_pages("What are OIE2016 and NYT F1/AUC metrics?", "p1")
+    contexts = service._build_contexts("What are OIE2016 and NYT F1/AUC metrics?", "p1", matches)
+
+    assert contexts
+    assert all("Table 5" in context.prompt_text for context in contexts)
+    assert all("This summary mentions" not in context.citation.excerpt for context in contexts)
+    assert all(context.citation.document_id is None for context in contexts)
+    assert "88.8" in contexts[0].citation.excerpt
+
+
+def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missing() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Summary\nSAC-KG is a KG construction framework.\n\n"
+            "## Tables\n### Page 8\n"
+            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="The values are not present in the provided text.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The exact values are still not included in the provided context.", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are SAC-KG metrics on OIE2016 and NYT?", save_answer=False)
+
+    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
+    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
+    assert response.citations
+    assert "Table 5" in response.citations[0].excerpt
+    assert "88.8" in response.citations[0].excerpt
+
+
+def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Summary\nA summary should not become the table citation.\n\n"
+            "## Tables\n### Page 4\n"
+            "Table 2: Ablation study.\n"
+            "| Variant | F1 |\n"
+            "| --- | --- |\n"
+            "| w/o verifier | 68.1 |\n"
+            "| SAC-KG full | 74.7 |\n"
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 4, "key_terms": ["Table 2", "ablation"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.ollama.payload = QueryAnswerPayload(answer_markdown="Table 2 reports the ablation result [0].", citations=[0], risk_level="normal")
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "Please cite Table 2 ablation results.", save_answer=False)
+
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 2")
+    assert "A summary should not" not in response.citations[0].excerpt
+
+
+def test_citation_markup_is_normalized_and_capped_to_returned_citations() -> None:
+    answer = "Metrics [[0]] are supported, but [3] is not. See [[Knowledge graph](sources/knowledge-graph.md)] and [[sources/foo.md]]."
+
+    renumbered = QueryService._renumber_answer_citations(answer, [0, 1])
+    renumbered = QueryService._drop_unreturned_citation_markers(renumbered, 2)
+
+    assert "[0]" in renumbered
+    assert "[3]" not in renumbered
+    assert "[[" not in renumbered
+    assert "sources/foo" not in renumbered
+
+
+def test_same_page_dedup_prefers_table_citation() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=20, excerpt="# Knowledge graph\n\n## Summary"),
+            prompt_text="summary",
+            score=20,
+        ),
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt="Table 5: results\n| SAC-KG | 88.8 |"),
+            prompt_text="Table 5: results\n| SAC-KG | 88.8 |",
+            score=1,
+        ),
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=2, excerpt="Other paragraph"),
+            prompt_text="Other paragraph",
+            score=2,
+        ),
+    ]
+
+    selected = service._select_citations(contexts, [0, 1, 2])
+
+    assert len(selected) == 2
+    assert any("Table 5" in citation.excerpt for citation in selected)
+
+
 def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:
     assert not QueryService(make_session())._needs_source_evidence("论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
     assert QueryService(make_session())._needs_source_evidence("请给出原文证据。")

@@ -98,6 +98,22 @@ def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
     assert any(chunk.page_label == "1" and "OpenIE6" in chunk.text for chunk in parsed.chunks)
 
 
+def test_html_table_to_markdown_expands_colspan_and_rowspan() -> None:
+    html = """
+    <table>
+      <tr><th rowspan="2">Model</th><th colspan="2">OIE2016</th><th colspan="2">NYT</th></tr>
+      <tr><th>F1</th><th>AUC</th><th>F1</th><th>AUC</th></tr>
+      <tr><td>SAC-KG ChatGPT</td><td>74.7</td><td>73.2</td><td>88.8</td><td>87.3</td></tr>
+    </table>
+    """
+
+    markdown = parser._html_table_to_markdown(html)
+
+    assert "| Model | OIE2016 | OIE2016 | NYT | NYT |" in markdown
+    assert "| Model | F1 | AUC | F1 | AUC |" in markdown
+    assert "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |" in markdown
+
+
 def test_parse_pdf_with_mineru_returns_none_when_cli_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(parser.settings, "mineru_bin", "missing-mineru")
     monkeypatch.setattr(parser, "_resolve_mineru_binary", lambda value: None)
