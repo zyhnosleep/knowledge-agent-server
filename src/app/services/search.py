@@ -64,6 +64,7 @@ class QueryService:
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         answer_payload = self._repair_unsupported_numeric_answer(question, index_context, contexts, answer_payload, chosen_indexes)
+        answer_payload = self._repair_missing_table_answer(question, index_context, contexts, answer_payload)
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         citations = self._select_citations(contexts, chosen_indexes)
@@ -436,6 +437,60 @@ class QueryService:
             risk_level=repaired.risk_level,
         )
 
+    def _repair_missing_table_answer(
+        self,
+        question: str,
+        index_context: str | None,
+        contexts: list[RetrievedContext],
+        answer_payload: QueryAnswerPayload,
+    ) -> QueryAnswerPayload:
+        table_indexes = self._table_citation_indexes(question, contexts)
+        if not table_indexes:
+            return answer_payload
+        if not self._answer_claims_table_data_missing(answer_payload.answer_markdown):
+            return answer_payload
+
+        prompt_sections: list[str] = []
+        if index_context:
+            prompt_sections.append("Index overview:\n" + index_context)
+        prompt_sections.extend(f"[{index}] {contexts[index].prompt_text}" for index in table_indexes[:4])
+        context_text = "\n\n".join(prompt_sections)
+        fallback = QueryAnswerPayload(
+            answer_markdown="\n".join(
+                [
+                    "The retrieved table context contains data relevant to the question, but the model could not synthesize it reliably.",
+                    "",
+                    context_text[:1600],
+                ]
+            ),
+            citations=table_indexes[:2],
+            risk_level=answer_payload.risk_level,
+        )
+        prompt = "\n\n".join(
+            [
+                f"Question: {question}",
+                (
+                    "The previous draft incorrectly said the requested table data was absent. "
+                    "The context below DOES contain relevant table or metric data. "
+                    "Answer using only these table contexts. Report the specific values that appear verbatim. "
+                    "Do not say the values are absent unless none of the requested table/dataset/metric values appear below. "
+                    "Return citation indexes exactly as shown in square brackets."
+                ),
+                self._build_answer_constraints(question, [contexts[index] for index in table_indexes[:4]]),
+                context_text,
+            ]
+        )
+        repaired = safe_model_call(
+            lambda: self.ollama.generate_structured(
+                QueryAnswerPayload,
+                system_prompt="You answer table and metric questions against retrieved wiki table contexts. Use only provided values and cite the supporting context indexes.",
+                user_prompt=prompt,
+            ),
+            fallback,
+        )
+        repaired.citations = [index for index in repaired.citations if index in table_indexes] or table_indexes[:2]
+        return repaired
+
     def _supported_citation_indexes(self, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
         if not contexts:
             return []
@@ -460,10 +515,66 @@ class QueryService:
         for index in self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts)):
             if index not in indexes:
                 indexes.append(index)
+        for index in self._table_citation_indexes(question, contexts):
+            if index not in indexes:
+                indexes.append(index)
         for index in self._coverage_citation_indexes(question, contexts):
             if index not in indexes:
                 indexes.append(index)
         return indexes or list(range(min(2, len(contexts))))
+
+    def _table_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
+        if not (self._is_table_query(question) or self._is_metric_query(question)):
+            return []
+        scored: list[tuple[float, int]] = []
+        for index, context in enumerate(contexts):
+            text = context.prompt_text
+            if not self._context_has_table_data(text):
+                continue
+            score = context.score
+            for facet in self._extract_query_facets(question):
+                if facet.lower() in text.lower():
+                    score += 6.0
+            for anchor in self._query_priority_anchors(question)["figure_table"]:
+                if anchor.lower() in text.lower():
+                    score += 8.0
+            for anchor in self._query_priority_anchors(question)["dataset"]:
+                if anchor.lower() in text.lower():
+                    score += 8.0
+            if any(metric in text.lower() for metric in ("f1", "auc", "precision", "recall", "score")):
+                score += 3.0
+            scored.append((score, index))
+        return [index for _, index in sorted(scored, reverse=True)[:3]]
+
+    @staticmethod
+    def _context_has_table_data(text: str) -> bool:
+        lowered = text.lower()
+        has_table_marker = "|" in text or "<table" in lowered or re.search(r"\btable\s*\d+", lowered)
+        has_number = bool(re.search(r"\d+(?:\.\d+)?", text))
+        return bool(has_table_marker and has_number)
+
+    @staticmethod
+    def _answer_claims_table_data_missing(answer_markdown: str) -> bool:
+        lowered = answer_markdown.lower()
+        markers = (
+            "not included",
+            "not available",
+            "absent",
+            "missing",
+            "no table data",
+            "exact numeric",
+            "specific table numbers are absent",
+            "未包含",
+            "未提供",
+            "缺少",
+            "缺失",
+            "无法报告",
+            "无法直接引用",
+            "无法获取",
+            "没有 table",
+            "没有表",
+        )
+        return any(marker in lowered or marker in answer_markdown for marker in markers)
 
     def _coverage_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
         indexes: list[int] = []

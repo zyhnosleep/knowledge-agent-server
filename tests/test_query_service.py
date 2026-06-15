@@ -27,6 +27,20 @@ class FakeVerifier:
         return VerificationPayload(verdict="local-only", notes="", flagged_claim_indexes=[])
 
 
+class SequencedFakeOllama(FakeOllama):
+    def __init__(self, payloads: list[QueryAnswerPayload]) -> None:
+        super().__init__()
+        self.payloads = payloads
+        self.prompts: list[str] = []
+
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        self.last_prompt = user_prompt
+        self.prompts.append(user_prompt)
+        if len(self.payloads) > 1:
+            return self.payloads.pop(0)
+        return self.payloads[0]
+
+
 def make_session() -> Session:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -504,6 +518,62 @@ def test_rank_blocks_prioritizes_dataset_metric_table() -> None:
 
     assert ranked[0][0].startswith("### Page 8")
     assert "74.7" in ranked[0][0]
+
+
+def test_metric_query_repairs_false_missing_answer_when_table_context_exists() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Summary\n"
+            "SAC-KG is a KG construction framework.\n\n"
+            "## Tables\n"
+            "### Page 8\n"
+            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
+        ),
+        source_document_ids=["d1"],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    fake_ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(
+                answer_markdown="The exact numeric values are not included in the provided text excerpts.",
+                citations=[1],
+                risk_level="normal",
+            ),
+            QueryAnswerPayload(
+                answer_markdown="Table 5 reports SAC-KG ChatGPT at OIE2016 F1 74.7 / AUC 73.2 and NYT F1 88.8 / AUC 87.3 [0].",
+                citations=[0],
+                risk_level="normal",
+            ),
+        ]
+    )
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", save_answer=False)
+
+    assert "74.7" in response.answer_markdown
+    assert "88.8" in response.answer_markdown
+    assert response.citations
+    assert "88.8" in response.citations[0].excerpt or "88.8" in fake_ollama.prompts[-1]
+    assert len(fake_ollama.prompts) == 2
 
 
 def test_build_contexts_adds_component_facets() -> None:
