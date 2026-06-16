@@ -662,16 +662,18 @@ class QueryService:
                 answer = "The table evidence contains the requested metrics: " + "; ".join(parts) + citation_marker
             return QueryAnswerPayload(answer_markdown=answer, citations=citations or table_indexes[:1], risk_level=risk_level)
 
-        if "ablation" in question.lower() or "消融" in question:
-            for index in table_indexes:
-                findings = summarize_ablation_table(contexts[index].prompt_text)
-                if findings:
-                    citation_marker = f" [{index}]"
-                    if self._is_chinese_question(question):
-                        answer = "Table 2 的消融结果显示：" + " ".join(findings) + citation_marker
-                    else:
-                        answer = "The ablation table shows: " + " ".join(findings) + citation_marker
-                    return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
+        for index in table_indexes:
+            findings = summarize_ablation_table(contexts[index].prompt_text)
+            if findings:
+                citation_marker = f" [{index}]"
+                table_label = self._extract_table_label(contexts[index].prompt_text)
+                if self._is_chinese_question(question):
+                    subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
+                    answer = subject + "显示：" + " ".join(findings) + citation_marker
+                else:
+                    subject = table_label or "The ablation table"
+                    answer = f"{subject} shows: " + " ".join(findings) + citation_marker
+                return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
 
         first_index = table_indexes[0]
         snippet = contexts[first_index].citation.excerpt or contexts[first_index].prompt_text[:1200]

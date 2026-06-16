@@ -899,7 +899,7 @@ def test_deterministic_table_answer_reports_structured_metrics() -> None:
 def test_deterministic_table_answer_summarizes_ablation_table() -> None:
     service = QueryService(make_session())
     table = (
-        "Table 2: Ablation study.\n"
+        "Table 7: Ablation study.\n"
         "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
         "| --- | --- | --- | --- | --- |\n"
         "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
@@ -913,8 +913,9 @@ def test_deterministic_table_answer_summarizes_ablation_table() -> None:
         )
     ]
 
-    answer = service._deterministic_table_answer("What did the ablation studies show in Table 2?", contexts, [0], "normal")
+    answer = service._deterministic_table_answer("What conclusions can be drawn from this table?", contexts, [0], "normal")
 
+    assert "Table 7 shows" in answer.answer_markdown
     assert "precision 88.81" in answer.answer_markdown
     assert "not treated as missing" not in answer.answer_markdown
 
