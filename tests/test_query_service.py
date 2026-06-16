@@ -872,6 +872,53 @@ def test_metric_extraction_repairs_mineru_flattened_table5_header_and_latex_row(
     assert "SAC-KG ChatGPT" in normalized
 
 
+def test_deterministic_table_answer_reports_structured_metrics() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 5: F1 score and AUC results.\n"
+        "| Model | OIE2016 | OIE2016 | NYT | NYT |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC |\n"
+        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer("OIE2016 and NYT metrics?", contexts, [0], "normal")
+
+    assert "OIE2016 F1 74.7 / AUC 73.2" in answer.answer_markdown
+    assert "NYT F1 88.8 / AUC 87.3" in answer.answer_markdown
+    assert answer.citations == [0]
+
+
+def test_deterministic_table_answer_summarizes_ablation_table() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 2: Ablation study.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer("What did the ablation studies show in Table 2?", contexts, [0], "normal")
+
+    assert "precision 88.81" in answer.answer_markdown
+    assert "not treated as missing" not in answer.answer_markdown
+
+
 def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:
     block = (
         "Table 2: Ablation study.\n"

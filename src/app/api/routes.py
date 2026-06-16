@@ -22,6 +22,7 @@ from app.services.pipeline import IngestionPipeline
 from app.services.queue import JobDispatcher
 from app.services.repositories import get_or_create_project
 from app.services.search import QueryService
+from app.services.wiki_quality import build_ingest_quality_report, lint_project_wiki
 
 router = APIRouter()
 settings = get_settings()
@@ -105,6 +106,14 @@ def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRea
     )
 
 
+@router.get("/documents/{document_id}/quality", response_model=dict)
+def get_document_quality(document_id: str, db: Session = Depends(get_db)) -> dict:
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return build_ingest_quality_report(document)
+
+
 @router.get("/runs", response_model=list[dict])
 def list_runs(db: Session = Depends(get_db)) -> list[dict]:
     runs = db.scalars(select(PipelineRun).order_by(PipelineRun.created_at.desc())).all()
@@ -142,6 +151,14 @@ def list_reviews(project_slug: str | None = None, db: Session = Depends(get_db))
         )
         for item in items
     ]
+
+
+@router.get("/wiki/lint", response_model=dict)
+def lint_wiki(project_slug: str = Query(default=settings.default_project_slug), db: Session = Depends(get_db)) -> dict:
+    try:
+        return lint_project_wiki(db, project_slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/query", response_model=QueryResponse)

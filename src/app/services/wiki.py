@@ -100,6 +100,22 @@ class WikiRenderer:
         if not intelligence:
             return []
         sections: list[str] = ["", "## Page Structure"]
+        quality = (document.metadata_json or {}).get("ingest_quality") or {}
+        if isinstance(quality, dict):
+            sections.extend(
+                [
+                    "",
+                    "## Ingest Quality",
+                    f"- Parser mode: `{quality.get('parser_mode') or 'unknown'}`",
+                    f"- Pages: {quality.get('page_count') or 'unknown'}",
+                    f"- Tables: {quality.get('table_count', 0)} captured / {quality.get('structured_table_count', 0)} structured",
+                    f"- Figures: {quality.get('figure_count', 0)}",
+                    f"- Formulas: {quality.get('formula_count', 0)}",
+                ]
+            )
+            warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+            if warnings:
+                sections.append("- Warnings: " + "; ".join(str(item) for item in warnings[:5]))
 
         # Pre-index tables and figures by page for fallback summaries.
         tables_by_page: dict[str, list[str]] = {}
@@ -320,6 +336,7 @@ class WikiRenderer:
 
     def render_log(self, document: Document, extraction: DocumentExtraction) -> Path:
         path = self.paths["wiki_root"] / "log.md"
+        quality = (document.metadata_json or {}).get("ingest_quality") or {}
         entry = "\n".join(
             [
                 f"## {document.title}",
@@ -328,6 +345,8 @@ class WikiRenderer:
                 f"- Summary length: {len(extraction.summary)}",
                 f"- Key facts preserved: {len(extraction.key_facts)}",
                 f"- Claims extracted: {len(extraction.claims)}",
+                f"- Tables captured: {quality.get('table_count', 0) if isinstance(quality, dict) else 0}",
+                f"- Structured tables: {quality.get('structured_table_count', 0) if isinstance(quality, dict) else 0}",
                 "",
             ]
         )

@@ -19,6 +19,7 @@ from pypdf import PdfReader
 from app.core.config import get_settings
 from app.services.ai import DocumentPagePayload, OllamaClient, safe_model_call
 from app.services.filesystem import display_title_from_path, slugify
+from app.services.table_extraction import extract_structured_tables
 from app.services.table_normalization import normalize_table_text
 
 logger = logging.getLogger(__name__)
@@ -378,6 +379,7 @@ def _mineru_content_to_parsed_doc(
             "content_list_path": str(content_list_path) if content_list_path else None,
             "page_outputs": page_outputs,
             "tables": tables,
+            "structured_tables": extract_structured_tables(tables),
             "formulas": formulas,
             "figures": figures,
         },
@@ -416,6 +418,7 @@ def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_pa
                     page_label=table.get("page_label"),
                 )
             )
+    intelligence["structured_tables"] = extract_structured_tables(existing_tables)
     if markdown.strip() and markdown.strip() not in parsed.text:
         parsed.text = (parsed.text + "\n\n## MinerU Markdown\n\n" + markdown).strip()
 
@@ -659,6 +662,7 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
             "ocr_fallback_enabled": settings.ocr_fallback_enabled,
             "page_outputs": page_outputs,
             "tables": tables,
+            "structured_tables": extract_structured_tables(tables),
             "formulas": formulas,
             "figures": figures,
         },

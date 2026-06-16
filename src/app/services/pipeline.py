@@ -43,6 +43,7 @@ from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
 from app.services.wiki import WikiRenderer
+from app.services.wiki_quality import build_ingest_quality_report
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -193,6 +194,9 @@ class IngestionPipeline:
             merged_metadata = dict(document.metadata_json or {})
             merged_metadata.update(parsed.metadata)
             document.metadata_json = merged_metadata
+            quality_report = build_ingest_quality_report(document)
+            merged_metadata["ingest_quality"] = quality_report
+            document.metadata_json = merged_metadata
             self._set_progress(run, 30, "chunking", "Replacing document chunks and preparing embeddings.")
             self._replace_chunks(document, parsed.chunks)
 
@@ -217,6 +221,7 @@ class IngestionPipeline:
                 "claims": len(claims),
                 "wiki_pages": len(wiki_pages),
                 "review_items": review_count,
+                "ingest_quality": quality_report,
             }
             self._set_progress(run, 100, "completed", "Ingest completed successfully.")
             self.db.commit()

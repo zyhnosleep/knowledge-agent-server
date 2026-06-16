@@ -136,9 +136,11 @@ def test_mineru_content_to_parsed_doc_normalizes_latex_table_cells(tmp_path) -> 
     )
 
     table = parsed.metadata["document_intelligence"]["tables"][0]["markdown"]
+    structured = parsed.metadata["document_intelligence"]["structured_tables"][0]
     assert "SAC-KG ChatGPT" in table
     assert "| Model | OIE2016 | OIE2016 | WEB | WEB | NYT | NYT | PENN | PENN |" in table
     assert "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |" in table
+    assert structured["rows"][0]["NYT F1"] == "88.8"
 
 
 def test_parse_pdf_with_mineru_returns_none_when_cli_missing(monkeypatch, tmp_path) -> None:

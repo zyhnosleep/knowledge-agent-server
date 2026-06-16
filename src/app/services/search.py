@@ -15,8 +15,9 @@ from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import slugify, strip_upload_prefix
-from app.services.wiki import WikiRenderer
+from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
+from app.services.wiki import WikiRenderer
 
 settings = get_settings()
 WIKI_PRIMARY_SCORE_THRESHOLD = 6.0
@@ -661,6 +662,17 @@ class QueryService:
                 answer = "The table evidence contains the requested metrics: " + "; ".join(parts) + citation_marker
             return QueryAnswerPayload(answer_markdown=answer, citations=citations or table_indexes[:1], risk_level=risk_level)
 
+        if "ablation" in question.lower() or "消融" in question:
+            for index in table_indexes:
+                findings = summarize_ablation_table(contexts[index].prompt_text)
+                if findings:
+                    citation_marker = f" [{index}]"
+                    if self._is_chinese_question(question):
+                        answer = "Table 2 的消融结果显示：" + " ".join(findings) + citation_marker
+                    else:
+                        answer = "The ablation table shows: " + " ".join(findings) + citation_marker
+                    return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
+
         first_index = table_indexes[0]
         snippet = contexts[first_index].citation.excerpt or contexts[first_index].prompt_text[:1200]
         if self._is_chinese_question(question):
@@ -680,6 +692,14 @@ class QueryService:
         for index in table_indexes:
             text = contexts[index].prompt_text
             table_label = self._extract_table_label(text)
+            structured_metrics = table_metric_values(text, requested)
+            if structured_metrics:
+                for item in structured_metrics:
+                    values = item.get("values") or {}
+                    dataset = str(item.get("dataset") or "")
+                    if dataset and values:
+                        results.append(ExtractedMetric(index, str(item.get("table_label") or table_label or "") or None, dataset, dict(values)))
+                continue
             parsed = self._extract_metric_values_from_markdown_table(text, index, table_label, requested)
             if not parsed:
                 parsed = self._extract_inline_metric_values(text, index, table_label, requested)
@@ -895,6 +915,11 @@ class QueryService:
     def _normalize_answer_citation_markup(answer_markdown: str) -> str:
         answer_markdown = re.sub(r"\[\[(\d+)\]\]", r"[\1]", answer_markdown)
         answer_markdown = re.sub(r"\[\[([^\]]+)\]\([^)]+\)\]", r"\1", answer_markdown)
+        answer_markdown = re.sub(
+            r"\[((?:\d+\s*,\s*)+\d+)\]",
+            lambda match: "".join(f"[{part.strip()}]" for part in match.group(1).split(",")),
+            answer_markdown,
+        )
 
         def replace_wiki_link(match: re.Match[str]) -> str:
             inner = match.group(1).strip()
@@ -902,7 +927,15 @@ class QueryService:
                 return ""
             return inner
 
-        return re.sub(r"\[\[([^\]]+)\]\]", replace_wiki_link, answer_markdown)
+        answer_markdown = re.sub(r"\[\[([^\]]+)\]\]", replace_wiki_link, answer_markdown)
+
+        def strip_unresolved_label(match: re.Match[str]) -> str:
+            inner = match.group(1).strip()
+            if re.fullmatch(r"\d+", inner):
+                return match.group(0)
+            return ""
+
+        return re.sub(r"\[([^\]\n]+)\](?!\()", strip_unresolved_label, answer_markdown)
 
     @staticmethod
     def _renumber_answer_citations(answer_markdown: str, selected_indexes: list[int]) -> str:
