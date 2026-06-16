@@ -17,7 +17,7 @@ from app.schemas.common import (
     QueryResponse,
     ReviewItemRead,
 )
-from app.services.filesystem import save_upload
+from app.services.filesystem import InvalidStoragePathError, UploadTooLargeError, safe_project_slug, save_upload
 from app.services.pipeline import IngestionPipeline
 from app.services.queue import JobDispatcher
 from app.services.repositories import get_or_create_project
@@ -28,20 +28,31 @@ router = APIRouter()
 settings = get_settings()
 
 
+def _validated_project_slug(project_slug: str) -> str:
+    try:
+        return safe_project_slug(project_slug)
+    except InvalidStoragePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", app_name=settings.app_name)
 
 
 @router.get("/projects", response_model=list[ProjectRead])
-def list_projects(db: Session = Depends(get_db)) -> list[ProjectRead]:
-    projects = db.scalars(select(Project).order_by(Project.created_at.desc())).all()
+def list_projects(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[ProjectRead]:
+    projects = db.scalars(select(Project).order_by(Project.created_at.desc()).limit(limit).offset(offset)).all()
     return [ProjectRead(id=item.id, slug=item.slug, name=item.name, description=item.description) for item in projects]
 
 
 @router.post("/projects", response_model=ProjectRead)
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> ProjectRead:
-    project = get_or_create_project(db, payload.slug, payload.name)
+    project = get_or_create_project(db, _validated_project_slug(payload.slug), payload.name)
     if payload.description and project.description != payload.description:
         project.description = payload.description
         db.commit()
@@ -59,9 +70,15 @@ async def ingest_upload(
     if not file.filename:
         raise HTTPException(status_code=400, detail="File name is required.")
 
-    saved_path = await save_upload(project_slug, file)
+    try:
+        safe_slug = _validated_project_slug(project_slug)
+        saved_path = await save_upload(safe_slug, file)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except InvalidStoragePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     pipeline = IngestionPipeline(db)
-    _, document, run = pipeline.register_document(project_slug, project_name, saved_path)
+    _, document, run = pipeline.register_document(safe_slug, project_name, saved_path)
     if run.status != "completed":
         result = JobDispatcher().enqueue_or_run("app.workers.jobs.run_document_ingestion", document.id)
         if isinstance(result, str):
@@ -70,14 +87,19 @@ async def ingest_upload(
 
 
 @router.get("/documents", response_model=list[DocumentRead])
-def list_documents(project_slug: str | None = None, db: Session = Depends(get_db)) -> list[DocumentRead]:
+def list_documents(
+    project_slug: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[DocumentRead]:
     statement = select(Document).order_by(Document.created_at.desc())
     if project_slug:
-        project = db.scalar(select(Project).where(Project.slug == project_slug))
+        project = db.scalar(select(Project).where(Project.slug == _validated_project_slug(project_slug)))
         if project is None:
             return []
         statement = statement.where(Document.project_id == project.id)
-    documents = db.scalars(statement).all()
+    documents = db.scalars(statement.limit(limit).offset(offset)).all()
     return [
         DocumentRead(
             id=item.id,
@@ -115,8 +137,12 @@ def get_document_quality(document_id: str, db: Session = Depends(get_db)) -> dic
 
 
 @router.get("/runs", response_model=list[dict])
-def list_runs(db: Session = Depends(get_db)) -> list[dict]:
-    runs = db.scalars(select(PipelineRun).order_by(PipelineRun.created_at.desc())).all()
+def list_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    runs = db.scalars(select(PipelineRun).order_by(PipelineRun.created_at.desc()).limit(limit).offset(offset)).all()
     return [
         {
             "id": run.id,
@@ -132,14 +158,19 @@ def list_runs(db: Session = Depends(get_db)) -> list[dict]:
 
 
 @router.get("/reviews", response_model=list[ReviewItemRead])
-def list_reviews(project_slug: str | None = None, db: Session = Depends(get_db)) -> list[ReviewItemRead]:
+def list_reviews(
+    project_slug: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[ReviewItemRead]:
     statement = select(ReviewItem).order_by(ReviewItem.created_at.desc())
     if project_slug:
-        project = db.scalar(select(Project).where(Project.slug == project_slug))
+        project = db.scalar(select(Project).where(Project.slug == _validated_project_slug(project_slug)))
         if project is None:
             return []
         statement = statement.where(ReviewItem.project_id == project.id)
-    items = db.scalars(statement).all()
+    items = db.scalars(statement.limit(limit).offset(offset)).all()
     return [
         ReviewItemRead(
             id=item.id,
@@ -154,9 +185,14 @@ def list_reviews(project_slug: str | None = None, db: Session = Depends(get_db))
 
 
 @router.get("/wiki/lint", response_model=dict)
-def lint_wiki(project_slug: str = Query(default=settings.default_project_slug), db: Session = Depends(get_db)) -> dict:
+def lint_wiki(
+    project_slug: str = Query(default=settings.default_project_slug),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict:
     try:
-        return lint_project_wiki(db, project_slug)
+        return lint_project_wiki(db, _validated_project_slug(project_slug), limit=limit, offset=offset)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

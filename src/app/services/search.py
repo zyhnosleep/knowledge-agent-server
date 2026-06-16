@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,7 +15,7 @@ from app.models.records import DocumentChunk, PageKind, Project, QuestionAnswer,
 from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
-from app.services.filesystem import slugify, strip_upload_prefix
+from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
 from app.services.wiki import WikiRenderer
@@ -1143,14 +1144,18 @@ class QueryService:
         return indexes
 
     def _load_index_context(self, project_slug: str) -> str | None:
-        index_path = settings.wiki_dir / project_slug / "index.md"
+        try:
+            project_path_slug = safe_project_slug(project_slug)
+        except InvalidStoragePathError:
+            return None
+        index_path = settings.wiki_dir / project_path_slug / "index.md"
         if not index_path.exists():
             return None
         return index_path.read_text(encoding="utf-8")[:4000]
 
     def _save_query_page(self, project: Project, question: str, response: QueryResponse, citations: list[Citation]) -> None:
         renderer = WikiRenderer(project)
-        slug = f"queries/{datetime.utcnow():%Y%m%d-%H%M%S}-{slugify(question)[:48]}"
+        slug = f"queries/{datetime.utcnow():%Y%m%d-%H%M%S}-{uuid4().hex[:8]}-{slugify(question)[:48]}"
         escaped_question = question.replace("\\", "\\\\").replace('"', '\\"')
         citation_lines: list[str] = []
         for citation in citations:

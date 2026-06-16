@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     raw_dir: Path = Field(default=Path("./data/raw"), alias="RAW_DIR")
     wiki_dir: Path = Field(default=Path("./data/wiki"), alias="WIKI_DIR")
     cache_dir: Path = Field(default=Path("./data/cache"), alias="CACHE_DIR")
+    max_upload_bytes: int = Field(default=50 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
 
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")

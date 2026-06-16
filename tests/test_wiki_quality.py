@@ -121,3 +121,49 @@ def test_lint_project_wiki_reports_table_quality_and_unresolved_citations(tmp_pa
     kinds = {issue["kind"] for issue in report["issues"]}
     assert "tables_section_empty" in kinds
     assert "unresolved_citation_labels" in kinds
+
+
+def test_lint_project_wiki_paginates_issues_but_keeps_total_count(tmp_path, monkeypatch) -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    pages = [
+        WikiPage(
+            id=f"w{index}",
+            project_id="p1",
+            slug=f"sources/paper-{index}",
+            title=f"Paper {index}",
+            kind=PageKind.source_summary.value,
+            markdown_path=str(tmp_path / f"paper-{index}.md"),
+            markdown_content="# Paper\n\n[Missing](missing.md)",
+            source_document_ids=[],
+        )
+        for index in range(4)
+    ]
+    db.add(project)
+    db.add_all(pages)
+    db.commit()
+    wiki_root = tmp_path / "wiki" / "demo"
+    wiki_root.mkdir(parents=True)
+    (wiki_root / "index.md").write_text("- empty index\n", encoding="utf-8")
+    from app.services import wiki_quality
+
+    monkeypatch.setattr(wiki_quality.settings, "wiki_dir", tmp_path / "wiki")
+
+    report = lint_project_wiki(db, "demo", limit=2, offset=1)
+
+    assert report["issue_count"] == 8
+    assert report["returned_issue_count"] == 2
+    assert report["limit"] == 2
+    assert report["offset"] == 1
+    assert len(report["issues"]) == 2
+
+
+def test_lint_project_wiki_rejects_unsafe_stored_project_slug() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="../evil", name="Bad"))
+    db.commit()
+
+    import pytest
+
+    with pytest.raises(ValueError, match="unsafe slug"):
+        lint_project_wiki(db, "../evil")

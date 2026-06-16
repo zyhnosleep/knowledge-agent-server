@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -113,6 +113,7 @@ class DocumentChunk(Base, TimestampMixin):
 
 class WikiPage(Base, TimestampMixin):
     __tablename__ = "wiki_pages"
+    __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_wiki_pages_project_slug"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
@@ -129,6 +130,7 @@ class WikiPage(Base, TimestampMixin):
 
 class Entity(Base, TimestampMixin):
     __tablename__ = "entities"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_entities_project_name"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)

@@ -11,6 +11,19 @@ from app.core.config import get_settings
 
 settings = get_settings()
 UPLOAD_PREFIX_PATTERN = re.compile(r"^[0-9a-f]{32}-(.+)$", re.IGNORECASE)
+PROJECT_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,119}$")
+
+
+class StoragePathError(ValueError):
+    """Base class for storage errors that API routes can map to client errors."""
+
+
+class InvalidStoragePathError(StoragePathError):
+    pass
+
+
+class UploadTooLargeError(StoragePathError):
+    pass
 
 
 def slugify(value: str) -> str:
@@ -37,23 +50,79 @@ def compute_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _ensure_within(child: Path, parent: Path) -> Path:
+    resolved_child = child.expanduser().resolve()
+    resolved_parent = parent.expanduser().resolve()
+    try:
+        resolved_child.relative_to(resolved_parent)
+    except ValueError as exc:
+        raise InvalidStoragePathError(f"Path escapes storage root: {child}") from exc
+    return resolved_child
+
+
+def safe_project_slug(project_slug: str) -> str:
+    value = (project_slug or "").strip()
+    if not value:
+        raise InvalidStoragePathError("Project slug is required.")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or "/" in value or "\\" in value:
+        raise InvalidStoragePathError("Project slug must not contain path components.")
+    if not PROJECT_SLUG_PATTERN.fullmatch(value):
+        raise InvalidStoragePathError("Project slug contains unsupported characters.")
+    return value
+
+
+def _safe_upload_filename(filename: str | None) -> str:
+    value = (filename or "").strip()
+    if not value or value in {".", ".."}:
+        raise InvalidStoragePathError("File name is required.")
+    path = Path(value)
+    if path.is_absolute() or path.name != value or ".." in path.parts or "/" in value or "\\" in value:
+        raise InvalidStoragePathError("File name must not contain path components.")
+    sanitized = re.sub(r"[\x00-\x1f\x7f]+", "", value).strip()
+    if ":" in sanitized:
+        raise InvalidStoragePathError("File name contains unsupported characters.")
+    if not sanitized or sanitized in {".", ".."}:
+        raise InvalidStoragePathError("File name is invalid.")
+    return sanitized
+
+
 def project_paths(project_slug: str) -> dict[str, Path]:
-    raw_root = settings.raw_dir / project_slug
-    wiki_root = settings.wiki_dir / project_slug
+    safe_slug = safe_project_slug(project_slug)
+    raw_base = settings.raw_dir.expanduser().resolve()
+    wiki_base = settings.wiki_dir.expanduser().resolve()
+    raw_base.mkdir(parents=True, exist_ok=True)
+    wiki_base.mkdir(parents=True, exist_ok=True)
+    raw_root = _ensure_within(raw_base / safe_slug, raw_base)
+    wiki_root = _ensure_within(wiki_base / safe_slug, wiki_base)
     raw_root.mkdir(parents=True, exist_ok=True)
     wiki_root.mkdir(parents=True, exist_ok=True)
     return {"raw_root": raw_root, "wiki_root": wiki_root}
 
 
 async def save_upload(project_slug: str, upload: UploadFile) -> Path:
-    paths = project_paths(project_slug)
-    target_name = f"{uuid4().hex}-{upload.filename}"
-    target_path = paths["raw_root"] / target_name
-    with target_path.open("wb") as handle:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            handle.write(chunk)
-    await upload.close()
-    return target_path
+    partial_path: Path | None = None
+    try:
+        paths = project_paths(project_slug)
+        safe_filename = _safe_upload_filename(upload.filename)
+        target_name = f"{uuid4().hex}-{safe_filename}"
+        target_path = _ensure_within(paths["raw_root"] / target_name, paths["raw_root"])
+        partial_path = _ensure_within(paths["raw_root"] / f".{target_name}.part", paths["raw_root"])
+        total_bytes = 0
+        with partial_path.open("wb") as handle:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > settings.max_upload_bytes:
+                    raise UploadTooLargeError(f"Upload exceeds MAX_UPLOAD_BYTES ({settings.max_upload_bytes}).")
+                handle.write(chunk)
+        partial_path.replace(target_path)
+        return target_path
+    except Exception:
+        if partial_path is not None:
+            partial_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()

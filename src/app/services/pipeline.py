@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -20,6 +21,7 @@ from app.models.records import (
     Project,
     ReviewItem,
     ReviewSeverity,
+    ReviewStatus,
     RunStatus,
     RunType,
     WikiPage,
@@ -228,10 +230,17 @@ class IngestionPipeline:
             return run
         except Exception as exc:  # noqa: BLE001
             logger.exception("Document processing failed")
-            document.status = DocumentStatus.failed.value
-            run.status = RunStatus.failed.value
-            run.notes = str(exc)
-            self._set_progress(run, 100, "failed", str(exc))
+            document_id = document.id
+            run_id = run.id
+            self.db.rollback()
+            failed_document = self.db.get(Document, document_id)
+            failed_run = self.db.get(PipelineRun, run_id)
+            if failed_document is not None:
+                failed_document.status = DocumentStatus.failed.value
+            if failed_run is not None:
+                failed_run.status = RunStatus.failed.value
+                failed_run.notes = str(exc)
+                self._set_progress(failed_run, 100, "failed", str(exc))
             self.db.commit()
             raise
 
@@ -1018,7 +1027,16 @@ class IngestionPipeline:
                 items.append(ExtractedEntity(name=concept, entity_type="concept", summary=""))
                 existing_names.add(concept)
 
+        unique_items: list[ExtractedEntity] = []
+        seen_item_names: set[str] = set()
         for item in items:
+            key = item.name.strip()
+            if not key or key in seen_item_names:
+                continue
+            seen_item_names.add(key)
+            unique_items.append(item)
+
+        for item in unique_items:
             existing = self.db.scalar(select(Entity).where(Entity.project_id == project_id, Entity.name == item.name))
             if existing:
                 existing.summary = item.summary or existing.summary
@@ -1036,8 +1054,12 @@ class IngestionPipeline:
             )
             self.db.add(entity)
             entities.append(entity)
-        self.db.commit()
-        return entities
+        try:
+            self.db.commit()
+            return entities
+        except IntegrityError:
+            self.db.rollback()
+            return list(self.db.scalars(select(Entity).where(Entity.project_id == project_id, Entity.name.in_([item.name for item in unique_items]))).all())
 
     def _create_claims(self, document: Document, extraction: DocumentExtraction) -> list[Claim]:
         self.db.query(Claim).filter(Claim.document_id == document.id).delete()
@@ -1329,6 +1351,16 @@ class IngestionPipeline:
         entity_decisions: dict[str, GrowthDecision],
     ) -> list[Entity]:
         entity_map = {entity.name.lower(): entity for entity in entities}
+        grow_names = [name for name, decision in entity_decisions.items() if decision.decision == "grow"]
+        if grow_names:
+            existing_entities = self.db.scalars(
+                select(Entity).where(Entity.project_id == project_id, Entity.name.in_(grow_names))
+            ).all()
+            for entity in existing_entities:
+                key = entity.name.lower()
+                if key not in entity_map:
+                    entities.append(entity)
+                    entity_map[key] = entity
         for name, decision in entity_decisions.items():
             if decision.decision != "grow" or name.lower() in entity_map:
                 continue
@@ -1345,7 +1377,11 @@ class IngestionPipeline:
             self.db.add(entity)
             entities.append(entity)
             entity_map[name.lower()] = entity
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            return list(self.db.scalars(select(Entity).where(Entity.project_id == project_id, Entity.name.in_(grow_names))).all())
         return entities
 
     def _render_wiki(
@@ -1501,7 +1537,10 @@ class IngestionPipeline:
         return page
 
     def _create_review_items(self, document: Document, extraction: DocumentExtraction, claims: list[Claim]) -> int:
-        self.db.query(ReviewItem).filter(ReviewItem.document_id == document.id).delete()
+        existing_items = self.db.scalars(select(ReviewItem).where(ReviewItem.document_id == document.id)).all()
+        for item in existing_items:
+            if item.status == ReviewStatus.pending.value and (item.payload or {}).get("generated_by") == "ingest":
+                self.db.delete(item)
         count = 0
         if not claims and (document.raw_text or "").strip():
             self.db.add(
@@ -1511,7 +1550,7 @@ class IngestionPipeline:
                     title="Verifier quantity check: no claims extracted",
                     detail="The document contains text, but no structured claims were generated.",
                     severity=ReviewSeverity.medium.value,
-                    payload={"issue": "empty_claim_set", "check": "quantity"},
+                    payload={"generated_by": "ingest", "issue": "empty_claim_set", "check": "quantity"},
                 )
             )
             count += 1
@@ -1530,7 +1569,7 @@ class IngestionPipeline:
                         title=f"Verifier quantity check: {head_name}",
                         detail=f"Head '{head_name}' has only {verified_count} verified triples.",
                         severity=ReviewSeverity.low.value,
-                        payload={"issue": "quantity_too_small", "head": head_name, "verified_count": verified_count},
+                        payload={"generated_by": "ingest", "issue": "quantity_too_small", "head": head_name, "verified_count": verified_count},
                     )
                 )
                 count += 1
@@ -1549,6 +1588,7 @@ class IngestionPipeline:
                         detail=f"{claim.subject} {claim.predicate} {claim.object_text}",
                         severity=ReviewSeverity.high.value if high_risk_errors & set(errors) else ReviewSeverity.medium.value,
                         payload={
+                            "generated_by": "ingest",
                             "issues": errors,
                             "check": "local_verifier",
                             "confidence": claim.confidence,
@@ -1567,7 +1607,7 @@ class IngestionPipeline:
                     title="Verifier coverage note",
                     detail=note,
                     severity=ReviewSeverity.low.value,
-                    payload={"issue": "coverage_note", "note": note},
+                    payload={"generated_by": "ingest", "issue": "coverage_note", "note": note},
                 )
             )
             count += 1
@@ -1584,7 +1624,7 @@ class IngestionPipeline:
                     title="External verification flagged claims",
                     detail=verification.notes,
                     severity=ReviewSeverity.high.value,
-                    payload={"flagged_claim_indexes": verification.flagged_claim_indexes, "verdict": verification.verdict},
+                    payload={"generated_by": "ingest", "flagged_claim_indexes": verification.flagged_claim_indexes, "verdict": verification.verdict},
                 )
             )
             count += 1

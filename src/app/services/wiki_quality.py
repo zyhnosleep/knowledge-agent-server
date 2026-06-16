@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.records import Document, PageKind, Project, WikiPage
+from app.services.filesystem import InvalidStoragePathError, safe_project_slug
 from app.services.table_extraction import extract_structured_tables, structure_table_markdown, table_metric_values
 
 settings = get_settings()
@@ -62,14 +63,18 @@ def build_ingest_quality_report(document: Document) -> dict:
     return report
 
 
-def lint_project_wiki(db: Session, project_slug: str) -> dict:
+def lint_project_wiki(db: Session, project_slug: str, *, limit: int = 50, offset: int = 0) -> dict:
     project = db.scalar(select(Project).where(Project.slug == project_slug))
     if project is None:
         raise ValueError(f"Project '{project_slug}' not found")
+    try:
+        project_path_slug = safe_project_slug(project.slug)
+    except InvalidStoragePathError as exc:
+        raise ValueError(f"Project '{project.slug}' has an unsafe slug") from exc
 
     pages = db.scalars(select(WikiPage).where(WikiPage.project_id == project.id)).all()
     issues: list[dict] = []
-    index_path = settings.wiki_dir / project.slug / "index.md"
+    index_path = settings.wiki_dir / project_path_slug / "index.md"
     if not index_path.exists():
         issues.append(_issue("missing_index", "high", "wiki/index.md does not exist", {}))
     else:
@@ -88,11 +93,17 @@ def lint_project_wiki(db: Session, project_slug: str) -> dict:
         if page.kind == PageKind.query_answer.value:
             issues.extend(_lint_query_answer_citations(page))
 
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, offset)
+    returned_issues = issues[safe_offset : safe_offset + safe_limit]
     return {
         "project_slug": project.slug,
         "page_count": len(pages),
         "issue_count": len(issues),
-        "issues": issues,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "returned_issue_count": len(returned_issues),
+        "issues": returned_issues,
     }
 
 

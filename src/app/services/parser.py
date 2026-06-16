@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+class DocumentParseError(RuntimeError):
+    def __init__(self, path: Path, message: str) -> None:
+        self.path = path
+        super().__init__(f"{path.name}: {message}")
+
+
 @dataclass
 class ParsedChunk:
     ordinal: int
@@ -81,9 +87,28 @@ def _parse_pdf(path: Path) -> ParsedDocument:
 
 
 def _extract_pdf_text_layer(path: Path) -> tuple[list[str], int]:
-    reader = PdfReader(str(path))
-    page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
-    return page_texts, len(reader.pages)
+    try:
+        reader = PdfReader(str(path))
+        if getattr(reader, "is_encrypted", False):
+            try:
+                decrypted = reader.decrypt("")
+            except Exception as exc:  # noqa: BLE001
+                raise DocumentParseError(path, "Encrypted PDF could not be decrypted.") from exc
+            if not decrypted:
+                raise DocumentParseError(path, "Encrypted PDF is not supported.")
+        pages = list(reader.pages)
+    except DocumentParseError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise DocumentParseError(path, f"Unable to read PDF: {exc}") from exc
+
+    page_texts: list[str] = []
+    for index, page in enumerate(pages):
+        try:
+            page_texts.append((page.extract_text() or "").strip())
+        except Exception as exc:  # noqa: BLE001
+            raise DocumentParseError(path, f"Unable to extract text from page {index + 1}: {exc}") from exc
+    return page_texts, len(pages)
 
 
 def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None:

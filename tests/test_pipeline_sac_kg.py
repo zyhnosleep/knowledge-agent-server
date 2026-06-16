@@ -2,8 +2,23 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
-from app.models.records import Claim, Document, DocumentChunk, Entity, Project
+import pytest
+
+from app.models.records import (
+    Claim,
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+    Entity,
+    PipelineRun,
+    Project,
+    ReviewItem,
+    ReviewStatus,
+    RunStatus,
+    RunType,
+)
 from app.services.ai import DocumentAnalysisPayload, DocumentExtraction, ExtractedClaim, GeneratedTriple, HeadAnalysisPayload, VerificationPayload
+from app.services.parser import ParsedChunk, ParsedDocument
 from app.services.pipeline import IngestionPipeline
 from app.services.wiki import WikiRenderer
 
@@ -141,6 +156,124 @@ def test_local_verifier_sends_unsupported_claim_to_review_queue() -> None:
     assert "missing_evidence" in claims[0].metadata_json["verification_errors"]
     assert "low_confidence" in claims[0].metadata_json["verification_errors"]
     assert review_count == 2
+
+
+def test_create_review_items_preserves_resolved_and_ignored_manual_items() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Case", file_name="case.md", sha256="abc", raw_path="raw/case.md", raw_text="Source text.")
+    db.add_all(
+        [
+            project,
+            document,
+            ReviewItem(
+                id="pending-ingest",
+                project_id="p1",
+                document_id="d1",
+                title="Old ingest",
+                detail="old",
+                status=ReviewStatus.pending.value,
+                payload={"generated_by": "ingest"},
+            ),
+            ReviewItem(
+                id="resolved-manual",
+                project_id="p1",
+                document_id="d1",
+                title="Resolved manual",
+                detail="keep",
+                status=ReviewStatus.resolved.value,
+                payload={"generated_by": "human"},
+            ),
+            ReviewItem(
+                id="ignored-manual",
+                project_id="p1",
+                document_id="d1",
+                title="Ignored manual",
+                detail="keep",
+                status=ReviewStatus.ignored.value,
+                payload={},
+            ),
+        ]
+    )
+    db.commit()
+    pipeline = IngestionPipeline(db)
+    pipeline.verifier = FakeVerifier()
+
+    review_count = pipeline._create_review_items(document, DocumentExtraction(title="Case", summary="Summary", claims=[]), claims=[])
+
+    items = {item.id: item for item in db.query(ReviewItem).all()}
+    assert review_count == 1
+    assert "pending-ingest" not in items
+    assert items["resolved-manual"].status == ReviewStatus.resolved.value
+    assert items["ignored-manual"].status == ReviewStatus.ignored.value
+    generated = [item for item in items.values() if item.id not in {"resolved-manual", "ignored-manual"}]
+    assert generated
+    assert all(item.payload.get("generated_by") == "ingest" for item in generated)
+
+
+def test_process_document_rolls_back_partial_changes_before_marking_failed(monkeypatch) -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Case", file_name="case.md", sha256="abc", raw_path="raw/case.md")
+    run = PipelineRun(id="r1", project_id="p1", document_id="d1", run_type=RunType.ingest.value, status=RunStatus.queued.value, provider_report={})
+    db.add_all([project, document, run])
+    db.commit()
+
+    from app.services import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "parse_document",
+        lambda path: ParsedDocument(
+            title="Parsed",
+            text="Parsed text",
+            chunks=[ParsedChunk(ordinal=0, text="Parsed text")],
+            metadata={},
+        ),
+    )
+
+    def failing_replace_chunks(self: IngestionPipeline, failed_document: Document, parsed_chunks) -> None:
+        self.db.add(DocumentChunk(document_id=failed_document.id, ordinal=99, text="partial"))
+        raise RuntimeError("chunk failure")
+
+    monkeypatch.setattr(IngestionPipeline, "_replace_chunks", failing_replace_chunks)
+
+    with pytest.raises(RuntimeError, match="chunk failure"):
+        IngestionPipeline(db).process_document("d1")
+
+    db.expire_all()
+    assert db.get(Document, "d1").status == DocumentStatus.failed.value
+    assert db.get(PipelineRun, "r1").status == RunStatus.failed.value
+    assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 0
+
+
+def test_ensure_growing_entities_reuses_existing_tail_entity() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    existing = Entity(id="e1", project_id="p1", name="SAC-KG", entity_type="concept", aliases=[], summary="Existing")
+    claim = Claim(
+        id="c1",
+        project_id="p1",
+        document_id="d1",
+        subject="Paper",
+        predicate="uses",
+        object_text="SAC-KG",
+        verification_status="verified",
+        metadata_json={},
+    )
+    db.add_all([project, existing, claim])
+    db.commit()
+
+    pipeline = IngestionPipeline(db)
+    result = pipeline._ensure_growing_entities(
+        project_id="p1",
+        entities=[],
+        claims=[claim],
+        entity_decisions={"SAC-KG": pipeline._rule_growth_decision({"name": "SAC-KG", "entity_type": "concept", "claim_count": 1, "item_type": "tail"})},
+    )
+
+    assert result == [existing]
+    assert db.query(Entity).filter(Entity.project_id == "p1", Entity.name == "SAC-KG").count() == 1
 
 
 def test_pruner_grows_durable_entities_and_prunes_transient_values() -> None:
