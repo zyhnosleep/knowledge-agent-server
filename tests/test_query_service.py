@@ -489,6 +489,35 @@ def test_build_answer_constraints_figure_query_with_context() -> None:
     assert "Figure" in constraints
 
 
+def test_context_evidence_text_handles_context_without_citation() -> None:
+    ctx = type("ctx", (), {"prompt_text": "Figure 1 shows the architecture with three components."})()
+
+    evidence = QueryService._context_evidence_text(ctx)  # type: ignore[arg-type]
+
+    assert evidence == "Figure 1 shows the architecture with three components."
+
+
+def test_coverage_citation_indexes_uses_citation_excerpt() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/kg",
+                page_title="KG",
+                page_kind="source_summary",
+                score=1,
+                excerpt="The Generator module extracts relations.",
+            ),
+            prompt_text="Overview text without the facet.",
+            score=1,
+        )
+    ]
+
+    indexes = service._coverage_citation_indexes("SAC-KG 的 Generator 做什么？", contexts)
+
+    assert indexes == [0]
+
+
 def test_build_answer_constraints_dataset_query() -> None:
     """Dataset questions should get classification guardrails."""
     db = make_session()
@@ -632,6 +661,27 @@ def test_unsupported_answer_numbers_detects_numbers_missing_from_evidence() -> N
     assert "74.7" not in unsupported
 
 
+def test_unsupported_answer_numbers_uses_citation_excerpt_as_evidence() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/sac-kg",
+                page_title="SAC-KG",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="Table 5: OIE2016 F1 74.7 AUC 73.2",
+            ),
+            prompt_text="Table 5 is mentioned in prose, but the windowed prompt omitted the values.",
+            score=10.0,
+        )
+    ]
+
+    unsupported = service._unsupported_answer_numbers("OIE2016 F1=74.7", contexts, [0])
+
+    assert unsupported == set()
+
+
 def test_repair_unsupported_numeric_answer_uses_supported_pairs_without_name_error() -> None:
     db = make_session()
     service = QueryService(db)
@@ -767,6 +817,80 @@ def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missin
     assert response.citations
     assert "Table 5" in response.citations[0].excerpt
     assert "88.8" in response.citations[0].excerpt
+
+
+def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_lacks_table() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    table_excerpt = (
+        "Table 5: F1 score and AUC results.\n"
+        "| Model | OIE2016 |  | NYT |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC |\n"
+        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/kg",
+                page_title="KG",
+                page_kind="source_summary",
+                score=10,
+                excerpt=table_excerpt,
+            ),
+            prompt_text="As shown in Table 5, the requested metrics are discussed without a reproduced table.",
+            score=10,
+        )
+    ]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="The specific metric values are not present in the provided text.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the provided context.", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are SAC-KG metrics on OIE2016 and NYT?", save_answer=False)
+
+    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
+    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
+    assert "74.7" in service.ollama.prompts[0]
+    assert "87.3" in service.ollama.prompts[0]
+    assert "74.7" in service.ollama.prompts[-1]
+    assert "87.3" in service.ollama.prompts[-1]
+
+
+def test_table_citation_indexes_detect_table_data_in_citation_excerpt() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/kg",
+                page_title="KG",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "Table 5: F1 score and AUC results.\n"
+                    "| Model | OIE2016 |  | NYT |  |\n"
+                    "| --- | --- | --- | --- | --- |\n"
+                    "|  | F1 | AUC | F1 | AUC |\n"
+                    "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+                ),
+            ),
+            prompt_text="The benchmark comparison is discussed in prose, but this context window omitted the table.",
+            score=10,
+        )
+    ]
+
+    indexes = service._table_citation_indexes("What are SAC-KG metrics on OIE2016 and NYT?", contexts)
+
+    assert indexes == [0]
 
 
 def test_metric_query_fallback_when_chinese_draft_says_values_cannot_be_extracted() -> None:
@@ -1035,6 +1159,30 @@ def test_deterministic_table_answer_summarizes_ablation_table() -> None:
     assert "Table 7 shows" in answer.answer_markdown
     assert "precision 88.81" in answer.answer_markdown
     assert "not treated as missing" not in answer.answer_markdown
+
+
+def test_deterministic_ablation_answer_uses_citation_excerpt_when_prompt_text_lacks_table() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 2: Ablation study.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text="The ablation study is discussed, but this context window omitted the reproduced table.",
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer("What conclusions can be drawn from the ablation study?", contexts, [0], "normal")
+
+    assert "Table 2 shows" in answer.answer_markdown
+    assert "precision 88.81" in answer.answer_markdown
+    assert answer.citations == [0]
 
 
 def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:

@@ -299,7 +299,7 @@ class QueryService:
         prompt_sections: list[str] = []
         if index_context:
             prompt_sections.append("Index overview:\n" + index_context)
-        prompt_sections.extend(f"[{index}] {context.prompt_text}" for index, context in enumerate(contexts))
+        prompt_sections.extend(f"[{index}] {self._context_evidence_text(context)}" for index, context in enumerate(contexts))
         context_text = "\n\n".join(prompt_sections)
 
         # Build figure/table/dataset-aware guardrails.
@@ -344,11 +344,11 @@ class QueryService:
         lowered = question.lower()
 
         has_figure_context = any(
-            "figure" in ctx.prompt_text.lower() or "fig." in ctx.prompt_text.lower()
+            "figure" in self._context_evidence_text(ctx).lower() or "fig." in self._context_evidence_text(ctx).lower()
             for ctx in contexts
         )
         has_table_context = any(
-            "table" in ctx.prompt_text.lower() or "|" in ctx.prompt_text
+            "table" in self._context_evidence_text(ctx).lower() or "|" in self._context_evidence_text(ctx)
             for ctx in contexts
         )
 
@@ -432,7 +432,7 @@ class QueryService:
         supported_pairs = [(index, contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts)]
         if not supported_pairs:
             supported_pairs = list(enumerate(contexts[: min(3, len(contexts))]))
-        constrained_context = "\n\n".join(f"[{index}] {ctx.prompt_text}" for index, ctx in supported_pairs)
+        constrained_context = "\n\n".join(f"[{index}] {self._context_evidence_text(ctx)}" for index, ctx in supported_pairs)
         if index_context:
             constrained_context = "Index overview:\n" + index_context + "\n\n" + constrained_context
         fallback = QueryAnswerPayload(
@@ -490,7 +490,7 @@ class QueryService:
         prompt_sections: list[str] = []
         if index_context:
             prompt_sections.append("Index overview:\n" + index_context)
-        prompt_sections.extend(f"[{index}] {contexts[index].prompt_text}" for index in table_indexes[:4])
+        prompt_sections.extend(f"[{index}] {self._context_table_evidence_text(contexts[index])}" for index in table_indexes[:4])
         context_text = "\n\n".join(prompt_sections)
         fallback = self._deterministic_table_answer(question, contexts, table_indexes, answer_payload.risk_level)
         prompt = "\n\n".join(
@@ -537,7 +537,7 @@ class QueryService:
         numeric_context_indexes = [
             index
             for index, context in enumerate(contexts)
-            if any(number in context.prompt_text for number in self._answer_numbers(answer_markdown))
+            if any(number in self._context_evidence_text(context) for number in self._answer_numbers(answer_markdown))
         ]
         return numeric_context_indexes or indexes
 
@@ -562,7 +562,7 @@ class QueryService:
             return []
         scored: list[tuple[float, int]] = []
         for index, context in enumerate(contexts):
-            text = context.prompt_text
+            text = self._context_table_evidence_text(context)
             if not self._context_has_table_data(text):
                 continue
             score = context.score
@@ -669,10 +669,10 @@ class QueryService:
             return QueryAnswerPayload(answer_markdown=answer, citations=citations or table_indexes[:1], risk_level=risk_level)
 
         for index in table_indexes:
-            findings = summarize_ablation_table(contexts[index].prompt_text)
+            findings = summarize_ablation_table(self._context_table_evidence_text(contexts[index]))
             if findings:
                 citation_marker = f" [{index}]"
-                table_label = self._extract_table_label(contexts[index].prompt_text)
+                table_label = self._extract_table_label(self._context_table_evidence_text(contexts[index]))
                 if self._is_chinese_question(question):
                     subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
                     answer = subject + "显示：" + " ".join(findings) + citation_marker
@@ -697,11 +697,11 @@ class QueryService:
         risk_level: str,
     ) -> QueryAnswerPayload | None:
         for index in table_indexes:
-            findings = summarize_ablation_table(contexts[index].prompt_text)
+            findings = summarize_ablation_table(self._context_table_evidence_text(contexts[index]))
             if not findings:
                 continue
             citation_marker = f" [{index}]"
-            table_label = self._extract_table_label(contexts[index].prompt_text)
+            table_label = self._extract_table_label(self._context_table_evidence_text(contexts[index]))
             if self._is_chinese_question(question):
                 subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
                 answer = subject + "显示：" + " ".join(findings) + citation_marker
@@ -720,7 +720,7 @@ class QueryService:
         row_selectors = self._question_row_selectors(question)
         results: list[ExtractedMetric] = []
         for index in table_indexes:
-            text = contexts[index].prompt_text
+            text = self._context_table_evidence_text(contexts[index])
             table_label = self._extract_table_label(text)
             requested = self._requested_datasets_for_table(question, text)
             table_row_selectors = [
@@ -768,10 +768,25 @@ class QueryService:
             if key not in requested:
                 requested.append(key)
         for index in table_indexes:
-            for dataset in cls._requested_datasets_for_table(question, contexts[index].prompt_text):
+            for dataset in cls._requested_datasets_for_table(question, cls._context_table_evidence_text(contexts[index])):
                 if dataset.upper() not in requested:
                     requested.append(dataset.upper())
         return requested
+
+    @staticmethod
+    def _context_table_evidence_text(context: RetrievedContext) -> str:
+        return QueryService._context_evidence_text(context)
+
+    @staticmethod
+    def _context_evidence_text(context: RetrievedContext) -> str:
+        parts: list[str] = []
+        citation = getattr(context, "citation", None)
+        excerpt = getattr(citation, "excerpt", "")
+        for text in (getattr(context, "prompt_text", ""), excerpt):
+            clean = (text or "").strip()
+            if clean and clean not in parts:
+                parts.append(clean)
+        return "\n\n".join(parts)
 
     @classmethod
     def _requested_datasets_for_table(cls, question: str, table_text: str) -> list[str]:
@@ -1049,7 +1064,7 @@ class QueryService:
         for facet in facets:
             lowered_facet = facet.lower()
             for index, context in enumerate(contexts):
-                if lowered_facet in context.prompt_text.lower():
+                if lowered_facet in self._context_evidence_text(context).lower():
                     indexes.append(index)
                     break
         return indexes
@@ -1111,7 +1126,7 @@ class QueryService:
         numbers = cls._answer_numbers(answer_markdown)
         if not numbers:
             return set()
-        evidence = "\n".join(contexts[index].prompt_text for index in chosen_indexes if 0 <= index < len(contexts))
+        evidence = "\n".join(cls._context_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
         return {number for number in numbers if number not in evidence}
 
     @staticmethod
