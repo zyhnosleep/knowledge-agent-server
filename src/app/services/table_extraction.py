@@ -68,16 +68,24 @@ def extract_structured_tables(markdown_blocks: list[dict]) -> list[dict]:
     return structured
 
 
-def table_metric_values(table_markdown: str, requested_datasets: list[str] | None = None) -> list[dict]:
+def table_metric_values(
+    table_markdown: str,
+    requested_datasets: list[str] | None = None,
+    row_selectors: list[str] | None = None,
+    requested_subjects: list[str] | None = None,
+) -> list[dict]:
     table = structure_table_markdown(table_markdown)
-    requested = {dataset.upper() for dataset in requested_datasets or []}
+    requested = {_normalize_lookup_key(dataset) for dataset in requested_datasets or []}
+    selectors = [_normalize_lookup_key(selector) for selector in [*(row_selectors or []), *(requested_subjects or [])] if selector]
+    datasets = _dataset_names_from_headers(table.headers)
     candidates: list[dict] = []
     for row in table.rows:
         model = _row_model(row)
-        if model and "sac-kg" not in model.lower():
+        if selectors and not _matches_any_selector(model, selectors):
             continue
-        for dataset in _dataset_names_from_headers(table.headers):
-            if requested and dataset.upper() not in requested:
+        for dataset in datasets:
+            dataset_key = _normalize_lookup_key(dataset)
+            if requested and dataset_key not in requested:
                 continue
             values = _dataset_metric_values(row, dataset)
             if values:
@@ -104,9 +112,10 @@ def summarize_ablation_table(table_markdown: str) -> list[str]:
 
     findings: list[str] = []
     for iteration, rows in grouped.items():
-        full = next((row for row in rows if _row_model(row).strip().lower() == "sac-kg"), None)
+        full = _select_full_model_row(rows)
         if not full:
             continue
+        full_model = _row_model(full)
         precision = full.get("Precision", "")
         specificity = full.get("Domain Specificity", "")
         recalls = full.get("Number of recalls", "")
@@ -118,11 +127,11 @@ def summarize_ablation_table(table_markdown: str) -> list[str]:
         if specificity:
             parts.append(f"domain specificity {specificity}")
         if parts:
-            findings.append(f"{iteration}: full SAC-KG reports " + ", ".join(parts) + ".")
+            findings.append(f"{iteration}: full {full_model} reports " + ", ".join(parts) + ".")
         worse = [
             _row_model(row)
             for row in rows
-            if _row_model(row).strip().lower() != "sac-kg" and _row_has_lower_scores(row, full)
+            if row is not full and _row_has_lower_scores(row, full)
         ]
         if worse:
             findings.append(f"{iteration}: ablated variants underperform the full model, including " + ", ".join(worse[:4]) + ".")
@@ -208,23 +217,94 @@ def _quality_flags(markdown: str, headers: list[str], rows: list[dict[str, str]]
 def _dataset_names_from_headers(headers: list[str]) -> list[str]:
     datasets: list[str] = []
     for header in headers:
-        match = re.match(r"\b(OIE2016|NYT|PENN|WEB|CoNLL|ACE|SemEval|WikiSQL|SQuAD|GLUE|SuperGLUE)\b", header, re.IGNORECASE)
-        if match and match.group(0).upper() not in datasets:
-            datasets.append(match.group(0).upper())
+        dataset = _dataset_name_from_header(header)
+        if dataset and dataset.upper() not in {item.upper() for item in datasets}:
+            datasets.append(dataset)
     return datasets
 
 
 def _dataset_metric_values(row: dict[str, str], dataset: str) -> dict[str, str]:
     values: dict[str, str] = {}
+    lookup = {_normalize_lookup_key(key): value for key, value in row.items()}
     for metric in ("F1", "AUC", "Precision", "Recall", "Accuracy"):
-        value = row.get(f"{dataset} {metric}") or row.get(f"{dataset.upper()} {metric}")
+        value = lookup.get(_normalize_lookup_key(f"{dataset} {metric}"))
         if value and re.search(r"\d+(?:\.\d+)?", value):
             values[metric] = value
     return values
 
 
 def _row_model(row: dict[str, str]) -> str:
-    return row.get("Model") or row.get("Variant") or row.get("Method") or ""
+    for key in ("Model", "Variant", "Method", "Approach", "System"):
+        if value := row.get(key):
+            return value
+    for key, value in row.items():
+        if value and not _is_metric_header(key) and not re.search(r"\d+(?:\.\d+)?", value):
+            return value
+    return ""
+
+
+def _dataset_name_from_header(header: str) -> str:
+    clean = re.sub(r"\s+", " ", header.strip())
+    for metric in ("F1", "AUC", "Precision", "Recall", "Accuracy"):
+        match = re.match(rf"(.+?)\s+{re.escape(metric)}(?:\s+\d+)?$", clean, re.IGNORECASE)
+        if match:
+            dataset = match.group(1).strip()
+            if dataset and dataset.lower() not in {"model", "variant", "method", "approach", "system"}:
+                return dataset
+    return ""
+
+
+def _select_full_model_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
+    full_rows = [row for row in rows if _row_model(row) and not _looks_ablated(_row_model(row))]
+    if not full_rows:
+        full_rows = [row for row in rows if _row_model(row)]
+    if not full_rows:
+        return None
+    return max(full_rows, key=_numeric_score_sum)
+
+
+def _looks_ablated(model: str) -> bool:
+    lowered = model.lower()
+    return bool(
+        re.search(r"\bw\s*/\s*o\b", lowered)
+        or re.search(r"\bwithout\b", lowered)
+        or re.search(r"\bablated?\b", lowered)
+        or re.search(r"\bremoved?\b", lowered)
+        or re.search(r"\bno\s+\w+", lowered)
+    )
+
+
+def _numeric_score_sum(row: dict[str, str]) -> float:
+    total = 0.0
+    count = 0
+    for key, value in row.items():
+        if _is_metric_header(key):
+            numeric = _float_value(value)
+            if numeric is not None:
+                total += numeric
+                count += 1
+    return total if count else float("-inf")
+
+
+def _is_metric_header(value: str) -> bool:
+    lowered = value.lower()
+    return bool(
+        "f1" in lowered
+        or "auc" in lowered
+        or "precision" in lowered
+        or "recall" in lowered
+        or "accuracy" in lowered
+        or "specificity" in lowered
+    )
+
+
+def _normalize_lookup_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _matches_any_selector(model: str, selectors: list[str]) -> bool:
+    model_key = _normalize_lookup_key(model)
+    return bool(model_key and any(selector in model_key or model_key in selector for selector in selectors))
 
 
 def _row_has_lower_scores(row: dict[str, str], baseline: dict[str, str]) -> bool:

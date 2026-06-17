@@ -646,6 +646,11 @@ class QueryService:
         table_indexes: list[int],
         risk_level: str,
     ) -> QueryAnswerPayload:
+        if not self._is_metric_query(question):
+            ablation_answer = self._deterministic_ablation_answer(question, contexts, table_indexes, risk_level)
+            if ablation_answer is not None:
+                return ablation_answer
+
         metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
         citations: list[int] = []
         if metrics:
@@ -684,18 +689,46 @@ class QueryService:
             answer = f"Relevant table evidence was found, so it should not be treated as missing. [{first_index}]\n\n{snippet}"
         return QueryAnswerPayload(answer_markdown=answer, citations=table_indexes[:1], risk_level=risk_level)
 
+    def _deterministic_ablation_answer(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        table_indexes: list[int],
+        risk_level: str,
+    ) -> QueryAnswerPayload | None:
+        for index in table_indexes:
+            findings = summarize_ablation_table(contexts[index].prompt_text)
+            if not findings:
+                continue
+            citation_marker = f" [{index}]"
+            table_label = self._extract_table_label(contexts[index].prompt_text)
+            if self._is_chinese_question(question):
+                subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
+                answer = subject + "显示：" + " ".join(findings) + citation_marker
+            else:
+                subject = table_label or "The ablation table"
+                answer = f"{subject} shows: " + " ".join(findings) + citation_marker
+            return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
+        return None
+
     def _extract_requested_metric_values(
         self,
         question: str,
         contexts: list[RetrievedContext],
         table_indexes: list[int],
     ) -> list[ExtractedMetric]:
-        requested = [dataset.upper() for dataset in self._query_priority_anchors(question)["dataset"]]
+        row_selectors = self._question_row_selectors(question)
         results: list[ExtractedMetric] = []
         for index in table_indexes:
             text = contexts[index].prompt_text
             table_label = self._extract_table_label(text)
-            structured_metrics = table_metric_values(text, requested)
+            requested = self._requested_datasets_for_table(question, text)
+            table_row_selectors = [
+                selector
+                for selector in row_selectors
+                if self._normalize_selector(selector) not in {self._normalize_selector(dataset) for dataset in requested}
+            ]
+            structured_metrics = table_metric_values(text, requested, row_selectors=table_row_selectors)
             if structured_metrics:
                 for item in structured_metrics:
                     values = item.get("values") or {}
@@ -703,12 +736,13 @@ class QueryService:
                     if dataset and values:
                         results.append(ExtractedMetric(index, str(item.get("table_label") or table_label or "") or None, dataset, dict(values)))
                 continue
-            parsed = self._extract_metric_values_from_markdown_table(text, index, table_label, requested)
+            parsed = self._extract_metric_values_from_markdown_table(text, index, table_label, requested, table_row_selectors)
             if not parsed:
                 parsed = self._extract_inline_metric_values(text, index, table_label, requested)
             results.extend(parsed)
 
-        filtered = [item for item in results if not requested or item.dataset.upper() in requested]
+        requested_all = self._requested_datasets_for_contexts(question, contexts, table_indexes)
+        filtered = [item for item in results if not requested_all or item.dataset.upper() in requested_all]
         ordered: list[ExtractedMetric] = []
         seen: set[tuple[int, str, tuple[tuple[str, str], ...]]] = set()
         for item in filtered:
@@ -717,7 +751,40 @@ class QueryService:
                 continue
             ordered.append(item)
             seen.add(key)
+            if len(ordered) >= 8:
+                break
         return ordered
+
+    @classmethod
+    def _requested_datasets_for_contexts(
+        cls,
+        question: str,
+        contexts: list[RetrievedContext],
+        table_indexes: list[int],
+    ) -> list[str]:
+        requested: list[str] = []
+        for anchor in cls._query_priority_anchors(question)["dataset"]:
+            key = anchor.upper()
+            if key not in requested:
+                requested.append(key)
+        for index in table_indexes:
+            for dataset in cls._requested_datasets_for_table(question, contexts[index].prompt_text):
+                if dataset.upper() not in requested:
+                    requested.append(dataset.upper())
+        return requested
+
+    @classmethod
+    def _requested_datasets_for_table(cls, question: str, table_text: str) -> list[str]:
+        normalized_question = cls._normalize_selector(question)
+        requested: list[str] = []
+        for item in table_metric_values(table_text):
+            dataset = str(item.get("dataset") or "")
+            if dataset and cls._normalize_selector(dataset) in normalized_question and dataset.upper() not in requested:
+                requested.append(dataset.upper())
+        for anchor in cls._query_priority_anchors(question)["dataset"]:
+            if anchor.upper() not in requested:
+                requested.append(anchor.upper())
+        return requested
 
     @classmethod
     def _extract_metric_values_from_markdown_table(
@@ -726,6 +793,7 @@ class QueryService:
         context_index: int,
         table_label: str | None,
         requested: list[str],
+        row_selectors: list[str] | None = None,
     ) -> list[ExtractedMetric]:
         rows = cls._markdown_table_rows(text)
         if len(rows) < 2:
@@ -733,7 +801,7 @@ class QueryService:
         simple = cls._extract_dataset_row_metrics(rows, context_index, table_label, requested)
         if simple:
             return simple
-        return cls._extract_dataset_column_metrics(rows, context_index, table_label, requested)
+        return cls._extract_dataset_column_metrics(rows, context_index, table_label, requested, row_selectors or [])
 
     @classmethod
     def _extract_dataset_row_metrics(
@@ -760,11 +828,10 @@ class QueryService:
         for row in rows[1:]:
             if dataset_col >= len(row):
                 continue
-            dataset_match = cls._DATASET_NAME_RE.search(row[dataset_col])
-            if not dataset_match:
+            dataset = cls._dataset_name_from_cell(row[dataset_col])
+            if not dataset:
                 continue
-            dataset = dataset_match.group(0).upper()
-            if requested and dataset not in requested:
+            if not cls._dataset_requested(dataset, requested):
                 continue
             values = {
                 metric: row[column].strip()
@@ -782,9 +849,10 @@ class QueryService:
         context_index: int,
         table_label: str | None,
         requested: list[str],
+        row_selectors: list[str],
     ) -> list[ExtractedMetric]:
         dataset_header_index = next(
-            (index for index, row in enumerate(rows) if any(cls._DATASET_NAME_RE.search(cell) for cell in row)),
+            (index for index, row in enumerate(rows) if cls._row_has_dataset_header(row)),
             None,
         )
         if dataset_header_index is None:
@@ -807,9 +875,9 @@ class QueryService:
         current_dataset: str | None = None
         for column in range(width):
             cell = dataset_header[column].strip() if column < len(dataset_header) else ""
-            dataset_match = cls._DATASET_NAME_RE.search(cell)
-            if dataset_match:
-                current_dataset = dataset_match.group(0).upper()
+            dataset_name = cls._dataset_name_from_cell(cell)
+            if dataset_name:
+                current_dataset = dataset_name
             elif cell and column == 0:
                 current_dataset = None
             if current_dataset:
@@ -821,15 +889,13 @@ class QueryService:
             if column < len(metric_header) and (metric := cls._normalize_metric_name(metric_header[column])) is not None
         }
         data_rows = rows[metric_header_index + 1 :]
-        preferred_rows = [row for row in data_rows if "sac-kg" in " | ".join(row).lower()]
-        if not preferred_rows and data_rows:
-            preferred_rows = [data_rows[-1]]
+        preferred_rows = cls._select_metric_rows(data_rows, row_selectors)
 
         results: list[ExtractedMetric] = []
         for row in preferred_rows:
             values_by_dataset: dict[str, dict[str, str]] = {}
             for column, dataset in dataset_by_col.items():
-                if requested and dataset not in requested:
+                if not cls._dataset_requested(dataset, requested):
                     continue
                 metric = metric_by_col.get(column)
                 if not metric or column >= len(row):
@@ -842,6 +908,53 @@ class QueryService:
                 if values:
                     results.append(ExtractedMetric(context_index, table_label, dataset, values))
         return results
+
+    @classmethod
+    def _select_metric_rows(cls, rows: list[list[str]], row_selectors: list[str], limit: int = 3) -> list[list[str]]:
+        data_rows = [row for row in rows if any(cell.strip() for cell in row)]
+        if not data_rows:
+            return []
+        selector_keys = [cls._normalize_selector(selector) for selector in row_selectors if selector]
+        if selector_keys:
+            matched = [
+                row
+                for row in data_rows
+                if any(selector and selector in cls._normalize_selector(row[0] if row else "") for selector in selector_keys)
+            ]
+            if matched:
+                return matched[:limit]
+        numeric_rows = [row for row in data_rows if sum(1 for cell in row[1:] if re.search(r"\d+(?:\.\d+)?", cell)) >= 1]
+        return numeric_rows[:limit]
+
+    @classmethod
+    def _question_row_selectors(cls, question: str) -> list[str]:
+        selectors: list[str] = []
+        dataset_keys = {cls._normalize_selector(anchor) for anchor in cls._query_priority_anchors(question)["dataset"]}
+        metric_words = {"f1", "auc", "precision", "recall", "accuracy", "score", "metric", "metrics", "performance"}
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*(?:\s+[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*){0,2}\b", question):
+            value = match.group(0).strip()
+            key = cls._normalize_selector(value)
+            if len(key) < 3 or key in dataset_keys or key.lower() in metric_words:
+                continue
+            if value.lower() in {"what", "table"}:
+                continue
+            selectors.append(value)
+        for facet in cls._extract_query_facets(question):
+            key = cls._normalize_selector(facet)
+            if len(key) >= 3 and key not in dataset_keys and facet not in selectors:
+                selectors.append(facet)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for selector in selectors:
+            key = cls._normalize_selector(selector)
+            if key and key not in seen:
+                ordered.append(selector)
+                seen.add(key)
+        return ordered[:4]
+
+    @staticmethod
+    def _normalize_selector(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
     @classmethod
     def _extract_inline_metric_values(
@@ -892,7 +1005,34 @@ class QueryService:
             return "Precision"
         if "recall" in lowered:
             return "Recall"
+        if "accuracy" in lowered:
+            return "Accuracy"
         return None
+
+    @classmethod
+    def _row_has_dataset_header(cls, row: list[str]) -> bool:
+        names = [cls._dataset_name_from_cell(cell) for cell in row[1:]]
+        return bool([name for name in names if name])
+
+    @classmethod
+    def _dataset_name_from_cell(cls, value: str) -> str:
+        clean = re.sub(r"\s+", " ", str(value or "").strip())
+        if (
+            not clean
+            or cls._normalize_metric_name(clean)
+            or re.fullmatch(r"-?\d+(?:\.\d+)?%?", clean)
+            or re.fullmatch(r":?-{3,}:?", clean)
+        ):
+            return ""
+        match = cls._DATASET_NAME_RE.search(clean)
+        return match.group(0).upper() if match else clean
+
+    @classmethod
+    def _dataset_requested(cls, dataset: str, requested: list[str]) -> bool:
+        if not requested:
+            return True
+        dataset_key = cls._normalize_selector(dataset)
+        return dataset_key in {cls._normalize_selector(item) for item in requested}
 
     @staticmethod
     def _extract_table_label(text: str) -> str | None:
@@ -1501,10 +1641,10 @@ class QueryService:
                 break
         lines = lines[start:]
 
-        anchors = {anchor.lower() for anchor in cls._query_priority_anchors(question)["dataset"]}
-        anchors.update(facet.lower() for facet in cls._extract_query_facets(question))
-        if "sac-kg" in question.lower():
-            anchors.add("sac-kg")
+        anchors = {cls._normalize_selector(anchor) for anchor in cls._query_priority_anchors(question)["dataset"]}
+        anchors.update(cls._normalize_selector(facet) for facet in cls._extract_query_facets(question))
+        anchors.update(cls._normalize_selector(selector) for selector in cls._question_row_selectors(question))
+        anchors = {anchor for anchor in anchors if anchor}
 
         caption_lines = [line for line in lines if not line.strip().startswith("|")][:2]
         table_lines = [line for line in lines if line.strip().startswith("|")]
@@ -1512,7 +1652,7 @@ class QueryService:
         relevant_rows = [
             line
             for line in table_lines[3:]
-            if any(anchor and anchor in line.lower() for anchor in anchors) or "sac-kg" in line.lower()
+            if any(anchor in cls._normalize_selector(line) for anchor in anchors)
         ]
         if not relevant_rows and table_lines:
             relevant_rows = table_lines[3:6]

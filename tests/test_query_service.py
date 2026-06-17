@@ -769,6 +769,123 @@ def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missin
     assert "88.8" in response.citations[0].excerpt
 
 
+def test_metric_query_fallback_when_chinese_draft_says_values_cannot_be_extracted() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Tables\n### Page 8\n"
+            "Table 5: F1 score and AUC results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="当前检索片段未直接包含完整表格，因此无法提取具体数值。", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="受限于当前检索内容，仍无法逐字提取这些指标。", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "SAC-KG 在 OIE2016 和 NYT 上的 F1/AUC 指标是什么？", save_answer=False)
+
+    assert "74.7" in response.answer_markdown
+    assert "73.2" in response.answer_markdown
+    assert "88.8" in response.answer_markdown
+    assert "87.3" in response.answer_markdown
+
+
+def test_metric_extraction_uses_requested_non_sac_kg_row_selector() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 3: Biomedical QA results.\n"
+        "| Model | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| ModelX | 81.4 | 76.2 | 72.1 | 69.8 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    metrics = service._extract_requested_metric_values(
+        "What are BioGraph-RAG Accuracy and F1 on PubMedQA and BioASQ?",
+        contexts,
+        [0],
+    )
+
+    values = {metric.dataset: metric.values for metric in metrics}
+    assert values["PUBMEDQA"] == {"Accuracy": "84.9", "F1": "79.6"}
+    assert values["BIOASQ"] == {"Accuracy": "75.2", "F1": "71.3"}
+
+
+def test_metric_extraction_does_not_treat_generic_datasets_as_row_selectors() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 3: Biomedical QA results.\n"
+        "| Model | PubMedQA |  | BioASQ |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| ModelX | 81.4 | 76.2 | 72.1 | 69.8 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    metrics = service._extract_requested_metric_values("What are Accuracy and F1 on PubMedQA and BioASQ?", contexts, [0])
+
+    by_dataset = {}
+    for metric in metrics:
+        by_dataset.setdefault(metric.dataset, []).append(metric.values)
+    assert any(values.get("F1") == "76.2" for values in by_dataset["PUBMEDQA"])
+    assert any(values.get("F1") == "69.8" for values in by_dataset["BIOASQ"])
+
+
+def test_table_block_excerpt_prefers_requested_non_sac_kg_row() -> None:
+    block = (
+        "Table 3: Biomedical QA results.\n"
+        "| Model | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| ModelX | 81.4 | 76.2 | 72.1 | 69.8 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "What are BioGraph-RAG metrics on PubMedQA and BioASQ?",
+    )
+
+    assert "BioGraph-RAG" in excerpt
+    assert "84.9" in excerpt
+
+
 def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

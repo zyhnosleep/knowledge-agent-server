@@ -69,12 +69,23 @@ def _compact_latex_group(value: str) -> str:
 
 
 def _compact_common_model_names(text: str) -> str:
-    text = re.sub(r"\bS\s*A\s*C\s*-\s*K\s*G\b", "SAC-KG", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bC\s*h\s*a\s*t\s*G\s*P\s*T\b", "ChatGPT", text, flags=re.IGNORECASE)
-    for suffix in ("prompt", "text", "verifier", "pruner"):
-        spaced_suffix = r"\s*".join(re.escape(char) for char in suffix)
-        text = re.sub(rf"w\s*/\s*o\s+{spaced_suffix}", f"w/o {suffix}", text, flags=re.IGNORECASE)
+    text = _compact_spaced_uppercase_runs(text)
+    text = re.sub(
+        r"\bw\s*/\s*o\s+((?:[A-Za-z]\s*){2,})",
+        lambda match: "w/o " + re.sub(r"\s+", "", match.group(1)),
+        text,
+        flags=re.IGNORECASE,
+    )
     return text
+
+
+def _compact_spaced_uppercase_runs(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        compact = re.sub(r"\s+", "", match.group(0))
+        return compact if len(compact) >= 3 else match.group(0)
+
+    text = re.sub(r"\b[A-Z](?:\s+[A-Z]){2,}(?:\s*-\s*[A-Z](?:\s+[A-Z])*)+\b", replace, text)
+    return re.sub(r"\b(?:[A-Z]\s+){2,}[A-Z]\b", replace, text)
 
 
 def _repair_markdown_table_rows(rows: list[list[str]]) -> list[list[str]]:
@@ -98,11 +109,15 @@ def _repair_dataset_metric_header(rows: list[list[str]]) -> None:
     )
     if metric_index is None:
         return
+    metric_row = rows[metric_index]
+    metric_count = max(len(metric_row) - 1, 0)
+    if metric_count <= 0:
+        return
     dataset_index = next(
         (
             index
             for index in range(metric_index - 1, -1, -1)
-            if any(_DATASET_NAME_RE.search(cell) for cell in rows[index])
+            if _dataset_names_from_header_row(rows[index], metric_count)
         ),
         None,
     )
@@ -110,17 +125,7 @@ def _repair_dataset_metric_header(rows: list[list[str]]) -> None:
         return
 
     dataset_row = rows[dataset_index]
-    metric_row = rows[metric_index]
-    metric_count = max(len(metric_row) - 1, 0)
-    if metric_count <= 0:
-        return
-
-    dataset_names = [
-        match.group(0).upper()
-        for cell in dataset_row[1:]
-        for match in [_DATASET_NAME_RE.search(cell)]
-        if match
-    ]
+    dataset_names = _dataset_names_from_header_row(dataset_row, metric_count)
     if not dataset_names or metric_count % len(dataset_names) != 0:
         return
     if len(dataset_names) == metric_count and all(dataset_row[index + 1].strip() for index in range(metric_count)):
@@ -128,6 +133,26 @@ def _repair_dataset_metric_header(rows: list[list[str]]) -> None:
 
     group_size = metric_count // len(dataset_names)
     rows[dataset_index] = [dataset_row[0] if dataset_row else "", *[name for name in dataset_names for _ in range(group_size)]]
+
+
+def _dataset_names_from_header_row(row: list[str], metric_count: int) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for cell in row[1:]:
+        clean = re.sub(r"\s+", " ", cell.strip())
+        if not clean or _is_metric_cell(clean) or _is_separator_row([clean]):
+            continue
+        if re.fullmatch(r"-?\d+(?:\.\d+)?%?", clean):
+            continue
+        match = _DATASET_NAME_RE.search(clean)
+        name = match.group(0).upper() if match else clean
+        key = name.lower()
+        if key not in seen:
+            names.append(name)
+            seen.add(key)
+    if not names or metric_count % len(names) != 0:
+        return []
+    return names
 
 
 def _repair_iteration_rowspans(rows: list[list[str]]) -> None:
@@ -162,5 +187,9 @@ def _is_separator_row(row: list[str]) -> bool:
 
 
 def _looks_like_model_name(value: str) -> bool:
-    lowered = value.lower()
-    return any(marker in lowered for marker in ("sac-kg", "openie", "stanford", "deepex", "pive", "human"))
+    stripped = value.strip()
+    if not stripped or _is_metric_cell(stripped) or _is_separator_row([stripped]):
+        return False
+    if re.fullmatch(r"-?\d+(?:\.\d+)?%?", stripped):
+        return False
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", stripped))

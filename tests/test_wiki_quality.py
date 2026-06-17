@@ -31,6 +31,39 @@ def test_structure_table_markdown_extracts_table5_metrics() -> None:
     assert metrics[1]["values"] == {"F1": "88.8", "AUC": "87.3"}
 
 
+def test_table_metric_values_extracts_non_sac_kg_model_rows() -> None:
+    markdown = (
+        "Table 3: Biomedical QA results.\n"
+        "| Model | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| ModelX | 81.4 | 76.2 | 72.1 | 69.8 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+
+    metrics = table_metric_values(markdown, ["PubMedQA", "BioASQ"], row_selectors=["BioGraph-RAG"])
+
+    assert [item["dataset"] for item in metrics] == ["PUBMEDQA", "BIOASQ"]
+    assert all(item["model"] == "BioGraph-RAG" for item in metrics)
+    assert metrics[0]["values"] == {"Accuracy": "84.9", "F1": "79.6"}
+    assert metrics[1]["values"] == {"Accuracy": "75.2", "F1": "71.3"}
+
+
+def test_table_metric_values_repairs_generic_merged_dataset_headers() -> None:
+    markdown = (
+        "Table 3: Biomedical QA results.\n"
+        "| Model | PubMedQA |  | BioASQ |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+
+    metrics = table_metric_values(markdown, ["PubMedQA", "BioASQ"], row_selectors=["BioGraph-RAG"])
+
+    assert metrics[0]["values"] == {"Accuracy": "84.9", "F1": "79.6"}
+    assert metrics[1]["values"] == {"Accuracy": "75.2", "F1": "71.3"}
+
+
 def test_summarize_ablation_table_reports_full_model_rows() -> None:
     markdown = (
         "Table 2: Ablation study.\n"
@@ -45,6 +78,23 @@ def test_summarize_ablation_table_reports_full_model_rows() -> None:
     assert findings
     assert "Iteration 1" in findings[0]
     assert "precision 88.81" in findings[0]
+
+
+def test_summarize_ablation_table_reports_actual_non_sac_kg_full_row() -> None:
+    markdown = (
+        "Table 4: Ablation study.\n"
+        "| Iteration | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | BioGraph-RAG w/o retriever | 7.10 | 70.20 | 65.00 |\n"
+        "| Iteration 1 | BioGraph-RAG | 9.40 | 83.50 | 78.10 |"
+    )
+
+    findings = summarize_ablation_table(markdown)
+
+    assert findings
+    assert "BioGraph-RAG" in findings[0]
+    assert "full SAC-KG" not in findings[0]
+    assert "precision 83.50" in findings[0]
 
 
 def test_build_ingest_quality_report_summarizes_tables() -> None:
