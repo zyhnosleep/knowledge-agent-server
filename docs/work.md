@@ -10,10 +10,11 @@
 
 当前最新明确结论：
 
-- MinerU 输出与 wiki/DB 中已经能包含 Table 2 / Table 5 的表格内容。
-- `/api/query` 的最终 citation 有时能返回完整 Table 5，但 answer/repair 阶段使用的 `contexts` 仍可能只拿到“提到 Table 5 的正文段落”，没有拿到真正 markdown 表格行。
+- MinerU pipeline 已经接入，外部拿到的 MinerU markdown 也证明 Table 2 / Table 5 可以被解析出来。
+- wiki/DB 中存在目标表格，但 `/api/query` 的 answer/repair 阶段仍可能只拿到“提到 Table 5 的正文段落”，没有拿到真正 markdown 表格行。
 - 第 3 问未达标的核心原因已经从“模型没读懂表格”定位为“query 上下文组装阶段没有把真实 table block 提前送入 answer/repair”。
-- 下一步修复重点应放在 `_build_contexts()` 和 table-first context promotion，而不是继续排查 MinerU。
+- 服务器已经确认运行在最新提交 `5df836d`，API 进程和日志正常，因此当前不是部署或重启问题。
+- 下一步修复重点应放在 `_build_contexts()`、table-first context promotion、table evidence 判定收紧，而不是继续排查 MinerU。
 
 ## 2. 已完成的工作
 
@@ -24,6 +25,7 @@
 - 增强 `start_api.sh`、`start_worker.sh`、`status.sh`、Redis/Ollama 检查逻辑。
 - 明确服务器没有系统 `sqlite3` 命令时，可以使用 Python 标准库 `sqlite3` 操作数据库。
 - 引入 `OLLAMA_KEEP_ALIVE` 配置，用于减少 Ollama 和 MinerU 争抢 RTX 3090 显存的风险。
+- 服务器验证时确认日志实际写在 `logs/api.log`，不是 `run/api.log`。
 
 ### 2.2 Git 与协作流程
 
@@ -31,6 +33,7 @@
 - 增加 `.gitignore`，排除 `data/`、`logs/`、`run/`、`tmp/`、PDF 原文、缓存和环境文件。
 - 增加 `.gitattributes`，稳定脚本和代码换行风格。
 - 形成“每轮改动后提交”的协作习惯，便于服务器 `git pull` 和回滚审查。
+- 在 query 表格证据链修复中使用多代理流程：planner / backend worker / reviewer 分工，最终由主线程整合并跑测试。
 
 ### 2.3 Wiki-first Query 主链路
 
@@ -39,6 +42,7 @@
 - 增加 query facets，使多实体问题如 Generator / Verifier / Pruner 能覆盖多个主题。
 - 修复 citation 编号归一化与重排问题，避免答案中出现未返回的 `[3]`、`[[0]]`、`[[sources/...]]` 等异常引用。
 - 增加普通问题优先返回 wiki citation、原文证据问题才保留 raw chunk citation 的逻辑。
+- 通过 SAC-KG 四问脚本持续验证 query 行为：定义、组件、Table 5 指标、Table 2 ablation。
 
 ### 2.4 SAC-KG 启发式 ingest 改造
 
@@ -47,6 +51,7 @@
 - Verifier 覆盖 quantity too small、format error、head entity error、head-tail contradiction、missing evidence、duplicate、potential conflict 等错误类型。
 - Pruner 从笼统保留/删除调整为基于 verified triples 的 tail entity `grow / keep / prune`。
 - 明确当前目标不是完整复现论文级 SAC-KG，而是把论文方法中适合本项目的结构化知识整理思路落地。
+- 在后续引入 20 篇新文献之前，需要优先验证该轻量化流程是否能泛化，而不是只对当前 SAC-KG 论文有效。
 
 ### 2.5 MinerU PDF 解析接入
 
@@ -55,7 +60,7 @@
 - 修复 MinerU CLI 传入相对路径导致找不到 PDF 的问题，改为传绝对路径。
 - 支持 MinerU v2 的嵌套 `content_list_v2.json` 结构。
 - 增加 MinerU markdown 兜底读取，把 `.md` 中的表格补进 `document_intelligence.tables`、`ParsedChunk` 和 `parsed.text`。
-- 验证外部获得的 MinerU markdown 中 Table 2 / Table 5 内容本身是存在的，因此当前不再优先怀疑 MinerU 原始输出。
+- 对用户提供的 MinerU markdown 文件进行审查，确认 Table 2 / Table 5 内容本身存在，因此当前不再优先怀疑 MinerU 原始输出。
 
 ### 2.6 Query 表格证据链修复
 
@@ -67,6 +72,7 @@
 - 修复 answer citation markup：`[[0]]`、孤立 `[n]`、超界 citation index 会在最终返回前重新编号或删除。
 - 增加 deterministic fallback：当模型声称表格缺失，而表格证据存在时，尝试用表格内容直接生成答案。
 - 增加 HTML table 到 markdown 的转换测试，覆盖 `colspan` / 多级表头场景。
+- 使用逻辑层诊断脚本确认当前第 3 问卡在 `contexts` 没有真实表格行，而不是 API 旧进程或 MinerU 缺表。
 
 相关已提交工作包括：
 
@@ -229,6 +235,16 @@ answer_lacks_metrics: False
 - 第 4 问答案不再出现 `full Model reports recalls Number of recalls`。
 - Table 2 citation 仍然保留。
 
+### 4.5 后续泛化验证
+
+目标：确保当前修复不是只对 SAC-KG 一篇论文有效。
+
+计划：
+
+- 在一次性加入 20 篇新文献前，建立固定验收表。
+- 每篇至少抽查：source summary、tables、figures、metric query、ablation/实验对比 query、citation 对齐。
+- 对不同论文中不叫 Table 5 的指标表、不同模型名和不同数据集名做回归测试。
+
 ## 5. 服务器验证流程
 
 每次 query 层改动部署后，按以下顺序验收：
@@ -261,45 +277,7 @@ bash tmp/sac_kg_query_batch.sh
 - `extracted_metrics` 是否为空。
 - `deterministic` 是否能输出具体值。
 
-## 6. 2026-06-15 至 2026-06-17 对话整理
-
-### 6.1 已完成工作
-
-- 审查 SAC-KG 四问结果，并明确 Table 2 / Table 5 是当前 query 验收核心。
-- 确认 MinerU 使用的是 pipeline 路线，不是旧的 Vision fallback 主链路。
-- 对用户提供的 MinerU markdown 文件进行审查，确认 MinerU markdown 本身包含目标表格，不能继续把问题简单归因给 MinerU。
-- 制定并执行 query 表格证据链修正计划。
-- 增加 citation excerpt 合并证据逻辑，使 answer draft、repair、deterministic fallback、unsupported number check、coverage citation 都能看到 `citation.excerpt`。
-- 通过 multi-agent 流程完成 backend worker 修改、reviewer 审查、本地测试与提交。
-- 提交 `5df836d Use citation excerpts in query evidence repair`。
-- 服务器部署后确认：代码版本是 `5df836d`，API 进程运行正常，请求返回 200，日志实际位于 `logs/api.log` 而不是 `run/api.log`。
-- 使用逻辑层诊断脚本进一步定位第 3 问未达标原因。
-
-### 6.2 遇到的问题
-
-- 早期怀疑 MinerU 未解析表格，但后续确认 MinerU markdown 与 wiki/DB 中已经存在目标表格。
-- query citation 能返回完整 Table 5，但 answer markdown 仍不输出具体数值。
-- 初步修复后，answer/repair 能使用 citation excerpt，但实际服务器诊断显示当前 `contexts` 仍然只拿到 raw chunk 正文段落。
-- `table_indexes=[1]` 命中的是 table mention，不是真正 table evidence。
-- `extracted_metrics` 为空，导致 deterministic fallback 退化为“找到相关表格证据，但只能附正文片段”。
-- 第 4 问虽然能引用 Table 2，但 ablation 摘要仍存在表头误读问题。
-
-### 6.3 当前判断
-
-- 第 3 问没有达标。
-- 当前不是部署问题，也不是 API 没重启，因为服务器确认运行在 `5df836d`。
-- 当前不是 MinerU 原始解析优先问题。
-- 当前核心问题是 `_build_contexts()` 阶段没有把真实 wiki table block 提前放进 contexts。
-
-### 6.4 后续展望
-
-- 先完成 table-first context promotion，使真实表格证据进入 answer/repair。
-- 再修 ablation 摘要质量。
-- 随后再考虑大规模 20 篇论文 ingest 的泛化质量。
-- 在引入 20 篇新文献前，需要形成一套稳定检查清单：每篇文献至少抽查 source page、tables、query citations、metric query、ablation/figure query。
-- 长期方向是把 `wiki/` 打造成可维护知识工作区：服务器负责 ingest/query/writeback，Obsidian 负责本地阅读、编辑和策展。
-
-## 7. 面向未来的维护方式
+## 6. 面向未来的维护方式
 
 建议以后每次重要工作后按以下模板追加：
 
