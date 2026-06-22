@@ -5,7 +5,7 @@ from app.db.session import Base
 from app.models.records import Document, DocumentChunk, Project, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import QueryService, RetrievedContext
+from app.services.search import ExtractedMetric, PageMatch, QueryService, RetrievedContext
 from app.schemas.common import Citation
 
 
@@ -774,6 +774,284 @@ def test_build_contexts_table_first_skips_summary_and_raw_when_table_exists() ->
     assert "88.8" in contexts[0].citation.excerpt
 
 
+def test_build_contexts_scans_wiki_tables_when_page_matches_are_empty() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/knowledge-graph",
+        title="Knowledge graph",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/knowledge-graph.md",
+        markdown_content=(
+            "# Knowledge graph\n\n"
+            "## Summary\n"
+            "The summary discusses benchmarks but does not reproduce the values.\n\n"
+            "## Tables\n"
+            "### Page 8\n"
+            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_contexts(
+        "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？",
+        "p1",
+        [],
+    )
+
+    assert contexts
+    assert contexts[0].citation.page_slug == "sources/knowledge-graph"
+    assert contexts[0].citation.excerpt.startswith("Table 5")
+    assert "74.7" in contexts[0].prompt_text
+    assert "88.8" in contexts[0].prompt_text
+
+
+def test_build_contexts_global_table_scan_requires_query_relevance() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/unrelated",
+        title="Unrelated",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/unrelated.md",
+        markdown_content=(
+            "# Unrelated\n\n"
+            "## Tables\n"
+            "### Page 2\n"
+            "Table 9: Unrelated benchmark.\n"
+            "| Model | F1 |\n"
+            "| --- | --- |\n"
+            "| OtherModel | 55.1 |\n"
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_contexts("What are FooNet Accuracy values on Dataset-A?", "p1", [])
+
+    assert contexts == []
+
+
+def test_global_table_scan_rejects_weak_metric_overlap_without_requested_entity_or_dataset() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/unrelated",
+        title="Unrelated",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/unrelated.md",
+        markdown_content=(
+            "# Unrelated\n\n"
+            "## Tables\n"
+            "### Page 4\n"
+            "Table 4: Generic benchmark with common metric words.\n"
+            "| Model | PubMedQA |  | BioASQ |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | Accuracy | F1 | Accuracy | F1 |\n"
+            "| OtherModel | 80.1 | 74.4 | 70.5 | 66.9 |\n"
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_contexts("What are FooNet Accuracy and F1 values on Dataset-A?", "p1", [])
+
+    assert contexts == []
+
+
+def test_build_contexts_global_table_scan_uses_generic_dataset_anchors() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/foo",
+        title="Foo",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/foo.md",
+        markdown_content=(
+            "# Foo\n\n"
+            "## Tables\n"
+            "### Page 2\n"
+            "Table 1: Unrelated benchmark.\n"
+            "| Model | F1 |\n"
+            "| --- | --- |\n"
+            "| OtherModel | 55.1 |\n"
+            "### Page 7\n"
+            "Table 7: FooNet benchmark results.\n"
+            "| Model | Dataset-A |  | Dataset-B |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | Accuracy | F1 | Accuracy | F1 |\n"
+            "| BaselineNet | 70.1 | 61.4 | 68.2 | 59.7 |\n"
+            "| FooNet | 91.2 | 89.5 | 87.6 | 85.4 |\n"
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_contexts("What are FooNet Accuracy and F1 on Dataset-A and Dataset-B?", "p1", [])
+
+    assert contexts
+    assert contexts[0].citation.excerpt.startswith("Table 7")
+    assert "91.2" in contexts[0].prompt_text
+    assert "85.4" in contexts[0].prompt_text
+
+
+def test_matched_page_unrelated_table_does_not_block_global_requested_table() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    matched_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/overview",
+        title="SAC-KG Overview",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/overview.md",
+        markdown_content=(
+            "# SAC-KG Overview\n\n"
+            "## Summary\n"
+            "This page discusses SAC-KG and mentions OIE2016 and NYT, but its table is unrelated.\n\n"
+            "## Tables\n"
+            "### Page 2\n"
+            "Table 1: Training configuration.\n"
+            "| Setting | Value |\n"
+            "| --- | --- |\n"
+            "| Batch size | 32 |\n"
+        ),
+        source_document_ids=[],
+        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT"]},
+    )
+    requested_table_page = WikiPage(
+        id="w2",
+        project_id="p1",
+        slug="sources/benchmark",
+        title="Benchmark",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/benchmark.md",
+        markdown_content=(
+            "# Benchmark\n\n"
+            "## Tables\n"
+            "### Page 8\n"
+            "Table 5: F1 score and AUC results on OIE2016 and NYT datasets.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, matched_page, requested_table_page])
+    db.commit()
+
+    service = QueryService(db)
+    matches = [PageMatch(page=matched_page, score=20.0)]
+    contexts = service._build_contexts("What are SAC-KG metrics on OIE2016 and NYT?", "p1", matches)
+
+    assert contexts
+    assert contexts[0].citation.page_slug == "sources/benchmark"
+    assert "74.7" in contexts[0].prompt_text
+    assert "Batch size" not in contexts[0].prompt_text
+
+
+def test_global_table_scan_requires_non_table_anchor_when_table_number_is_not_unique() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wrong_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/wrong",
+        title="Wrong",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/wrong.md",
+        markdown_content=(
+            "# Wrong\n\n"
+            "## Tables\n"
+            "### Page 8\n"
+            "Table 5: Another model results on unrelated datasets.\n"
+            "| Model | Dataset-X |  |\n"
+            "| --- | --- | --- |\n"
+            "|  | F1 | AUC |\n"
+            "| OtherModel | 60.1 | 58.2 |\n"
+        ),
+        source_document_ids=[],
+    )
+    right_page = WikiPage(
+        id="w2",
+        project_id="p1",
+        slug="sources/right",
+        title="Right",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/right.md",
+        markdown_content=(
+            "# Right\n\n"
+            "## Tables\n"
+            "### Page 8\n"
+            "Table 5: F1 score and AUC results on OIE2016 and NYT datasets.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, wrong_page, right_page])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_contexts("What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", "p1", [])
+
+    assert contexts
+    assert contexts[0].citation.page_slug == "sources/right"
+    assert all("OtherModel" not in context.prompt_text for context in contexts)
+
+
+def test_metric_query_without_structured_table_does_not_fall_back_to_prose_source_chunk() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="KG", file_name="kg.pdf", sha256="abc", raw_path="raw/kg.pdf", status="ready")
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="As shown in Table 5, SAC-KG performs well on OIE2016 and NYT, but exact values are not reproduced here.",
+        page_label="8",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are SAC-KG metrics on OIE2016 and NYT?", save_answer=False)
+
+    assert "No supporting evidence was found yet" in response.answer_markdown
+    assert response.citations == []
+    assert "As shown in Table 5" not in service.ollama.last_prompt
+
+
 def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missing() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -817,6 +1095,87 @@ def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missin
     assert response.citations
     assert "Table 5" in response.citations[0].excerpt
     assert "88.8" in response.citations[0].excerpt
+
+
+def test_metric_query_repairs_answer_that_only_mentions_metric_names() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    table = (
+        "Table 4: Biomedical QA benchmark.\n"
+        "| Method | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(
+                answer_markdown="Table 4 reports Accuracy and F1 for PubMedQA and BioASQ, but the answer omits the numbers. [0]",
+                citations=[0],
+                risk_level="normal",
+            ),
+            QueryAnswerPayload(
+                answer_markdown="The repaired answer still only says Accuracy and F1 are reported for PubMedQA and BioASQ. [0]",
+                citations=[0],
+                risk_level="normal",
+            ),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are BioGraph-RAG Accuracy and F1 values on PubMedQA and BioASQ?", save_answer=False)
+
+    assert "PUBMEDQA" in response.answer_markdown
+    assert "84.9" in response.answer_markdown
+    assert "79.6" in response.answer_markdown
+    assert "BIOASQ" in response.answer_markdown
+    assert "75.2" in response.answer_markdown
+    assert "71.3" in response.answer_markdown
+
+
+def test_chinese_table_query_prompt_requires_chinese_answer() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    table = (
+        "Table 5: F1 score and AUC results.\n"
+        "| Model | OIE2016 |  | NYT |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC |\n"
+        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    fake_ollama = FakeOllama()
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+
+    service.answer("demo", "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", save_answer=False)
+
+    assert "Answer in Chinese" in fake_ollama.last_prompt
 
 
 def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_lacks_table() -> None:
@@ -891,6 +1250,204 @@ def test_table_citation_indexes_detect_table_data_in_citation_excerpt() -> None:
     indexes = service._table_citation_indexes("What are SAC-KG metrics on OIE2016 and NYT?", contexts)
 
     assert indexes == [0]
+
+
+def test_table_citation_indexes_ignore_prose_table_mentions_without_table_rows() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/paper",
+                page_title="Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt="As shown in Table 3, ModelX improves the F1 score by 5 points over baselines.",
+            ),
+            prompt_text="As shown in Table 3, ModelX improves the F1 score by 5 points over baselines.",
+            score=10,
+        )
+    ]
+
+    indexes = service._table_citation_indexes("What does Table 3 report about F1?", contexts)
+
+    assert indexes == []
+
+
+def test_table_citation_indexes_ignore_table5_prose_without_metric_values_or_rows() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/kg",
+                page_title="KG",
+                page_kind="source_summary",
+                score=10,
+                excerpt="As shown in Table 5, SAC-KG performs well across the benchmark datasets.",
+            ),
+            prompt_text="As shown in Table 5, SAC-KG performs well across the benchmark datasets.",
+            score=10,
+        )
+    ]
+
+    indexes = service._table_citation_indexes("What are SAC-KG metrics in Table 5?", contexts)
+
+    assert indexes == []
+
+
+def test_metric_query_selects_real_table5_over_higher_scored_prose_context() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    prose_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=50,
+            excerpt="As shown in Table 5, SAC-KG outperforms other baselines on benchmark datasets.",
+        ),
+        prompt_text="As shown in Table 5, SAC-KG outperforms other baselines on benchmark datasets.",
+        score=50,
+    )
+    table = (
+        "Table 5: F1 score and AUC results.\n"
+        "| Model | OIE2016 |  | NYT |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC |\n"
+        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+    )
+    table_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=5,
+            excerpt=table,
+        ),
+        prompt_text=table,
+        score=5,
+    )
+    contexts = [prose_context, table_context]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="The exact values are not present in the provided context.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the provided context.", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
+
+    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
+    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 5")
+    assert all("As shown in Table 5" not in citation.excerpt for citation in response.citations)
+
+
+def test_table_evidence_replacement_preserves_inline_citation_marker() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    prose_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=50,
+            excerpt="As shown in Table 5, SAC-KG outperforms baselines on benchmark datasets.",
+        ),
+        prompt_text="As shown in Table 5, SAC-KG outperforms baselines on benchmark datasets.",
+        score=50,
+    )
+    table = (
+        "Table 5: F1 score and AUC results.\n"
+        "| Model | OIE2016 |  | NYT |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | F1 | AUC | F1 | AUC |\n"
+        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+    )
+    table_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=5,
+            excerpt=table,
+        ),
+        prompt_text=table,
+        score=5,
+    )
+    contexts = [prose_context, table_context]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(
+                answer_markdown="Table 5 reports OIE2016 F1 74.7 / AUC 73.2 and NYT F1 88.8 / AUC 87.3 [0].",
+                citations=[0],
+                risk_level="normal",
+            )
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
+
+    assert response.answer_markdown.endswith("[0].")
+    assert len(response.citations) == 1
+    assert response.citations[0].excerpt.startswith("Table 5")
+
+
+def test_context_has_table_data_rejects_html_until_it_is_converted_to_markdown() -> None:
+    html_table = (
+        "<table><tr><th>Method</th><th>F1</th></tr>"
+        "<tr><td>ModelX</td><td>81.4</td></tr></table>"
+    )
+
+    assert not QueryService._context_has_table_data(html_table)
+
+
+def test_context_has_table_data_accepts_legacy_pipe_table_without_separator() -> None:
+    table = (
+        "| Model | F1 | AUC |\n"
+        "| ModelX | 81.4 | 76.2 |"
+    )
+
+    assert QueryService._context_has_table_data(table)
+
+
+def test_citation_is_table_evidence_requires_structured_rows() -> None:
+    prose = Citation(
+        page_slug="sources/paper",
+        page_title="Paper",
+        page_kind="source_summary",
+        score=10,
+        excerpt="As shown in Table 3, ModelX improves the F1 score by 5 points over baselines.",
+    )
+    table = Citation(
+        page_slug="sources/paper",
+        page_title="Paper",
+        page_kind="source_summary",
+        score=1,
+        excerpt=(
+            "Table 3: Benchmark results.\n"
+            "| Model | F1 |\n"
+            "| --- | --- |\n"
+            "| ModelX | 81.4 |"
+        ),
+    )
+
+    assert not QueryService._citation_is_table_evidence(prose)
+    assert QueryService._citation_is_table_evidence(table)
 
 
 def test_metric_query_fallback_when_chinese_draft_says_values_cannot_be_extracted() -> None:
@@ -991,6 +1548,121 @@ def test_metric_extraction_does_not_treat_generic_datasets_as_row_selectors() ->
     assert any(values.get("F1") == "69.8" for values in by_dataset["BIOASQ"])
 
 
+def test_answer_contains_extracted_metrics_requires_values_not_metric_names_only() -> None:
+    metrics = [
+        ExtractedMetric(0, "Table 4", "PubMedQA", {"Accuracy": "84.9", "F1": "79.6"}),
+        ExtractedMetric(0, "Table 4", "BioASQ", {"Accuracy": "75.2", "F1": "71.3"}),
+    ]
+
+    assert not QueryService._answer_contains_extracted_metrics(
+        "Table 4 discusses PubMedQA and BioASQ Accuracy/F1 metrics, but does not list the values.",
+        metrics,
+    )
+    assert QueryService._answer_contains_extracted_metrics(
+        "Table 4 reports PubMedQA Accuracy 84.9 / F1 79.6 and BioASQ Accuracy 75.2 / F1 71.3.",
+        metrics,
+    )
+
+
+def test_metric_query_without_extracted_metrics_does_not_return_generic_table_snippet() -> None:
+    service = QueryService(make_session())
+    context_text = (
+        "Table 9: Dataset overview.\n"
+        "The article mentions PubMedQA and BioASQ with several observations, but the metric values are not reproduced here."
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=context_text),
+            prompt_text=context_text,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer(
+        "What are Accuracy and F1 values on PubMedQA and BioASQ?",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert answer.answer_markdown == "The retrieved table evidence does not contain parseable requested metric values. [0]"
+    assert "Dataset overview" not in answer.answer_markdown
+
+
+def test_metric_extraction_handles_generic_multi_level_dataset_headers() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 4: Biomedical QA benchmark.\n"
+        "| Method | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| Baseline | 80.1 | 74.4 | 70.5 | 66.9 |\n"
+        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    metrics = service._extract_requested_metric_values(
+        "What are BioGraph-RAG Accuracy and F1 values on PubMedQA and BioASQ?",
+        contexts,
+        [0],
+    )
+
+    values = {metric.dataset: metric.values for metric in metrics}
+    assert values["PUBMEDQA"] == {"Accuracy": "84.9", "F1": "79.6"}
+    assert values["BIOASQ"] == {"Accuracy": "75.2", "F1": "71.3"}
+
+
+def test_metric_query_extracts_generic_table7_foonet_metrics() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    table = (
+        "Table 7: FooNet benchmark results.\n"
+        "| Model | Dataset-A |  | Dataset-B |  |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  | Accuracy | F1 | Accuracy | F1 |\n"
+        "| BaselineNet | 70.1 | 61.4 | 68.2 | 59.7 |\n"
+        "| FooNet | 91.2 | 89.5 | 87.6 | 85.4 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/foo", page_title="Foo", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="The exact metric values are not present in the provided context.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The requested metric values still cannot be extracted.", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are FooNet Accuracy and F1 on Dataset-A and Dataset-B in Table 7?", save_answer=False)
+
+    assert "Table 7" in response.answer_markdown
+    assert "DATASET-A" in response.answer_markdown
+    assert "91.2" in response.answer_markdown
+    assert "89.5" in response.answer_markdown
+    assert "DATASET-B" in response.answer_markdown
+    assert "87.6" in response.answer_markdown
+    assert "85.4" in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 7")
+
+
 def test_table_block_excerpt_prefers_requested_non_sac_kg_row() -> None:
     block = (
         "Table 3: Biomedical QA results.\n"
@@ -1008,6 +1680,34 @@ def test_table_block_excerpt_prefers_requested_non_sac_kg_row() -> None:
 
     assert "BioGraph-RAG" in excerpt
     assert "84.9" in excerpt
+
+
+def test_table_block_excerpt_starts_at_table_fragment_after_prose() -> None:
+    block = (
+        "As shown in Table 3, the following benchmark summarizes the reported metrics.\n"
+        "| Model | F1 | AUC |\n"
+        "| --- | --- | --- |\n"
+        "| ModelX | 81.4 | 76.2 |"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "What does Table 3 report?")
+
+    assert excerpt.startswith("| Model |")
+    assert "ModelX" in excerpt
+    assert "As shown in Table 3" not in excerpt
+
+
+def test_table_block_excerpt_starts_at_html_table_after_prose() -> None:
+    block = (
+        "As shown in Table 3, the following benchmark summarizes the reported metrics.\n"
+        "<table><tr><th>Model</th><th>F1</th></tr><tr><td>ModelX</td><td>81.4</td></tr></table>"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "What does Table 3 report?")
+
+    assert excerpt.startswith("<table>")
+    assert "ModelX" in excerpt
+    assert "As shown in Table 3" not in excerpt
 
 
 def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
@@ -1048,6 +1748,81 @@ def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
     assert "A summary should not" not in response.citations[0].excerpt
 
 
+def test_table2_ablation_selects_markdown_table_over_higher_scored_prose_context() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    prose_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=40,
+            excerpt="As shown in Table 2, the ablation study validates each component.",
+        ),
+        prompt_text="As shown in Table 2, the ablation study validates each component.",
+        score=40,
+    )
+    table = (
+        "Table 2: Ablation study.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |"
+    )
+    table_context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/kg",
+            page_title="KG",
+            page_kind="source_summary",
+            score=5,
+            excerpt=table,
+        ),
+        prompt_text=table,
+        score=5,
+    )
+    contexts = [prose_context, table_context]
+
+    service = QueryService(db)
+    service._load_index_context = lambda project_slug: None
+    service._search_wiki_pages = lambda question, project_id: []
+    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(answer_markdown="The ablation values are not included in the provided context.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The ablation values still cannot be extracted.", citations=[0], risk_level="normal"),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What conclusions can be drawn from Table 2 ablation study?", save_answer=False)
+
+    assert "Table 2 shows" in response.answer_markdown
+    assert "precision 88.81" in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 2")
+    assert all("As shown in Table 2" not in citation.excerpt for citation in response.citations)
+
+
+def test_ablation_table_excerpt_keeps_all_rows_needed_for_summary() -> None:
+    block = (
+        "Table 2: Ablation study for a multi-round model.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | Full Model | 13.50 | 88.81 | 80.50 |\n"
+        "| Iteration 1 | w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| Iteration 2 | Full Model | 9.94 | 84.61 | 76.27 |\n"
+        "| Iteration 2 | w/o prompt | 8.66 | 78.44 | 70.01 |\n"
+        "| Iteration 3 | Full Model | 6.63 | 76.74 | 68.60 |\n"
+        "| Iteration 3 | w/o prompt | 5.08 | 70.11 | 63.20 |"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
+
+    assert "84.61" in excerpt
+    assert "76.74" in excerpt
+
+
 def test_citation_markup_is_normalized_and_capped_to_returned_citations() -> None:
     answer = "Metrics [[0]] are supported, but [3] is not. See [[Knowledge graph](sources/knowledge-graph.md)] and [[sources/foo.md]]."
 
@@ -1069,8 +1844,14 @@ def test_same_page_dedup_prefers_table_citation() -> None:
             score=20,
         ),
         RetrievedContext(
-            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt="Table 5: results\n| SAC-KG | 88.8 |"),
-            prompt_text="Table 5: results\n| SAC-KG | 88.8 |",
+            citation=Citation(
+                page_slug="sources/kg",
+                page_title="KG",
+                page_kind="source_summary",
+                score=1,
+                excerpt="Table 5: results\n| Model | F1 |\n| --- | --- |\n| SAC-KG | 88.8 |",
+            ),
+            prompt_text="Table 5: results\n| Model | F1 |\n| --- | --- |\n| SAC-KG | 88.8 |",
             score=1,
         ),
         RetrievedContext(
@@ -1183,6 +1964,72 @@ def test_deterministic_ablation_answer_uses_citation_excerpt_when_prompt_text_la
     assert "Table 2 shows" in answer.answer_markdown
     assert "precision 88.81" in answer.answer_markdown
     assert answer.citations == [0]
+
+
+def test_chinese_deterministic_ablation_answer_is_localized() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 2: Ablation study.\n"
+        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Iteration 1 | Full Model | 13.50 | 88.81 | 80.50 |\n"
+        "| Iteration 1 | w/o prompt | 10.15 | 80.64 | 74.19 |\n"
+        "| Iteration 2 | Full Model | 9.94 | 84.61 | 76.27 |\n"
+        "| Iteration 2 | w/o prompt | 8.66 | 78.44 | 70.01 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
+            prompt_text=table,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer("论文中的 ablation studies 得出了什么结论？请引用 Table 2。", contexts, [0], "normal")
+
+    assert "Table 2 的消融结果显示" in answer.answer_markdown
+    assert "完整模型" in answer.answer_markdown
+    assert "精确率 88.81" in answer.answer_markdown
+    assert "underperform" not in answer.answer_markdown
+
+
+def test_deterministic_ablation_answer_returns_none_without_structured_table() -> None:
+    service = QueryService(make_session())
+    context_text = (
+        "Table 2 is referenced in the paper. The prose says an ablation study was conducted, "
+        "but no rows or metric values are included in this retrieved context."
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=context_text),
+            prompt_text=context_text,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_ablation_answer("What conclusions can be drawn from Table 2 ablation?", contexts, [0], "normal")
+
+    assert answer is None
+
+
+def test_deterministic_table_answer_does_not_fake_ablation_without_structured_table() -> None:
+    service = QueryService(make_session())
+    context_text = (
+        "Table 2 is referenced in the paper. The prose says an ablation study was conducted, "
+        "but no rows or metric values are included in this retrieved context."
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=context_text),
+            prompt_text=context_text,
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_table_answer("What conclusions can be drawn from Table 2 ablation?", contexts, [0], "normal")
+
+    assert answer.answer_markdown == "The retrieved table evidence does not contain a structured ablation table. [0]"
+    assert "conducted" not in answer.answer_markdown
 
 
 def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:

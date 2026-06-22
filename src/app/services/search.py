@@ -81,11 +81,17 @@ class QueryService:
         answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
+        chosen_indexes = self._table_evidence_indexes_only(question, contexts, chosen_indexes)
         chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
         citations = self._select_citations(contexts, chosen_indexes)
         if not self._needs_source_evidence(question):
             citations = self._prefer_wiki_citations(citations, page_matches, project.id, question=question)
-        answer_markdown = self._renumber_answer_citations(answer_payload.answer_markdown, chosen_indexes)
+        answer_text_for_citations = self._retarget_table_answer_citations(
+            question,
+            answer_payload.answer_markdown,
+            chosen_indexes,
+        )
+        answer_markdown = self._renumber_answer_citations(answer_text_for_citations, chosen_indexes)
         answer_markdown = self._drop_unreturned_citation_markers(answer_markdown, len(citations))
         if not citations:
             answer_markdown = self._strip_answer_citation_markers(answer_markdown)
@@ -232,6 +238,8 @@ class QueryService:
                 for block, block_score in self._rank_blocks(question, table_blocks)[:5]:
                     if not self._context_has_table_data(block):
                         continue
+                    if not self._table_block_matches_query(question, block):
+                        continue
                     has_table_context = True
                     score = match.score + TABLE_CONTEXT_SCORE_BOOST + block_score
                     contexts.append(
@@ -279,6 +287,13 @@ class QueryService:
 
         if needs_table_first and has_table_context:
             return self._finalize_contexts(contexts)
+        if needs_table_first:
+            global_table_contexts = self._search_wiki_table_contexts(question, project_id, page_matches)
+            if global_table_contexts:
+                contexts.extend(global_table_contexts)
+                return self._finalize_contexts(contexts)
+            if is_metric_query or is_table_query:
+                return self._finalize_contexts(contexts)
         contexts.extend(fallback_contexts)
         if self._should_use_wiki_only(question, page_matches):
             return self._finalize_contexts(contexts)
@@ -287,6 +302,112 @@ class QueryService:
         if contexts:
             return self._finalize_contexts(contexts)
         return self._search_source_chunks(question, project_id, [], limit=5)
+
+    def _search_wiki_table_contexts(
+        self,
+        question: str,
+        project_id: str,
+        page_matches: list[PageMatch],
+        limit: int = 5,
+    ) -> list[RetrievedContext]:
+        matched_page_ids = {match.page.id for match in page_matches}
+        pages = self.db.scalars(
+            select(WikiPage).where(
+                WikiPage.project_id == project_id,
+                WikiPage.kind != PageKind.query_answer.value,
+            )
+        ).all()
+        contexts: list[RetrievedContext] = []
+        for page in pages:
+            page_body = self._strip_frontmatter(page.markdown_content)
+            table_blocks = self._extract_table_blocks(page_body)
+            if not table_blocks:
+                continue
+            page_bonus = 8.0 if page.id in matched_page_ids else 0.0
+            for block, block_score in self._rank_blocks(question, table_blocks)[:3]:
+                if not self._context_has_table_data(block):
+                    continue
+                if not self._table_block_matches_query(question, block):
+                    continue
+                score = TABLE_CONTEXT_SCORE_BOOST + page_bonus + block_score
+                contexts.append(
+                    RetrievedContext(
+                        citation=Citation(
+                            page_slug=page.slug,
+                            page_title=strip_upload_prefix(page.title),
+                            page_kind=page.kind,
+                            score=score,
+                            page_label=self._extract_page_label_from_block(block),
+                            excerpt=self._table_block_excerpt(block, question),
+                        ),
+                        prompt_text=block[:2000],
+                        score=score,
+                    )
+                )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    @classmethod
+    def _table_block_matches_query(cls, question: str, block: str) -> bool:
+        block_key = cls._normalize_selector(block)
+        if not block_key:
+            return False
+        anchors = cls._query_priority_anchors(question)
+        table_terms = [cls._normalize_selector(anchor) for anchor in anchors["figure_table"]]
+        dataset_terms = [cls._normalize_selector(anchor) for anchor in anchors["dataset"]]
+        generic_terms = [
+            cls._normalize_selector(anchor)
+            for anchor in [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question)]
+        ]
+        table_terms = [term for term in table_terms if len(term) >= 3]
+        low_signal_terms = {
+            "what",
+            "which",
+            "where",
+            "when",
+            "does",
+            "please",
+            "cite",
+            "show",
+            "tell",
+            "give",
+            "drawn",
+            "conclusion",
+            "conclusions",
+            "report",
+            "reports",
+            "result",
+            "results",
+            "table",
+            "figure",
+            "metric",
+            "metrics",
+            "dataset",
+            "datasets",
+            "value",
+            "values",
+            "score",
+            "scores",
+            "performance",
+            "accuracy",
+            "precision",
+            "recall",
+            "ablation",
+            "study",
+        }
+        non_table_terms = [
+            term
+            for term in [*dataset_terms, *generic_terms]
+            if len(term) >= 3
+            and term not in low_signal_terms
+            and not re.fullmatch(r"(?:table|figure|fig)\d+", term)
+        ]
+        if non_table_terms:
+            return any(term in block_key for term in non_table_terms)
+        if table_terms:
+            return any(term in block_key for term in table_terms)
+        query_terms = cls._tokenize(question)
+        block_terms = cls._tokenize(block)
+        return len(query_terms & block_terms) >= 2
 
     def _draft_answer(self, question: str, index_context: str | None, contexts: list[RetrievedContext]) -> QueryAnswerPayload:
         if not contexts:
@@ -353,6 +474,12 @@ class QueryService:
         )
 
         # Figure/Table constraint: if context has them, don't say "not included".
+        if self._is_chinese_question(question):
+            parts.append(
+                "IMPORTANT: Answer in Chinese because the user's question is written in Chinese. "
+                "Keep table labels, dataset names, model names, and metric names verbatim when needed."
+            )
+
         if self._is_figure_query(question):
             if has_figure_context:
                 parts.append(
@@ -480,10 +607,7 @@ class QueryService:
             return answer_payload
         extracted_metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
         answer_missing = self._answer_claims_table_data_missing(answer_payload.answer_markdown)
-        answer_lacks_metrics = bool(extracted_metrics) and not self._answer_contains_extracted_metrics(
-            answer_payload.answer_markdown,
-            extracted_metrics,
-        )
+        answer_lacks_metrics = self._answer_lacks_requested_metrics(question, answer_payload.answer_markdown, extracted_metrics)
         if not answer_missing and not answer_lacks_metrics:
             return answer_payload
 
@@ -517,10 +641,7 @@ class QueryService:
         )
         repaired.answer_markdown = self._normalize_answer_citation_markup(repaired.answer_markdown)
         repaired.citations = [index for index in repaired.citations if index in table_indexes] or table_indexes[:2]
-        repaired_lacks_metrics = bool(extracted_metrics) and not self._answer_contains_extracted_metrics(
-            repaired.answer_markdown,
-            extracted_metrics,
-        )
+        repaired_lacks_metrics = self._answer_lacks_requested_metrics(question, repaired.answer_markdown, extracted_metrics)
         if self._answer_claims_table_data_missing(repaired.answer_markdown) or repaired_lacks_metrics:
             return fallback
         return repaired
@@ -557,13 +678,42 @@ class QueryService:
                 indexes.append(index)
         return indexes or list(range(min(2, len(contexts))))
 
+    def _table_evidence_indexes_only(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        indexes: list[int],
+    ) -> list[int]:
+        if not (self._is_table_query(question) or self._is_metric_query(question)):
+            return indexes
+        table_indexes = self._table_citation_indexes(question, contexts)
+        if not table_indexes:
+            return indexes
+        allowed = set(table_indexes)
+        return [index for index in indexes if index in allowed] or table_indexes
+
     def _table_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
         if not (self._is_table_query(question) or self._is_metric_query(question)):
             return []
         scored: list[tuple[float, int]] = []
+        priority_terms = {
+            self._normalize_selector(anchor)
+            for anchor in self._query_priority_anchors(question)["dataset"]
+            if len(self._normalize_selector(anchor)) >= 3
+        }
+        generic_terms = {
+            self._normalize_selector(anchor)
+            for anchor in self._extract_generic_table_terms(question)
+            if len(self._normalize_selector(anchor)) >= 3
+        }
+        requested_table_terms = priority_terms or generic_terms
+        requires_requested_terms = self._is_metric_query(question) and bool(requested_table_terms)
         for index, context in enumerate(contexts):
             text = self._context_table_evidence_text(context)
             if not self._context_has_table_data(text):
+                continue
+            text_key = self._normalize_selector(text)
+            if requires_requested_terms and not any(term in text_key for term in requested_table_terms):
                 continue
             score = context.score
             for facet in self._extract_query_facets(question):
@@ -582,10 +732,45 @@ class QueryService:
 
     @staticmethod
     def _context_has_table_data(text: str) -> bool:
-        lowered = text.lower()
-        has_table_marker = "|" in text or "<table" in lowered or re.search(r"\btable\s*\d+", lowered)
-        has_number = bool(re.search(r"\d+(?:\.\d+)?", text))
-        return bool(has_table_marker and has_number)
+        return QueryService._has_markdown_table_rows(text)
+
+    @staticmethod
+    def _has_markdown_table_rows(text: str) -> bool:
+        rows: list[list[str]] = []
+        for line in normalize_table_text(text).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("|") and "|" in stripped[1:]:
+                rows.append([cell.strip() for cell in stripped.strip("|").split("|")])
+                continue
+            if QueryService._markdown_rows_have_data(rows):
+                return True
+            rows = []
+        return QueryService._markdown_rows_have_data(rows)
+
+    @staticmethod
+    def _markdown_rows_have_data(rows: list[list[str]]) -> bool:
+        if len(rows) < 2:
+            return False
+        has_separator = any(QueryService._is_markdown_separator_row(row) for row in rows)
+        non_separator_rows = [row for row in rows if not QueryService._is_markdown_separator_row(row)]
+        has_data_row = any(QueryService._is_markdown_data_row(row) for row in non_separator_rows[1:])
+        if has_separator:
+            return has_data_row
+        has_header = QueryService._is_markdown_data_row(non_separator_rows[0])
+        has_numeric_data_row = any(
+            QueryService._is_markdown_data_row(row) and any(re.search(r"\d+(?:\.\d+)?", cell) for cell in row)
+            for row in non_separator_rows[1:]
+        )
+        return has_header and has_numeric_data_row
+
+    @staticmethod
+    def _is_markdown_separator_row(row: list[str]) -> bool:
+        cells = [cell.strip() for cell in row if cell.strip()]
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+    @staticmethod
+    def _is_markdown_data_row(row: list[str]) -> bool:
+        return sum(1 for cell in row if cell.strip()) >= 2
 
     @staticmethod
     def _answer_claims_table_data_missing(answer_markdown: str) -> bool:
@@ -604,6 +789,7 @@ class QueryService:
             "not included in the provided context",
             "cannot determine from the provided",
             "cannot answer from the provided",
+            "cannot be extracted",
             "未包含",
             "未提供",
             "缺少",
@@ -639,6 +825,12 @@ class QueryService:
                     return False
         return True
 
+    @classmethod
+    def _answer_lacks_requested_metrics(cls, question: str, answer_markdown: str, metrics: list[ExtractedMetric]) -> bool:
+        if not cls._is_metric_query(question):
+            return False
+        return bool(metrics) and not cls._answer_contains_extracted_metrics(answer_markdown, metrics)
+
     def _deterministic_table_answer(
         self,
         question: str,
@@ -646,10 +838,18 @@ class QueryService:
         table_indexes: list[int],
         risk_level: str,
     ) -> QueryAnswerPayload:
+        is_ablation_query = "ablation" in question.lower() or "消融" in question
         if not self._is_metric_query(question):
             ablation_answer = self._deterministic_ablation_answer(question, contexts, table_indexes, risk_level)
             if ablation_answer is not None:
                 return ablation_answer
+            if is_ablation_query:
+                first_index = table_indexes[0]
+                if self._is_chinese_question(question):
+                    answer = f"检索到的表格证据中没有可解析的结构化消融表。 [{first_index}]"
+                else:
+                    answer = f"The retrieved table evidence does not contain a structured ablation table. [{first_index}]"
+                return QueryAnswerPayload(answer_markdown=answer, citations=table_indexes[:1], risk_level=risk_level)
 
         metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
         citations: list[int] = []
@@ -675,13 +875,20 @@ class QueryService:
                 table_label = self._extract_table_label(self._context_table_evidence_text(contexts[index]))
                 if self._is_chinese_question(question):
                     subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
-                    answer = subject + "显示：" + " ".join(findings) + citation_marker
+                    answer = subject + "显示：" + " ".join(self._localize_ablation_findings(findings)) + citation_marker
                 else:
                     subject = table_label or "The ablation table"
                     answer = f"{subject} shows: " + " ".join(findings) + citation_marker
                 return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
 
         first_index = table_indexes[0]
+        if self._is_metric_query(question):
+            if self._is_chinese_question(question):
+                answer = f"检索到的表格证据中没有可解析的请求指标值。 [{first_index}]"
+            else:
+                answer = f"The retrieved table evidence does not contain parseable requested metric values. [{first_index}]"
+            return QueryAnswerPayload(answer_markdown=answer, citations=table_indexes[:1], risk_level=risk_level)
+
         snippet = contexts[first_index].citation.excerpt or contexts[first_index].prompt_text[:1200]
         if self._is_chinese_question(question):
             answer = f"已找到相关表格证据，不能判定为缺失。相关片段如下： [{first_index}]\n\n{snippet}"
@@ -704,12 +911,37 @@ class QueryService:
             table_label = self._extract_table_label(self._context_table_evidence_text(contexts[index]))
             if self._is_chinese_question(question):
                 subject = f"{table_label} 的消融结果" if table_label else "消融表结果"
-                answer = subject + "显示：" + " ".join(findings) + citation_marker
+                answer = subject + "显示：" + " ".join(self._localize_ablation_findings(findings)) + citation_marker
             else:
                 subject = table_label or "The ablation table"
                 answer = f"{subject} shows: " + " ".join(findings) + citation_marker
             return QueryAnswerPayload(answer_markdown=answer, citations=[index], risk_level=risk_level)
         return None
+
+    @staticmethod
+    def _localize_ablation_findings(findings: list[str]) -> list[str]:
+        localized: list[str] = []
+        report_re = re.compile(
+            r"^(?P<iteration>.+?): full (?P<model>.+?) reports (?P<parts>.+)\.$",
+            re.IGNORECASE,
+        )
+        underperform_re = re.compile(
+            r"^(?P<iteration>.+?): ablated variants underperform the full model, including (?P<models>.+)\.$",
+            re.IGNORECASE,
+        )
+        for finding in findings:
+            if match := report_re.match(finding):
+                parts = match.group("parts")
+                parts = re.sub(r"\brecalls\b", "召回数", parts, flags=re.IGNORECASE)
+                parts = re.sub(r"\bprecision\b", "精确率", parts, flags=re.IGNORECASE)
+                parts = re.sub(r"\bdomain specificity\b", "领域特异性", parts, flags=re.IGNORECASE)
+                localized.append(f"{match.group('iteration')}：完整模型 {match.group('model')} 的{parts}。")
+                continue
+            if match := underperform_re.match(finding):
+                localized.append(f"{match.group('iteration')}：消融变体整体弱于完整模型，包括 {match.group('models')}。")
+                continue
+            localized.append(finding)
+        return localized
 
     def _extract_requested_metric_values(
         self,
@@ -1108,6 +1340,22 @@ class QueryService:
 
         return re.sub(r"\[(\d+)\]", replace, answer_markdown)
 
+    @classmethod
+    def _retarget_table_answer_citations(
+        cls,
+        question: str,
+        answer_markdown: str,
+        selected_indexes: list[int],
+    ) -> str:
+        if not selected_indexes or not (cls._is_table_query(question) or cls._is_metric_query(question)):
+            return answer_markdown
+        normalized = cls._normalize_answer_citation_markup(answer_markdown)
+        markers = [int(match) for match in re.findall(r"\[(\d+)\]", normalized)]
+        if not markers or any(marker in selected_indexes for marker in markers):
+            return normalized
+        first_selected = selected_indexes[0]
+        return re.sub(r"\[(\d+)\]", f"[{first_selected}]", normalized)
+
     @staticmethod
     def _strip_answer_citation_markers(answer_markdown: str) -> str:
         answer_markdown = QueryService._normalize_answer_citation_markup(answer_markdown)
@@ -1217,9 +1465,7 @@ class QueryService:
 
     @staticmethod
     def _citation_is_table_evidence(citation: Citation) -> bool:
-        excerpt = citation.excerpt or ""
-        lowered = excerpt.lower()
-        return bool("|" in excerpt or re.search(r"\btable\s*\d+", lowered))
+        return QueryService._context_has_table_data(citation.excerpt or "")
 
     def _prefer_wiki_citations(
         self,
@@ -1551,6 +1797,54 @@ class QueryService:
         return ordered
 
     @classmethod
+    def _extract_generic_table_terms(cls, question: str) -> list[str]:
+        stopwords = {
+            "what",
+            "which",
+            "where",
+            "when",
+            "does",
+            "drawn",
+            "from",
+            "table",
+            "metrics",
+            "metric",
+            "values",
+            "value",
+            "score",
+            "scores",
+            "performance",
+            "accuracy",
+            "precision",
+            "recall",
+            "ablation",
+            "study",
+            "results",
+            "result",
+        }
+        terms: list[str] = []
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*\b", question):
+            value = match.group(0).strip()
+            normalized = cls._normalize_selector(value)
+            if len(normalized) < 3 or normalized in stopwords:
+                continue
+            if value[:1].islower() and "-" not in value and "_" not in value:
+                continue
+            if cls._normalize_metric_name(value):
+                continue
+            terms.append(value)
+        for match in re.finditer(r"\b[A-Za-z0-9_-]*[Dd]ataset[-_\s]*[A-Za-z0-9_-]+\b", question):
+            terms.append(match.group(0).strip())
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            key = cls._normalize_selector(term)
+            if key and key not in seen:
+                ordered.append(term)
+                seen.add(key)
+        return ordered[:8]
+
+    @classmethod
     def _query_priority_anchors(cls, question: str) -> dict[str, list[str]]:
         if not question:
             return {"figure_table": [], "dataset": []}
@@ -1648,10 +1942,17 @@ class QueryService:
         lines = [line.rstrip() for line in block.strip().splitlines() if line.strip()]
         if not lines:
             return block[:max_chars]
+        if "ablation" in question.lower() or "消融" in question:
+            max_chars = max(max_chars, 2400)
 
         start = 0
         for index, line in enumerate(lines):
-            if re.search(r"\bTable\s*\d+\b", line, re.IGNORECASE) or line.strip().startswith("|"):
+            stripped = line.strip()
+            if (
+                re.match(r"^(?:#+\s*)?Table\s*\d+\b", stripped, re.IGNORECASE)
+                or stripped.startswith("|")
+                or stripped.lower().startswith("<table")
+            ):
                 start = index
                 break
         lines = lines[start:]
@@ -1664,11 +1965,14 @@ class QueryService:
         caption_lines = [line for line in lines if not line.strip().startswith("|")][:2]
         table_lines = [line for line in lines if line.strip().startswith("|")]
         header_lines = table_lines[:3]
-        relevant_rows = [
-            line
-            for line in table_lines[3:]
-            if any(anchor in cls._normalize_selector(line) for anchor in anchors)
-        ]
+        if "ablation" in question.lower() or "消融" in question:
+            relevant_rows = table_lines[3:]
+        else:
+            relevant_rows = [
+                line
+                for line in table_lines[3:]
+                if any(anchor in cls._normalize_selector(line) for anchor in anchors)
+            ]
         if not relevant_rows and table_lines:
             relevant_rows = table_lines[3:6]
 
