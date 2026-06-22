@@ -1,3 +1,4 @@
+from app.services import ai
 from app.services.ai import HeadAnalysisPayload, OllamaClient
 
 
@@ -39,6 +40,52 @@ def test_generate_structured_retries_empty_schema_response(monkeypatch) -> None:
     assert parsed.summary == "Recovered"
     assert calls[0]["format"] != "json"
     assert calls[1]["format"] == "json"
+
+
+def test_generate_structured_sends_keep_alive_to_all_chat_requests(monkeypatch) -> None:
+    monkeypatch.setattr(ai.settings, "ollama_keep_alive", "0", raising=False)
+    client = OllamaClient()
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self.data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self.data
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def post(self, url: str, json: dict) -> FakeResponse:
+            calls.append(json)
+            if len(calls) == 1:
+                return FakeResponse({"message": {"content": ""}})
+            return FakeResponse(
+                {"message": {"content": '{"head_entity":"Hypertension","summary":"Recovered","triples":[]}'}}
+            )
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+
+    client.generate_structured(
+        HeadAnalysisPayload,
+        system_prompt="Return JSON.",
+        user_prompt="Analyze this head.",
+        model="fake-model",
+    )
+
+    assert calls[0]["keep_alive"] == "0"
+    assert calls[1]["keep_alive"] == "0"
 
 
 def test_json_mode_payload_uses_compact_schema_shape() -> None:

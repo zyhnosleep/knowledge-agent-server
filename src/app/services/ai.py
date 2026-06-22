@@ -240,6 +240,8 @@ class OllamaClient:
         return base64.b64encode(data).decode("utf-8")
 
     def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if settings.ollama_keep_alive is not None:
+            payload = {**payload, "keep_alive": settings.ollama_keep_alive}
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(f"{self.base_url}/api/chat", json=payload)
             response.raise_for_status()
