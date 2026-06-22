@@ -216,16 +216,15 @@ class OllamaClient:
             return self._parse_structured_content(schema, self._message_content(retry_data))
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        vectors: list[list[float]] = []
+        if not texts:
+            return []
         with httpx.Client(timeout=self.timeout) as client:
-            for text in texts:
-                response = client.post(
-                    f"{self.base_url}/api/embed",
-                    json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": text}),
-                )
-                response.raise_for_status()
-                vectors.append(response.json()["embeddings"][0])
-        return vectors
+            response = client.post(
+                f"{self.base_url}/api/embed",
+                json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": texts}),
+            )
+            response.raise_for_status()
+            return response.json()["embeddings"]
 
     @staticmethod
     def _encode_image(image: bytes | str | Path) -> str:

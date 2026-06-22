@@ -88,7 +88,7 @@ def test_generate_structured_sends_keep_alive_to_all_chat_requests(monkeypatch) 
     assert calls[1]["keep_alive"] == "0"
 
 
-def test_embed_sends_keep_alive_to_embedding_requests(monkeypatch) -> None:
+def test_embed_sends_keep_alive_to_single_batch_embedding_request(monkeypatch) -> None:
     monkeypatch.setattr(ai.settings, "ollama_keep_alive", "0", raising=False)
     monkeypatch.setattr(ai.settings, "ollama_embedding_model", "fake-embedding", raising=False)
     client = OllamaClient()
@@ -99,7 +99,7 @@ def test_embed_sends_keep_alive_to_embedding_requests(monkeypatch) -> None:
             return None
 
         def json(self) -> dict:
-            return {"embeddings": [[0.1, 0.2, 0.3]]}
+            return {"embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]}
 
     class FakeHttpClient:
         def __init__(self, *args, **kwargs) -> None:
@@ -117,8 +117,8 @@ def test_embed_sends_keep_alive_to_embedding_requests(monkeypatch) -> None:
 
     monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
 
-    assert client.embed(["alpha"]) == [[0.1, 0.2, 0.3]]
-    assert calls == [{"model": "fake-embedding", "input": "alpha", "keep_alive": "0"}]
+    assert client.embed(["alpha", "beta"]) == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    assert calls == [{"model": "fake-embedding", "input": ["alpha", "beta"], "keep_alive": "0"}]
 
 
 def test_json_mode_payload_uses_compact_schema_shape() -> None:
