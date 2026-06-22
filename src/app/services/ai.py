@@ -221,7 +221,7 @@ class OllamaClient:
             for text in texts:
                 response = client.post(
                     f"{self.base_url}/api/embed",
-                    json={"model": settings.ollama_embedding_model, "input": text},
+                    json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": text}),
                 )
                 response.raise_for_status()
                 vectors.append(response.json()["embeddings"][0])
@@ -240,12 +240,16 @@ class OllamaClient:
         return base64.b64encode(data).decode("utf-8")
 
     def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if settings.ollama_keep_alive is not None:
-            payload = {**payload, "keep_alive": settings.ollama_keep_alive}
         with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}/api/chat", json=payload)
+            response = client.post(f"{self.base_url}/api/chat", json=self._with_keep_alive(payload))
             response.raise_for_status()
             return response.json()
+
+    @staticmethod
+    def _with_keep_alive(payload: dict[str, Any]) -> dict[str, Any]:
+        if settings.ollama_keep_alive is None:
+            return payload
+        return {**payload, "keep_alive": settings.ollama_keep_alive}
 
     @staticmethod
     def _message_content(data: dict[str, Any]) -> Any:
