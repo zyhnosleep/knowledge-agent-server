@@ -60,6 +60,23 @@ def test_render_entity_pages_collects_claims() -> None:
     assert "outperforms baseline B" in pages[0][2]
 
 
+def test_render_entity_pages_disambiguates_duplicate_slugs() -> None:
+    project = Project(id="p1", slug="demo", name="Demo")
+    renderer = WikiRenderer(project)
+    entity_links: dict[str, str] = {}
+    entities = [
+        Entity(id="e1", project_id="p1", name="OPLS4", entity_type="method", aliases=[], summary="Base model"),
+        Entity(id="e2", project_id="p1", name="OPLS4*", entity_type="method", aliases=[], summary="Variant model"),
+    ]
+
+    pages = renderer.render_entity_pages(entities, [], entity_links=entity_links)
+
+    assert [page[1] for page in pages] == ["entities/opls4", "entities/opls4-2"]
+    assert entity_links == {"OPLS4": "entities/opls4", "OPLS4*": "entities/opls4-2"}
+    assert 'title: "OPLS4"' in pages[0][2]
+    assert 'title: "OPLS4*"' in pages[1][2]
+
+
 def test_render_index_uses_slug_when_markdown_path_has_windows_separators(tmp_path: Path) -> None:
     project = Project(id="p1", slug="demo", name="Demo")
     renderer = WikiRenderer(project)

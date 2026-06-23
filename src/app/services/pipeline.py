@@ -1398,7 +1398,7 @@ class IngestionPipeline:
 
         pages: list[WikiPage] = []
         grow_entities = [entity for entity in entities if entity_decisions.get(entity.name, GrowthDecision(name=entity.name)).decision == "grow"]
-        entity_links = {entity.name: f"entities/{slugify(entity.name)}" for entity in grow_entities}
+        entity_links = renderer.build_entity_links(grow_entities)
         source_metadata = self._source_page_metadata(extraction, entities, claims)
         summary_slug, summary_md = renderer.render_document_summary(
             document,

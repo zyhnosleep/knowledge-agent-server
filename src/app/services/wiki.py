@@ -198,11 +198,13 @@ class WikiRenderer:
             inbound_by_entity[claim.object_text].append(claim)
 
         pages: list[tuple[str, str, str]] = []
-        entity_links = entity_links or {}
+        if entity_links is None:
+            entity_links = {}
         metadata_by_name = metadata_by_name or {}
+        entity_slugs = self.build_entity_links(entities, entity_links)
+        entity_links.update(entity_slugs)
         for entity in entities:
-            slug = f"entities/{slugify(entity.name)}"
-            entity_links.setdefault(entity.name, slug)
+            slug = entity_slugs[entity.name]
             claim_lines = [
                 self._format_claim_line(claim, entity_links)
                 for claim in by_entity.get(entity.name, [])
@@ -261,6 +263,26 @@ class WikiRenderer:
             )
             pages.append((entity.name, slug, content))
         return pages
+
+    @staticmethod
+    def build_entity_links(entities: list[Entity], entity_links: dict[str, str] | None = None) -> dict[str, str]:
+        entity_links = entity_links or {}
+        slugs_by_name: dict[str, str] = {}
+        used_slugs: set[str] = set()
+        for entity in entities:
+            existing_slug = entity_links.get(entity.name)
+            if existing_slug and existing_slug not in used_slugs:
+                slug = existing_slug
+            else:
+                base_slug = f"entities/{slugify(entity.name)}"
+                slug = base_slug
+                suffix = 2
+                while slug in used_slugs:
+                    slug = f"{base_slug}-{suffix}"
+                    suffix += 1
+            slugs_by_name[entity.name] = slug
+            used_slugs.add(slug)
+        return slugs_by_name
 
     def _format_claim_line(self, claim: Claim, entity_links: dict[str, str] | None = None) -> str:
         entity_links = entity_links or {}
