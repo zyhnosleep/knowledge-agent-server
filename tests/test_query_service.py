@@ -868,7 +868,7 @@ def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
     assert any("LFMM" in context.prompt_text for context in contexts)
 
 
-def test_scientific_rag_query_can_return_extractive_evidence_without_llm() -> None:
+def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
     document = Document(
@@ -908,16 +908,23 @@ def test_scientific_rag_query_can_return_extractive_evidence_without_llm() -> No
 
     service = QueryService(db)
     service.ollama = ExplodingOllama()
-    service._draft_answer = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("draft answer should not be required for scientific evidence fallback")
+    contexts = service._build_rag_contexts(
+        "OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
     )
-    response = service.answer("demo", "OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？", save_answer=False)
+    answer = service._deterministic_scientific_evidence_answer_if_supported(
+        "OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？",
+        contexts,
+        "normal",
+    )
 
-    assert "Drude" in response.answer_markdown
-    assert "polarizability" in response.answer_markdown
-    assert "LFMM" in response.answer_markdown
-    assert response.citations
-    assert response.citations[0].chunk_id == "c1"
+    assert answer is not None
+    assert "Drude" in answer.answer_markdown
+    assert "polarizability" in answer.answer_markdown
+    assert "LFMM" in answer.answer_markdown
+    assert answer.citations
+    assert contexts[answer.citations[0]].citation.chunk_id == "c1"
 
 
 def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:

@@ -192,12 +192,6 @@ class QueryService:
             "high" if self._is_high_risk(question) else "normal",
         )
         if answer_payload is None:
-            answer_payload = self._deterministic_scientific_evidence_answer_if_supported(
-                question,
-                contexts,
-                "high" if self._is_high_risk(question) else "normal",
-            )
-        if answer_payload is None:
             answer_payload = self._draft_answer(question, None, contexts)
         verification_status = "local-only"
 
