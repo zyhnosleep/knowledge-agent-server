@@ -192,6 +192,12 @@ class QueryService:
             "high" if self._is_high_risk(question) else "normal",
         )
         if answer_payload is None:
+            answer_payload = self._deterministic_scientific_evidence_answer_if_supported(
+                question,
+                contexts,
+                "high" if self._is_high_risk(question) else "normal",
+            )
+        if answer_payload is None:
             answer_payload = self._draft_answer(question, None, contexts)
         verification_status = "local-only"
 
@@ -1020,6 +1026,89 @@ class QueryService:
         if re.search(r"\d+(?:\.\d+)?", evidence) and not re.search(r"\d+(?:\.\d+)?", answer.answer_markdown):
             return None
         return answer
+
+    def _deterministic_scientific_evidence_answer_if_supported(
+        self,
+        question: str,
+        contexts: list[RetrievedContext],
+        risk_level: str,
+    ) -> QueryAnswerPayload | None:
+        if self._is_table_query(question) or self._is_metric_query(question):
+            return None
+        if not self._is_scientific_evidence_query(question):
+            return None
+        evidence_terms = self._scientific_evidence_terms(question)
+        query_terms = self._tokenize(question) | {term.lower() for term in evidence_terms}
+        selected: list[tuple[int, str, int]] = []
+        for index, context in enumerate(contexts):
+            evidence = self._context_evidence_text(context)
+            if not evidence.strip():
+                continue
+            evidence_key = self._normalize_selector(evidence)
+            coverage = sum(1 for term in evidence_terms if self._normalize_selector(term) in evidence_key)
+            lexical_overlap = len(self._tokenize(evidence) & self._tokenize(question))
+            if coverage <= 0 and lexical_overlap <= 0:
+                continue
+            snippet = self._window_text(evidence, query_terms, max_chars=760, question=question).strip()
+            if not snippet:
+                continue
+            selected.append((index, snippet, coverage * 4 + lexical_overlap))
+        if not selected:
+            return None
+        selected.sort(key=lambda item: item[2], reverse=True)
+        deduped: list[tuple[int, str]] = []
+        seen_snippets: set[str] = set()
+        for index, snippet, _score in selected:
+            normalized = re.sub(r"\s+", " ", snippet)[:220]
+            if normalized in seen_snippets:
+                continue
+            deduped.append((index, snippet))
+            seen_snippets.add(normalized)
+            if len(deduped) >= 5:
+                break
+        if not deduped:
+            return None
+        citations = [index for index, _ in deduped]
+        if self._is_chinese_question(question):
+            parts = [f"证据片段 {ordinal + 1}：{snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
+            answer = "根据原文 RAG 证据，可以直接抽取到以下相关信息：" + "\n\n".join(parts)
+        else:
+            parts = [f"Evidence {ordinal + 1}: {snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
+            answer = "The retrieved source evidence directly supports the following points:\n\n" + "\n\n".join(parts)
+        return QueryAnswerPayload(answer_markdown=answer, citations=citations, risk_level=risk_level)
+
+    @classmethod
+    def _is_scientific_evidence_query(cls, question: str) -> bool:
+        terms = [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question)]
+        if any(cls._is_table_model_term_key(cls._normalize_selector(term)) for term in terms):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:amber|charmm|cmap|drude|ff\d+[a-z0-9-]*|flucct|fret|lfmm|opls[a-z0-9-]*|resp|sparta|tip4p[-a-z0-9]*)\b",
+                question,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _scientific_evidence_terms(cls, question: str) -> list[str]:
+        terms: list[str] = []
+        for term in [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question), *cls._extract_query_facets(question)]:
+            key = cls._normalize_selector(term)
+            if len(key) >= 3 and key not in cls._CLAIM_ANCHOR_STOP_KEYS:
+                terms.append(term)
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)*\b", question):
+            value = match.group(0)
+            if len(cls._normalize_selector(value)) >= 3:
+                terms.append(value)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            key = cls._normalize_selector(term)
+            if key and key not in seen:
+                ordered.append(term)
+                seen.add(key)
+        return ordered[:24]
 
     def _repair_missing_table_answer(
         self,

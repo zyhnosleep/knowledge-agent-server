@@ -56,6 +56,11 @@ class CountingFakeOllama(FakeOllama):
         )
 
 
+class ExplodingOllama(FakeOllama):
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        raise AssertionError("LLM should not be required for deterministic scientific evidence answers")
+
+
 def make_session() -> Session:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -861,6 +866,58 @@ def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
     assert contexts
     assert any(context.citation.chunk_id == "c1" for context in contexts)
     assert any("LFMM" in context.prompt_text for context in contexts)
+
+
+def test_scientific_rag_query_can_return_extractive_evidence_without_llm() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="abc",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={
+            "source_slug": "sources/opls5",
+            "source_title": "OPLS5",
+            "paper_profile": {
+                "title": "OPLS5",
+                "aliases": ["OPLS5"],
+                "key_terms": ["OPLS5", "Drude", "polarizability", "LFMM"],
+                "routing_summary": "OPLS5 adds polarizability and improves metals.",
+                "source_slug": "sources/opls5",
+            },
+        },
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=7,
+        text=(
+            "OPLS5 uses a Drude model for intramolecular polarizability. "
+            "Metal containing systems employ FlucCT and LFMM functionality."
+        ),
+        page_label="7",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = ExplodingOllama()
+    service._draft_answer = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("draft answer should not be required for scientific evidence fallback")
+    )
+    response = service.answer("demo", "OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？", save_answer=False)
+
+    assert "Drude" in response.answer_markdown
+    assert "polarizability" in response.answer_markdown
+    assert "LFMM" in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].chunk_id == "c1"
 
 
 def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
