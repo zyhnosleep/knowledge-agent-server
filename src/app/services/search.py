@@ -11,11 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.records import DocumentChunk, PageKind, Project, QuestionAnswer, WikiPage
+from app.models.records import Document, DocumentChunk, PageKind, Project, QuestionAnswer, WikiPage
 from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
+from app.services.paper_profile import alias_in_text, ensure_paper_profile, paper_profile_text
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
 from app.services.wiki import WikiRenderer
@@ -27,6 +28,7 @@ MIN_CONTEXT_SCORE = 2.5
 CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
 TABLE_CONTEXT_SCORE_BOOST = 40.0
+PAPER_ROUTE_MIN_SCORE = 2.0
 
 
 @dataclass
@@ -40,6 +42,13 @@ class RetrievedContext:
 class PageMatch:
     page: WikiPage
     score: float
+
+
+@dataclass
+class PaperMatch:
+    document: Document
+    score: float
+    exact_alias: bool = False
 
 
 @dataclass
@@ -57,6 +66,12 @@ class QueryService:
         self.verifier = ExternalVerifier()
 
     def answer(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
+        mode = (settings.query_mode or "rag").strip().lower()
+        if mode == "wiki":
+            return self._answer_wiki_first(project_slug, question, save_answer=save_answer)
+        return self._answer_rag_first(project_slug, question, save_answer=save_answer)
+
+    def _answer_wiki_first(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
         if project is None:
             raise ValueError(f"Project '{project_slug}' not found")
@@ -86,6 +101,64 @@ class QueryService:
         citations = self._select_citations(contexts, chosen_indexes)
         if not self._needs_source_evidence(question):
             citations = self._prefer_wiki_citations(citations, page_matches, project.id, question=question)
+        answer_text_for_citations = self._retarget_table_answer_citations(
+            question,
+            answer_payload.answer_markdown,
+            chosen_indexes,
+        )
+        answer_markdown = self._renumber_answer_citations(answer_text_for_citations, chosen_indexes)
+        answer_markdown = self._drop_unreturned_citation_markers(answer_markdown, len(citations))
+        if not citations:
+            answer_markdown = self._strip_answer_citation_markers(answer_markdown)
+        response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
+
+        if save_answer:
+            record = QuestionAnswer(
+                project_id=project.id,
+                question=question,
+                answer_markdown=response.answer_markdown,
+                citations=[citation.model_dump() for citation in citations],
+                risk_level=answer_payload.risk_level,
+                verification_status=verification_status,
+            )
+            self.db.add(record)
+            self._save_query_page(project, question, response, citations)
+            self.db.commit()
+        return response
+
+    def _answer_rag_first(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
+        project = self.db.scalar(select(Project).where(Project.slug == project_slug))
+        if project is None:
+            raise ValueError(f"Project '{project_slug}' not found")
+
+        paper_matches = self._route_papers(question, project.id)
+        contexts = self._build_rag_contexts(question, project.id, paper_matches)
+        if not contexts:
+            contexts = self._search_source_chunks(question, project.id, [], limit=5)
+        if not contexts:
+            return self._answer_wiki_first(project_slug, question, save_answer=save_answer)
+
+        answer_payload = self._draft_answer(question, None, contexts)
+        verification_status = "local-only"
+
+        if self._is_high_risk(question):
+            verification = self._verify_answer(answer_payload.answer_markdown, contexts)
+            verification_status = verification.verdict
+            if verification.notes:
+                answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
+
+        answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
+        chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
+        answer_payload = self._repair_unsupported_numeric_answer(question, None, contexts, answer_payload, chosen_indexes)
+        answer_payload = self._repair_missing_table_answer(question, None, contexts, answer_payload)
+        answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
+        chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
+        chosen_indexes = self._table_evidence_indexes_only(question, contexts, chosen_indexes)
+        chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
+        citations = self._select_citations(contexts, chosen_indexes)
+
         answer_text_for_citations = self._retarget_table_answer_citations(
             question,
             answer_payload.answer_markdown,
@@ -156,6 +229,122 @@ class QueryService:
             matches.append(PageMatch(page=page, score=float(score)))
         return sorted(matches, key=lambda item: item.score, reverse=True)[:limit]
 
+    def _route_papers(self, question: str, project_id: str, limit: int = 3) -> list[PaperMatch]:
+        query_terms = self._tokenize(question)
+        documents = self.db.scalars(select(Document).where(Document.project_id == project_id)).all()
+        matches: list[PaperMatch] = []
+        for document in documents:
+            profile = ensure_paper_profile(document)
+            profile_text = paper_profile_text(document)
+            profile_terms = self._tokenize(profile_text)
+            title_terms = self._tokenize(document.title)
+            alias_values = [str(item) for item in profile.get("aliases") or []]
+            key_values = [str(item) for item in profile.get("key_terms") or []]
+            alias_terms = self._tokenize(" ".join(alias_values))
+            key_terms = self._tokenize(" ".join(key_values))
+            exact_alias = self._question_has_exact_alias(question, alias_values)
+            score = (
+                len(query_terms & profile_terms)
+                + len(query_terms & title_terms) * 3
+                + len(query_terms & alias_terms) * 5
+                + len(query_terms & key_terms) * 2
+            )
+            if exact_alias:
+                score += 18
+            if score >= PAPER_ROUTE_MIN_SCORE:
+                matches.append(PaperMatch(document=document, score=float(score), exact_alias=exact_alias))
+        self.db.flush()
+        ranked = sorted(matches, key=lambda item: item.score, reverse=True)
+        if self._is_cross_paper_query(question):
+            return ranked[: max(limit, 5)]
+        exact_matches = [match for match in ranked if match.exact_alias]
+        if exact_matches:
+            return exact_matches[:limit]
+        return ranked[:limit]
+
+    def _build_rag_contexts(self, question: str, project_id: str, paper_matches: list[PaperMatch]) -> list[RetrievedContext]:
+        document_ids = [match.document.id for match in paper_matches]
+        contexts: list[RetrievedContext] = []
+        if self._is_table_query(question) or self._is_metric_query(question):
+            contexts.extend(self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS))
+        if document_ids:
+            contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS))
+        if not contexts and not document_ids:
+            contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
+        return self._finalize_contexts(contexts)
+
+    @staticmethod
+    def _question_has_exact_alias(question: str, aliases: list[str]) -> bool:
+        return any(alias_in_text(alias, question) for alias in aliases if str(alias or "").strip())
+
+    @staticmethod
+    def _is_cross_paper_query(question: str) -> bool:
+        lowered = question.lower()
+        markers = (
+            "compare",
+            "comparison",
+            "versus",
+            " vs ",
+            " v.s.",
+            "between",
+            "across papers",
+            "multiple papers",
+            "跨论文",
+            "比较",
+            "对比",
+            "相比",
+            "差异",
+            "区别",
+        )
+        return any(marker in lowered or marker in question for marker in markers)
+
+    def _search_document_table_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 5,
+    ) -> list[RetrievedContext]:
+        statement = select(Document).where(Document.project_id == project_id)
+        if document_ids:
+            statement = statement.where(Document.id.in_(document_ids))
+        documents = self.db.scalars(statement).all()
+        contexts: list[RetrievedContext] = []
+        for document in documents:
+            metadata = document.metadata_json or {}
+            intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
+            tables = intelligence.get("tables") if isinstance(intelligence, dict) else []
+            if not isinstance(tables, list):
+                continue
+            for ordinal, table in enumerate(tables):
+                if isinstance(table, dict):
+                    markdown = str(table.get("markdown") or "")
+                    page_label = str(table.get("page_label") or "").strip() or None
+                else:
+                    markdown = str(table or "")
+                    page_label = None
+                block = normalize_table_text(markdown)
+                if not block or not self._context_has_table_data(block):
+                    continue
+                if not self._table_block_matches_query(question, block):
+                    continue
+                block_score = self._rank_blocks(question, [block])[0][1]
+                score = TABLE_CONTEXT_SCORE_BOOST + block_score + max(0.0, 2.0 - ordinal * 0.01)
+                excerpt = self._table_block_excerpt(block, question)
+                contexts.append(
+                    RetrievedContext(
+                        citation=Citation(
+                            document_id=document.id,
+                            score=score,
+                            page_label=page_label,
+                            excerpt=excerpt,
+                        ),
+                        prompt_text=block[:4000],
+                        score=score,
+                    )
+                )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
     def _search_source_chunks(self, question: str, project_id: str, document_ids: list[str], limit: int = 3) -> list[RetrievedContext]:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(DocumentChunk.document.has(project_id=project_id))
         if document_ids:
@@ -164,6 +353,7 @@ class QueryService:
 
         question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         query_terms = self._tokenize(question)
+        needs_table_first = self._is_table_query(question) or self._is_metric_query(question)
         scored: list[RetrievedContext] = []
         for chunk in chunks:
             score = 0.0
@@ -176,7 +366,18 @@ class QueryService:
                     score = min(0.3 + overlap * 0.1, 0.85)
             if score <= 0:
                 continue
-            prompt_text = self._window_text(chunk.text, query_terms, max_chars=1600, question=question)
+            has_table_data = self._context_has_table_data(chunk.text)
+            if needs_table_first and not has_table_data and not self._context_has_metric_numbers(chunk.text):
+                continue
+            if needs_table_first and has_table_data:
+                if not self._table_block_matches_query(question, chunk.text):
+                    continue
+                score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
+                prompt_text = self._table_block_excerpt(chunk.text, question, max_chars=2400)
+                excerpt = prompt_text
+            else:
+                prompt_text = self._window_text(chunk.text, query_terms, max_chars=1600, question=question)
+                excerpt = prompt_text[:280]
             scored.append(
                 RetrievedContext(
                     citation=Citation(
@@ -184,13 +385,19 @@ class QueryService:
                         chunk_id=chunk.id,
                         score=score,
                         page_label=chunk.page_label,
-                        excerpt=prompt_text[:280],
+                        excerpt=excerpt,
                     ),
                     prompt_text=prompt_text,
                     score=score,
                 )
             )
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _context_has_metric_numbers(text: str) -> bool:
+        lowered = text.lower()
+        has_metric_word = bool(re.search(r"\b(f\s*1|auc|precision|recall|accuracy|rmse|mae|score|metric)\b", lowered))
+        return has_metric_word and bool(re.search(r"\d+(?:\.\d+)?", text))
 
     def _build_contexts(self, question: str, project_id: str, page_matches: list[PageMatch]) -> list[RetrievedContext]:
         contexts: list[RetrievedContext] = []

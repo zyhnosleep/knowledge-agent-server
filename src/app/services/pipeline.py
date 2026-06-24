@@ -41,6 +41,7 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.filesystem import compute_sha256, display_title_from_path, slugify, strip_upload_prefix
+from app.services.paper_profile import ensure_paper_profile
 from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
@@ -196,6 +197,8 @@ class IngestionPipeline:
             merged_metadata = dict(document.metadata_json or {})
             merged_metadata.update(parsed.metadata)
             document.metadata_json = merged_metadata
+            ensure_paper_profile(document)
+            merged_metadata = dict(document.metadata_json or {})
             quality_report = build_ingest_quality_report(document)
             merged_metadata["ingest_quality"] = quality_report
             document.metadata_json = merged_metadata

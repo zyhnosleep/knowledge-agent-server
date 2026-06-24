@@ -5,7 +5,7 @@ from app.db.session import Base
 from app.models.records import Document, DocumentChunk, Project, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import ExtractedMetric, PageMatch, QueryService, RetrievedContext
+from app.services.search import ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
 from app.schemas.common import Citation
 
 
@@ -77,7 +77,7 @@ def test_query_service_uses_wiki_page_context_and_returns_page_citation() -> Non
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "When is the follow-up?", save_answer=False)
+    response = service._answer_wiki_first("demo", "When is the follow-up?", save_answer=False)
 
     assert isinstance(response, QueryResponse)
     assert response.answer_markdown == "Follow-up is recommended in two weeks."
@@ -291,7 +291,7 @@ def test_query_service_prefers_wiki_only_for_strong_chinese_match() -> None:
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
 
     assert response.citations
     assert response.citations[0].page_slug == "sources/社区慢病随访记录"
@@ -344,7 +344,7 @@ def test_query_service_filters_irrelevant_wiki_pages_and_empty_entities() -> Non
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/community-followup"
@@ -386,7 +386,7 @@ def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "多久后复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "多久后复查？", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/two"
@@ -425,11 +425,377 @@ def test_query_service_promotes_raw_chunk_citations_to_wiki_pages_when_source_ev
     service.verifier = FakeVerifier()
     service._should_use_wiki_only = lambda question, page_matches: False
 
-    response = service.answer("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/community-followup"
     assert response.citations[0].chunk_id is None
+
+
+def test_rag_router_prefers_exact_opls4_over_opls5() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    opls4 = Document(
+        id="opls4",
+        project_id="p1",
+        title="OPLS4 Force Field Development and Validation",
+        file_name="opls4.pdf",
+        sha256="opls4",
+        raw_path="raw/opls4.pdf",
+        raw_text="OPLS4 addresses OPLS3e salt bridge overstabilization and acidic residue pKa bias.",
+        status="ready",
+    )
+    opls5 = Document(
+        id="opls5",
+        project_id="p1",
+        title="OPLS5 Force Field Development and Validation",
+        file_name="opls5.pdf",
+        sha256="opls5",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 improves OPLS4 with additional torsion and charge validation.",
+        status="ready",
+    )
+    db.add_all([project, opls4, opls5])
+    db.commit()
+
+    matches = QueryService(db)._route_papers("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization？", "p1")
+
+    assert [match.document.id for match in matches] == ["opls4"]
+
+
+def test_rag_router_filters_to_exact_alias_document_when_related_paper_repeats_alias() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    opls4 = Document(
+        id="opls4",
+        project_id="p1",
+        title="OPLS4 Force Field Development and Validation",
+        file_name="opls4.pdf",
+        sha256="opls4",
+        raw_path="raw/opls4.pdf",
+        raw_text="OPLS4 addresses protein-ligand force field validation.",
+        status="ready",
+    )
+    related = Document(
+        id="related",
+        project_id="p1",
+        title="OPLS5 Related Work and Validation",
+        file_name="opls5.pdf",
+        sha256="related",
+        raw_path="raw/opls5.pdf",
+        raw_text=("OPLS5 compares against OPLS4. " * 20) + "OPLS5 adds new torsion validation.",
+        status="ready",
+    )
+    db.add_all([project, opls4, related])
+    db.commit()
+
+    matches = QueryService(db)._route_papers("OPLS4 的主要改进是什么？", "p1")
+
+    assert [match.document.id for match in matches] == ["opls4"]
+
+
+def test_rag_router_prefers_charmm36m_over_charmm36() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    charmm36 = Document(
+        id="charmm36",
+        project_id="p1",
+        title="CHARMM36 force field",
+        file_name="charmm36.pdf",
+        sha256="c36",
+        raw_path="raw/charmm36.pdf",
+        raw_text="CHARMM36 is a protein force field.",
+        status="ready",
+    )
+    charmm36m = Document(
+        id="charmm36m",
+        project_id="p1",
+        title="CHARMM36m protein force field",
+        file_name="charmm36m.pdf",
+        sha256="c36m",
+        raw_path="raw/charmm36m.pdf",
+        raw_text="CHARMM36m improves intrinsically disordered protein ensembles.",
+        status="ready",
+    )
+    db.add_all([project, charmm36, charmm36m])
+    db.commit()
+
+    matches = QueryService(db)._route_papers("CHARMM36m 对 IDP 采样做了什么改进？", "p1")
+
+    assert [match.document.id for match in matches] == ["charmm36m"]
+
+
+def test_rag_router_does_not_match_hyphenated_alias_prefix() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    ff99sb = Document(
+        id="ff99sb",
+        project_id="p1",
+        title="ff99SB protein force field",
+        file_name="ff99SB.pdf",
+        sha256="ff99",
+        raw_path="raw/ff99SB.pdf",
+        raw_text="ff99SB is a protein force field.",
+        status="ready",
+    )
+    ff99sb_disp = Document(
+        id="ff99sb-disp",
+        project_id="p1",
+        title="ff99SB-disp protein force field",
+        file_name="ff99SB-disp.pdf",
+        sha256="disp",
+        raw_path="raw/ff99SB-disp.pdf",
+        raw_text=("ff99SB-disp compares against ff99SB. " * 20) + "The dispersion model improves IDP ensembles.",
+        status="ready",
+    )
+    db.add_all([project, ff99sb, ff99sb_disp])
+    db.commit()
+
+    matches = QueryService(db)._route_papers("ff99SB 的蛋白质力场结论是什么？", "p1")
+
+    assert [match.document.id for match in matches] == ["ff99sb"]
+
+
+def test_rag_router_allows_multiple_documents_for_comparison_query() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add_all(
+        [
+            project,
+            Document(
+                id="opls4",
+                project_id="p1",
+                title="OPLS4 Force Field Development",
+                file_name="opls4.pdf",
+                sha256="opls4",
+                raw_path="raw/opls4.pdf",
+                raw_text="OPLS4 force field validation.",
+                status="ready",
+            ),
+            Document(
+                id="opls5",
+                project_id="p1",
+                title="OPLS5 Force Field Development",
+                file_name="opls5.pdf",
+                sha256="opls5",
+                raw_path="raw/opls5.pdf",
+                raw_text="OPLS5 force field validation.",
+                status="ready",
+            ),
+        ]
+    )
+    db.commit()
+
+    matches = QueryService(db)._route_papers("请比较 OPLS4 和 OPLS5 的主要差异。", "p1")
+
+    assert {"opls4", "opls5"}.issubset({match.document.id for match in matches})
+
+
+def test_rag_table_query_uses_document_table_evidence_not_profile_or_wiki() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={
+            "document_intelligence": {
+                "tables": [
+                    {
+                        "page_label": "7",
+                        "markdown": (
+                            "Table 7: FooNet results.\n"
+                            "| Model | Dataset-A | Dataset-A | Dataset-B | Dataset-B |\n"
+                            "| --- | --- | --- | --- | --- |\n"
+                            "|  | Accuracy | F1 | Accuracy | F1 |\n"
+                            "| FooNet | 91.2 | 88.4 | 84.1 | 80.6 |"
+                        ),
+                    }
+                ]
+            }
+        },
+        status="ready",
+    )
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/foonet",
+        title="FooNet wiki",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/foonet.md",
+        markdown_content="# FooNet\n\n## Summary\nThe wiki summary should not be the RAG citation.",
+        source_document_ids=["d1"],
+    )
+    db.add_all([project, document, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+    service._search_wiki_pages = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("wiki-first should not run in rag mode"))
+    service.ollama.payload = QueryAnswerPayload(
+        answer_markdown="Table 7 reports Dataset-A Accuracy 91.2 / F1 88.4 and Dataset-B Accuracy 84.1 / F1 80.6 [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+
+    response = service.answer("demo", "What are FooNet Accuracy and F1 on Dataset-A and Dataset-B in Table 7?", save_answer=False)
+
+    assert response.citations
+    assert response.citations[0].document_id == "d1"
+    assert response.citations[0].page_slug is None
+    assert response.citations[0].page_label == "7"
+    assert response.citations[0].excerpt.startswith("Table 7")
+    assert "91.2" in response.citations[0].excerpt
+    assert "paper_profile" not in service.ollama.last_prompt
+    assert "wiki summary should not" not in service.ollama.last_prompt.lower()
+
+
+def test_rag_metric_answer_retargets_conflicting_prose_numbers_to_table_values() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={
+            "document_intelligence": {
+                "tables": [
+                    {
+                        "page_label": "7",
+                        "markdown": (
+                            "Table 7: FooNet results.\n"
+                            "| Model | Dataset-A | Dataset-A |\n"
+                            "| --- | --- | --- |\n"
+                            "|  | Accuracy | F1 |\n"
+                            "| FooNet | 91.2 | 88.4 |"
+                        ),
+                    }
+                ]
+            }
+        },
+        status="ready",
+    )
+    prose_chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="A draft note says FooNet reaches Dataset-A Accuracy 99.9 and F1 98.8, but this is not the table.",
+        page_label="2",
+        embedding=None,
+    )
+    db.add_all([project, document, prose_chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = SequencedFakeOllama(
+        [
+            QueryAnswerPayload(
+                answer_markdown="FooNet reports Dataset-A Accuracy 99.9 and F1 98.8 [1].",
+                citations=[1],
+                risk_level="normal",
+            ),
+            QueryAnswerPayload(
+                answer_markdown="The values still cannot be extracted.",
+                citations=[0],
+                risk_level="normal",
+            ),
+        ]
+    )
+    service.verifier = FakeVerifier()
+
+    response = service.answer("demo", "What are FooNet Accuracy and F1 on Dataset-A in Table 7?", save_answer=False)
+
+    assert "91.2" in response.answer_markdown
+    assert "88.4" in response.answer_markdown
+    assert "99.9" not in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 7")
+
+
+def test_rag_table_query_ignores_unrelated_table_source_chunk() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        status="ready",
+    )
+    unrelated_table = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text=(
+            "Table 3: unrelated setup.\n"
+            "| Setting | Value |\n"
+            "| --- | --- |\n"
+            "| Batch size | 32 |"
+        ),
+        page_label="3",
+        embedding=None,
+    )
+    db.add_all([project, document, unrelated_table])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "What are FooNet Accuracy and F1 on Dataset-A in Table 7?",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert contexts == []
+
+
+def test_answer_respects_public_query_mode_wiki_switch() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Medical Case", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/medical-case",
+        title="Medical Case Summary",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/medical-case.md",
+        markdown_content="# Medical Case Summary\n\nThe doctor recommended a follow-up in two weeks after discharge.",
+        source_document_ids=["d1"],
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="Patient demographics appear here without the timing.",
+        page_label="1",
+        embedding=None,
+    )
+    db.add_all([project, document, wiki_page, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+    old_mode = settings.query_mode
+    settings.query_mode = "wiki"
+    try:
+        response = service.answer("demo", "When is the follow-up?", save_answer=False)
+    finally:
+        settings.query_mode = old_mode
+
+    assert response.citations
+    assert response.citations[0].page_slug == "sources/medical-case"
 
 
 # ---- New tests for PDF query validation fixes ----
