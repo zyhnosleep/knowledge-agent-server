@@ -2625,7 +2625,7 @@ class QueryService:
         lowered = question.lower()
         return bool(
             re.search(r"table\s*(?:s\s*)?\d+", lowered)
-            or "表" in question
+            or "\u8868" in question
             or "tabular" in lowered
         )
 
@@ -2638,7 +2638,7 @@ class QueryService:
         return bool(
             re.search(r"(?<![a-z0-9])f\s*1(?![a-z0-9])", lowered)
             or re.search(
-                r"\b(auc|precision|recall|accuracy|bleu|rouge|metric|score|performance|oie2016|nyt|penn|web)\b",
+                r"\b(auc|precision|recall|accuracy|bleu|rouge|rmse|mae|mse|hfe|pka|metric|score|performance|oie2016|nyt|penn|web)\b",
                 lowered,
             )
         )

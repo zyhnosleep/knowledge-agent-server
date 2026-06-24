@@ -1240,12 +1240,14 @@ def test_is_figure_query_detects_figure_questions() -> None:
 
 def test_is_table_query_detects_table_questions() -> None:
     assert QueryService._is_table_query("Table 2 鐨勭粨鏋滄槸浠€涔堬紵")
+    assert QueryService._is_table_query("OPLS5 \u7684\u8868\u683c\u4e2d\u6709\u54ea\u4e9b\u6570\u503c\uff1f")
     assert QueryService._is_table_query("What are the results in table 5?")
     assert not QueryService._is_table_query("What is the abstract about?")
 
 
 def test_is_metric_query_detects_metric_questions() -> None:
     assert QueryService._is_metric_query("SAC-KG 鍦?OIE2016 涓婄殑鎸囨爣鏄粈涔堬紵")
+    assert QueryService._is_metric_query("OPLS5 \u7684 binding RMSE \u76f8\u6bd4 OPLS4 \u6709\u54ea\u4e9b\u6570\u503c\u6539\u5584\uff1f")
     assert QueryService._is_metric_query("What is the F1 score?")
     assert QueryService._is_metric_query("NYT AUC performance")
     assert not QueryService._is_metric_query("Who wrote this paper?")
@@ -3044,6 +3046,69 @@ def test_generic_table_answer_uses_caption_matched_numeric_rows() -> None:
     )
 
     assert answer is not None
+    assert "1.18" in answer.answer_markdown
+    assert "1.12" in answer.answer_markdown
+
+
+def test_generic_table_answer_keeps_late_binding_table_when_earlier_tables_have_many_rows() -> None:
+    service = QueryService(make_session())
+    table3 = (
+        "Table 3. Interaction energy comparison for configurations that have changed in OPLS5.\n"
+        "| Group | CCSD(T)/CBS | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Acetate | -10.5 | -11.3 | -10.5 |\n"
+        "| Guanidine | -10.0 | -11.9 | -11.2 |\n"
+        "| Benzene | -2.0 | -2.6 | -2.1 |\n"
+        "| Phenol | -4.0 | -4.8 | -4.1 |\n"
+        "| Pyridine | -3.0 | -3.9 | -3.2 |"
+    )
+    tables = [
+        (
+            "Table 4. Acetate pKa shift.\n"
+            "| System | Exp. | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Acetate-guanidinium | -0.136 | -0.26 | -0.14 |"
+        ),
+        (
+            "Table 5. Root mean square errors for glutamic acid pKa sets.\n"
+            "| Amino acid | Number | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| GLU | 44 | 0.70 | 0.61 |"
+        ),
+        table3,
+        (
+            "Table 2. Hydration free energies for small aromatic molecules.\n"
+            "| Compound | Exp. | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| RMS error | | 0.76 | 0.46 |"
+        ),
+        (
+            "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+            "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| PerturbationClass | No.cmpds | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+            "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+            "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |"
+        ),
+    ]
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/opls5", page_title="OPLS5", page_kind="source_summary", score=10 - index, excerpt=table),
+            prompt_text=table,
+            score=10 - index,
+        )
+        for index, table in enumerate(tables)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa 和 binding RMSE 相比 OPLS4 有哪些数值改善？",
+        contexts,
+        list(range(len(contexts))),
+        "normal",
+    )
+
+    assert answer is not None
+    assert "Table 7" in answer.answer_markdown
     assert "1.18" in answer.answer_markdown
     assert "1.12" in answer.answer_markdown
 
