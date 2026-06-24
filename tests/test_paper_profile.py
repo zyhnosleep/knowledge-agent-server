@@ -60,6 +60,7 @@ def test_paper_profile_refreshes_legacy_profile_without_version() -> None:
 
 def test_paper_profile_retrieval_terms_include_late_scientific_terms() -> None:
     noisy_front_matter = " ".join(f"AuthorName{i} Department University Page" for i in range(300))
+    atom_type_noise = " ".join(["N-CX-2C-2C", "C-CX-3C-CT", "CX-2C-CA-CA"] * 80)
     document = Document(
         id="d1",
         project_id="p1",
@@ -69,6 +70,8 @@ def test_paper_profile_retrieval_terms_include_late_scientific_terms() -> None:
         raw_path="raw/ff14sb.pdf",
         raw_text=(
             noisy_front_matter
+            + "\n\n"
+            + atom_type_noise
             + "\n\nThe fitting protocol later uses GAlib and QM-MM target data for side-chain torsions. "
             + "A separate section discusses CMAP and a 500 K Boltzmann population fit."
         ),
@@ -88,6 +91,9 @@ def test_paper_profile_retrieval_terms_include_late_scientific_terms() -> None:
     assert "GAlib" in terms
     assert "CMAP" in terms
     assert "500 K" in terms
+    assert "QM-MM" in terms[:32]
+    assert "GAlib" in terms[:32]
+    assert "N-CX-2C-2C" not in terms[:32]
 
 
 def test_alias_in_text_uses_boundaries_for_near_names() -> None:

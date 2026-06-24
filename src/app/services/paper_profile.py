@@ -233,6 +233,8 @@ def _keyword_terms(text: str) -> list[str]:
             return
         if compact.startswith(("author", "department", "university")):
             return
+        if _looks_like_atom_type_series(token):
+            return
         has_digit = any(char.isdigit() for char in token)
         has_separator = any(char in token for char in "-_/")
         uppercase_count = sum(1 for char in token if char.isupper())
@@ -268,6 +270,14 @@ def _keyword_terms(text: str) -> list[str]:
         add_candidate(match.group(0), match.start())
     ranked = sorted(candidates.values(), key=lambda item: (-item[1], item[2], item[0].lower()))
     return [term for term, _score, _position in ranked]
+
+
+def _looks_like_atom_type_series(token: str) -> bool:
+    parts = [part for part in re.split(r"[-_/]", token) if part]
+    if len(parts) < 3:
+        return False
+    short_parts = sum(1 for part in parts if len(part) <= 3 and re.fullmatch(r"[A-Za-z0-9]+", part))
+    return short_parts / len(parts) >= 0.75
 
 
 def _profile_source_text(
