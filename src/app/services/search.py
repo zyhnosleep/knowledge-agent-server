@@ -16,7 +16,13 @@ from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
-from app.services.paper_profile import alias_in_text, paper_profile_data, paper_profile_text, source_fields_for_document
+from app.services.paper_profile import (
+    alias_in_text,
+    paper_profile_data,
+    paper_profile_retrieval_terms,
+    paper_profile_text,
+    source_fields_for_document,
+)
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
 from app.services.wiki import WikiRenderer
@@ -451,10 +457,7 @@ class QueryService:
     def _paper_profile_retrieval_terms(cls, paper_matches: list[PaperMatch]) -> list[str]:
         terms: list[str] = []
         for match in paper_matches:
-            metadata = match.document.metadata_json or {}
-            raw_profile = metadata.get("paper_profile") if isinstance(metadata, dict) else None
-            profile = raw_profile if isinstance(raw_profile, dict) and raw_profile.get("key_terms") else paper_profile_data(match.document)
-            for term in profile.get("key_terms") or []:
+            for term in paper_profile_retrieval_terms(match.document):
                 value = str(term or "").strip()
                 if cls._is_profile_retrieval_term(value):
                     terms.append(value)

@@ -10,6 +10,10 @@ from app.services.filesystem import slugify, strip_upload_prefix
 PROFILE_VERSION = "paper-profile-v1"
 
 PROFILE_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)*\b")
+PROFILE_NUMERIC_UNIT_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s*(?:K|kcal(?:\s*/\s*mol|\s+mol)?|fs|ps|ns|us|A)(?![\w/])",
+    re.IGNORECASE,
+)
 TABLE_LABEL_RE = re.compile(r"\bTable\s*\d+\b", re.IGNORECASE)
 
 
@@ -58,6 +62,21 @@ def paper_profile_data(document: Document) -> dict:
     return build_paper_profile(document).to_dict()
 
 
+def paper_profile_retrieval_terms(document: Document) -> list[str]:
+    metadata = dict(document.metadata_json or {})
+    existing = metadata.get("paper_profile") if isinstance(metadata.get("paper_profile"), dict) else {}
+    existing_terms = existing.get("key_terms") if isinstance(existing, dict) and isinstance(existing.get("key_terms"), list) else []
+    aliases = existing.get("aliases") if isinstance(existing, dict) and isinstance(existing.get("aliases"), list) else []
+    source_text = _profile_source_text(document)
+    return _ordered_unique(
+        [
+            *[str(term) for term in aliases],
+            *_keyword_terms(source_text),
+            *[str(term) for term in existing_terms],
+        ]
+    )[:96]
+
+
 def ensure_source_identity(document: Document, preferred_title: str | None = None) -> dict:
     metadata = dict(document.metadata_json or {})
     _ensure_source_identity(document, metadata, preferred_title=preferred_title)
@@ -92,16 +111,7 @@ def build_paper_profile(document: Document) -> PaperProfile:
     tables = intelligence.get("tables") if isinstance(intelligence, dict) else []
     figures = intelligence.get("figures") if isinstance(intelligence, dict) else []
     title_text = "\n".join(part for part in (clean_title, str(document.file_name or "")) if part)
-    text = "\n".join(
-        part
-        for part in (
-            title_text,
-            (document.raw_text or "")[:5000],
-            _join_table_text(tables),
-            _join_figure_text(figures),
-        )
-        if part
-    )
+    text = _profile_source_text(document, title_text=title_text, tables=tables, figures=figures)
     aliases = _ordered_unique([clean_title, *_title_aliases(title)])
     table_terms = [match.group(0).replace(" ", " ") for match in TABLE_LABEL_RE.finditer(_join_table_text(tables))]
     figure_terms = [match.group(0).replace(" ", " ") for match in re.finditer(r"\b(?:Figure|Fig\.)\s*\d+\b", _join_figure_text(figures), re.IGNORECASE)]
@@ -191,17 +201,99 @@ def _keyword_terms(text: str) -> list[str]:
         "field",
         "study",
         "paper",
+        "page",
+        "supporting",
+        "information",
+        "department",
+        "university",
+        "author",
     }
-    terms: list[str] = []
-    for match in PROFILE_TERM_RE.finditer(text):
-        token = match.group(0)
+    domain_terms = {
+        "backbone",
+        "barrier",
+        "boltzmann",
+        "cmap",
+        "helical",
+        "population",
+        "propensity",
+        "rotamer",
+        "rotamers",
+        "sidechain",
+        "side-chain",
+        "torsion",
+        "torsions",
+    }
+    candidates: dict[str, tuple[str, float, int]] = {}
+
+    def add_candidate(token: str, position: int) -> None:
+        token = re.sub(r"\s+", " ", token).strip()
         normalized = token.lower()
-        if len(token) < 4 or normalized in stopwords:
-            continue
-        if token[:1].islower() and "-" not in token and "/" not in token:
-            continue
-        terms.append(token)
-    return terms
+        compact = normalized.replace("-", "").replace("_", "").replace("/", "").replace(" ", "")
+        if len(compact) < 3 or normalized in stopwords:
+            return
+        if compact.startswith(("author", "department", "university")):
+            return
+        has_digit = any(char.isdigit() for char in token)
+        has_separator = any(char in token for char in "-_/")
+        uppercase_count = sum(1 for char in token if char.isupper())
+        is_acronym = uppercase_count >= 2 and token.upper() == token
+        is_mixed_case = bool(re.search(r"[a-z][A-Z]", token)) or (
+            uppercase_count >= 2 and any(char.islower() for char in token)
+        )
+        is_numeric_unit = bool(PROFILE_NUMERIC_UNIT_RE.fullmatch(token))
+        is_domain_term = normalized in domain_terms or compact in domain_terms
+        if not (has_digit or has_separator or is_acronym or is_mixed_case or is_numeric_unit or is_domain_term):
+            return
+        score = 1.0
+        if has_digit:
+            score += 5.0
+        if has_separator:
+            score += 4.0
+        if is_acronym or is_mixed_case:
+            score += 4.0
+        if is_numeric_unit:
+            score += 5.0
+        if is_domain_term:
+            score += 3.0
+        existing = candidates.get(normalized)
+        if existing is None:
+            candidates[normalized] = (token, score, position)
+        else:
+            first_token, existing_score, first_position = existing
+            candidates[normalized] = (first_token, existing_score + 1.0, first_position)
+
+    for match in PROFILE_NUMERIC_UNIT_RE.finditer(text):
+        add_candidate(match.group(0), match.start())
+    for match in PROFILE_TERM_RE.finditer(text):
+        add_candidate(match.group(0), match.start())
+    ranked = sorted(candidates.values(), key=lambda item: (-item[1], item[2], item[0].lower()))
+    return [term for term, _score, _position in ranked]
+
+
+def _profile_source_text(
+    document: Document,
+    title_text: str | None = None,
+    tables: object | None = None,
+    figures: object | None = None,
+) -> str:
+    metadata = document.metadata_json or {}
+    if tables is None or figures is None:
+        intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
+        tables = intelligence.get("tables") if isinstance(intelligence, dict) else []
+        figures = intelligence.get("figures") if isinstance(intelligence, dict) else []
+    if title_text is None:
+        title = strip_upload_prefix(document.title or document.file_name or "Untitled document")
+        title_text = "\n".join(part for part in (_clean_title(title), str(document.file_name or "")) if part)
+    return "\n".join(
+        part
+        for part in (
+            title_text,
+            document.raw_text or "",
+            _join_table_text(tables),
+            _join_figure_text(figures),
+        )
+        if part
+    )
 
 
 def _join_table_text(tables: object) -> str:

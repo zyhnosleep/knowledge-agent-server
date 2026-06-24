@@ -1,5 +1,5 @@
 from app.models.records import Document
-from app.services.paper_profile import alias_in_text, ensure_paper_profile
+from app.services.paper_profile import alias_in_text, ensure_paper_profile, paper_profile_retrieval_terms
 
 
 def test_paper_profile_contains_routing_summary_aliases_and_tables() -> None:
@@ -56,6 +56,38 @@ def test_paper_profile_refreshes_legacy_profile_without_version() -> None:
     assert profile["profile_version"]
     assert profile["routing_summary"] != "old"
     assert "CHARMM36m" in profile["aliases"]
+
+
+def test_paper_profile_retrieval_terms_include_late_scientific_terms() -> None:
+    noisy_front_matter = " ".join(f"AuthorName{i} Department University Page" for i in range(300))
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff14SB parameter update",
+        file_name="ff14sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff14sb.pdf",
+        raw_text=(
+            noisy_front_matter
+            + "\n\nThe fitting protocol later uses GAlib and QM-MM target data for side-chain torsions. "
+            + "A separate section discusses CMAP and a 500 K Boltzmann population fit."
+        ),
+        metadata_json={
+            "paper_profile": {
+                "profile_version": "paper-profile-v1",
+                "routing_summary": "old noisy profile",
+                "key_terms": ["Page", "Department", "University"],
+            }
+        },
+        status="ready",
+    )
+
+    terms = paper_profile_retrieval_terms(document)
+
+    assert "QM-MM" in terms
+    assert "GAlib" in terms
+    assert "CMAP" in terms
+    assert "500 K" in terms
 
 
 def test_alias_in_text_uses_boundaries_for_near_names() -> None:
