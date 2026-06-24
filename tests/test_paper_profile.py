@@ -94,6 +94,8 @@ def test_paper_profile_retrieval_terms_include_late_scientific_terms() -> None:
     assert "GAlib" in terms
     assert "CMAP" in terms
     assert "500 K" in terms
+    assert "fitting" in terms[:32]
+    assert "protocol" in terms[:32]
     assert "QM-MM" in terms[:32]
     assert "GAlib" in terms[:32]
     assert "N-CX-2C-2C" not in terms[:32]
