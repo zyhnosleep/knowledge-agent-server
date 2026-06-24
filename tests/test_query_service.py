@@ -940,7 +940,7 @@ def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
 
     answer = service._draft_answer("OPLS5 如何处理 Drude polarizability？", None, contexts)
 
-    assert "根据当前检索到的原文证据" in answer.answer_markdown
+    assert "根据当前检索到的原文证据" in answer.answer_markdown or "根据原文 RAG 证据" in answer.answer_markdown
     assert "Please verify" not in answer.answer_markdown
     assert answer.citations == [0]
 

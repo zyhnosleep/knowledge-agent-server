@@ -851,7 +851,11 @@ class QueryService:
                     context_text[:1400],
                 ]
             )
-        fallback = QueryAnswerPayload(
+        fallback = self._deterministic_scientific_evidence_answer_if_supported(
+            question,
+            contexts,
+            "high" if self._is_high_risk(question) else "normal",
+        ) or QueryAnswerPayload(
             answer_markdown=fallback_text,
             citations=list(range(len(contexts))),
             risk_level="high" if self._is_high_risk(question) else "normal",
