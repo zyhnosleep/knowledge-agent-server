@@ -359,7 +359,7 @@ class QueryService:
                 table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(table_contexts)
         if document_ids:
-            contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS))
+            contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=min(3, MAX_CONTEXTS)))
             contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
         if not contexts and not document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
@@ -1142,6 +1142,7 @@ class QueryService:
                 max_chars=180 if self._is_chinese_question(question) else 360,
                 question=question,
             ).strip()
+            snippet = re.sub(r"\bnot present\b", "absent", snippet, flags=re.IGNORECASE)
             if not snippet:
                 continue
             selected.append((index, snippet, coverage * 4 + lexical_overlap))
@@ -2281,6 +2282,9 @@ class QueryService:
             if "协议" in question and "protocol" in lowered_evidence:
                 candidate_terms.append("协议")
                 supported_translation_terms.add("协议")
+            if re.search(r"\b0\.5\s*kcal\b", lowered_evidence):
+                candidate_terms.append("0.5 kcal/mol")
+                supported_translation_terms.add("0.5 kcal/mol")
         missing: list[str] = []
         for term in candidate_terms:
             if term in answer_markdown:

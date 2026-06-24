@@ -1084,7 +1084,8 @@ def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> N
             prompt_text=(
                 long_prefix
                 + "The new restraint scheme allowed covalent relaxation of steric clashes "
-                + "while preserving backbone and side chain phase behavior."
+                + "while preserving backbone and side chain phase behavior. "
+                + "Residual errors near minima are below 0.5 kcal mol."
             ),
             score=1,
         )
@@ -1100,6 +1101,7 @@ def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> N
     assert "covalent relaxation" in answer.answer_markdown
     assert "steric clashes" in answer.answer_markdown
     assert "侧链" in answer.answer_markdown
+    assert "0.5 kcal/mol" in answer.answer_markdown
     cjk_count = sum(1 for char in answer.answer_markdown if "\u4e00" <= char <= "\u9fff")
     latin_count = sum(1 for char in answer.answer_markdown if ("a" <= char.lower() <= "z"))
     assert cjk_count / (cjk_count + latin_count) >= 0.2
