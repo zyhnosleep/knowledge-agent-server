@@ -29,6 +29,7 @@ CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
+QUERY_GENERATION_TIMEOUT_SECONDS = 45
 
 
 @dataclass
@@ -832,15 +833,26 @@ class QueryService:
         # Build figure/table/dataset-aware guardrails.
         constraints = self._build_answer_constraints(question, contexts)
 
-        fallback = QueryAnswerPayload(
-            answer_markdown="\n".join(
+        if self._is_chinese_question(question):
+            fallback_text = "\n".join(
+                [
+                    "## 回答",
+                    "根据当前检索到的原文证据，暂时返回可核查的证据片段；以下内容均来自返回的 citation。",
+                    "",
+                    context_text[:1400],
+                ]
+            )
+        else:
+            fallback_text = "\n".join(
                 [
                     "## Answer",
                     "The answer below is based on the currently retrieved source evidence. Please verify against the cited materials when needed.",
                     "",
                     context_text[:1400],
                 ]
-            ),
+            )
+        fallback = QueryAnswerPayload(
+            answer_markdown=fallback_text,
             citations=list(range(len(contexts))),
             risk_level="high" if self._is_high_risk(question) else "normal",
         )
@@ -856,12 +868,22 @@ class QueryService:
                 context_text,
             ]
         )
+        def generate_with_query_timeout() -> QueryAnswerPayload:
+            original_timeout = getattr(self.ollama, "timeout", None)
+            if original_timeout is not None:
+                self.ollama.timeout = min(float(original_timeout), QUERY_GENERATION_TIMEOUT_SECONDS)
+            try:
+                return self.ollama.generate_structured(
+                    QueryAnswerPayload,
+                    system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
+                    user_prompt=prompt,
+                )
+            finally:
+                if original_timeout is not None:
+                    self.ollama.timeout = original_timeout
+
         return safe_model_call(
-            lambda: self.ollama.generate_structured(
-                QueryAnswerPayload,
-                system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
-                user_prompt=prompt,
-            ),
+            lambda: generate_with_query_timeout(),
             fallback,
         )
 

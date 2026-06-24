@@ -927,6 +927,24 @@ def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> N
     assert contexts[answer.citations[0]].citation.chunk_id == "c1"
 
 
+def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
+    service = QueryService(make_session())
+    service.ollama = ExplodingOllama()
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/opls5", page_title="OPLS5", page_kind="source_summary", score=1, excerpt="OPLS5 uses Drude polarizability."),
+            prompt_text="OPLS5 uses Drude polarizability and LFMM metal functionality.",
+            score=1,
+        )
+    ]
+
+    answer = service._draft_answer("OPLS5 如何处理 Drude polarizability？", None, contexts)
+
+    assert "根据当前检索到的原文证据" in answer.answer_markdown
+    assert "Please verify" not in answer.answer_markdown
+    assert answer.citations == [0]
+
+
 def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
