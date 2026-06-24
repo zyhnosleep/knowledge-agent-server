@@ -60,6 +60,27 @@ class ExtractedMetric:
 
 
 class QueryService:
+    _TABLE_MODEL_TERM_RE = re.compile(r"^(?:amber|charmm|gaff|opls|c\d+|ff\d+)[a-z0-9]*$")
+    _TABLE_BROAD_METRIC_TERM_KEYS = {
+        "accuracy",
+        "auc",
+        "error",
+        "errors",
+        "f1",
+        "mae",
+        "metric",
+        "metrics",
+        "mse",
+        "performance",
+        "precision",
+        "recall",
+        "rmse",
+        "score",
+        "scores",
+        "value",
+        "values",
+    }
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.ollama = OllamaClient()
@@ -2393,6 +2414,8 @@ class QueryService:
     def _rank_blocks(self, question: str, blocks: list[str]) -> list[tuple[str, float]]:
         facets = [facet.lower() for facet in self._extract_query_facets(question)]
         query_terms = self._tokenize(question)
+        generic_terms = self._extract_generic_table_terms(question)
+        specific_anchor_terms = [term for term in generic_terms if self._is_specific_table_anchor(term)]
         ranked: list[tuple[str, float]] = []
         for index, block in enumerate(blocks):
             lowered = block.lower()
@@ -2408,15 +2431,41 @@ class QueryService:
             for anchor in self._query_priority_anchors(question)["dataset"]:
                 if anchor.lower() in lowered:
                     score += 8.0
-            for term in self._extract_generic_table_terms(question):
+            matched_specific_anchors = 0
+            for term in generic_terms:
                 if self._selector_matches_text(term, block, block_key):
-                    score += 1.0 if self._normalize_selector(term) in {"opls3e", "opls4", "opls5", "c36", "c36m"} else 4.0
+                    score += self._generic_table_term_weight(term)
+                    if self._is_specific_table_anchor(term):
+                        matched_specific_anchors += 1
+            if specific_anchor_terms:
+                if matched_specific_anchors:
+                    score += matched_specific_anchors * 4.0
+                else:
+                    score -= 2.5
             if any(metric in lowered for metric in ("f1", "auc", "precision", "recall", "score", "指标")):
                 score += 2.0
             if re.search(r"\d+(?:\.\d+)?", block):
                 score += 1.5
             ranked.append((block, score - index * 0.01))
         return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    @classmethod
+    def _generic_table_term_weight(cls, term: str) -> float:
+        key = cls._normalize_selector(term)
+        if cls._is_table_model_term_key(key):
+            return 1.0
+        if key in cls._TABLE_BROAD_METRIC_TERM_KEYS:
+            return 1.5
+        return 4.0
+
+    @classmethod
+    def _is_specific_table_anchor(cls, term: str) -> bool:
+        key = cls._normalize_selector(term)
+        return bool(key and not cls._is_table_model_term_key(key) and key not in cls._TABLE_BROAD_METRIC_TERM_KEYS)
+
+    @classmethod
+    def _is_table_model_term_key(cls, key: str) -> bool:
+        return bool(key and cls._TABLE_MODEL_TERM_RE.fullmatch(key))
 
     @classmethod
     def _extract_query_facets(cls, question: str) -> list[str]:

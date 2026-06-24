@@ -2994,6 +2994,29 @@ def test_rank_blocks_uses_generic_aliases_for_multi_table_selection() -> None:
     assert ranked[0][0] == aromatic_hfe
 
 
+def test_rank_blocks_prefers_binding_table_over_generic_rmse_table() -> None:
+    service = QueryService(make_session())
+    generic_rmse = (
+        "Table 6. OPLS4 and OPLS5 model performance (RMSE) comparison.\n"
+        "| Row | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- |\n"
+        "| No external field | 16.6 | 2.9 |"
+    )
+    binding_rmse = (
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| TotalWeightedAverage | 1183 | 1.18 | 1.29 | 1.12 | 1.25 |"
+    )
+
+    ranked = service._rank_blocks(
+        "OPLS5 的 binding RMSE 相比 OPLS4 有哪些数值？",
+        [generic_rmse, binding_rmse],
+    )
+
+    assert ranked[0][0] == binding_rmse
+
+
 def test_generic_table_answer_uses_caption_matched_numeric_rows() -> None:
     service = QueryService(make_session())
     table = (
