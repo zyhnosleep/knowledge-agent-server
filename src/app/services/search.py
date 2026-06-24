@@ -16,7 +16,7 @@ from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
-from app.services.paper_profile import alias_in_text, ensure_paper_profile, paper_profile_text
+from app.services.paper_profile import alias_in_text, paper_profile_data, paper_profile_text
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
 from app.services.wiki import WikiRenderer
@@ -234,7 +234,7 @@ class QueryService:
         documents = self.db.scalars(select(Document).where(Document.project_id == project_id)).all()
         matches: list[PaperMatch] = []
         for document in documents:
-            profile = ensure_paper_profile(document)
+            profile = paper_profile_data(document)
             profile_text = paper_profile_text(document)
             profile_terms = self._tokenize(profile_text)
             title_terms = self._tokenize(document.title)
@@ -253,7 +253,6 @@ class QueryService:
                 score += 18
             if score >= PAPER_ROUTE_MIN_SCORE:
                 matches.append(PaperMatch(document=document, score=float(score), exact_alias=exact_alias))
-        self.db.flush()
         ranked = sorted(matches, key=lambda item: item.score, reverse=True)
         if self._is_cross_paper_query(question):
             return ranked[: max(limit, 5)]
@@ -309,6 +308,7 @@ class QueryService:
         if document_ids:
             statement = statement.where(Document.id.in_(document_ids))
         documents = self.db.scalars(statement).all()
+        source_page_fields = self._source_page_fields_by_document_id(project_id, [document.id for document in documents])
         contexts: list[RetrievedContext] = []
         for document in documents:
             metadata = document.metadata_json or {}
@@ -330,11 +330,12 @@ class QueryService:
                     continue
                 block_score = self._rank_blocks(question, [block])[0][1]
                 score = TABLE_CONTEXT_SCORE_BOOST + block_score + max(0.0, 2.0 - ordinal * 0.01)
-                excerpt = self._table_block_excerpt(block, question)
+                excerpt = self._table_citation_excerpt(block, question)
                 contexts.append(
                     RetrievedContext(
                         citation=Citation(
                             document_id=document.id,
+                            **source_page_fields.get(document.id, {}),
                             score=score,
                             page_label=page_label,
                             excerpt=excerpt,
@@ -345,11 +346,37 @@ class QueryService:
                 )
         return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
 
+    def _source_page_fields_by_document_id(self, project_id: str, document_ids: list[str]) -> dict[str, dict[str, str]]:
+        wanted = set(document_ids)
+        if not wanted:
+            return {}
+        pages = self.db.scalars(
+            select(WikiPage).where(
+                WikiPage.project_id == project_id,
+                WikiPage.kind == PageKind.source_summary.value,
+            )
+        ).all()
+        fields: dict[str, dict[str, str]] = {}
+        for page in pages:
+            for document_id in page.source_document_ids or []:
+                if document_id not in wanted or document_id in fields:
+                    continue
+                fields[document_id] = {
+                    "page_slug": page.slug,
+                    "page_title": strip_upload_prefix(page.title),
+                    "page_kind": page.kind,
+                }
+        return fields
+
     def _search_source_chunks(self, question: str, project_id: str, document_ids: list[str], limit: int = 3) -> list[RetrievedContext]:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(DocumentChunk.document.has(project_id=project_id))
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
         chunks = self.db.scalars(statement).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
 
         question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         query_terms = self._tokenize(question)
@@ -373,7 +400,7 @@ class QueryService:
                 if not self._table_block_matches_query(question, chunk.text):
                     continue
                 score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
-                prompt_text = self._table_block_excerpt(chunk.text, question, max_chars=2400)
+                prompt_text = self._table_citation_excerpt(chunk.text, question, max_chars=2400)
                 excerpt = prompt_text
             else:
                 prompt_text = self._window_text(chunk.text, query_terms, max_chars=1600, question=question)
@@ -383,6 +410,7 @@ class QueryService:
                     citation=Citation(
                         document_id=chunk.document_id,
                         chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
                         score=score,
                         page_label=chunk.page_label,
                         excerpt=excerpt,
@@ -398,6 +426,19 @@ class QueryService:
         lowered = text.lower()
         has_metric_word = bool(re.search(r"\b(f\s*1|auc|precision|recall|accuracy|rmse|mae|score|metric)\b", lowered))
         return has_metric_word and bool(re.search(r"\d+(?:\.\d+)?", text))
+
+    @classmethod
+    def _table_citation_excerpt(cls, block: str, question: str = "", max_chars: int = 1200) -> str:
+        excerpt = cls._table_block_excerpt(block, question, max_chars=max_chars)
+        if re.search(r"\btable\b", excerpt, re.IGNORECASE):
+            return excerpt
+        table_anchors = [
+            anchor
+            for anchor in cls._query_priority_anchors(question)["figure_table"]
+            if re.match(r"table\s*\d+", anchor, re.IGNORECASE)
+        ]
+        label = table_anchors[0] if table_anchors else "Table evidence"
+        return f"{label}: {excerpt}"
 
     def _build_contexts(self, question: str, project_id: str, page_matches: list[PageMatch]) -> list[RetrievedContext]:
         contexts: list[RetrievedContext] = []
@@ -1702,7 +1743,7 @@ class QueryService:
         seen: set[str] = set()
         for citation in citations:
             replacement = citation
-            if citation.document_id and citation.page_slug is None:
+            if citation.document_id and (citation.page_slug is None or citation.chunk_id is not None):
                 page = page_by_doc_id.get(citation.document_id) or self._source_page_for_document(project_id, citation.document_id)
                 if page is not None:
                     page_body = self._strip_frontmatter(page.markdown_content)

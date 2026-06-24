@@ -42,10 +42,18 @@ def ensure_paper_profile(document: Document) -> dict:
     existing = metadata.get("paper_profile")
     if isinstance(existing, dict) and existing.get("profile_version") == PROFILE_VERSION and existing.get("routing_summary"):
         return existing
-    profile = build_paper_profile(document).to_dict()
+    profile = paper_profile_data(document)
     metadata["paper_profile"] = profile
     document.metadata_json = metadata
     return profile
+
+
+def paper_profile_data(document: Document) -> dict:
+    metadata = dict(document.metadata_json or {})
+    existing = metadata.get("paper_profile")
+    if isinstance(existing, dict) and existing.get("profile_version") == PROFILE_VERSION and existing.get("routing_summary"):
+        return existing
+    return build_paper_profile(document).to_dict()
 
 
 def build_paper_profile(document: Document) -> PaperProfile:
@@ -96,7 +104,7 @@ def build_paper_profile(document: Document) -> PaperProfile:
 
 
 def paper_profile_text(document: Document) -> str:
-    profile = ensure_paper_profile(document)
+    profile = paper_profile_data(document)
     parts = [
         str(profile.get("title") or document.title or ""),
         str(profile.get("one_sentence") or ""),

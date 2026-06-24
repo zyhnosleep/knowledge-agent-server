@@ -463,6 +463,27 @@ def test_rag_router_prefers_exact_opls4_over_opls5() -> None:
     assert [match.document.id for match in matches] == ["opls4"]
 
 
+def test_rag_router_does_not_persist_lazy_profile_during_query() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="opls4",
+        project_id="p1",
+        title="OPLS4 Force Field Development and Validation",
+        file_name="opls4.pdf",
+        sha256="opls4",
+        raw_path="raw/opls4.pdf",
+        raw_text="OPLS4 addresses protein-ligand force field validation.",
+        status="ready",
+    )
+    db.add_all([project, document])
+    db.commit()
+
+    QueryService(db)._route_papers("OPLS4 的主要改进是什么？", "p1")
+
+    assert "paper_profile" not in (document.metadata_json or {})
+
+
 def test_rag_router_filters_to_exact_alias_document_when_related_paper_repeats_alias() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -647,12 +668,53 @@ def test_rag_table_query_uses_document_table_evidence_not_profile_or_wiki() -> N
 
     assert response.citations
     assert response.citations[0].document_id == "d1"
-    assert response.citations[0].page_slug is None
+    assert response.citations[0].page_slug == "sources/foonet"
     assert response.citations[0].page_label == "7"
     assert response.citations[0].excerpt.startswith("Table 7")
     assert "91.2" in response.citations[0].excerpt
     assert "paper_profile" not in service.ollama.last_prompt
     assert "wiki summary should not" not in service.ollama.last_prompt.lower()
+
+
+def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={
+            "document_intelligence": {
+                "tables": [
+                    {
+                        "page_label": "7",
+                        "markdown": (
+                            "| Model | Accuracy | F1 |\n"
+                            "| --- | --- | --- |\n"
+                            "| FooNet | 91.2 | 88.4 |"
+                        ),
+                    }
+                ]
+            }
+        },
+        status="ready",
+    )
+    db.add_all([project, document])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "What does the FooNet metric table report?",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert contexts
+    assert contexts[0].citation.excerpt.startswith("Table evidence:")
+    assert "91.2" in contexts[0].citation.excerpt
 
 
 def test_rag_metric_answer_retargets_conflicting_prose_numbers_to_table_values() -> None:
