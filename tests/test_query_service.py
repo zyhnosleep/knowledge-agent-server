@@ -983,6 +983,31 @@ def test_rag_contexts_boost_rare_profile_terms() -> None:
     assert any(context.citation.chunk_id == "rare" for context in contexts)
 
 
+def test_finalize_contexts_keeps_more_same_source_evidence() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"c{index}",
+                page_slug="sources/demo",
+                page_title="Demo",
+                page_kind="source_summary",
+                score=10 - index,
+                page_label=str(index),
+                excerpt=f"distinct evidence {index}",
+            ),
+            prompt_text=f"distinct evidence {index}",
+            score=10 - index,
+        )
+        for index in range(6)
+    ]
+
+    finalized = service._finalize_contexts(contexts)
+
+    assert [context.citation.chunk_id for context in finalized] == ["c0", "c1", "c2", "c3", "c4"]
+
+
 def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1066,7 +1091,7 @@ def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> N
     ]
 
     answer = service._deterministic_scientific_evidence_answer_if_supported(
-        "为什么 ff14SB 的 restraint/fitting 方案能避免 ff12SB 中的 artifact？",
+        "为什么 ff14SB 的 restraint/fitting 方案能改善侧链 artifact？",
         contexts,
         "normal",
     )
@@ -1074,6 +1099,7 @@ def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> N
     assert answer is not None
     assert "covalent relaxation" in answer.answer_markdown
     assert "steric clashes" in answer.answer_markdown
+    assert "侧链" in answer.answer_markdown
     cjk_count = sum(1 for char in answer.answer_markdown if "\u4e00" <= char <= "\u9fff")
     latin_count = sum(1 for char in answer.answer_markdown if ("a" <= char.lower() <= "z"))
     assert cjk_count / (cjk_count + latin_count) >= 0.2

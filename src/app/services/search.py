@@ -596,7 +596,7 @@ class QueryService:
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
-            rare_route_bonus = min(rare_route_overlap * 0.6, 1.8)
+            rare_route_bonus = min(rare_route_overlap * 1.1, 3.0)
             if question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
@@ -2266,19 +2266,26 @@ class QueryService:
             *cls._salient_evidence_acronyms(contexts[:3], limit=8),
             *cls._salient_evidence_phrases(contexts[:3], limit=8),
         ]
+        supported_translation_terms: set[str] = set()
         if cls._is_chinese_question(question):
             lowered_evidence = evidence.lower()
             if "侧链" in question and re.search(r"\bside[- ]chain\b", lowered_evidence):
                 candidate_terms.append("侧链")
+                supported_translation_terms.add("侧链")
             if "骨架" in question and "backbone" in lowered_evidence:
                 candidate_terms.append("骨架")
+                supported_translation_terms.add("骨架")
             if "拟合" in question and "fitting" in lowered_evidence:
                 candidate_terms.append("拟合")
+                supported_translation_terms.add("拟合")
             if "协议" in question and "protocol" in lowered_evidence:
                 candidate_terms.append("协议")
+                supported_translation_terms.add("协议")
         missing: list[str] = []
         for term in candidate_terms:
-            if term in answer_markdown or term not in evidence:
+            if term in answer_markdown:
+                continue
+            if term not in evidence and term not in supported_translation_terms:
                 continue
             if term not in missing:
                 missing.append(term)
@@ -2700,7 +2707,7 @@ class QueryService:
                 continue
             if citation.page_slug:
                 current_count = page_counts.get(citation.page_slug, 0)
-                per_page_limit = 5 if self._context_has_table_data(citation.excerpt or context.prompt_text) else 3
+                per_page_limit = 5
                 if current_count >= per_page_limit:
                     continue
                 page_counts[citation.page_slug] = current_count + 1
