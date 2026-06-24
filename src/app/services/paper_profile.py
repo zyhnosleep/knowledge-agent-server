@@ -247,14 +247,14 @@ def _keyword_terms(text: str) -> list[str]:
         if not (has_digit or has_separator or is_acronym or is_mixed_case or is_numeric_unit or is_domain_term):
             return
         score = 1.0
-        if has_digit:
+        if has_digit and not is_numeric_unit:
             score += 5.0
-        if has_separator:
+        if has_separator and not is_numeric_unit:
             score += 4.0
         if is_acronym or is_mixed_case:
             score += 4.0
         if is_numeric_unit:
-            score += 5.0
+            score += 2.0
         if is_domain_term:
             score += 3.0
         existing = candidates.get(normalized)
