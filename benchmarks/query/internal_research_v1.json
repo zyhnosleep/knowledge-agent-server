@@ -1,0 +1,1010 @@
+{
+  "name": "internal_research_v1",
+  "description": "Query acceptance benchmark for 10 force-field papers ingested into the internal-research project.",
+  "cases": [
+    {
+      "id": "charmm36_overview",
+      "project_slug": "internal-research",
+      "question": "CHARMM36 蛋白力场主要想修正 CHARMM22/CMAP 的什么问题？它用了哪些参数化和验证策略？",
+      "answer_must_include": [
+        "CHARMM36",
+        "CHARMM22",
+        "CMAP",
+        "QM",
+        "NMR"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/charmm36-force-field-refinement-for-proteins",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "charmm36_table_metrics",
+      "project_slug": "internal-research",
+      "question": "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？和 C22/CMAP 的螺旋比例有什么差异？",
+      "answer_must_include": [
+        "Ala5",
+        "51.9",
+        "Ac-(AAQAA)3-NH2",
+        "21.0",
+        "C22/CMAP",
+        "95.3"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table"
+      ],
+      "citation_source_hint": "sources/charmm36-force-field-refinement-for-proteins",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table",
+        "Ala5",
+        "51.9",
+        "Ac-(AAQAA)3-NH2",
+        "21.0",
+        "95.3"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table",
+          "Ala5",
+          "51.9",
+          "Ac-(AAQAA)3-NH2",
+          "21.0",
+          "95.3"
+        ]
+      ]
+    },
+    {
+      "id": "charmm36_mechanism",
+      "project_slug": "internal-research",
+      "question": "CHARMM36 为什么能改善 C22/CMAP 的 helix-coil 平衡和侧链 rotamer 采样？",
+      "answer_must_include": [
+        "CMAP",
+        "helix-coil",
+        "rotamer",
+        "QM",
+        "SPARTA"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/charmm36-force-field-refinement-for-proteins",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "charmm36idpsff_overview",
+      "project_slug": "internal-research",
+      "question": "CHARMM36IDPSFF 是从哪个力场发展来的？它主要针对哪类蛋白体系做了什么修改？",
+      "answer_must_include": [
+        "CHARMM36IDPSFF",
+        "CHARMM36m",
+        "IDP",
+        "CMAP",
+        "PPII"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS4"
+      ],
+      "citation_source_hint": "sources/charmm36idpsff",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "charmm36idpsff_table_metrics",
+      "project_slug": "internal-research",
+      "question": "CHARMM36IDPSFF 的 Rg 表格中，Aβ40 和 ACTR 的实验值与模拟值分别是多少？这些数值说明了什么局限？",
+      "answer_must_include": [
+        "Aβ40",
+        "12.0",
+        "11.53",
+        "ACTR",
+        "25.00",
+        "13.07"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table"
+      ],
+      "citation_source_hint": "sources/charmm36idpsff",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table",
+        "Aβ40",
+        "12.0",
+        "11.53",
+        "ACTR",
+        "25.00",
+        "13.07"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table",
+          "Aβ40",
+          "12.0",
+          "11.53",
+          "ACTR",
+          "25.00",
+          "13.07"
+        ]
+      ]
+    },
+    {
+      "id": "charmm36idpsff_mechanism",
+      "project_slug": "internal-research",
+      "question": "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？它在哪些场景仍有不足？",
+      "answer_must_include": [
+        "CHARMM36m",
+        "a99SB",
+        "NMR",
+        "large IDPs",
+        "radius of gyration",
+        "fast-folding"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS4"
+      ],
+      "citation_source_hint": "sources/charmm36idpsff",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "charmm36m_overview",
+      "project_slug": "internal-research",
+      "question": "CHARMM36m 主要解决 CHARMM36 在折叠蛋白和 IDP 模拟中的哪些问题？",
+      "answer_must_include": [
+        "CHARMM36m",
+        "CHARMM36",
+        "IDP",
+        "CMAP",
+        "NMR",
+        "FRET"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_source_hint": "sources/charmm36m-force-field",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "charmm36m_table_metrics",
+      "project_slug": "internal-research",
+      "question": "CHARMM36m 的 Table 1 中，RS peptide、FG-nucleoporin peptide 和 HEWL19 的 alphaL probability 相比 C36 降到了多少？",
+      "answer_must_include": [
+        "Table 1",
+        "RS peptide",
+        "80",
+        "1.8",
+        "FG-nucleoporin",
+        "32",
+        "1.1",
+        "HEWL19",
+        "11",
+        "0.5"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table 1"
+      ],
+      "citation_source_hint": "sources/charmm36m-force-field",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table 1",
+        "RS peptide",
+        "80",
+        "1.8",
+        "FG-nucleoporin",
+        "32",
+        "1.1",
+        "HEWL19",
+        "11",
+        "0.5"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table 1",
+          "RS peptide",
+          "80",
+          "1.8",
+          "FG-nucleoporin",
+          "32",
+          "1.1",
+          "HEWL19",
+          "11",
+          "0.5"
+        ]
+      ]
+    },
+    {
+      "id": "charmm36m_mechanism",
+      "project_slug": "internal-research",
+      "question": "CHARMM36 的 alphaL 过采样 artifact 是怎么产生的？CHARMM36m 如何用局部 CMAP 修正它？",
+      "answer_must_include": [
+        "Lennard-Jones",
+        "steric",
+        "alphaL",
+        "CMAP",
+        "60",
+        "45",
+        "2kT"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "ff99sb-disp"
+      ],
+      "citation_source_hint": "sources/charmm36m-force-field",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff14sb_overview",
+      "project_slug": "internal-research",
+      "question": "ff14SB 相对 ff99SB/ff12SB 的主要改进是什么？请概括侧链、骨架和拟合协议的变化。",
+      "answer_must_include": [
+        "ff14SB",
+        "ff99SB",
+        "ff12SB",
+        "QM-MM",
+        "GAlib",
+        "侧链"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/ff14sb",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff14sb_table_metrics",
+      "project_slug": "internal-research",
+      "question": "ff14SB 的 Table S3 中，Asp、Ile/Thr/Val、Phe/Tyr solving group 的 objective value 从 ff99SB 到 ff14SB 如何变化？",
+      "answer_must_include": [
+        "Table S3",
+        "Asp",
+        "2.5",
+        "0.9",
+        "Ile",
+        "Val",
+        "1.2",
+        "0.8",
+        "Phe",
+        "Tyr",
+        "1.7"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table S3"
+      ],
+      "citation_source_hint": "sources/ff14sb",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table S3",
+        "Asp",
+        "2.5",
+        "0.9",
+        "Ile",
+        "Val",
+        "1.2",
+        "0.8",
+        "Phe",
+        "Tyr",
+        "1.7"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table S3",
+          "Asp",
+          "2.5",
+          "0.9",
+          "Ile",
+          "Val",
+          "1.2",
+          "0.8",
+          "Phe",
+          "Tyr",
+          "1.7"
+        ]
+      ]
+    },
+    {
+      "id": "ff14sb_mechanism",
+      "project_slug": "internal-research",
+      "question": "为什么 ff14SB 的 restraint/fitting 方案能避免 ff12SB 中的 artifact？",
+      "answer_must_include": [
+        "covalent relaxation",
+        "steric clashes",
+        "backbone",
+        "side chain",
+        "phase"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/ff14sb",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff19sb_overview",
+      "project_slug": "internal-research",
+      "question": "ff19SB 的核心更新是什么？它为什么推荐和 OPC water model 一起使用？",
+      "answer_must_include": [
+        "ff19SB",
+        "amino-acid specific",
+        "backbone",
+        "QM",
+        "CMAP",
+        "OPC",
+        "TIP3P"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "CHARMM36m"
+      ],
+      "citation_source_hint": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff19sb_parameter_metrics",
+      "project_slug": "internal-research",
+      "question": "ff19SB 的参数化策略中，RESP charge fitting、QM level、CMAP 分配和验证规模有哪些具体锚点？",
+      "answer_must_include": [
+        "RESP",
+        "HF/6-31G",
+        "M05-2X",
+        "MP2/cc-pVQZ",
+        "Leu CMAP",
+        "Ile",
+        "Val CMAP",
+        "5 milliseconds"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "Table 1"
+      ],
+      "citation_source_hint": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff19sb_mechanism",
+      "project_slug": "internal-research",
+      "question": "ff19SB 为什么不再把 Alanine 当作所有残基的通用骨架模型？β-branched residues 的机制是什么？",
+      "answer_must_include": [
+        "Alanine",
+        "Valine",
+        "Leucine",
+        "Ile",
+        "Val",
+        "Thr",
+        "steric",
+        "helical propensity"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "CHARMM36m"
+      ],
+      "citation_source_hint": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff99sb_disp_overview",
+      "project_slug": "internal-research",
+      "question": "ff99sb-disp/TIP4P-D 这篇文献认为标准水模型导致 IDP 模拟失败的根本原因是什么？",
+      "answer_must_include": [
+        "ff99sb-disp",
+        "TIP4P-D",
+        "London dispersion",
+        "IDP",
+        "molten globule",
+        "Rg",
+        "FRET"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/ff99sb-disp",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff99sb_disp_table_metrics",
+      "project_slug": "internal-research",
+      "question": "TIP4P-D 在水模型参数表中相对 TIP3P 的 C6、偶极矩和表面张力数值是什么？",
+      "answer_must_include": [
+        "Table 1",
+        "TIP4P-D",
+        "TIP3P",
+        "C6",
+        "900",
+        "595",
+        "2.403",
+        "2.35",
+        "71.2",
+        "47.8"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table 1"
+      ],
+      "citation_source_hint": "sources/ff99sb-disp",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table 1",
+        "TIP4P-D",
+        "TIP3P",
+        "C6",
+        "900",
+        "595",
+        "2.403",
+        "2.35",
+        "71.2",
+        "47.8"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table 1",
+          "TIP4P-D",
+          "TIP3P",
+          "C6",
+          "900",
+          "595",
+          "2.403",
+          "2.35",
+          "71.2",
+          "47.8"
+        ]
+      ]
+    },
+    {
+      "id": "ff99sb_disp_mechanism",
+      "project_slug": "internal-research",
+      "question": "为什么 TIP4P-D 比 TIP3P/TIP4P-EW/TIP4P/2005 更能改善 IDP 构象采样？",
+      "answer_must_include": [
+        "dispersion",
+        "C6",
+        "50%",
+        "TIP4P-EW",
+        "TIP4P/2005",
+        "expanded ensembles"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/ff99sb-disp",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff99sb_ildn_overview",
+      "project_slug": "internal-research",
+      "question": "ff99SB-ILDN 修改了哪些残基的侧链扭转势？它用什么 QM 和 NMR 验证策略？",
+      "answer_must_include": [
+        "ff99SB-ILDN",
+        "Ile",
+        "Leu",
+        "Asp",
+        "Asn",
+        "LMP2",
+        "500 K",
+        "390",
+        "RDCs"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "ff14SB"
+      ],
+      "citation_source_hint": "sources/ff99sb-ildn",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "ff99sb_ildn_table_parameters",
+      "project_slug": "internal-research",
+      "question": "ff99SB-ILDN 的 Table I 列出了哪些残基/角度的修改参数？theta0 的设置是什么？",
+      "answer_must_include": [
+        "Table I",
+        "Ile",
+        "Leu",
+        "Asp",
+        "Asn",
+        "theta",
+        "0.0",
+        "χ1",
+        "χ2"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table I"
+      ],
+      "citation_source_hint": "sources/ff99sb-ildn",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table I",
+        "Ile",
+        "Leu",
+        "Asp",
+        "Asn",
+        "0.0",
+        "χ1",
+        "χ2"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table I",
+          "Ile",
+          "Leu",
+          "Asp",
+          "Asn",
+          "0.0",
+          "χ1",
+          "χ2"
+        ]
+      ]
+    },
+    {
+      "id": "ff99sb_ildn_mechanism",
+      "project_slug": "internal-research",
+      "question": "ff99SB-ILDN 为什么选择 500 K 的 Boltzmann population fitting，而不是直接拟合能量曲线或室温拟合？",
+      "answer_must_include": [
+        "Boltzmann",
+        "500 K",
+        "population",
+        "barrier",
+        "0.5 kcal/mol"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "ff14SB"
+      ],
+      "citation_source_hint": "sources/ff99sb-ildn",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "oplsaa_overview",
+      "project_slug": "internal-research",
+      "question": "OPLS-AA 相对 OPLS-UA 的主要扩展是什么？它如何拟合 torsion 和 nonbonded 参数？",
+      "answer_must_include": [
+        "OPLS-AA",
+        "OPLS-UA",
+        "explicit hydrogen",
+        "RHF/6-31G",
+        "34 organic liquids",
+        "Monte Carlo",
+        "BOSS"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS4"
+      ],
+      "citation_source_hint": "sources/opls-aa-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "oplsaa_table_metrics",
+      "project_slug": "internal-research",
+      "question": "OPLS-AA 的表格中，butane 构象能和 methanol ΔHvap 如何体现与 6-31G/实验的一致性？",
+      "answer_must_include": [
+        "Table 1",
+        "butane",
+        "6.04",
+        "6.19",
+        "Table 7",
+        "methanol",
+        "8.95",
+        "exptl"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table"
+      ],
+      "citation_source_hint": "sources/opls-aa-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table 1",
+        "butane",
+        "6.04",
+        "6.19",
+        "Table 7",
+        "methanol",
+        "8.95"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table 1",
+          "butane",
+          "6.04",
+          "6.19"
+        ],
+        [
+          "Table 7",
+          "methanol",
+          "8.95"
+        ]
+      ]
+    },
+    {
+      "id": "oplsaa_mechanism",
+      "project_slug": "internal-research",
+      "question": "为什么 OPLS-AA 的显式氢和液体性质验证能改善相对 OPLS-UA 的可转移性？",
+      "answer_must_include": [
+        "explicit hydrogen",
+        "charge",
+        "torsional",
+        "hydration free energy",
+        "tetrapeptide"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS4"
+      ],
+      "citation_source_hint": "sources/opls-aa-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "opls4_overview",
+      "project_slug": "internal-research",
+      "question": "OPLS4 相对 OPLS3e 的主要改进有哪些？请覆盖水/离子、酸性残基 torsion、硫相互作用和 FEP 验证。",
+      "answer_must_include": [
+        "OPLS4",
+        "OPLS3e",
+        "van der Waals",
+        "GLH",
+        "ASP",
+        "χ1",
+        "sulfur",
+        "FEP"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/opls4",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "opls4_table_metrics",
+      "project_slug": "internal-research",
+      "question": "OPLS4 的 pKa 和 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？",
+      "answer_must_include": [
+        "Table 5",
+        "OPLS3e",
+        "2.0",
+        "OPLS4",
+        "1.2",
+        "1.4",
+        "0.1",
+        "Table 8",
+        "1.08",
+        "0.40"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "opls4-force-field-development-and-validation"
+      ],
+      "citation_must_include": [
+        "Table"
+      ],
+      "citation_source_hint": "sources/opls4",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table 5",
+        "OPLS3e",
+        "2.0",
+        "OPLS4",
+        "1.2",
+        "Table 8",
+        "1.08",
+        "0.40"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table 5",
+          "OPLS3e",
+          "2.0",
+          "OPLS4",
+          "1.2"
+        ],
+        [
+          "Table 8",
+          "1.08",
+          "0.40"
+        ]
+      ]
+    },
+    {
+      "id": "opls4_mechanism",
+      "project_slug": "internal-research",
+      "question": "OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？",
+      "answer_must_include": [
+        "salt bridge",
+        "neutral state",
+        "MSE",
+        "χ1",
+        "GLH",
+        "ASP",
+        "GLU",
+        "vdW"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS5"
+      ],
+      "citation_source_hint": "sources/opls4",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "opls5_overview",
+      "project_slug": "internal-research",
+      "question": "OPLS5 在 OPLS4 基础上新增了哪些物理项和适用场景？",
+      "answer_must_include": [
+        "OPLS5",
+        "OPLS4",
+        "Drude",
+        "polarizability",
+        "charge transfer",
+        "LFMM",
+        "metal"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS3e only"
+      ],
+      "citation_source_hint": "sources/opls5-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true
+    },
+    {
+      "id": "opls5_table_metrics",
+      "project_slug": "internal-research",
+      "question": "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa 和 binding RMSE 相比 OPLS4 有哪些数值改善？",
+      "answer_must_include": [
+        "Table 2",
+        "0.76",
+        "0.46",
+        "Table 4",
+        "-0.136",
+        "-0.14",
+        "Table 5",
+        "GLU",
+        "0.70",
+        "0.61",
+        "Table 7",
+        "1.18",
+        "1.12"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG"
+      ],
+      "citation_must_include": [
+        "Table"
+      ],
+      "citation_source_hint": "sources/opls5-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true,
+      "citation_excerpt_must_include": [
+        "Table 2",
+        "0.76",
+        "0.46",
+        "Table 4",
+        "-0.136",
+        "-0.14",
+        "Table 5",
+        "GLU",
+        "0.70",
+        "0.61",
+        "Table 7",
+        "1.18",
+        "1.12"
+      ],
+      "citation_excerpt_groups_must_include": [
+        [
+          "Table 2",
+          "0.76",
+          "0.46"
+        ],
+        [
+          "Table 4",
+          "-0.136",
+          "-0.14"
+        ],
+        [
+          "Table 5",
+          "GLU",
+          "0.70",
+          "0.61"
+        ],
+        [
+          "Table 7",
+          "1.18",
+          "1.12"
+        ]
+      ]
+    },
+    {
+      "id": "opls5_mechanism",
+      "project_slug": "internal-research",
+      "question": "为什么 OPLS5 对 polarizability-sensitive/cation-pi 和金属体系比 OPLS4 更准确？",
+      "answer_must_include": [
+        "Drude",
+        "polarizability",
+        "cation",
+        "FXA",
+        "-2.4",
+        "-0.5",
+        "charge transfer",
+        "LFMM",
+        "MMP13"
+      ],
+      "answer_must_not_include": [
+        "未包含",
+        "无法提取",
+        "not present",
+        "not found",
+        "SAC-KG",
+        "OPLS3e only"
+      ],
+      "citation_source_hint": "sources/opls5-force-field-development-and-validation",
+      "require_citation": true,
+      "require_chinese": true
+    }
+  ]
+}
