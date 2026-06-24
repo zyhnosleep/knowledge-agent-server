@@ -468,7 +468,7 @@ class QueryService:
             if key and key not in seen:
                 ordered.append(term)
                 seen.add(key)
-        return ordered[:32]
+        return ordered[:96]
 
     @classmethod
     def _is_profile_retrieval_term(cls, term: str) -> bool:

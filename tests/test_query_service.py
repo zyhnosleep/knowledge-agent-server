@@ -885,7 +885,13 @@ def test_rag_contexts_use_profile_terms_only_for_retrieval_expansion() -> None:
             "paper_profile": {
                 "title": "ff14SB",
                 "aliases": ["ff14SB"],
-                "key_terms": ["ff14SB", "QM-MM", "GAlib", "side-chain"],
+                "key_terms": [
+                    "ff14SB",
+                    *[f"NoiseTerm{index}" for index in range(40)],
+                    "QM-MM",
+                    "GAlib",
+                    "side-chain",
+                ],
                 "routing_summary": "ff14SB improves side-chain and backbone fitting.",
                 "source_slug": "sources/ff14sb",
             },
