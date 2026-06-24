@@ -969,6 +969,63 @@ def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
     assert contexts == []
 
 
+def test_sac_kg_claim_evidence_rejects_cross_document_chunk_ids() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    routed = Document(
+        id="routed",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="routed",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={"source_slug": "sources/opls5", "source_title": "OPLS5"},
+        status="ready",
+    )
+    other = Document(
+        id="other",
+        project_id="p1",
+        title="Other Paper",
+        file_name="other.pdf",
+        sha256="other",
+        raw_path="raw/other.pdf",
+        raw_text="Other paper.",
+        metadata_json={"source_slug": "sources/other", "source_title": "Other"},
+        status="ready",
+    )
+    foreign_chunk = DocumentChunk(
+        id="foreign",
+        document_id="other",
+        ordinal=0,
+        text="The Drude model and LFMM functionality belong to another paper.",
+        page_label="9",
+        embedding=None,
+    )
+    stale_claim = Claim(
+        id="claim1",
+        project_id="p1",
+        document_id="routed",
+        subject="Drude model",
+        predicate="supports",
+        object_text="LFMM metal functionality",
+        evidence_chunk_id="foreign",
+        confidence=0.7,
+        verification_status="needs-review",
+        metadata_json={},
+    )
+    db.add_all([project, routed, other, foreign_chunk, stale_claim])
+    db.commit()
+
+    contexts = QueryService(db)._search_claim_evidence_contexts(
+        "OPLS5 如何用 Drude 和 LFMM 处理 metal 体系？",
+        "p1",
+        ["routed"],
+    )
+
+    assert contexts == []
+
+
 def test_rag_metric_answer_retargets_conflicting_prose_numbers_to_table_values() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1105,13 +1162,51 @@ def test_rag_table_query_falls_back_to_global_document_tables_when_router_misses
     contexts = QueryService(db)._build_rag_contexts(
         "What are FooNet Accuracy and F1 on Dataset-A in Table 7?",
         "p1",
-        [PaperMatch(document=wrong_document, score=20, exact_alias=True)],
+        [PaperMatch(document=wrong_document, score=2, exact_alias=False)],
     )
 
     assert contexts
     assert contexts[0].citation.document_id == "right"
     assert contexts[0].citation.page_slug == "sources/right-foonet"
     assert "91.2" in contexts[0].citation.excerpt
+
+
+def test_rag_table_query_does_not_global_fallback_for_exact_routed_document() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    routed_document = Document(
+        id="routed",
+        project_id="p1",
+        title="FooNet",
+        file_name="foonet.pdf",
+        sha256="routed",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet paper has no relevant table.",
+        metadata_json={"source_slug": "sources/foonet"},
+        status="ready",
+    )
+    other_document = make_table_document(
+        id="other",
+        title="Other FooNet Benchmark",
+        source_slug="sources/other-foonet",
+        table_markdown=(
+            "Table 7: FooNet benchmark results.\n"
+            "| Model | Dataset-A | Dataset-A |\n"
+            "| --- | --- | --- |\n"
+            "|  | Accuracy | F1 |\n"
+            "| FooNet | 91.2 | 88.4 |"
+        ),
+    )
+    db.add_all([project, routed_document, other_document])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "What are FooNet Accuracy and F1 on Dataset-A in Table 7?",
+        "p1",
+        [PaperMatch(document=routed_document, score=20, exact_alias=True)],
+    )
+
+    assert contexts == []
 
 
 def test_route_papers_locks_subject_before_de_table_phrase() -> None:

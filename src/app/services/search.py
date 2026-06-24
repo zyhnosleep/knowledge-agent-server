@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -345,7 +345,8 @@ class QueryService:
         contexts: list[RetrievedContext] = []
         if self._is_table_query(question) or self._is_metric_query(question):
             table_contexts = self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
-            if not table_contexts and document_ids:
+            has_exact_route = any(match.exact_alias for match in paper_matches)
+            if not table_contexts and document_ids and not has_exact_route:
                 table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(table_contexts)
         if document_ids:
@@ -455,11 +456,18 @@ class QueryService:
             return []
         statement = (
             select(Claim, DocumentChunk)
-            .join(DocumentChunk, DocumentChunk.id == Claim.evidence_chunk_id)
+            .join(
+                DocumentChunk,
+                and_(
+                    DocumentChunk.id == Claim.evidence_chunk_id,
+                    DocumentChunk.document_id == Claim.document_id,
+                ),
+            )
             .where(
                 Claim.project_id == project_id,
                 Claim.document_id.in_(document_ids),
                 Claim.evidence_chunk_id.is_not(None),
+                DocumentChunk.document.has(project_id=project_id),
             )
         )
         rows = self.db.execute(statement).all()
