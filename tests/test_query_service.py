@@ -868,6 +868,60 @@ def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
     assert any("LFMM" in context.prompt_text for context in contexts)
 
 
+def test_rag_contexts_use_profile_terms_only_for_retrieval_expansion() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff14SB",
+        file_name="ff14sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff14sb.pdf",
+        raw_text="ff14SB paper.",
+        metadata_json={
+            "source_slug": "sources/ff14sb",
+            "source_title": "ff14SB",
+            "paper_profile": {
+                "title": "ff14SB",
+                "aliases": ["ff14SB"],
+                "key_terms": ["ff14SB", "QM-MM", "GAlib", "side-chain"],
+                "routing_summary": "ff14SB improves side-chain and backbone fitting.",
+                "source_slug": "sources/ff14sb",
+            },
+        },
+        status="ready",
+    )
+    generic_chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="ff14SB improves fitting protocol details in supporting information.",
+        page_label="1",
+        embedding=None,
+    )
+    profile_term_chunk = DocumentChunk(
+        id="c2",
+        document_id="d1",
+        ordinal=5,
+        text="QM-MM refinement and GAlib population evolution were used for side-chain parameters.",
+        page_label="5",
+        embedding=None,
+    )
+    db.add_all([project, document, generic_chunk, profile_term_chunk])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "ff14SB 的 fitting protocol 有什么变化？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert any(context.citation.chunk_id == "c2" for context in contexts)
+    assert any("GAlib" in context.citation.excerpt for context in contexts)
+    assert all("paper_profile" not in context.prompt_text for context in contexts)
+
+
 def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

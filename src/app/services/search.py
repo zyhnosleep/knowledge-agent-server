@@ -343,6 +343,7 @@ class QueryService:
 
     def _build_rag_contexts(self, question: str, project_id: str, paper_matches: list[PaperMatch]) -> list[RetrievedContext]:
         document_ids = [match.document.id for match in paper_matches]
+        profile_terms = self._paper_profile_retrieval_terms(paper_matches)
         contexts: list[RetrievedContext] = []
         if self._is_table_query(question) or self._is_metric_query(question):
             table_contexts = self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
@@ -352,7 +353,7 @@ class QueryService:
             contexts.extend(table_contexts)
         if document_ids:
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS))
-            contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS))
+            contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
         if not contexts and not document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
         return self._finalize_contexts(contexts)
@@ -446,6 +447,41 @@ class QueryService:
             fields[document.id] = source_fields_for_document(document)
         return fields
 
+    @classmethod
+    def _paper_profile_retrieval_terms(cls, paper_matches: list[PaperMatch]) -> list[str]:
+        terms: list[str] = []
+        for match in paper_matches:
+            metadata = match.document.metadata_json or {}
+            raw_profile = metadata.get("paper_profile") if isinstance(metadata, dict) else None
+            profile = raw_profile if isinstance(raw_profile, dict) and raw_profile.get("key_terms") else paper_profile_data(match.document)
+            for term in profile.get("key_terms") or []:
+                value = str(term or "").strip()
+                if cls._is_profile_retrieval_term(value):
+                    terms.append(value)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            key = cls._normalize_selector(term)
+            if key and key not in seen:
+                ordered.append(term)
+                seen.add(key)
+        return ordered[:32]
+
+    @classmethod
+    def _is_profile_retrieval_term(cls, term: str) -> bool:
+        key = cls._normalize_selector(term)
+        if len(key) < 3 or key in cls._CLAIM_ANCHOR_STOP_KEYS:
+            return False
+        if cls._is_table_model_term_key(key):
+            return False
+        if re.search(r"[-_/]", term):
+            return True
+        if re.search(r"\d", term):
+            return True
+        if re.search(r"[A-Z].*[A-Z]", term) or re.search(r"[a-z][A-Z]", term):
+            return True
+        return key in {"backbone", "sidechain", "sidechains", "rotamer", "rotamers", "torsion", "torsions"}
+
     def _search_claim_evidence_contexts(
         self,
         question: str,
@@ -521,7 +557,14 @@ class QueryService:
             seen_chunk_ids.add(chunk.id)
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
-    def _search_source_chunks(self, question: str, project_id: str, document_ids: list[str], limit: int = 3) -> list[RetrievedContext]:
+    def _search_source_chunks(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 3,
+        route_terms: list[str] | None = None,
+    ) -> list[RetrievedContext]:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(DocumentChunk.document.has(project_id=project_id))
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
@@ -532,19 +575,24 @@ class QueryService:
         )
 
         question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
-        query_terms = self._tokenize(question)
+        base_query_terms = self._tokenize(question)
+        route_query_terms = self._tokenize(" ".join(route_terms or []))
+        query_terms = base_query_terms | route_query_terms
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
         scored: list[RetrievedContext] = []
         for chunk in chunks:
             score = 0.0
+            chunk_terms = self._tokenize(chunk.text)
+            overlap = len(base_query_terms & chunk_terms)
+            route_overlap = len(route_query_terms & chunk_terms)
             if question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8)
             else:
-                chunk_terms = self._tokenize(chunk.text)
-                overlap = len(query_terms & chunk_terms)
-                if overlap:
-                    score = min(0.3 + overlap * 0.1, 0.85)
+                total_overlap = overlap + route_overlap
+                if total_overlap:
+                    score = min(0.3 + total_overlap * 0.1, 0.85)
             if score <= 0:
                 continue
             has_table_data = self._context_has_table_data(chunk.text)
