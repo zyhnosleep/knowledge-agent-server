@@ -2,7 +2,7 @@
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
-from app.models.records import Document, DocumentChunk, Project, QuestionAnswer, WikiPage
+from app.models.records import Claim, Document, DocumentChunk, Project, QuestionAnswer, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
 from app.services.search import ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
@@ -792,6 +792,75 @@ def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() 
     assert contexts
     assert contexts[0].citation.excerpt.startswith("Table evidence:")
     assert "91.2" in contexts[0].citation.excerpt
+
+
+def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="abc",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={
+            "source_slug": "sources/opls5",
+            "source_title": "OPLS5",
+            "paper_profile": {
+                "title": "OPLS5",
+                "aliases": ["OPLS5"],
+                "key_terms": ["OPLS5", "polarizability", "metals"],
+                "routing_summary": "OPLS5 adds polarizability and improves metal treatment.",
+                "source_slug": "sources/opls5",
+            },
+        },
+        status="ready",
+    )
+    evidence_chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=7,
+        text=(
+            "The Drude model incorporates intramolecular polarizability. "
+            "Metal containing systems employ FlucCT and LFMM functionality."
+        ),
+        page_label="7",
+        embedding=None,
+    )
+    generic_chunk = DocumentChunk(
+        id="c2",
+        document_id="d1",
+        ordinal=1,
+        text="OPLS5 overview title and author list.",
+        page_label="1",
+        embedding=None,
+    )
+    claim = Claim(
+        id="claim1",
+        project_id="p1",
+        document_id="d1",
+        subject="Drude model",
+        predicate="supports",
+        object_text="intramolecular polarizability and LFMM metal functionality",
+        evidence_chunk_id="c1",
+        confidence=0.7,
+        verification_status="needs-review",
+        metadata_json={"evidence_excerpt": evidence_chunk.text},
+    )
+    db.add_all([project, document, evidence_chunk, generic_chunk, claim])
+    db.commit()
+
+    contexts = QueryService(db)._search_claim_evidence_contexts(
+        "OPLS5 如何用 Drude polarizability 和 LFMM 改善 metal 体系？",
+        "p1",
+        ["d1"],
+    )
+
+    assert contexts
+    assert any(context.citation.chunk_id == "c1" for context in contexts)
+    assert any("LFMM" in context.prompt_text for context in contexts)
 
 
 def test_rag_metric_answer_retargets_conflicting_prose_numbers_to_table_values() -> None:

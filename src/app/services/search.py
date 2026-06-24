@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.records import Document, DocumentChunk, PageKind, Project, QuestionAnswer, WikiPage
+from app.models.records import Claim, Document, DocumentChunk, PageKind, Project, QuestionAnswer, WikiPage
 from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
@@ -332,6 +332,7 @@ class QueryService:
                 table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(table_contexts)
         if document_ids:
+            contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS))
             contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS))
         if not contexts and not document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
@@ -425,6 +426,76 @@ class QueryService:
         for document in documents:
             fields[document.id] = source_fields_for_document(document)
         return fields
+
+    def _search_claim_evidence_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 5,
+    ) -> list[RetrievedContext]:
+        if not document_ids:
+            return []
+        statement = (
+            select(Claim, DocumentChunk)
+            .join(DocumentChunk, DocumentChunk.id == Claim.evidence_chunk_id)
+            .where(
+                Claim.project_id == project_id,
+                Claim.document_id.in_(document_ids),
+                Claim.evidence_chunk_id.is_not(None),
+            )
+        )
+        rows = self.db.execute(statement).all()
+        if not rows:
+            return []
+
+        source_page_fields = self._source_page_fields_by_document_id(project_id, document_ids)
+        query_terms = self._tokenize(question)
+        selector_terms = {
+            self._normalize_selector(term)
+            for term in [
+                *self._question_row_selectors(question),
+                *self._extract_generic_table_terms(question),
+                *self._extract_query_facets(question),
+            ]
+            if len(self._normalize_selector(term)) >= 3
+        }
+        scored: list[RetrievedContext] = []
+        seen_chunk_ids: set[str] = set()
+        for claim, chunk in rows:
+            if chunk.id in seen_chunk_ids:
+                continue
+            claim_text = f"{claim.subject} {claim.predicate} {claim.object_text} {claim.metadata_json or {}}"
+            combined_text = f"{claim_text}\n{chunk.text}"
+            overlap = len(query_terms & self._tokenize(combined_text))
+            combined_key = self._normalize_selector(combined_text)
+            anchor_matches = sum(1 for term in selector_terms if term in combined_key)
+            if overlap <= 0 and anchor_matches <= 0:
+                continue
+            evidence_terms = query_terms | self._tokenize(claim_text)
+            evidence = self._window_text(chunk.text, evidence_terms, max_chars=1400, question=question)
+            prompt_text = (
+                "SAC-KG claim hint: "
+                f"{claim.subject} {claim.predicate} {claim.object_text}\n\n"
+                f"Source evidence:\n{evidence}"
+            )
+            score = 18.0 + overlap * 2.0 + anchor_matches * 3.0 + float(claim.confidence or 0.0)
+            scored.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=chunk.document_id,
+                        chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
+                        score=score,
+                        page_label=chunk.page_label,
+                        excerpt=evidence[:900],
+                    ),
+                    prompt_text=prompt_text,
+                    score=score,
+                )
+            )
+            seen_chunk_ids.add(chunk.id)
+        return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
     def _search_source_chunks(self, question: str, project_id: str, document_ids: list[str], limit: int = 3) -> list[RetrievedContext]:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(DocumentChunk.document.has(project_id=project_id))
