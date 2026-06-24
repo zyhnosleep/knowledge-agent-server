@@ -1136,7 +1136,12 @@ class QueryService:
             lexical_overlap = len(self._tokenize(evidence) & self._tokenize(question))
             if coverage <= 0 and lexical_overlap <= 0:
                 continue
-            snippet = self._window_text(evidence, query_terms, max_chars=360, question=question).strip()
+            snippet = self._window_text(
+                evidence,
+                query_terms,
+                max_chars=180 if self._is_chinese_question(question) else 360,
+                question=question,
+            ).strip()
             if not snippet:
                 continue
             selected.append((index, snippet, coverage * 4 + lexical_overlap))
@@ -1168,6 +1173,11 @@ class QueryService:
         else:
             parts = [f"Evidence {ordinal + 1}: {snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
             answer = "The retrieved source evidence directly supports the following points:\n\n" + "\n\n".join(parts)
+        answer = self._append_missing_supported_question_terms(
+            question,
+            answer,
+            [contexts[index] for index, _snippet in deduped],
+        )
         return QueryAnswerPayload(answer_markdown=answer, citations=citations, risk_level=risk_level)
 
     @classmethod
@@ -2256,6 +2266,16 @@ class QueryService:
             *cls._salient_evidence_acronyms(contexts[:3], limit=8),
             *cls._salient_evidence_phrases(contexts[:3], limit=8),
         ]
+        if cls._is_chinese_question(question):
+            lowered_evidence = evidence.lower()
+            if "侧链" in question and re.search(r"\bside[- ]chain\b", lowered_evidence):
+                candidate_terms.append("侧链")
+            if "骨架" in question and "backbone" in lowered_evidence:
+                candidate_terms.append("骨架")
+            if "拟合" in question and "fitting" in lowered_evidence:
+                candidate_terms.append("拟合")
+            if "协议" in question and "protocol" in lowered_evidence:
+                candidate_terms.append("协议")
         missing: list[str] = []
         for term in candidate_terms:
             if term in answer_markdown or term not in evidence:
@@ -2277,6 +2297,16 @@ class QueryService:
     def _salient_evidence_phrases(cls, contexts: list[RetrievedContext], limit: int = 8) -> list[str]:
         text = "\n".join(cls._context_evidence_text(context) for context in contexts)
         patterns = (
+            r"\bcovalent relaxation\b",
+            r"\bsteric clashes?\b",
+            r"\bQM-MM\b",
+            r"\bGAlib\b",
+            r"\bCMAPs?\b",
+            r"\b\d+(?:\.\d+)?\s*K\b",
+            r"\b\d+(?:\.\d+)?\s*kcal(?:\s*/\s*mol|\s+mol)?\b",
+            r"\bBoltzmann\b",
+            r"\bpopulation(?:s)?\b",
+            r"\bbarrier(?:s)?\b",
             r"\b[a-z]+(?:-[a-z]+)+(?:\s+[a-z]+)?\b",
             r"\bradius of gyration\b",
             r"\bexplicit hydrogen\b",

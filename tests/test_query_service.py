@@ -1042,6 +1042,43 @@ def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> N
     assert contexts[answer.citations[0]].citation.chunk_id == "c1"
 
 
+def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> None:
+    service = QueryService(make_session())
+    long_prefix = "ff14SB fitting protocol background. " + ("intro text " * 80)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="c1",
+                page_slug="sources/ff14sb",
+                page_title="ff14SB",
+                page_kind="source_summary",
+                score=1,
+                excerpt=long_prefix,
+            ),
+            prompt_text=(
+                long_prefix
+                + "The new restraint scheme allowed covalent relaxation of steric clashes "
+                + "while preserving backbone and side chain phase behavior."
+            ),
+            score=1,
+        )
+    ]
+
+    answer = service._deterministic_scientific_evidence_answer_if_supported(
+        "为什么 ff14SB 的 restraint/fitting 方案能避免 ff12SB 中的 artifact？",
+        contexts,
+        "normal",
+    )
+
+    assert answer is not None
+    assert "covalent relaxation" in answer.answer_markdown
+    assert "steric clashes" in answer.answer_markdown
+    cjk_count = sum(1 for char in answer.answer_markdown if "\u4e00" <= char <= "\u9fff")
+    latin_count = sum(1 for char in answer.answer_markdown if ("a" <= char.lower() <= "z"))
+    assert cjk_count / (cjk_count + latin_count) >= 0.2
+
+
 def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
     service = QueryService(make_session())
     service.ollama = ExplodingOllama()
