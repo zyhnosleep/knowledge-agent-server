@@ -7,6 +7,7 @@ from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
 from app.services.search import ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
 from app.schemas.common import Citation
+from app.services.table_normalization import normalize_table_text
 
 
 class FakeOllama:
@@ -39,6 +40,20 @@ class SequencedFakeOllama(FakeOllama):
         if len(self.payloads) > 1:
             return self.payloads.pop(0)
         return self.payloads[0]
+
+
+class CountingFakeOllama(FakeOllama):
+    def __init__(self) -> None:
+        super().__init__()
+        self.generate_calls = 0
+
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        self.generate_calls += 1
+        return QueryAnswerPayload(
+            answer_markdown="The requested table values are not present in the provided context.",
+            citations=[0],
+            risk_level="normal",
+        )
 
 
 def make_session() -> Session:
@@ -924,6 +939,52 @@ def test_rag_table_query_falls_back_to_global_document_tables_when_router_misses
     assert "91.2" in contexts[0].citation.excerpt
 
 
+def test_route_papers_locks_subject_before_de_table_phrase() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    opls4 = make_table_document(
+        id="opls4",
+        title="opls4",
+        source_slug="sources/opls4",
+        table_markdown="Table 2.\n| Row | OPLS4 |\n| --- | --- |\n| value | 1.0 |",
+        raw_text="OPLS4 force field paper.",
+    )
+    opls4.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "opls4",
+        "one_sentence": "OPLS4 force field paper.",
+        "routing_summary": "Aliases: OPLS4.",
+        "aliases": ["OPLS4"],
+        "key_terms": ["OPLS4"],
+        "source_slug": "sources/opls4",
+    }
+    opls5 = make_table_document(
+        id="opls5",
+        title="opls5",
+        source_slug="sources/opls5",
+        table_markdown="Table 2.\n| Row | OPLS4 | OPLS5 |\n| --- | --- | --- |\n| value | 0.76 | 0.46 |",
+        raw_text="OPLS5 force field paper.",
+    )
+    opls5.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "opls5",
+        "one_sentence": "OPLS5 force field paper.",
+        "routing_summary": "Aliases: OPLS5.",
+        "aliases": ["OPLS5"],
+        "key_terms": ["OPLS5", "OPLS4"],
+        "source_slug": "sources/opls5",
+    }
+    db.add_all([opls4, opls5])
+    db.commit()
+
+    matches = QueryService(db)._route_papers(
+        "OPLS5 的表格中，芳香小分子 HFE 相比 OPLS4 有哪些数值改善？",
+        "p1",
+    )
+
+    assert [match.document.title for match in matches] == ["opls5"]
+
+
 def test_explicit_table_query_does_not_use_prose_metric_chunk_as_table_evidence() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1440,8 +1501,8 @@ def test_metric_query_repairs_false_missing_answer_when_table_context_exists() -
     assert "74.7" in response.answer_markdown
     assert "88.8" in response.answer_markdown
     assert response.citations
-    assert "88.8" in response.citations[0].excerpt or "88.8" in fake_ollama.prompts[-1]
-    assert len(fake_ollama.prompts) == 2
+    assert "88.8" in response.citations[0].excerpt
+    assert len(fake_ollama.prompts) == 0
 
 
 def test_build_contexts_adds_component_facets() -> None:
@@ -2031,9 +2092,10 @@ def test_chinese_table_query_prompt_requires_chinese_answer() -> None:
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
+    response = service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
 
-    assert "Answer in Chinese" in fake_ollama.last_prompt
+    assert fake_ollama.last_prompt == ""
+    assert "已在表格证据中找到相关指标" in response.answer_markdown
 
 
 def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_lacks_table() -> None:
@@ -2077,10 +2139,7 @@ def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_
 
     assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
     assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
-    assert "74.7" in service.ollama.prompts[0]
-    assert "87.3" in service.ollama.prompts[0]
-    assert "74.7" in service.ollama.prompts[-1]
-    assert "87.3" in service.ollama.prompts[-1]
+    assert service.ollama.prompts == []
 
 
 def test_table_citation_indexes_detect_table_data_in_citation_excerpt() -> None:
@@ -2106,6 +2165,32 @@ def test_table_citation_indexes_detect_table_data_in_citation_excerpt() -> None:
     ]
 
     indexes = service._table_citation_indexes("What are SAC-KG metrics on OIE2016 and NYT?", contexts)
+
+    assert indexes == [0]
+
+
+def test_table_citation_indexes_detect_supplemental_table_labels() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table S3: Objective values O for each solving group.\n"
+        "| Solving group | Amino acids | O ff99SB | O ff14SB |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 9 | Asp | 2.5 | 0.9 |\n"
+        "| 2 | Ile Thr Val | 1.2 | 0.8 |\n"
+        "| 5 | Phe Tyr | 1.7 | 0.8 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff14sb", page_title="ff14SB", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+
+    indexes = service._table_citation_indexes(
+        "ff14SB 的 Table S3 中，Asp、Ile/Thr/Val、Phe/Tyr solving group 的 objective value 如何变化？",
+        contexts,
+    )
 
     assert indexes == [0]
 
@@ -2260,7 +2345,7 @@ def test_table_evidence_replacement_preserves_inline_citation_marker() -> None:
 
     response = service.answer("demo", "What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
 
-    assert response.answer_markdown.endswith("[0].")
+    assert response.answer_markdown.endswith("[0]")
     assert len(response.citations) == 1
     assert response.citations[0].excerpt.startswith("Table 5")
 
@@ -2530,6 +2615,316 @@ def test_metric_query_extracts_generic_table7_foonet_metrics() -> None:
     assert response.citations[0].excerpt.startswith("Table 7")
 
 
+def test_generic_table_terms_include_lowercase_scientific_entities() -> None:
+    terms = QueryService._extract_generic_table_terms(
+        "OPLS-AA 的表格中，butane 构象能和 methanol ΔHvap 如何体现与 6-31G/实验的一致性？"
+    )
+
+    assert "butane" in terms
+    assert "methanol" in terms
+    assert "6-31G" in terms
+    assert QueryService._is_comparison_or_difference_query("如何体现与 6-31G/实验的一致性？")
+
+
+def test_generic_table_terms_keep_chinese_aliases_for_multi_table_questions() -> None:
+    terms = QueryService._extract_generic_table_terms(
+        "OPLS5 \u7684\u8868\u683c\u4e2d\uff0c\u82b3\u9999\u5c0f\u5206\u5b50 HFE\u3001"
+        "\u76d0\u6865 pKa shift\u3001GLU pKa \u548c binding RMSE "
+        "\u76f8\u6bd4 OPLS4 \u6709\u54ea\u4e9b\u6570\u503c\u6539\u5584\uff1f"
+    )
+
+    assert "aromatic" in terms
+    assert "acetate" in terms
+    assert "guanidinium" in terms
+
+
+def test_table_block_excerpt_uses_lowercase_scientific_terms_for_rows() -> None:
+    block = (
+        "Table 1. Relative Energies (kcal/mol).\n"
+        "| molecule | dihedral | conf | OPLS-AA | 6-31G* |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| ethane | H-C-C-H | 0 | 3.01 | 2.99 |\n"
+        "| propane | H-C-C-C | 0 | 3.32 | 3.34 |\n"
+        "| pentane | C-C-C-C | 0 | 4.21 | 4.20 |\n"
+        "| butane | C-C-C-C | 0 | 6.04 | 6.19 |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "OPLS-AA 的表格中，butane 构象能如何体现与 6-31G 的一致性？",
+    )
+
+    assert "butane" in excerpt
+    assert "6.04" in excerpt
+    assert "6.19" in excerpt
+
+
+def test_table_block_excerpt_does_not_match_selector_inside_longer_chemical_name() -> None:
+    block = (
+        "Table 1. Relative Energies (kcal/mol).\n"
+        "| molecule | dihedral | conf | OPLS-AA | 6-31G* |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| butane | C-C-C-C | 0 | 6.04 | 6.19 |\n"
+        "| 2-methylbutane | C-C-C-C | 120 | 3.68 | 3.65 |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "OPLS-AA 的表格中，butane 构象能如何体现与 6-31G 的一致性？",
+    )
+
+    assert "butane" in excerpt
+    assert "6.04" in excerpt
+    assert "2-methylbutane" not in excerpt
+    assert "3.68" not in excerpt
+
+
+def test_table_block_excerpt_maps_chinese_error_terms_to_rmse_rows() -> None:
+    block = (
+        "Table 8. Relative Interaction Energy between Sigma-Hole and Head-on Directions (kcal/mol).\n"
+        "| interaction partner | CCSD(T)/CBS | OPLS3e | OPLS4 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| NMA oxygen | -2.15 | -0.99 | -1.94 |\n"
+        "| pyridine nitrogen | -1.88 | -0.44 | -1.64 |\n"
+        "| water oxygen | 10.99 | -0.33 | -0.51 |\n"
+        "| RMS error |  | 1.08 | 0.40 |"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "OPLS4 的 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？",
+    )
+
+    assert "RMS error" in excerpt
+    assert "1.08" in excerpt
+    assert "0.40" in excerpt
+
+
+def test_generic_table_answer_keeps_secondary_calcd_exptl_headers() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 7. OPLS-AA Energetic Results for Liquid Hydrocarbons and Alcohols.\n"
+        "|  |  |  |  |  | Delta H vap | Delta H vap |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        "| liquid | T | - E inter ( 1 ) | E intra ( g ) | E intra ( 1 ) | calcd | exptl |\n"
+        "| methanol | 25.00 | 8.51 ± 0.02 | 7.08 ± 0.02 | 7.23 ± 0.01 | 8.95 ± 0.02 | 8.95c |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/opls-aa", page_title="OPLS-AA", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        "OPLS-AA 的表格中，methanol ΔHvap 如何体现与实验的一致性？",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert answer is not None
+    assert "exptl" in answer.answer_markdown
+    assert "8.95c" in answer.answer_markdown
+
+
+def test_generic_table_answer_keeps_paired_comparison_rows() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 1: alpha L conformational sampling.\n"
+        "| System | Simulation | alpha L probability (%) | alpha L propensity Max. | alpha L length |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| FG-nucleoporin peptide | C36 | 32 ± 6 | 22 ± 2 | 14 aa |\n"
+        "| FG-nucleoporin peptide | C36m | 1.1 ± 0.3 | 6.2 ± 0.2 | 5 aa |\n"
+        "| RS peptide | C36 | 80 ± 2 | 41 ± 1 | 17 aa |\n"
+        "| RS peptide | C36m | 1.8 ± 0.5 | 5.5 ± 0.2 | 5 aa |\n"
+        "| IN | C36 | 64 ± 18 | 14 ± 2 | 7 aa |\n"
+        "| IN | C36m | 3 ± 2 | 5.6 ± 0.5 | 4 aa |\n"
+        "| HEWL19 peptide | C36 | 11 ± 7 | 12 ± 2 | 8 aa |\n"
+        "| HEWL19 peptide | C36m | 0.5 ± 0.4 | 6.1 ± 0.7 | 3 aa |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/charmm36m", page_title="CHARMM36m", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        "CHARMM36m 的 Table 1 中，RS peptide、FG-nucleoporin peptide 和 HEWL19 的 alphaL probability 相比 C36 降到了多少？",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert answer is not None
+    assert "80 ± 2" in answer.answer_markdown
+    assert "1.8 ± 0.5" in answer.answer_markdown
+    assert "32 ± 6" in answer.answer_markdown
+    assert "1.1 ± 0.3" in answer.answer_markdown
+    assert "11 ± 7" in answer.answer_markdown
+    assert "0.5 ± 0.4" in answer.answer_markdown
+    cjk_count = sum(1 for char in answer.answer_markdown if "\u4e00" <= char <= "\u9fff")
+    latin_count = sum(1 for char in answer.answer_markdown if "a" <= char.lower() <= "z")
+    assert cjk_count / (cjk_count + latin_count) >= 0.2
+
+
+def test_deterministic_table_answer_uses_generic_rows_for_objective_values() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table S3: Objective values O for each solving group.\n"
+        "| Solving group | Amino acids | O ff99SB | O ff14SB |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 9 | Asp | 2.5 | 0.9 |\n"
+        "| 2 | Ile Thr Val | 1.2 | 0.8 |\n"
+        "| 5 | Phe Tyr | 1.7 | 0.8 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff14sb", page_title="ff14SB", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+
+    answer = service._deterministic_table_answer(
+        "ff14SB 的 Table S3 中，Asp、Ile/Thr/Val、Phe/Tyr solving group 的 objective value 从 ff99SB 到 ff14SB 如何变化？",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert "F1" not in answer.answer_markdown
+    assert "Asp" in answer.answer_markdown
+    assert "2.5" in answer.answer_markdown
+    assert "0.9" in answer.answer_markdown
+    assert "Ile Thr Val" in answer.answer_markdown
+    assert "1.2" in answer.answer_markdown
+    assert "0.8" in answer.answer_markdown
+    assert "Phe Tyr" in answer.answer_markdown
+    assert "1.7" in answer.answer_markdown
+
+
+def test_non_metric_table_answer_ignores_metric_extractor_candidates(monkeypatch) -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table S3: Objective values O for each solving group.\n"
+        "| Solving group | Amino acids | O ff99SB | O ff14SB |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 9 | Asp | 2.5 | 0.9 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff14sb", page_title="ff14SB", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+    monkeypatch.setattr(
+        service,
+        "_extract_requested_metric_values",
+        lambda question, contexts, table_indexes: [ExtractedMetric(0, "Table S3", "Solving group", {"F1": "O ff14SB"})],
+    )
+
+    answer = service._deterministic_table_answer(
+        "ff14SB 的 Table S3 中，Asp solving group 的 objective value 从 ff99SB 到 ff14SB 如何变化？",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert "F1" not in answer.answer_markdown
+    assert "2.5" in answer.answer_markdown
+    assert "0.9" in answer.answer_markdown
+
+
+def test_rag_table_query_answers_grouped_peptide_values_without_model_generation() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    table = (
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Property | ff99SB | ff99SB* | C22/CMAP | C36 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| Ala5 | | | | | |\n"
+        "|  | % ppII | 46.2 (1.0) | 52.1 (1.1) | 45.4 (1.0) | 51.9 (1.1) |\n"
+        "|  | % alpha-helix | 0.2 (0.1) | 0.3 (0.1) | 0.1 (0.1) | 0.1 (0.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | | | | | |\n"
+        "|  | % ppII | 28.0 (1.4) | 30.1 (1.2) | 0.5 (0.2) | 29.5 (1.2) |\n"
+        "|  | % alpha-helix | 5.4 (0.8) | 8.2 (1.1) | 95.3 (0.1) | 21.0 (1.7) |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36-force-field-refinement-for-proteins",
+                page_title="CHARMM36",
+                page_kind="source_summary",
+                score=42,
+                excerpt=QueryService._table_citation_excerpt(table, "CHARMM36 table Ala5 Ac-(AAQAA)3-NH2 C22/CMAP C36"),
+            ),
+            prompt_text=table,
+            score=42,
+        )
+    ]
+
+    service = QueryService(db)
+    fake_ollama = CountingFakeOllama()
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+    service._route_papers = lambda question, project_id: []
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
+    service._search_source_chunks = lambda question, project_id, document_ids, limit=5: []
+
+    response = service.answer(
+        "demo",
+        "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？和 C22/CMAP 的螺旋比例有什么差异？",
+        save_answer=False,
+    )
+
+    assert fake_ollama.generate_calls == 0
+    assert "Ala5" in response.answer_markdown
+    assert "51.9" in response.answer_markdown
+    assert "Ac-(AAQAA)3-NH2" in response.answer_markdown
+    assert "21.0" in response.answer_markdown
+    assert "C22/CMAP" in response.answer_markdown
+    assert "95.3" in response.answer_markdown
+    assert "C36 21.0" in response.answer_markdown
+    assert "C22/CMAP 95.3" in response.answer_markdown
+    assert response.citations
+    assert response.citations[0].excerpt.startswith("Table 4")
+
+
+def test_answer_constraints_preserve_scientific_acronyms_from_evidence() -> None:
+    context = RetrievedContext(
+        citation=Citation(
+            page_slug="sources/charmm36-force-field-refinement-for-proteins",
+            page_title="CHARMM36",
+            page_kind="source_summary",
+            score=1,
+            excerpt=(
+                "CHARMM36 refined CMAP against QM energy surfaces and validated against "
+                "NMR scalar couplings and SPARTA chemical shifts."
+            ),
+        ),
+        prompt_text=(
+            "The parameterization used QM target data, CMAP corrections, NMR observables, "
+            "and SPARTA validation for CHARMM36."
+        ),
+        score=1,
+    )
+
+    constraints = QueryService(make_session())._build_answer_constraints(
+        "CHARMM36 用了哪些参数化和验证策略？",
+        [context],
+    )
+
+    assert "QM" in constraints
+    assert "NMR" in constraints
+    assert "SPARTA" in constraints
+
+
 def test_table_block_excerpt_prefers_requested_non_sac_kg_row() -> None:
     block = (
         "Table 3: Biomedical QA results.\n"
@@ -2573,6 +2968,61 @@ def test_rank_blocks_prefers_table_with_more_requested_row_anchors_and_values() 
     )
 
     assert ranked[0][0] == right_table
+
+
+def test_rank_blocks_uses_generic_aliases_for_multi_table_selection() -> None:
+    service = QueryService(make_session())
+    aromatic_hfe = (
+        "Table 2. Hydration free energies for small aromatic molecules impacted by OPLS5.\n"
+        "| Compound | Exp. | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| RMS error | | 0.76 | 0.46 |"
+    )
+    generic_rmse = (
+        "Table 6. OPLS4 and OPLS5 model performance (RMSE) comparison.\n"
+        "| Row | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- |\n"
+        "| No external field | 16.6 | 2.9 |"
+    )
+
+    ranked = service._rank_blocks(
+        "OPLS5 \u7684\u8868\u683c\u4e2d\uff0c\u82b3\u9999\u5c0f\u5206\u5b50 HFE "
+        "\u76f8\u6bd4 OPLS4 \u6709\u54ea\u4e9b\u6570\u503c\u6539\u5584\uff1f",
+        [generic_rmse, aromatic_hfe],
+    )
+
+    assert ranked[0][0] == aromatic_hfe
+
+
+def test_generic_table_answer_uses_caption_matched_numeric_rows() -> None:
+    service = QueryService(make_session())
+    table = (
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| PerturbationClass | No.cmpds | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+        "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |\n"
+        "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+        "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/opls5", page_title="OPLS5", page_kind="source_summary", score=10, excerpt=table),
+            prompt_text=table,
+            score=10,
+        )
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        "OPLS5 的 binding RMSE 相比 OPLS4 有哪些数值？",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert answer is not None
+    assert "1.18" in answer.answer_markdown
+    assert "1.12" in answer.answer_markdown
 
 
 def test_table_block_match_requires_multiple_anchors_for_multi_anchor_question() -> None:
@@ -2950,6 +3400,65 @@ def test_same_page_dedup_prefers_table_citation() -> None:
     assert any("Table 5" in citation.excerpt for citation in selected)
 
 
+def test_select_citations_keeps_multiple_table_citations_from_same_source() -> None:
+    service = QueryService(make_session())
+    contexts = []
+    for table_number in range(2, 6):
+        table = (
+            f"Table {table_number}. Metrics.\n"
+            "| Row | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            f"| value | 0.{table_number}0 | 0.{table_number}1 |"
+        )
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    page_slug="sources/opls5",
+                    page_title="OPLS5",
+                    page_kind="source_summary",
+                    score=50 - table_number,
+                    excerpt=table,
+                ),
+                prompt_text=table,
+                score=50 - table_number,
+            )
+        )
+
+    citations = service._select_citations(contexts, [0, 1, 2, 3])
+
+    assert len(citations) == 4
+    assert all(citation.excerpt.startswith("Table") for citation in citations)
+
+
+def test_finalize_contexts_keeps_more_than_three_table_contexts_from_same_source() -> None:
+    service = QueryService(make_session())
+    contexts = []
+    for table_number in range(2, 6):
+        table = (
+            f"Table {table_number}. Metrics.\n"
+            "| Row | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            f"| value | 0.{table_number}0 | 0.{table_number}1 |"
+        )
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    page_slug="sources/opls5",
+                    page_title="OPLS5",
+                    page_kind="source_summary",
+                    score=50 - table_number,
+                    excerpt=table,
+                ),
+                prompt_text=table,
+                score=50 - table_number,
+            )
+        )
+
+    finalized = service._finalize_contexts(contexts)
+
+    assert len(finalized) == 4
+
+
 def test_metric_extraction_repairs_mineru_flattened_table5_header_and_latex_row() -> None:
     service = QueryService(make_session())
     table = (
@@ -3127,6 +3636,25 @@ def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:
     normalized = QueryService._extract_table_blocks("## Tables\n### Page 5\n" + block)[0]
 
     assert "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |" in normalized
+
+
+def test_table_normalization_repairs_spaced_decimal_and_uncertainty_values() -> None:
+    block = (
+        "Table 1: OCR values.\n"
+        "| System | C36 | C36m | Expt |\n"
+        "| --- | --- | --- | --- |\n"
+        "| RS peptide | 8 0 pm 2 | 1 . 8 pm 0 . 5 | 6 04 |\n"
+        "| methanol | 8 95 | 6 19 | 0 . 46 |\n"
+    )
+
+    normalized = normalize_table_text(block)
+
+    assert "80 ± 2" in normalized
+    assert "1.8 ± 0.5" in normalized
+    assert "6.04" in normalized
+    assert "8.95" in normalized
+    assert "6.19" in normalized
+    assert "0.46" in normalized
 
 
 def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:

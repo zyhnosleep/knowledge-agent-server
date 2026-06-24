@@ -55,8 +55,20 @@ def normalize_table_cell(cell: str) -> str:
     text = re.sub(r"\\[A-Za-z]+", "", text)
     text = text.replace("{", "").replace("}", "")
     text = _compact_common_model_names(text)
+    text = _repair_ocr_numeric_spacing(text)
     text = re.sub(r"\s*/\s*", "/", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _repair_ocr_numeric_spacing(text: str) -> str:
+    text = re.sub(r"\bpm\b", "±", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+    text = re.sub(r"(?<!\d)(\d)\s+(\d{2})(?!\d)", r"\1.\2", text)
+
+    def join_single_digit_run(match: re.Match[str]) -> str:
+        return re.sub(r"\s+", "", match.group(0))
+
+    return re.sub(r"(?<![\d.])\d(?:\s+\d)+(?![\d.])", join_single_digit_run, text)
 
 
 def _compact_latex_group(value: str) -> str:
