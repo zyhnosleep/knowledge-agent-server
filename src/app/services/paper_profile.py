@@ -233,6 +233,8 @@ def _keyword_terms(text: str) -> list[str]:
             return
         if compact.startswith(("author", "department", "university")):
             return
+        if _looks_like_artifact_path(token):
+            return
         if _looks_like_atom_type_series(token):
             return
         has_digit = any(char.isdigit() for char in token)
@@ -251,8 +253,10 @@ def _keyword_terms(text: str) -> list[str]:
             score += 5.0
         if has_separator and not is_numeric_unit:
             score += 4.0
-        if is_acronym or is_mixed_case:
+        if is_acronym:
             score += 4.0
+        if is_mixed_case:
+            score += 7.0
         if is_numeric_unit:
             score += 2.0
         if is_domain_term:
@@ -278,6 +282,16 @@ def _looks_like_atom_type_series(token: str) -> bool:
         return False
     short_parts = sum(1 for part in parts if len(part) <= 3 and re.fullmatch(r"[A-Za-z0-9]+", part))
     return short_parts / len(parts) >= 0.75
+
+
+def _looks_like_artifact_path(token: str) -> bool:
+    lowered = token.lower()
+    if lowered.startswith(("images/", "image/", "figures/", "figure/")):
+        return True
+    parts = [part for part in re.split(r"[/\\]", token) if part]
+    if len(parts) >= 2 and re.fullmatch(r"[a-f0-9]{24,}", parts[-1], re.IGNORECASE):
+        return True
+    return len(token) > 48 and ("/" in token or "\\" in token)
 
 
 def _profile_source_text(
