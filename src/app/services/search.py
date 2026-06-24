@@ -596,7 +596,7 @@ class QueryService:
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
-            rare_route_bonus = min(rare_route_overlap * 1.1, 3.0)
+            rare_route_bonus = min(rare_route_overlap * 1.6, 4.0)
             if question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
@@ -2249,7 +2249,7 @@ class QueryService:
         contexts: list[RetrievedContext],
     ) -> str:
         evidence_parts: list[str] = []
-        for context in contexts[:3]:
+        for context in contexts[:5]:
             evidence_parts.append(cls._context_evidence_text(context))
             citation = getattr(context, "citation", None)
             if citation is not None:
@@ -2264,8 +2264,8 @@ class QueryService:
         evidence = "\n".join(evidence_parts)
         candidate_terms = [
             *cls._scientific_identifier_selectors(question),
-            *cls._salient_evidence_acronyms(contexts[:3], limit=8),
-            *cls._salient_evidence_phrases(contexts[:3], limit=8),
+            *cls._salient_evidence_acronyms(contexts[:5], limit=8),
+            *cls._salient_evidence_phrases(contexts[:5], limit=8),
         ]
         supported_translation_terms: set[str] = set()
         if cls._is_chinese_question(question):
