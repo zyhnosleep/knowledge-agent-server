@@ -928,6 +928,61 @@ def test_rag_contexts_use_profile_terms_only_for_retrieval_expansion() -> None:
     assert all("paper_profile" not in context.prompt_text for context in contexts)
 
 
+def test_rag_contexts_boost_rare_profile_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff14SB",
+        file_name="ff14sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff14sb.pdf",
+        raw_text="ff14SB paper.",
+        metadata_json={
+            "source_slug": "sources/ff14sb",
+            "source_title": "ff14SB",
+            "paper_profile": {
+                "title": "ff14SB",
+                "aliases": ["ff14SB"],
+                "key_terms": ["ff14SB", "backbone", "NoiseTerm0", "NoiseTerm1", "RareMethod"],
+                "routing_summary": "ff14SB fitting protocol.",
+                "source_slug": "sources/ff14sb",
+            },
+        },
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id=f"common-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="ff14SB backbone NoiseTerm0 NoiseTerm1 repeated evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(5)
+    ]
+    rare_chunk = DocumentChunk(
+        id="rare",
+        document_id="d1",
+        ordinal=10,
+        text="RareMethod changes the fitting protocol for side-chain parameters.",
+        page_label="10",
+        embedding=None,
+    )
+    db.add_all([project, document, *chunks, rare_chunk])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "ff14SB 的 fitting protocol 有什么变化？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert any(context.citation.chunk_id == "rare" for context in contexts)
+
+
 def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

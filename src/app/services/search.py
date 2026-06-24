@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -581,6 +582,11 @@ class QueryService:
         base_query_terms = self._tokenize(question)
         route_query_terms = self._tokenize(" ".join(route_terms or []))
         query_terms = base_query_terms | route_query_terms
+        route_token_counts: Counter[str] = Counter()
+        if route_query_terms:
+            for chunk in chunks:
+                route_token_counts.update(route_query_terms & self._tokenize(chunk.text))
+        rare_route_terms = {term for term, count in route_token_counts.items() if count <= 3}
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
         scored: list[RetrievedContext] = []
@@ -589,13 +595,15 @@ class QueryService:
             chunk_terms = self._tokenize(chunk.text)
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
+            rare_route_overlap = len(rare_route_terms & chunk_terms)
+            rare_route_bonus = min(rare_route_overlap * 0.35, 1.0)
             if question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
-                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8)
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
             else:
                 total_overlap = overlap + route_overlap
                 if total_overlap:
-                    score = min(0.3 + total_overlap * 0.1, 0.85)
+                    score = min(0.3 + total_overlap * 0.1 + rare_route_bonus, 1.2)
             if score <= 0:
                 continue
             has_table_data = self._context_has_table_data(chunk.text)
