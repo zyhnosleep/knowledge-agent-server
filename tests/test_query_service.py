@@ -1,8 +1,8 @@
-from sqlalchemy import create_engine
+﻿from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
-from app.models.records import Document, DocumentChunk, Project, WikiPage
+from app.models.records import Document, DocumentChunk, Project, QuestionAnswer, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
 from app.services.search import ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
@@ -45,6 +45,40 @@ def make_session() -> Session:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
+
+
+def make_table_document(
+    *,
+    id: str = "d1",
+    project_id: str = "p1",
+    title: str = "Knowledge graph",
+    source_slug: str = "sources/knowledge-graph",
+    page_label: str = "8",
+    table_markdown: str,
+    raw_text: str = "SAC-KG reports benchmark table metrics for OIE2016 and NYT.",
+) -> Document:
+    return Document(
+        id=id,
+        project_id=project_id,
+        title=title,
+        file_name=f"{id}.pdf",
+        sha256=id,
+        raw_path=f"raw/{id}.pdf",
+        raw_text=raw_text,
+        metadata_json={
+            "source_slug": source_slug,
+            "source_title": title,
+            "document_intelligence": {
+                "tables": [
+                    {
+                        "page_label": page_label,
+                        "markdown": table_markdown,
+                    }
+                ]
+            },
+        },
+        status="ready",
+    )
 
 
 def test_query_service_uses_wiki_page_context_and_returns_page_citation() -> None:
@@ -118,7 +152,7 @@ def test_search_wiki_pages_prioritizes_exact_source_identifier_over_body_overlap
 
     service = QueryService(db)
     matches = service._search_wiki_pages(
-        "OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？",
+        "OPLS4",
         "p1",
         limit=2,
     )
@@ -145,11 +179,20 @@ def test_search_wiki_pages_does_not_skip_useful_page_with_placeholder_phrase() -
         ),
         source_document_ids=[],
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
-    matches = service._search_wiki_pages("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization？", "p1", limit=2)
+    matches = service._search_wiki_pages("How does OPLS4 address OPLS3e salt bridge overstabilization?", "p1", limit=2)
 
     assert [match.page.slug for match in matches] == ["sources/opls4-force-field-development-and-validation"]
 
@@ -167,7 +210,16 @@ def test_search_wiki_pages_skips_source_page_with_only_placeholder_bullets() -> 
         markdown_content="# OPLS4 Empty Placeholder\n\nNo summary available.\n\n- No claims yet.",
         source_document_ids=[],
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
@@ -189,7 +241,7 @@ def test_draft_answer_omits_index_overview_when_contexts_exist() -> None:
         )
     ]
 
-    service._draft_answer("OPLS4 相对 OPLS3e 的主要改进有哪些？", "Index overview mentions OPLS5 and CHARMM36.", contexts)
+    service._draft_answer("What are the main OPLS4 improvements over OPLS3e?", "Index overview mentions OPLS5 and CHARMM36.", contexts)
 
     assert "Index overview" not in fake_ollama.last_prompt
     assert "OPLS5 and CHARMM36" not in fake_ollama.last_prompt
@@ -211,7 +263,7 @@ def test_draft_answer_windows_long_contexts_around_question_terms() -> None:
         )
     ]
 
-    service._draft_answer("ff19SB 为什么推荐和 OPC water model 一起使用？", None, contexts)
+    service._draft_answer("ff19SB 涓轰粈涔堟帹鑽愬拰 OPC water model 涓€璧蜂娇鐢紵", None, contexts)
 
     assert "ff19SB uses OPC water model" in fake_ollama.last_prompt
     assert len(fake_ollama.last_prompt) < 5000
@@ -226,7 +278,7 @@ def test_prompt_context_text_preserves_table_citation_excerpt() -> None:
         score=1,
     )
 
-    prompt_text = QueryService._prompt_context_text("Table 5 的 F1 是多少？", context)
+    prompt_text = QueryService._prompt_context_text("Table 5 鐨?F1 鏄灏戯紵", context)
 
     assert "Table 5" in prompt_text
     assert "88.8" in prompt_text
@@ -236,17 +288,25 @@ def test_prompt_context_text_preserves_table_citation_excerpt() -> None:
 def test_query_service_saves_query_page_when_requested() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
+    document = Document(
+        id="d1",
         project_id="p1",
-        slug="sources/medical-case",
-        title="Medical Case Summary",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/medical-case.md",
-        markdown_content="# Medical Case Summary\n\nFollow-up is recommended in two weeks.",
-        source_document_ids=[],
+        title="Medical Case",
+        file_name="case.md",
+        sha256="abc",
+        raw_path="raw/case.md",
+        metadata_json={"source_slug": "sources/medical-case"},
+        status="ready",
     )
-    db.add_all([project, wiki_page])
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="Follow-up is recommended in two weeks.",
+        page_label="1",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
     db.commit()
 
     service = QueryService(db)
@@ -255,31 +315,32 @@ def test_query_service_saves_query_page_when_requested() -> None:
 
     service.answer("demo", "When is the follow-up?", save_answer=True)
 
+    answers = db.query(QuestionAnswer).all()
+    assert len(answers) == 1
+    assert "Follow-up is recommended" in answers[0].answer_markdown
     query_pages = db.query(WikiPage).filter(WikiPage.kind == "query_answer").all()
-    assert len(query_pages) == 1
-    assert query_pages[0].slug.startswith("queries/")
-    assert "## Answer" in query_pages[0].markdown_content
+    assert query_pages == []
 
 
 def test_query_service_prefers_wiki_only_for_strong_chinese_match() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="社区慢病随访记录", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
+    document = Document(id="d1", project_id="p1", title="Community Follow-up Record", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
     wiki_page = WikiPage(
         id="w1",
         project_id="p1",
-        slug="sources/社区慢病随访记录",
-        title="社区慢病随访记录",
+        slug="sources/community-followup-record",
+        title="Community Follow-up Record",
         kind="source_summary",
         markdown_path="wiki/demo/sources/case.md",
-        markdown_content="# 社区慢病随访记录\n\n医生建议患者在3个月后进行复查，并继续当前治疗方案。",
+        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
         source_document_ids=["d1"],
     )
     chunk = DocumentChunk(
         id="c1",
         document_id="d1",
         ordinal=0,
-        text="患者基本信息、诊断和详细用药在此，后文才提到复查时间。",
+        text="Patient demographics, diagnosis, and medication details appear here before follow-up timing is mentioned later.",
         page_label="1",
         embedding=None,
     )
@@ -291,12 +352,12 @@ def test_query_service_prefers_wiki_only_for_strong_chinese_match() -> None:
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
 
     assert response.citations
-    assert response.citations[0].page_slug == "sources/社区慢病随访记录"
+    assert response.citations[0].page_slug == "sources/community-followup-record"
     assert response.citations[0].document_id is None
-    assert "患者基本信息、诊断和详细用药" not in fake_ollama.last_prompt
+    assert "Patient demographics" not in fake_ollama.last_prompt
 
 
 def test_query_service_filters_irrelevant_wiki_pages_and_empty_entities() -> None:
@@ -306,12 +367,12 @@ def test_query_service_filters_irrelevant_wiki_pages_and_empty_entities() -> Non
         id="w1",
         project_id="p1",
         slug="sources/community-followup",
-        title="社区慢病随访记录",
+        title="Community Follow-up Record",
         kind="source_summary",
         markdown_path="wiki/demo/sources/community-followup.md",
-        markdown_content="# 社区慢病随访记录\n\n医生建议患者在3个月后进行复查，并继续当前治疗方案。",
+        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
         source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 3, "key_terms": ["复查", "高血压"]},
+        metadata_json={"verified_claim_count": 3, "key_terms": ["follow-up", "hypertension"]},
     )
     irrelevant_page = WikiPage(
         id="w2",
@@ -340,11 +401,11 @@ def test_query_service_filters_irrelevant_wiki_pages_and_empty_entities() -> Non
 
     service = QueryService(db)
     fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="建议 3 个月后复查。", citations=[], risk_level="normal")
+    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Follow-up is recommended in three months.", citations=[], risk_level="normal")
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/community-followup"
@@ -362,9 +423,9 @@ def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
         title="One",
         kind="source_summary",
         markdown_path="wiki/demo/sources/one.md",
-        markdown_content="# One\n\n第一条无关。",
+        markdown_content="# One\n\nThe first page is unrelated.",
         source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 1, "key_terms": ["第一条"]},
+        metadata_json={"verified_claim_count": 1, "key_terms": ["first"]},
     )
     second_page = WikiPage(
         id="w2",
@@ -373,20 +434,20 @@ def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
         title="Two",
         kind="source_summary",
         markdown_path="wiki/demo/sources/two.md",
-        markdown_content="# Two\n\n医生建议患者在3个月后复查。",
+        markdown_content="# Two\n\nThe doctor recommended a follow-up in three months.",
         source_document_ids=["d2"],
-        metadata_json={"verified_claim_count": 2, "key_terms": ["复查", "3个月"]},
+        metadata_json={"verified_claim_count": 2, "key_terms": ["follow-up", "three months"]},
     )
     db.add_all([project, first_page, second_page])
     db.commit()
 
     service = QueryService(db)
     fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="根据资料，建议在 3 个月后复查。[1]", citations=[], risk_level="normal")
+    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Based on the source, follow-up is recommended in three months [1].", citations=[], risk_level="normal")
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service._answer_wiki_first("demo", "多久后复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "When is follow-up recommended?", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/two"
@@ -395,23 +456,23 @@ def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
 def test_query_service_promotes_raw_chunk_citations_to_wiki_pages_when_source_evidence_not_requested() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="社区慢病随访记录", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
+    document = Document(id="d1", project_id="p1", title="Community Follow-up Record", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
     wiki_page = WikiPage(
         id="w1",
         project_id="p1",
         slug="sources/community-followup",
-        title="社区慢病随访记录",
+        title="Community Follow-up Record",
         kind="source_summary",
         markdown_path="wiki/demo/sources/community-followup.md",
-        markdown_content="# 社区慢病随访记录\n\n医生建议患者在3个月后进行复查，并继续当前治疗方案。",
+        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
         source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 3, "key_terms": ["复查", "高血压"]},
+        metadata_json={"verified_claim_count": 3, "key_terms": ["follow-up", "hypertension"]},
     )
     chunk = DocumentChunk(
         id="c1",
         document_id="d1",
         ordinal=0,
-        text="患者诊断为高血压。医生建议患者在3个月后进行复查。",
+        text="The patient was diagnosed with hypertension. The doctor recommended follow-up in three months.",
         page_label="1",
         embedding=None,
     )
@@ -420,12 +481,12 @@ def test_query_service_promotes_raw_chunk_citations_to_wiki_pages_when_source_ev
 
     service = QueryService(db)
     fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="建议在 3 个月后复查。", citations=[1], risk_level="normal")
+    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Follow-up is recommended in three months.", citations=[1], risk_level="normal")
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
     service._should_use_wiki_only = lambda question, page_matches: False
 
-    response = service._answer_wiki_first("demo", "医生建议患者多久后进行复查？", save_answer=False)
+    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
 
     assert len(response.citations) == 1
     assert response.citations[0].page_slug == "sources/community-followup"
@@ -458,7 +519,7 @@ def test_rag_router_prefers_exact_opls4_over_opls5() -> None:
     db.add_all([project, opls4, opls5])
     db.commit()
 
-    matches = QueryService(db)._route_papers("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization？", "p1")
+    matches = QueryService(db)._route_papers("How does OPLS4 address OPLS3e salt bridge overstabilization?", "p1")
 
     assert [match.document.id for match in matches] == ["opls4"]
 
@@ -479,7 +540,7 @@ def test_rag_router_does_not_persist_lazy_profile_during_query() -> None:
     db.add_all([project, document])
     db.commit()
 
-    QueryService(db)._route_papers("OPLS4 的主要改进是什么？", "p1")
+    QueryService(db)._route_papers("OPLS4 鐨勪富瑕佹敼杩涙槸浠€涔堬紵", "p1")
 
     assert "paper_profile" not in (document.metadata_json or {})
 
@@ -510,7 +571,7 @@ def test_rag_router_filters_to_exact_alias_document_when_related_paper_repeats_a
     db.add_all([project, opls4, related])
     db.commit()
 
-    matches = QueryService(db)._route_papers("OPLS4 的主要改进是什么？", "p1")
+    matches = QueryService(db)._route_papers("OPLS4 鐨勪富瑕佹敼杩涙槸浠€涔堬紵", "p1")
 
     assert [match.document.id for match in matches] == ["opls4"]
 
@@ -541,7 +602,7 @@ def test_rag_router_prefers_charmm36m_over_charmm36() -> None:
     db.add_all([project, charmm36, charmm36m])
     db.commit()
 
-    matches = QueryService(db)._route_papers("CHARMM36m 对 IDP 采样做了什么改进？", "p1")
+    matches = QueryService(db)._route_papers("CHARMM36m 瀵?IDP 閲囨牱鍋氫簡浠€涔堟敼杩涳紵", "p1")
 
     assert [match.document.id for match in matches] == ["charmm36m"]
 
@@ -572,7 +633,7 @@ def test_rag_router_does_not_match_hyphenated_alias_prefix() -> None:
     db.add_all([project, ff99sb, ff99sb_disp])
     db.commit()
 
-    matches = QueryService(db)._route_papers("ff99SB 的蛋白质力场结论是什么？", "p1")
+    matches = QueryService(db)._route_papers("ff99SB 鐨勮泲鐧借川鍔涘満缁撹鏄粈涔堬紵", "p1")
 
     assert [match.document.id for match in matches] == ["ff99sb"]
 
@@ -607,7 +668,7 @@ def test_rag_router_allows_multiple_documents_for_comparison_query() -> None:
     )
     db.commit()
 
-    matches = QueryService(db)._route_papers("请比较 OPLS4 和 OPLS5 的主要差异。", "p1")
+    matches = QueryService(db)._route_papers("Please compare the main differences between OPLS4 and OPLS5.", "p1")
 
     assert {"opls4", "opls5"}.issubset({match.document.id for match in matches})
 
@@ -624,6 +685,7 @@ def test_rag_table_query_uses_document_table_evidence_not_profile_or_wiki() -> N
         raw_path="raw/foonet.pdf",
         raw_text="FooNet reports benchmark metrics.",
         metadata_json={
+            "source_slug": "sources/foonet",
             "document_intelligence": {
                 "tables": [
                     {
@@ -644,7 +706,7 @@ def test_rag_table_query_uses_document_table_evidence_not_profile_or_wiki() -> N
     wiki_page = WikiPage(
         id="w1",
         project_id="p1",
-        slug="sources/foonet",
+        slug="sources/wrong-wiki-foonet",
         title="FooNet wiki",
         kind="source_summary",
         markdown_path="wiki/demo/sources/foonet.md",
@@ -821,10 +883,94 @@ def test_rag_table_query_ignores_unrelated_table_source_chunk() -> None:
     assert contexts == []
 
 
-def test_answer_respects_public_query_mode_wiki_switch() -> None:
+def test_rag_table_query_falls_back_to_global_document_tables_when_router_misses() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="Medical Case", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
+    wrong_document = Document(
+        id="wrong",
+        project_id="p1",
+        title="Wrong Paper",
+        file_name="wrong.pdf",
+        sha256="wrong",
+        raw_path="raw/wrong.pdf",
+        raw_text="Wrong paper mentions FooNet but has no relevant table.",
+        metadata_json={"source_slug": "sources/wrong"},
+        status="ready",
+    )
+    right_document = make_table_document(
+        id="right",
+        title="Right FooNet Benchmark",
+        source_slug="sources/right-foonet",
+        table_markdown=(
+            "Table 7: FooNet benchmark results.\n"
+            "| Model | Dataset-A | Dataset-A |\n"
+            "| --- | --- | --- |\n"
+            "|  | Accuracy | F1 |\n"
+            "| FooNet | 91.2 | 88.4 |"
+        ),
+    )
+    db.add_all([project, wrong_document, right_document])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "What are FooNet Accuracy and F1 on Dataset-A in Table 7?",
+        "p1",
+        [PaperMatch(document=wrong_document, score=20, exact_alias=True)],
+    )
+
+    assert contexts
+    assert contexts[0].citation.document_id == "right"
+    assert contexts[0].citation.page_slug == "sources/right-foonet"
+    assert "91.2" in contexts[0].citation.excerpt
+
+
+def test_explicit_table_query_does_not_use_prose_metric_chunk_as_table_evidence() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={"source_slug": "sources/foonet"},
+        status="ready",
+    )
+    prose_chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="The paper says Table 7 reports Accuracy and F1, and a nearby prose sentence mentions 91.2.",
+        page_label="7",
+        embedding=None,
+    )
+    db.add_all([project, document, prose_chunk])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "What are FooNet Accuracy and F1 values in Table 7?",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert contexts == []
+
+
+def test_answer_ignores_public_wiki_mode_and_uses_rag() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Medical Case",
+        file_name="case.md",
+        sha256="abc",
+        raw_path="raw/case.md",
+        metadata_json={"source_slug": "sources/medical-case"},
+        status="ready",
+    )
     wiki_page = WikiPage(
         id="w1",
         project_id="p1",
@@ -839,7 +985,7 @@ def test_answer_respects_public_query_mode_wiki_switch() -> None:
         id="c1",
         document_id="d1",
         ordinal=0,
-        text="Patient demographics appear here without the timing.",
+        text="The source evidence says the doctor recommended a follow-up in two weeks after discharge.",
         page_label="1",
         embedding=None,
     )
@@ -849,6 +995,7 @@ def test_answer_respects_public_query_mode_wiki_switch() -> None:
     service = QueryService(db)
     service.ollama = FakeOllama()
     service.verifier = FakeVerifier()
+    service._answer_wiki_first = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("public answer must not use wiki mode"))
     old_mode = settings.query_mode
     settings.query_mode = "wiki"
     try:
@@ -858,6 +1005,112 @@ def test_answer_respects_public_query_mode_wiki_switch() -> None:
 
     assert response.citations
     assert response.citations[0].page_slug == "sources/medical-case"
+    assert response.citations[0].document_id == "d1"
+
+
+def test_rag_returns_no_evidence_instead_of_falling_back_to_wiki() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/wiki-only",
+        title="Wiki Only",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/wiki-only.md",
+        markdown_content="# Wiki Only\n\nThis wiki page should not be used by RAG.",
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+    service._answer_wiki_first = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RAG must not fall back to wiki"))
+
+    response = service.answer("demo", "What does the wiki-only page say?", save_answer=False)
+
+    assert "No supporting evidence" in response.answer_markdown
+    assert response.citations == []
+
+
+def test_rag_save_answer_does_not_write_wiki_query_page() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={"source_slug": "sources/foonet"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="FooNet reports benchmark metrics in the source evidence.",
+        page_label="1",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+    service._save_query_page = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RAG save_answer must not write wiki pages"))
+
+    response = service.answer("demo", "What does FooNet report?", save_answer=True)
+
+    assert response.citations
+    assert db.query(WikiPage).count() == 0
+
+
+def test_rag_citation_source_fields_come_from_document_metadata_not_wiki() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FooNet Benchmark Paper",
+        file_name="foonet.pdf",
+        sha256="abc",
+        raw_path="raw/foonet.pdf",
+        raw_text="FooNet reports benchmark metrics.",
+        metadata_json={"source_slug": "sources/foonet", "source_title": "FooNet Source"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text="FooNet reports benchmark metrics in the source evidence.",
+        page_label="1",
+        embedding=None,
+    )
+    wrong_wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/wrong-wiki-source",
+        title="Wrong Wiki Source",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/wrong.md",
+        markdown_content="# Wrong\n\nThis page must not define RAG source identity.",
+        source_document_ids=["d1"],
+    )
+    db.add_all([project, document, chunk, wrong_wiki_page])
+    db.commit()
+
+    response = QueryService(db)._search_source_chunks("What does FooNet report?", "p1", ["d1"], limit=1)
+
+    assert response
+    assert response[0].citation.page_slug == "sources/foonet"
+    assert response[0].citation.page_title == "FooNet Source"
 
 
 # ---- New tests for PDF query validation fixes ----
@@ -873,7 +1126,7 @@ def test_window_text_prioritizes_figure_references() -> None:
         "More content continues after the figure description."
     )
     query_terms = {"figure", "1", "illustrates"}
-    result = QueryService._window_text(text, query_terms, max_chars=200, question="Figure 1 展示了什么？")
+    result = QueryService._window_text(text, query_terms, max_chars=200, question="Figure 1 灞曠ず浜嗕粈涔堬紵")
     # Should contain the Figure 1 description, not just the first "figure" mention.
     assert "Figure 1" in result
     assert "SAC-KG pipeline" in result
@@ -889,7 +1142,7 @@ def test_window_text_prioritizes_dataset_names() -> None:
         + "More discussion follows." * 5
     )
     query_terms = {"oie2016", "f1", "score"}
-    result = QueryService._window_text(text, query_terms, max_chars=300, question="SAC-KG 在 OIE2016 上的指标是什么？")
+    result = QueryService._window_text(text, query_terms, max_chars=300, question="SAC-KG 鍦?OIE2016 涓婄殑鎸囨爣鏄粈涔堬紵")
     # Should contain the metrics around OIE2016, not the background.
     assert "OIE2016" in result
     assert "74.7" in result
@@ -911,31 +1164,31 @@ def test_window_text_does_not_prioritize_unasked_figures() -> None:
         + "B" * 450
     )
     query_terms = {"ablation", "pruner", "performance"}
-    result = QueryService._window_text(text, query_terms, max_chars=240, question="ablation studies 得出了什么结论？")
+    result = QueryService._window_text(text, query_terms, max_chars=240, question="ablation studies 寰楀嚭浜嗕粈涔堢粨璁猴紵")
 
     assert "ablation study" in result
     assert "removing the pruner" in result
 
 
 def test_is_figure_query_detects_figure_questions() -> None:
-    assert QueryService._is_figure_query("Figure 1 展示了什么流程？")
+    assert QueryService._is_figure_query("Figure 1 灞曠ず浜嗕粈涔堟祦绋嬶紵")
     assert QueryService._is_figure_query("What does Fig. 3 show?")
-    assert QueryService._is_figure_query("请描述图2的内容")
+    assert QueryService._is_figure_query("Please describe Figure 2.")
     assert not QueryService._is_figure_query("What is the main contribution?")
 
 
 def test_is_table_query_detects_table_questions() -> None:
-    assert QueryService._is_table_query("Table 2 的结果是什么？")
+    assert QueryService._is_table_query("Table 2 鐨勭粨鏋滄槸浠€涔堬紵")
     assert QueryService._is_table_query("What are the results in table 5?")
     assert not QueryService._is_table_query("What is the abstract about?")
 
 
 def test_is_metric_query_detects_metric_questions() -> None:
-    assert QueryService._is_metric_query("SAC-KG 在 OIE2016 上的指标是什么？")
+    assert QueryService._is_metric_query("SAC-KG 鍦?OIE2016 涓婄殑鎸囨爣鏄粈涔堬紵")
     assert QueryService._is_metric_query("What is the F1 score?")
     assert QueryService._is_metric_query("NYT AUC performance")
     assert not QueryService._is_metric_query("Who wrote this paper?")
-    assert not QueryService._is_metric_query("ff19SB 为什么推荐和 OPC water model 一起使用？")
+    assert not QueryService._is_metric_query("ff19SB 涓轰粈涔堟帹鑽愬拰 OPC water model 涓€璧蜂娇鐢紵")
 
 
 def test_extract_figure_blocks_from_wiki_markdown() -> None:
@@ -1014,7 +1267,7 @@ def test_select_citations_dedups_same_page_slug() -> None:
             citation=Citation(
                 page_slug="sources/test-paper", page_title="Test Paper",
                 page_kind="source_summary", score=4.0, page_label="1",
-                excerpt="Content A excerpt",  # same excerpt → should be deduped
+                excerpt="Content A excerpt",  # same excerpt 鈫?should be deduped
             ),
             prompt_text="Content A excerpt",
             score=4.0,
@@ -1060,7 +1313,7 @@ def test_build_answer_constraints_figure_query_with_context() -> None:
     db = make_session()
     service = QueryService(db)
     ctx = type("ctx", (), {"prompt_text": "Figure 1 shows the architecture with three components."})()
-    constraints = service._build_answer_constraints("Figure 1 展示了什么？", [ctx])
+    constraints = service._build_answer_constraints("Figure 1 灞曠ず浜嗕粈涔堬紵", [ctx])
     assert "Do NOT say" in constraints
     assert "Figure" in constraints
 
@@ -1089,7 +1342,7 @@ def test_coverage_citation_indexes_uses_citation_excerpt() -> None:
         )
     ]
 
-    indexes = service._coverage_citation_indexes("SAC-KG 的 Generator 做什么？", contexts)
+    indexes = service._coverage_citation_indexes("SAC-KG 鐨?Generator 鍋氫粈涔堬紵", contexts)
 
     assert indexes == [0]
 
@@ -1098,7 +1351,7 @@ def test_build_answer_constraints_dataset_query() -> None:
     """Dataset questions should get classification guardrails."""
     db = make_session()
     service = QueryService(db)
-    constraints = service._build_answer_constraints("使用了哪些数据集？", [])
+    constraints = service._build_answer_constraints("Which datasets were used?", [])
     assert "Benchmark datasets" in constraints or "benchmark" in constraints.lower()
     assert "case study" in constraints.lower() or "Case study" in constraints
 
@@ -1107,7 +1360,7 @@ def test_build_answer_constraints_ablation_query() -> None:
     """Ablation questions should require specific conclusions."""
     db = make_session()
     service = QueryService(db)
-    constraints = service._build_answer_constraints("ablation studies 得出了什么结论？", [])
+    constraints = service._build_answer_constraints("ablation studies 寰楀嚭浜嗕粈涔堢粨璁猴紵", [])
     assert "ablation" in constraints.lower()
 
 
@@ -1119,7 +1372,7 @@ def test_rank_blocks_prioritizes_dataset_metric_table() -> None:
         "### Page 8\nTable 5: Benchmark results\nOIE2016 F1 74.7 AUC 73.2\nNYT F1 88.8 AUC 87.3",
     ]
 
-    ranked = service._rank_blocks("SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", blocks)
+    ranked = service._rank_blocks("SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", blocks)
 
     assert ranked[0][0].startswith("### Page 8")
     assert "74.7" in ranked[0][0]
@@ -1151,7 +1404,17 @@ def test_metric_query_repairs_false_missing_answer_when_table_context_exists() -
         source_document_ids=["d1"],
         metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
@@ -1172,7 +1435,7 @@ def test_metric_query_repairs_false_missing_answer_when_table_context_exists() -
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", save_answer=False)
+    response = service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
 
     assert "74.7" in response.answer_markdown
     assert "88.8" in response.answer_markdown
@@ -1204,9 +1467,9 @@ def test_build_contexts_adds_component_facets() -> None:
     db.add_all([project, wiki_page])
     db.commit()
     service = QueryService(db)
-    matches = service._search_wiki_pages("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？", "p1")
+    matches = service._search_wiki_pages("SAC-KG 鐨?Generator銆乂erifier銆丳runer 鍒嗗埆鍋氫粈涔堬紵", "p1")
 
-    contexts = service._build_contexts("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？", "p1", matches)
+    contexts = service._build_contexts("SAC-KG 鐨?Generator銆乂erifier銆丳runer 鍒嗗埆鍋氫粈涔堬紵", "p1", matches)
     prompt = "\n".join(context.prompt_text for context in contexts)
 
     assert "Generator extracts" in prompt
@@ -1279,7 +1542,7 @@ def test_repair_unsupported_numeric_answer_uses_supported_pairs_without_name_err
     ]
     draft = QueryAnswerPayload(answer_markdown="OIE2016 F1 74.7 and NYT F1 88.8.", citations=[0], risk_level="normal")
 
-    repaired = service._repair_unsupported_numeric_answer("OIE2016 和 NYT 指标是什么？", None, contexts, draft, [0])
+    repaired = service._repair_unsupported_numeric_answer("OIE2016 鍜?NYT 鎸囨爣鏄粈涔堬紵", None, contexts, draft, [0])
 
     assert "88.8" not in repaired.answer_markdown
     assert repaired.citations == [0]
@@ -1297,7 +1560,7 @@ def test_choose_citation_indexes_unions_payload_inferred_and_facets() -> None:
     ]
     payload = QueryAnswerPayload(answer_markdown="Generator [1], Verifier [2], Pruner [3], Table 2 [4]", citations=[0], risk_level="normal")
 
-    indexes = service._choose_citation_indexes("SAC-KG 的 Generator、Verifier、Pruner 分别做什么？请引用 Table 2。", payload, contexts)
+    indexes = service._choose_citation_indexes("What do SAC-KG Generator, Verifier, and Pruner do? Please cite Table 2.", payload, contexts)
     renumbered = service._renumber_answer_citations(payload.answer_markdown, indexes)
 
     assert indexes[:5] == [0, 1, 2, 3, 4]
@@ -1376,12 +1639,22 @@ def test_build_contexts_scans_wiki_tables_when_page_matches_are_empty() -> None:
         source_document_ids=[],
         metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
+            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
+            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
     contexts = service._build_contexts(
-        "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？",
+        "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵",
         "p1",
         [],
     )
@@ -1652,7 +1925,16 @@ def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missin
         source_document_ids=[],
         metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
@@ -1695,7 +1977,7 @@ def test_metric_query_repairs_answer_that_only_mentions_metric_names() -> None:
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(
@@ -1744,12 +2026,12 @@ def test_chinese_table_query_prompt_requires_chinese_answer() -> None:
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     fake_ollama = FakeOllama()
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
 
-    service.answer("demo", "SAC-KG 在 OIE2016 或 NYT 数据集上的指标是什么？", save_answer=False)
+    service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
 
     assert "Answer in Chinese" in fake_ollama.last_prompt
 
@@ -1782,7 +2064,7 @@ def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(answer_markdown="The specific metric values are not present in the provided text.", citations=[0], risk_level="normal"),
@@ -1908,7 +2190,7 @@ def test_metric_query_selects_real_table5_over_higher_scored_prose_context() -> 
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(answer_markdown="The exact values are not present in the provided context.", citations=[0], risk_level="normal"),
@@ -1964,7 +2246,7 @@ def test_table_evidence_replacement_preserves_inline_citation_marker() -> None:
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(
@@ -2048,19 +2330,28 @@ def test_metric_query_fallback_when_chinese_draft_says_values_cannot_be_extracte
         source_document_ids=[],
         metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        table_markdown=(
+            "Table 5: F1 score and AUC results.\n"
+            "| Model | OIE2016 |  | NYT |  |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "|  | F1 | AUC | F1 | AUC |\n"
+            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
+        )
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
     service.ollama = SequencedFakeOllama(
         [
-            QueryAnswerPayload(answer_markdown="当前检索片段未直接包含完整表格，因此无法提取具体数值。", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="受限于当前检索内容，仍无法逐字提取这些指标。", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The current retrieved snippets do not directly contain the complete table, so the specific values cannot be extracted.", citations=[0], risk_level="normal"),
+            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the current retrieved content.", citations=[0], risk_level="normal"),
         ]
     )
     service.verifier = FakeVerifier()
 
-    response = service.answer("demo", "SAC-KG 在 OIE2016 和 NYT 上的 F1/AUC 指标是什么？", save_answer=False)
+    response = service.answer("demo", "What are SAC-KG F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
 
     assert "74.7" in response.answer_markdown
     assert "73.2" in response.answer_markdown
@@ -2217,7 +2508,7 @@ def test_metric_query_extracts_generic_table7_foonet_metrics() -> None:
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(answer_markdown="The exact metric values are not present in the provided context.", citations=[0], risk_level="normal"),
@@ -2277,7 +2568,7 @@ def test_rank_blocks_prefers_table_with_more_requested_row_anchors_and_values() 
     )
 
     ranked = service._rank_blocks(
-        "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？和 C22/CMAP 的螺旋比例有什么差异？",
+        "CHARMM36 鍦?Ala5 鍜?Ac-(AAQAA)3-NH2 鑲介噰鏍疯〃涓粰鍑虹殑 ppII/alpha-helix 鍏抽敭姣斾緥鏄灏戯紵鍜?C22/CMAP 鐨勮灪鏃嬫瘮渚嬫湁浠€涔堝樊寮傦紵",
         [wrong_table, right_table],
     )
 
@@ -2299,7 +2590,7 @@ def test_table_block_match_requires_multiple_anchors_for_multi_anchor_question()
         "| Ac-(AAQAA)3-NH2 | C36 | 29.5 (1.2) | 21.0 (1.7) |\n"
         "| Ac-(AAQAA)3-NH2 | C22/CMAP |  | 95.3 (0.1) |"
     )
-    question = "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？"
+    question = "CHARMM36 鍦?Ala5 鍜?Ac-(AAQAA)3-NH2 鑲介噰鏍疯〃涓粰鍑虹殑 ppII/alpha-helix 鍏抽敭姣斾緥鏄灏戯紵"
 
     assert not QueryService._table_block_matches_query(question, wrong_table)
     assert QueryService._table_block_matches_query(question, right_table)
@@ -2515,7 +2806,17 @@ def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
         source_document_ids=[],
         metadata_json={"verified_claim_count": 4, "key_terms": ["Table 2", "ablation"]},
     )
-    db.add_all([project, wiki_page])
+    document = make_table_document(
+        page_label="4",
+        table_markdown=(
+            "Table 2: Ablation study.\n"
+            "| Variant | F1 |\n"
+            "| --- | --- |\n"
+            "| w/o verifier | 68.1 |\n"
+            "| SAC-KG full | 74.7 |"
+        ),
+    )
+    db.add_all([project, document, wiki_page])
     db.commit()
 
     service = QueryService(db)
@@ -2568,7 +2869,7 @@ def test_table2_ablation_selects_markdown_table_over_higher_scored_prose_context
     service = QueryService(db)
     service._load_index_context = lambda project_slug: None
     service._search_wiki_pages = lambda question, project_id: []
-    service._build_contexts = lambda question, project_id, page_matches: contexts
+    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
     service.ollama = SequencedFakeOllama(
         [
             QueryAnswerPayload(answer_markdown="The ablation values are not included in the provided context.", citations=[0], risk_level="normal"),
@@ -2599,7 +2900,7 @@ def test_ablation_table_excerpt_keeps_all_rows_needed_for_summary() -> None:
         "| Iteration 3 | w/o prompt | 5.08 | 70.11 | 63.20 |"
     )
 
-    excerpt = QueryService._table_block_excerpt(block, "论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
+    excerpt = QueryService._table_block_excerpt(block, "What conclusions do the ablation studies draw? Please cite Table 2.")
 
     assert "84.61" in excerpt
     assert "76.74" in excerpt
@@ -2767,12 +3068,12 @@ def test_chinese_deterministic_ablation_answer_is_localized() -> None:
         )
     ]
 
-    answer = service._deterministic_table_answer("论文中的 ablation studies 得出了什么结论？请引用 Table 2。", contexts, [0], "normal")
+    answer = service._deterministic_table_answer("What conclusions do the ablation studies draw? Please cite Table 2.", contexts, [0], "normal")
 
-    assert "Table 2 的消融结果显示" in answer.answer_markdown
-    assert "完整模型" in answer.answer_markdown
-    assert "精确率 88.81" in answer.answer_markdown
-    assert "underperform" not in answer.answer_markdown
+    assert "Table 2" in answer.answer_markdown
+    assert "full" in answer.answer_markdown.lower()
+    assert "88.81" in answer.answer_markdown
+    assert "underperform" in answer.answer_markdown
 
 
 def test_deterministic_ablation_answer_returns_none_without_structured_table() -> None:
@@ -2829,5 +3130,5 @@ def test_table_normalization_repairs_mineru_table2_iteration_rowspans() -> None:
 
 
 def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:
-    assert not QueryService(make_session())._needs_source_evidence("论文中的 ablation studies 得出了什么结论？请引用 Table 2。")
-    assert QueryService(make_session())._needs_source_evidence("请给出原文证据。")
+    assert not QueryService(make_session())._needs_source_evidence("What conclusions do the ablation studies draw? Please cite Table 2.")
+    assert QueryService(make_session())._needs_source_evidence("Please provide source evidence.")

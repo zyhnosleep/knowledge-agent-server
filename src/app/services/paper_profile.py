@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.models.records import Document
-from app.services.filesystem import strip_upload_prefix
+from app.services.filesystem import slugify, strip_upload_prefix
 
 
 PROFILE_VERSION = "paper-profile-v1"
@@ -39,6 +39,8 @@ class PaperProfile:
 
 def ensure_paper_profile(document: Document) -> dict:
     metadata = dict(document.metadata_json or {})
+    _ensure_source_identity(document, metadata)
+    document.metadata_json = metadata
     existing = metadata.get("paper_profile")
     if isinstance(existing, dict) and existing.get("profile_version") == PROFILE_VERSION and existing.get("routing_summary"):
         return existing
@@ -56,11 +58,36 @@ def paper_profile_data(document: Document) -> dict:
     return build_paper_profile(document).to_dict()
 
 
+def ensure_source_identity(document: Document, preferred_title: str | None = None) -> dict:
+    metadata = dict(document.metadata_json or {})
+    _ensure_source_identity(document, metadata, preferred_title=preferred_title)
+    document.metadata_json = metadata
+    return metadata
+
+
+def source_fields_for_document(document: Document) -> dict[str, str]:
+    metadata = dict(document.metadata_json or {})
+    _ensure_source_identity(document, metadata)
+    profile = metadata.get("paper_profile") if isinstance(metadata.get("paper_profile"), dict) else {}
+    source_slug = str(metadata.get("source_slug") or profile.get("source_slug") or "").strip()
+    source_title = str(metadata.get("source_title") or profile.get("title") or document.title or document.file_name or source_slug).strip()
+    return {
+        "page_slug": source_slug or source_slug_for_title(document.title or document.file_name or document.id),
+        "page_title": strip_upload_prefix(source_title),
+        "page_kind": "source_summary",
+    }
+
+
+def source_slug_for_title(title: str | None) -> str:
+    cleaned = strip_upload_prefix(str(title or "")).strip()
+    return f"sources/{slugify(cleaned or 'untitled-document')}"
+
+
 def build_paper_profile(document: Document) -> PaperProfile:
     metadata = document.metadata_json or {}
     title = strip_upload_prefix(document.title or document.file_name or "Untitled document")
     clean_title = _clean_title(title)
-    source_slug = str(metadata.get("source_slug") or metadata.get("page_slug") or "").strip() or None
+    source_slug = str(metadata.get("source_slug") or metadata.get("page_slug") or "").strip() or source_slug_for_title(clean_title)
     intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
     tables = intelligence.get("tables") if isinstance(intelligence, dict) else []
     figures = intelligence.get("figures") if isinstance(intelligence, dict) else []
@@ -209,6 +236,12 @@ def _first_sentence(text: str) -> str:
     if match:
         return match.group(1).strip()
     return normalized[:300].strip()
+
+
+def _ensure_source_identity(document: Document, metadata: dict, preferred_title: str | None = None) -> None:
+    title = strip_upload_prefix(preferred_title or document.title or document.file_name or "Untitled document")
+    metadata.setdefault("source_slug", source_slug_for_title(title))
+    metadata.setdefault("source_title", _clean_title(title))
 
 
 def _ordered_unique(values: list[str]) -> list[str]:

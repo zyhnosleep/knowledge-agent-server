@@ -41,7 +41,7 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.filesystem import compute_sha256, display_title_from_path, slugify, strip_upload_prefix
-from app.services.paper_profile import ensure_paper_profile
+from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
 from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
@@ -197,6 +197,7 @@ class IngestionPipeline:
             merged_metadata = dict(document.metadata_json or {})
             merged_metadata.update(parsed.metadata)
             document.metadata_json = merged_metadata
+            ensure_source_identity(document, document.title)
             ensure_paper_profile(document)
             merged_metadata = dict(document.metadata_json or {})
             quality_report = build_ingest_quality_report(document)
@@ -205,16 +206,22 @@ class IngestionPipeline:
             self._set_progress(run, 30, "chunking", "Replacing document chunks and preparing embeddings.")
             self._replace_chunks(document, parsed.chunks)
 
-            self._set_progress(run, 45, "extracting", "Generating head-driven triples and wiki facts with Ollama.")
+            self._set_progress(run, 45, "extracting", "Generating SAC-KG routing facts with Ollama.")
             extraction = self._extract_document(document, parsed.text)
+            ensure_source_identity(document, extraction.title or document.title)
+            ensure_paper_profile(document)
             self._set_progress(run, 65, "structuring", "Writing entities, claims, verifier metadata, and pruner decisions.")
             entities = self._upsert_entities(document.project_id, extraction)
             claims = self._create_claims(document, extraction)
             entity_decisions = self._decide_entity_growth(document, entities, claims)
             self._apply_claim_growth_decisions(claims, entity_decisions)
             entities = self._ensure_growing_entities(document.project_id, entities, claims, entity_decisions)
-            self._set_progress(run, 82, "rendering_wiki", "Rendering Obsidian-friendly wiki pages.")
-            wiki_pages = self._render_wiki(document, extraction, entities, claims, entity_decisions)
+            if settings.wiki_enabled:
+                self._set_progress(run, 82, "rendering_wiki", "Rendering optional Obsidian-friendly wiki pages.")
+                wiki_pages = self._render_wiki(document, extraction, entities, claims, entity_decisions)
+            else:
+                self._set_progress(run, 82, "indexing_rag", "Skipping wiki rendering; RAG and SAC-KG artifacts are ready.")
+                wiki_pages = []
             self._set_progress(run, 94, "reviewing", "Creating review items and final provider report.")
             review_count = self._create_review_items(document, extraction, claims)
 
@@ -293,7 +300,7 @@ class IngestionPipeline:
         chunks = self.db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id).order_by(DocumentChunk.ordinal)).all()
         contexts = self._select_generation_contexts(document, full_text, list(chunks))
         sentence_entries = self._build_sentence_entries(list(chunks))
-        wiki_context = self._current_wiki_context(document.project_id)
+        wiki_context = self._current_wiki_context(document.project_id) if settings.wiki_enabled else ""
         seed_analysis = self._seed_document_analysis(document, full_text, contexts, wiki_context)
         candidate_heads = self._collect_candidate_heads(document, full_text, seed_analysis)
         previous_claims = self._project_verified_claims(document.project_id)
@@ -332,12 +339,12 @@ class IngestionPipeline:
         prompt = "\n\n".join(
             [
                 f"Document title: {document.title}",
-                "Task: extract a document overview for head-driven wiki generation.",
+                "Task: extract a document overview for RAG routing and SAC-KG-style evidence organization.",
                 (
                     "Return a concise summary, key facts, entities, concepts, and draft triples. "
                     "Preserve exact dates, doses, diagnoses, and recommendations."
                 ),
-                "Current wiki/index context:\n" + (wiki_context or "No existing wiki context."),
+                "Current corpus context:\n" + (wiki_context or "No existing corpus context."),
                 "Retrieved document contexts:\n" + json.dumps(contexts, ensure_ascii=False),
             ]
         )
@@ -517,7 +524,7 @@ class IngestionPipeline:
                     "Preserve exact evidence, dates, doses, and follow-up guidance. "
                     "Return related entities and concepts only when they are grounded in the snippets."
                 ),
-                "Current wiki/index context:\n" + (wiki_context or "No existing wiki context."),
+                "Current corpus context:\n" + (wiki_context or "No existing corpus context."),
                 "Open KG example triples:\n" + json.dumps(open_kg_examples, ensure_ascii=False),
                 "Retrieved domain snippets:\n" + json.dumps(contexts, ensure_ascii=False),
             ]
@@ -808,6 +815,8 @@ class IngestionPipeline:
         )
 
     def _current_wiki_terms(self, project_id: str) -> list[str]:
+        if not settings.wiki_enabled:
+            return []
         pages = self.db.scalars(select(WikiPage).where(WikiPage.project_id == project_id)).all()
         terms: list[str] = []
         for page in pages:
@@ -886,6 +895,8 @@ class IngestionPipeline:
         return terms
 
     def _current_wiki_context(self, project_id: str) -> str:
+        if not settings.wiki_enabled:
+            return ""
         pages = self.db.scalars(
             select(WikiPage)
             .where(WikiPage.project_id == project_id, WikiPage.kind != PageKind.query_answer.value)
@@ -1180,7 +1191,7 @@ class IngestionPipeline:
             errors.append("head_tail_contradiction")
 
         # source_fact claims are fallback triples — relax confidence threshold
-        # so they count as verified and improve wiki-first scoring.
+        # so they count as verified and improve downstream RAG scoring.
         confidence_threshold = 0.45 if is_source_fact else 0.6
         if claim.confidence < confidence_threshold:
             errors.append("low_confidence")
@@ -1258,7 +1269,7 @@ class IngestionPipeline:
                 [
                     f"Document title: {document.title}",
                     (
-                        "Decide whether each candidate should continue growing in the wiki graph. "
+                        "Decide whether each candidate should continue growing in the SAC-KG routing graph. "
                         "Use grow for durable head or tail entities, keep for useful but not yet expanded items, "
                         "and prune for dates, doses, isolated numbers, or transient values."
                     ),
@@ -1269,7 +1280,7 @@ class IngestionPipeline:
             ai_decisions = safe_model_call(
                 lambda: self.ollama.generate_structured(
                     GrowthDecisionPayload,
-                    system_prompt="You are the Pruner in a SAC-KG-inspired wiki pipeline. Return strict JSON decisions only.",
+                    system_prompt="You are the Pruner in a SAC-KG-inspired RAG pipeline. Return strict JSON decisions only.",
                     user_prompt=prompt,
                     model=settings.ollama_batch_model,
                 ),
@@ -1301,7 +1312,7 @@ class IngestionPipeline:
         if item_type == "tail" and claim_count == 1 and len(name) > 36:
             return GrowthDecision(name=name, item_type=item_type, decision="keep", reason="Tail value is descriptive but may be too broad for its own page.")
         if claim_count > 0:
-            return GrowthDecision(name=name, item_type=item_type, decision="grow", reason="Supported by verified claims and suitable for wiki expansion.")
+            return GrowthDecision(name=name, item_type=item_type, decision="grow", reason="Supported by verified claims and suitable for RAG routing expansion.")
         return GrowthDecision(name=name, item_type=item_type, decision="keep", reason="Needs pruner judgment before creating a standalone page.")
 
     def _infer_tail_entity_type(self, tail_name: str, entities: list[Entity]) -> str:

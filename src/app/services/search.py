@@ -16,7 +16,7 @@ from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
-from app.services.paper_profile import alias_in_text, paper_profile_data, paper_profile_text
+from app.services.paper_profile import alias_in_text, paper_profile_data, paper_profile_text, source_fields_for_document
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
 from app.services.wiki import WikiRenderer
@@ -66,9 +66,6 @@ class QueryService:
         self.verifier = ExternalVerifier()
 
     def answer(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
-        mode = (settings.query_mode or "rag").strip().lower()
-        if mode == "wiki":
-            return self._answer_wiki_first(project_slug, question, save_answer=save_answer)
         return self._answer_rag_first(project_slug, question, save_answer=save_answer)
 
     def _answer_wiki_first(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
@@ -136,7 +133,20 @@ class QueryService:
         if not contexts:
             contexts = self._search_source_chunks(question, project.id, [], limit=5)
         if not contexts:
-            return self._answer_wiki_first(project_slug, question, save_answer=save_answer)
+            answer_payload = self._draft_answer(question, None, [])
+            response = QueryResponse(answer_markdown=answer_payload.answer_markdown, citations=[], verification_status="local-only")
+            if save_answer:
+                record = QuestionAnswer(
+                    project_id=project.id,
+                    question=question,
+                    answer_markdown=response.answer_markdown,
+                    citations=[],
+                    risk_level=answer_payload.risk_level,
+                    verification_status=response.verification_status,
+                )
+                self.db.add(record)
+                self.db.commit()
+            return response
 
         answer_payload = self._draft_answer(question, None, contexts)
         verification_status = "local-only"
@@ -180,7 +190,6 @@ class QueryService:
                 verification_status=verification_status,
             )
             self.db.add(record)
-            self._save_query_page(project, question, response, citations)
             self.db.commit()
         return response
 
@@ -265,7 +274,10 @@ class QueryService:
         document_ids = [match.document.id for match in paper_matches]
         contexts: list[RetrievedContext] = []
         if self._is_table_query(question) or self._is_metric_query(question):
-            contexts.extend(self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS))
+            table_contexts = self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
+            if not table_contexts and document_ids:
+                table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
+            contexts.extend(table_contexts)
         if document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS))
         if not contexts and not document_ids:
@@ -350,22 +362,15 @@ class QueryService:
         wanted = set(document_ids)
         if not wanted:
             return {}
-        pages = self.db.scalars(
-            select(WikiPage).where(
-                WikiPage.project_id == project_id,
-                WikiPage.kind == PageKind.source_summary.value,
+        documents = self.db.scalars(
+            select(Document).where(
+                Document.project_id == project_id,
+                Document.id.in_(wanted),
             )
         ).all()
         fields: dict[str, dict[str, str]] = {}
-        for page in pages:
-            for document_id in page.source_document_ids or []:
-                if document_id not in wanted or document_id in fields:
-                    continue
-                fields[document_id] = {
-                    "page_slug": page.slug,
-                    "page_title": strip_upload_prefix(page.title),
-                    "page_kind": page.kind,
-                }
+        for document in documents:
+            fields[document.id] = source_fields_for_document(document)
         return fields
 
     def _search_source_chunks(self, question: str, project_id: str, document_ids: list[str], limit: int = 3) -> list[RetrievedContext]:
@@ -380,7 +385,8 @@ class QueryService:
 
         question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         query_terms = self._tokenize(question)
-        needs_table_first = self._is_table_query(question) or self._is_metric_query(question)
+        is_table_query = self._is_table_query(question)
+        needs_table_first = is_table_query or self._is_metric_query(question)
         scored: list[RetrievedContext] = []
         for chunk in chunks:
             score = 0.0
@@ -394,6 +400,8 @@ class QueryService:
             if score <= 0:
                 continue
             has_table_data = self._context_has_table_data(chunk.text)
+            if is_table_query and not has_table_data:
+                continue
             if needs_table_first and not has_table_data and not self._context_has_metric_numbers(chunk.text):
                 continue
             if needs_table_first and has_table_data:
@@ -681,7 +689,7 @@ class QueryService:
             answer_markdown="\n".join(
                 [
                     "## Answer",
-                    "The answer below is based on the currently retrieved wiki pages and source evidence. Please verify against the cited materials when needed.",
+                    "The answer below is based on the currently retrieved source evidence. Please verify against the cited materials when needed.",
                     "",
                     context_text[:1400],
                 ]
@@ -693,7 +701,7 @@ class QueryService:
             [
                 f"Question: {question}",
                 (
-                    "Answer using the retrieved wiki pages first, and use source evidence only when it adds precision. "
+                    "Answer using only the retrieved source evidence. "
                     "If the question contains multiple entities, datasets, metrics, tables, figures, or components, "
                     "answer each requested item explicitly. Return citation indexes that directly support each claim."
                 ),
@@ -704,7 +712,7 @@ class QueryService:
         return safe_model_call(
             lambda: self.ollama.generate_structured(
                 QueryAnswerPayload,
-                system_prompt="You are answering against a maintained wiki. Prefer synthesized wiki pages, cite supporting context indexes, and do not claim facts that are absent from the provided material.",
+                system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
                 user_prompt=prompt,
             ),
             fallback,
@@ -883,7 +891,7 @@ class QueryService:
         repaired = safe_model_call(
             lambda: self.ollama.generate_structured(
                 QueryAnswerPayload,
-                system_prompt="You answer table and metric questions against retrieved wiki table contexts. Use only provided values and cite the supporting context indexes.",
+                system_prompt="You answer table and metric questions against retrieved source table contexts. Use only provided values and cite the supporting context indexes.",
                 user_prompt=prompt,
             ),
             fallback,

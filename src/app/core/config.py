@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")
     query_mode: str = Field(default="rag", alias="QUERY_MODE")
+    wiki_enabled: bool = Field(default=False, alias="WIKI_ENABLED")
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_generation_model: str = Field(default="qwen3:14b", alias="OLLAMA_GENERATION_MODEL")
