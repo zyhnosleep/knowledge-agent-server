@@ -401,8 +401,11 @@ class QueryService:
             and term not in low_signal_terms
             and not re.fullmatch(r"(?:table|figure|fig)\d+", term)
         ]
+        non_table_terms = list(dict.fromkeys(non_table_terms))
         if non_table_terms:
-            return any(term in block_key for term in non_table_terms)
+            matched_terms = {term for term in non_table_terms if term in block_key}
+            required_matches = 2 if len(non_table_terms) >= 2 else 1
+            return len(matched_terms) >= required_matches
         if table_terms:
             return any(term in block_key for term in table_terms)
         query_terms = cls._tokenize(question)
@@ -1967,15 +1970,23 @@ class QueryService:
             max_chars = max(max_chars, 2400)
 
         start = 0
+        table_caption_index: int | None = None
+        first_table_index: int | None = None
         for index, line in enumerate(lines):
             stripped = line.strip()
-            if (
-                re.match(r"^(?:#+\s*)?Table\s*\d+\b", stripped, re.IGNORECASE)
-                or stripped.startswith("|")
-                or stripped.lower().startswith("<table")
-            ):
-                start = index
+            if re.match(r"^(?:#+\s*)?Table\s*\d+\b", stripped, re.IGNORECASE):
+                table_caption_index = index
                 break
+            if first_table_index is None and (stripped.startswith("|") or stripped.lower().startswith("<table")):
+                first_table_index = index
+        if table_caption_index is not None:
+            start = table_caption_index
+        elif first_table_index is not None:
+            has_page_heading = any(
+                re.match(r"^#+\s*Page\s+\d+\b", line.strip(), re.IGNORECASE)
+                for line in lines[:first_table_index]
+            )
+            start = 0 if has_page_heading else first_table_index
         lines = lines[start:]
 
         anchors = {cls._normalize_selector(anchor) for anchor in cls._query_priority_anchors(question)["dataset"]}
@@ -1983,19 +1994,16 @@ class QueryService:
         anchors.update(cls._normalize_selector(selector) for selector in cls._question_row_selectors(question))
         anchors = {anchor for anchor in anchors if anchor}
 
-        caption_lines = [line for line in lines if not line.strip().startswith("|")][:2]
-        table_lines = [line for line in lines if line.strip().startswith("|")]
-        header_lines = table_lines[:3]
+        caption_lines = cls._table_caption_lines(lines)
+        table_lines = [line for line in lines if cls._is_table_line(line)]
+        header_line_count = cls._table_header_line_count(table_lines)
+        header_lines = table_lines[:header_line_count]
         if "ablation" in question.lower() or "消融" in question:
-            relevant_rows = table_lines[3:]
+            relevant_rows = table_lines[header_line_count:]
         else:
-            relevant_rows = [
-                line
-                for line in table_lines[3:]
-                if any(anchor in cls._normalize_selector(line) for anchor in anchors)
-            ]
+            relevant_rows = cls._table_relevant_rows_with_group_children(table_lines[header_line_count:], anchors)
         if not relevant_rows and table_lines:
-            relevant_rows = table_lines[3:6]
+            relevant_rows = table_lines[header_line_count : header_line_count + 3]
 
         excerpt_lines: list[str] = []
         for line in [*caption_lines, *header_lines, *relevant_rows]:
@@ -2003,6 +2011,95 @@ class QueryService:
                 excerpt_lines.append(line)
         excerpt = "\n".join(excerpt_lines).strip() or "\n".join(lines).strip()
         return excerpt[:max_chars]
+
+    @classmethod
+    def _table_caption_lines(cls, lines: list[str]) -> list[str]:
+        caption_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if cls._is_table_line(stripped):
+                break
+            if re.match(r"^#+\s*Page\s+\d+\b", stripped, re.IGNORECASE):
+                continue
+            if stripped:
+                caption_lines.append(line)
+        caption_lines = caption_lines[:2]
+        if not caption_lines:
+            return []
+        if any(re.search(r"\btable\b", line, re.IGNORECASE) for line in caption_lines):
+            return caption_lines
+        return [f"Table evidence: {caption_lines[0]}", *caption_lines[1:]]
+
+    @classmethod
+    def _table_relevant_rows_with_group_children(cls, table_lines: list[str], anchors: set[str]) -> list[str]:
+        if not anchors:
+            return []
+        selected_indexes: set[int] = set()
+        for index, line in enumerate(table_lines):
+            if not any(anchor in cls._normalize_selector(line) for anchor in anchors):
+                continue
+            selected_indexes.add(index)
+            if cls._table_line_needs_group_children(line) or (
+                index + 1 < len(table_lines) and cls._table_line_is_group_child(table_lines[index + 1])
+            ):
+                for child_index in range(index + 1, len(table_lines)):
+                    if not cls._table_line_is_group_child(table_lines[child_index]):
+                        break
+                    selected_indexes.add(child_index)
+        return [line for index, line in enumerate(table_lines) if index in selected_indexes]
+
+    @classmethod
+    def _table_header_line_count(cls, table_lines: list[str]) -> int:
+        if not table_lines:
+            return 0
+        for index, line in enumerate(table_lines):
+            cells = cls._markdown_table_line_cells(line)
+            if not cls._is_markdown_separator_row(cells):
+                continue
+            header_count = index + 1
+            if index + 1 < len(table_lines) and cls._table_line_looks_like_secondary_header(table_lines[index + 1]):
+                header_count += 1
+            return header_count
+        return min(1, len(table_lines))
+
+    @classmethod
+    def _table_line_looks_like_secondary_header(cls, line: str) -> bool:
+        cells = cls._markdown_table_line_cells(line)
+        if not cells:
+            return False
+        non_empty = [cell for cell in cells if cell.strip()]
+        if not non_empty or cells[0].strip():
+            return False
+        has_number = any(re.search(r"\d+(?:\.\d+)?", cell) for cell in non_empty)
+        return not has_number
+
+    @classmethod
+    def _table_line_needs_group_children(cls, line: str) -> bool:
+        cells = cls._markdown_table_line_cells(line)
+        if not cells or cls._is_markdown_separator_row(cells):
+            return False
+        non_empty = [cell for cell in cells if cell.strip()]
+        if len(non_empty) <= 1:
+            return True
+        numeric_cells = [cell for cell in non_empty if re.search(r"\d+(?:\.\d+)?", cell)]
+        return not numeric_cells and len(non_empty) <= 2
+
+    @classmethod
+    def _table_line_is_group_child(cls, line: str) -> bool:
+        cells = cls._markdown_table_line_cells(line)
+        return bool(cells) and not cls._is_markdown_separator_row(cells) and not cells[0].strip()
+
+    @staticmethod
+    def _markdown_table_line_cells(line: str) -> list[str]:
+        stripped = line.strip()
+        if not stripped.startswith("|") or "|" not in stripped[1:]:
+            return []
+        return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith("|") or stripped.lower().startswith("<table")
 
     @staticmethod
     def _extract_page_label_from_block(block: str) -> str | None:

@@ -1830,6 +1830,212 @@ def test_table_block_excerpt_prefers_requested_non_sac_kg_row() -> None:
     assert "84.9" in excerpt
 
 
+def test_rank_blocks_prefers_table_with_more_requested_row_anchors_and_values() -> None:
+    service = QueryService(make_session())
+    wrong_table = (
+        "Table 9: Scalar coupling values.\n"
+        "|  | Ala3 | Ala5 | Ala7 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| C36 | 0.61 | 0.74 | 0.43 |\n"
+        "| C22/CMAP |  | 1.73 |  |"
+    )
+    right_table = (
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Force field | % ppII | % alpha-helix |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Ala5 | C36 | 51.9 (1.1) | 0.1 (0.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | C36 | 29.5 (1.2) | 21.0 (1.7) |\n"
+        "| Ac-(AAQAA)3-NH2 | C22/CMAP |  | 95.3 (0.1) |"
+    )
+
+    ranked = service._rank_blocks(
+        "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？和 C22/CMAP 的螺旋比例有什么差异？",
+        [wrong_table, right_table],
+    )
+
+    assert ranked[0][0] == right_table
+
+
+def test_table_block_match_requires_multiple_anchors_for_multi_anchor_question() -> None:
+    wrong_table = (
+        "Table 9: Scalar coupling values.\n"
+        "|  | Ala3 | Ala5 | Ala7 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| C36 | 0.61 | 0.74 | 0.43 |"
+    )
+    right_table = (
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Force field | % ppII | % alpha-helix |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Ala5 | C36 | 51.9 (1.1) | 0.1 (0.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | C36 | 29.5 (1.2) | 21.0 (1.7) |\n"
+        "| Ac-(AAQAA)3-NH2 | C22/CMAP |  | 95.3 (0.1) |"
+    )
+    question = "CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？"
+
+    assert not QueryService._table_block_matches_query(question, wrong_table)
+    assert QueryService._table_block_matches_query(question, right_table)
+
+
+def test_table_block_match_deduplicates_single_anchor_with_explicit_table() -> None:
+    block = (
+        "Table 4: Force-field results.\n"
+        "| Model | Value |\n"
+        "| --- | --- |\n"
+        "| C36 | 51.9 |"
+    )
+
+    assert QueryService._table_block_matches_query("What does Table 4 report for C36?", block)
+
+
+def test_table_block_excerpt_includes_grouped_child_rows_after_matched_parent_rows() -> None:
+    block = (
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Property | ff99SB | ff99SB* | C22/CMAP | C36 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| Ala5 | | | | | |\n"
+        "|  | % ppII | 46.2 (1.0) | 52.1 (1.1) | 45.4 (1.0) | 51.9 (1.1) |\n"
+        "|  | % alpha-helix | 0.2 (0.1) | 0.3 (0.1) | 0.1 (0.1) | 0.1 (0.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | | | | | |\n"
+        "|  | % ppII | 28.0 (1.4) | 30.1 (1.2) | 0.5 (0.2) | 29.5 (1.2) |\n"
+        "|  | % alpha-helix | 5.4 (0.8) | 8.2 (1.1) | 95.3 (0.1) | 21.0 (1.7) |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "What does the peptide sampling table report for Ala5 and Ac-(AAQAA)3-NH2?",
+    )
+
+    assert "Ala5" in excerpt
+    assert "Ac-(AAQAA)3-NH2" in excerpt
+    assert "51.9" in excerpt
+    assert "21.0" in excerpt
+    assert "95.3" in excerpt
+
+
+def test_table_block_excerpt_keeps_grouped_child_rows_for_generic_parent_match() -> None:
+    block = (
+        "Table 6: Grouped simulation results.\n"
+        "| System | Property | Baseline | Model |\n"
+        "| --- | --- | --- | --- |\n"
+        "| System A | | | |\n"
+        "|  | compactness | 1.20 | 0.82 |\n"
+        "|  | stability | 4.10 | 5.30 |\n"
+        "| System B | | | |\n"
+        "|  | compactness | 2.20 | 1.90 |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "What does Table 6 report for System A?",
+    )
+
+    assert "System A" in excerpt
+    assert "compactness" in excerpt
+    assert "0.82" in excerpt
+    assert "stability" in excerpt
+    assert "5.30" in excerpt
+    assert "System B" not in excerpt
+
+
+def test_table_block_excerpt_keeps_continuation_rows_after_matched_value_row() -> None:
+    block = (
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Property | C22/CMAP | C36 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Ala5 | % ppII | 45.4 (1.0) | 51.9 (1.1) |\n"
+        "|  | % alpha-helix | 0.1 (0.1) | 0.1 (0.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | % ppII | 0.5 (0.2) | 29.5 (1.2) |\n"
+        "|  | % alpha-helix | 95.3 (0.1) | 21.0 (1.7) |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "What does the peptide sampling table report for Ala5 and Ac-(AAQAA)3-NH2?",
+    )
+
+    assert "Ala5" in excerpt
+    assert "51.9" in excerpt
+    assert "Ac-(AAQAA)3-NH2" in excerpt
+    assert "95.3" in excerpt
+    assert "21.0" in excerpt
+
+
+def test_table_block_excerpt_keeps_table_caption_after_page_heading() -> None:
+    block = (
+        "### Page 30\n"
+        "Table 4: Peptide sampling populations.\n"
+        "| Peptide | Property | C22/CMAP | C36 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Ala5 | | | |\n"
+        "|  | % ppII | 26.2 (1.8) | 51.9 (1.1) |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "What does Table 4 report for Ala5?")
+
+    assert excerpt.startswith("Table 4")
+    assert "### Page" not in excerpt
+    assert "Ala5" in excerpt
+    assert "51.9" in excerpt
+
+
+def test_table_block_excerpt_labels_table_evidence_when_caption_lacks_table_word() -> None:
+    block = (
+        "### Page 30\n"
+        "Properties of peptides used in parameter optimization: Ala5 and Ac-(AAQAA)3-NH2.\n"
+        "Statistical errors from a block error analysis are given in brackets.\n"
+        "| Peptide | Property | C22/CMAP | C36 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Ala5 | | | |\n"
+        "|  | % ppII | 26.2 (1.8) | 51.9 (1.1) |\n"
+        "| Ac-(AAQAA)3-NH2 | | | |\n"
+        "|  | % a-helix | 95.3 (0.1) | 21.0 (1.7) |\n"
+    )
+
+    excerpt = QueryService._table_block_excerpt(
+        block,
+        "What does the peptide sampling table report for Ala5 and Ac-(AAQAA)3-NH2?",
+    )
+
+    assert excerpt.startswith("Table evidence:")
+    assert "### Page" not in excerpt
+    assert "Properties of peptides" in excerpt
+    assert "Ala5" in excerpt
+    assert "51.9" in excerpt
+    assert "Ac-(AAQAA)3-NH2" in excerpt
+    assert "95.3" in excerpt
+    assert "21.0" in excerpt
+
+
+def test_table_block_excerpt_keeps_captionless_html_table_after_page_heading() -> None:
+    block = (
+        "### Page 12\n"
+        "Measurements for ModelX.\n"
+        "<table><tr><th>Model</th><th>F1</th></tr><tr><td>ModelX</td><td>81.4</td></tr></table>"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "What does the table report for ModelX?")
+
+    assert excerpt.startswith("Table evidence:")
+    assert "Measurements for ModelX" in excerpt
+    assert "<table>" in excerpt
+    assert "81.4" in excerpt
+
+
+def test_table_block_excerpt_uses_word_boundary_for_existing_table_caption() -> None:
+    block = (
+        "### Page 13\n"
+        "Stable measurements for ModelX.\n"
+        "| Model | F1 |\n"
+        "| --- | --- |\n"
+        "| ModelX | 81.4 |"
+    )
+
+    excerpt = QueryService._table_block_excerpt(block, "What does the table report for ModelX?")
+
+    assert excerpt.startswith("Table evidence: Stable measurements")
+
+
 def test_table_block_excerpt_starts_at_table_fragment_after_prose() -> None:
     block = (
         "As shown in Table 3, the following benchmark summarizes the reported metrics.\n"
