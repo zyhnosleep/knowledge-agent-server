@@ -2775,6 +2775,8 @@ class QueryService:
             line_key = cls._normalize_selector(line)
             if not any(cls._selector_matches_text(anchor, line, line_key) for anchor in anchors):
                 continue
+            if not cls._table_line_has_data_number(line) and not cls._table_line_needs_group_children(line):
+                continue
             selected_indexes.add(index)
             if cls._table_line_needs_group_children(line) or (
                 index + 1 < len(table_lines) and cls._table_line_is_group_child(table_lines[index + 1])
@@ -2839,6 +2841,19 @@ class QueryService:
             return True
         numeric_cells = [cell for cell in non_empty if re.search(r"\d+(?:\.\d+)?", cell)]
         return not numeric_cells and len(non_empty) <= 2
+
+    @classmethod
+    def _table_line_has_data_number(cls, line: str) -> bool:
+        cells = cls._markdown_table_line_cells(line)
+        if not cells or cls._is_markdown_separator_row(cells):
+            return False
+        for cell in cells:
+            key = cls._normalize_selector(cell)
+            if cls._is_table_model_term_key(key):
+                continue
+            if re.search(r"\d+(?:\.\d+)?", cell):
+                return True
+        return False
 
     @classmethod
     def _table_line_is_group_child(cls, line: str) -> bool:

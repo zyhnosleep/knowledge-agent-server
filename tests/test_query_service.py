@@ -3050,6 +3050,33 @@ def test_generic_table_answer_uses_caption_matched_numeric_rows() -> None:
     assert "1.12" in answer.answer_markdown
 
 
+def test_generic_table_rows_ignore_repeated_headers_before_fallback_rows() -> None:
+    table = (
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n\n"
+        "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| PerturbationClass | No.cmpds | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+        "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |\n"
+        "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+        "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |\n"
+        "| TotalWeightedAverage | 1183 | 1.18 | 1.29 | 1.12 | 1.25 |\n\n"
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| PerturbationClass | No.cmpds | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+        "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |"
+    )
+
+    rows = QueryService._generic_table_value_rows(
+        "OPLS5 的 binding RMSE 相比 OPLS4 有哪些数值？",
+        table,
+    )
+
+    rendered = " ".join(row["values"] for row in rows)
+    assert "1.18" in rendered
+    assert "1.12" in rendered
+
+
 def test_generic_table_answer_keeps_late_binding_table_when_earlier_tables_have_many_rows() -> None:
     service = QueryService(make_session())
     table3 = (
