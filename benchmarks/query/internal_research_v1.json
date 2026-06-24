@@ -798,7 +798,10 @@
         "SAC-KG",
         "OPLS5"
       ],
-      "citation_source_hint": "sources/opls4",
+      "citation_source_hint": [
+        "sources/opls4",
+        "sources/opls4-force-field-development-and-validation"
+      ],
       "require_citation": true,
       "require_chinese": true
     },
@@ -829,7 +832,10 @@
       "citation_must_include": [
         "Table"
       ],
-      "citation_source_hint": "sources/opls4",
+      "citation_source_hint": [
+        "sources/opls4",
+        "sources/opls4-force-field-development-and-validation"
+      ],
       "require_citation": true,
       "require_chinese": true,
       "citation_excerpt_must_include": [
@@ -879,7 +885,10 @@
         "SAC-KG",
         "OPLS5"
       ],
-      "citation_source_hint": "sources/opls4",
+      "citation_source_hint": [
+        "sources/opls4",
+        "sources/opls4-force-field-development-and-validation"
+      ],
       "require_citation": true,
       "require_chinese": true
     },

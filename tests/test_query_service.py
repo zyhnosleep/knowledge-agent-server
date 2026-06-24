@@ -86,6 +86,153 @@ def test_query_service_uses_wiki_page_context_and_returns_page_citation() -> Non
     assert "follow-up in two weeks" in fake_ollama.last_prompt.lower()
 
 
+def test_search_wiki_pages_prioritizes_exact_source_identifier_over_body_overlap() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    target_page = WikiPage(
+        id="w-target",
+        project_id="p1",
+        slug="sources/opls4",
+        title="OPLS4",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/opls4.md",
+        markdown_content="# OPLS4\n\nCanonical source page.",
+        source_document_ids=[],
+    )
+    distracting_page = WikiPage(
+        id="w-distractor",
+        project_id="p1",
+        slug="sources/opls5-force-field-development-and-validation",
+        title="OPLS5 Force Field Development and Validation",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/opls5.md",
+        markdown_content=(
+            "# OPLS5\n\n"
+            "OPLS3e salt bridge overstabilization acidic residue pKa bias water ions torsion sulfur FEP validation. "
+            "OPLS3e salt bridge overstabilization acidic residue pKa bias water ions torsion sulfur FEP validation."
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, target_page, distracting_page])
+    db.commit()
+
+    service = QueryService(db)
+    matches = service._search_wiki_pages(
+        "OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？",
+        "p1",
+        limit=2,
+    )
+
+    assert matches[0].page.slug == "sources/opls4"
+
+
+def test_search_wiki_pages_does_not_skip_useful_page_with_placeholder_phrase() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/opls4-force-field-development-and-validation",
+        title="OPLS4 Force Field Development and Validation",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/opls4.md",
+        markdown_content=(
+            "# OPLS4 Force Field Development and Validation\n\n"
+            "## Summary\n"
+            "OPLS4 addresses OPLS3e salt bridge overstabilization and acidic residue pKa bias.\n\n"
+            "## Figure Notes\n"
+            "No summary available."
+        ),
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    matches = service._search_wiki_pages("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization？", "p1", limit=2)
+
+    assert [match.page.slug for match in matches] == ["sources/opls4-force-field-development-and-validation"]
+
+
+def test_search_wiki_pages_skips_source_page_with_only_placeholder_bullets() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/empty-opls4",
+        title="OPLS4 Empty Placeholder",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/empty-opls4.md",
+        markdown_content="# OPLS4 Empty Placeholder\n\nNo summary available.\n\n- No claims yet.",
+        source_document_ids=[],
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    matches = service._search_wiki_pages("OPLS4", "p1", limit=2)
+
+    assert matches == []
+
+
+def test_draft_answer_omits_index_overview_when_contexts_exist() -> None:
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    service.ollama = fake_ollama
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/opls4", page_title="OPLS4", page_kind="source_summary", score=20, excerpt="OPLS4 evidence"),
+            prompt_text="OPLS4 evidence",
+            score=20,
+        )
+    ]
+
+    service._draft_answer("OPLS4 相对 OPLS3e 的主要改进有哪些？", "Index overview mentions OPLS5 and CHARMM36.", contexts)
+
+    assert "Index overview" not in fake_ollama.last_prompt
+    assert "OPLS5 and CHARMM36" not in fake_ollama.last_prompt
+    assert "OPLS4 evidence" in fake_ollama.last_prompt
+
+
+def test_draft_answer_windows_long_contexts_around_question_terms() -> None:
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    service.ollama = fake_ollama
+    long_prefix = "unrelated filler " * 500
+    long_suffix = "more unrelated filler " * 500
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff19sb", page_title="ff19SB", page_kind="source_summary", score=20, excerpt="ff19SB evidence"),
+            prompt_text=long_prefix + "ff19SB uses OPC water model with amino-acid specific CMAP." + long_suffix,
+            score=20,
+        )
+    ]
+
+    service._draft_answer("ff19SB 为什么推荐和 OPC water model 一起使用？", None, contexts)
+
+    assert "ff19SB uses OPC water model" in fake_ollama.last_prompt
+    assert len(fake_ollama.last_prompt) < 5000
+
+
+def test_prompt_context_text_preserves_table_citation_excerpt() -> None:
+    long_prompt = "Table 1 unrelated filler\n" + ("| A | B |\n| --- | --- |\n| x | y |\n" * 200)
+    excerpt = "Table 5\n| Model | F1 |\n| --- | --- |\n| SAC-KG | 88.8 |"
+    context = RetrievedContext(
+        citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=excerpt),
+        prompt_text=long_prompt,
+        score=1,
+    )
+
+    prompt_text = QueryService._prompt_context_text("Table 5 的 F1 是多少？", context)
+
+    assert "Table 5" in prompt_text
+    assert "88.8" in prompt_text
+    assert len(prompt_text) <= 2400
+
+
 def test_query_service_saves_query_page_when_requested() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -360,6 +507,7 @@ def test_is_metric_query_detects_metric_questions() -> None:
     assert QueryService._is_metric_query("What is the F1 score?")
     assert QueryService._is_metric_query("NYT AUC performance")
     assert not QueryService._is_metric_query("Who wrote this paper?")
+    assert not QueryService._is_metric_query("ff19SB 为什么推荐和 OPC water model 一起使用？")
 
 
 def test_extract_figure_blocks_from_wiki_markdown() -> None:

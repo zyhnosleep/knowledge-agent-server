@@ -149,7 +149,7 @@ class QueryService:
                 score += 0.5
             if page.kind == PageKind.entity.value and verified_count <= 0:
                 continue
-            if "No claims yet." in body_text or "No summary available." in body_text:
+            if self._is_placeholder_wiki_page(body_text):
                 continue
             if score <= 0:
                 continue
@@ -418,9 +418,9 @@ class QueryService:
             )
 
         prompt_sections: list[str] = []
-        if index_context:
+        if index_context and not contexts:
             prompt_sections.append("Index overview:\n" + index_context)
-        prompt_sections.extend(f"[{index}] {self._context_evidence_text(context)}" for index, context in enumerate(contexts))
+        prompt_sections.extend(f"[{index}] {self._prompt_context_text(question, context)}" for index, context in enumerate(contexts))
         context_text = "\n\n".join(prompt_sections)
 
         # Build figure/table/dataset-aware guardrails.
@@ -559,9 +559,7 @@ class QueryService:
         supported_pairs = [(index, contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts)]
         if not supported_pairs:
             supported_pairs = list(enumerate(contexts[: min(3, len(contexts))]))
-        constrained_context = "\n\n".join(f"[{index}] {self._context_evidence_text(ctx)}" for index, ctx in supported_pairs)
-        if index_context:
-            constrained_context = "Index overview:\n" + index_context + "\n\n" + constrained_context
+        constrained_context = "\n\n".join(f"[{index}] {self._prompt_context_text(question, ctx)}" for index, ctx in supported_pairs)
         fallback = QueryAnswerPayload(
             answer_markdown=(
                 "The retrieved evidence did not support the specific numeric values in the first draft. "
@@ -612,9 +610,9 @@ class QueryService:
             return answer_payload
 
         prompt_sections: list[str] = []
-        if index_context:
+        if index_context and not table_indexes:
             prompt_sections.append("Index overview:\n" + index_context)
-        prompt_sections.extend(f"[{index}] {self._context_table_evidence_text(contexts[index])}" for index in table_indexes[:4])
+        prompt_sections.extend(f"[{index}] {self._prompt_context_text(question, contexts[index])}" for index in table_indexes[:4])
         context_text = "\n\n".join(prompt_sections)
         fallback = self._deterministic_table_answer(question, contexts, table_indexes, answer_payload.risk_level)
         prompt = "\n\n".join(
@@ -1008,6 +1006,14 @@ class QueryService:
     @staticmethod
     def _context_table_evidence_text(context: RetrievedContext) -> str:
         return QueryService._context_evidence_text(context)
+
+    @classmethod
+    def _prompt_context_text(cls, question: str, context: RetrievedContext) -> str:
+        evidence = cls._context_evidence_text(context)
+        max_chars = 2400 if (cls._is_table_query(question) or cls._is_metric_query(question)) else 1600
+        if len(evidence) <= max_chars:
+            return evidence
+        return cls._window_text(evidence, cls._tokenize(question), max_chars=max_chars, question=question)
 
     @staticmethod
     def _context_evidence_text(context: RetrievedContext) -> str:
@@ -1627,6 +1633,18 @@ class QueryService:
         return markdown
 
     @staticmethod
+    def _is_placeholder_wiki_page(markdown: str) -> bool:
+        lines = [line.strip() for line in markdown.splitlines() if line.strip()]
+        non_heading_lines = [line for line in lines if not line.startswith("#")]
+        placeholder_lines = {"No claims yet.", "No summary available."}
+        meaningful_lines = [
+            line
+            for line in non_heading_lines
+            if line.lstrip("-*0123456789. ").strip() not in placeholder_lines
+        ]
+        return bool(non_heading_lines) and not meaningful_lines
+
+    @staticmethod
     def _tokenize(text: str) -> set[str]:
         lowered = text.lower()
         tokens: set[str] = set()
@@ -1882,12 +1900,15 @@ class QueryService:
     def _is_metric_query(question: str) -> bool:
         """Detect questions asking about metrics, scores, or benchmark results."""
         lowered = question.lower()
-        metric_markers = [
-            "指标", "f1", "auc", "precision", "recall", "accuracy",
-            "bleu", "rouge", "metric", "score", "performance",
-            "oie2016", "nyt", "penn", "web",
-        ]
-        return any(marker in lowered for marker in metric_markers)
+        if any(marker in question for marker in ("\u6307\u6807", "\u5206\u6570", "\u5f97\u5206")):
+            return True
+        return bool(
+            re.search(r"(?<![a-z0-9])f\s*1(?![a-z0-9])", lowered)
+            or re.search(
+                r"\b(auc|precision|recall|accuracy|bleu|rouge|metric|score|performance|oie2016|nyt|penn|web)\b",
+                lowered,
+            )
+        )
 
     @staticmethod
     def _extract_figure_blocks(markdown: str) -> list[str]:

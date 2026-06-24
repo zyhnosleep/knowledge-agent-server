@@ -76,3 +76,17 @@ The benchmark now confirms that the system has moved beyond ingest-only validati
 3. Fix table evidence retrieval and citation selection. Table answers can include correct values while citing nearby or wrong table excerpts.
 4. Improve false-negative repair. Several answers say evidence is absent even when the relevant paper has been ingested.
 5. Revisit strict expected atoms after query routing is fixed. Some `missing_expected_answer_text` failures are likely benchmark wording strictness, but source/citation failures should be addressed first.
+
+## Follow-up Query Fix Sample
+
+After removing index-overview contamination, adding prompt context windowing, fixing `ff19SB` metric-query misclassification, and narrowing placeholder-page filtering, a five-case representative rerun still failed 5/5 but showed source-routing improvement:
+
+| Case | Result after fix | Observation |
+| --- | --- | --- |
+| `ff19sb_overview` | fail: `missing_expected_answer_text` | Now cites `sources/ff19sb-amino-acid-specific-protein-backbone-parameters`; previous no-evidence/source-routing failure is resolved. |
+| `opls4_mechanism` | fail: `missing_expected_answer_text` | Now cites `sources/opls4-force-field-development-and-validation`; previous OPLS5 wrong-source failure is resolved. |
+| `opls5_overview` | fail: `missing_expected_answer_text` | Cites OPLS5 and OPLS4; likely benchmark atom strictness or answer wording issue. |
+| `charmm36_table_metrics` | fail: `missing_citation_text`, `citation_not_table` | Answer contains requested values, but citations point to the wrong table excerpts. |
+| `oplsaa_table_metrics` | fail: `http_error`, `no_citation` | Still times out at 180 seconds. |
+
+This confirms the next repair round should prioritize table block targeting/citation selection and query latency, then tune overly exact expected atoms.

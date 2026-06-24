@@ -17,7 +17,7 @@ The benchmark covers these source wiki pages:
 - `sources/opls4`
 - `sources/opls5-force-field-development-and-validation`
 
-`sources/knowledge-graph-sac-kg-framework-overview` is intentionally excluded. For OPLS4, `sources/opls4` is the canonical test source; `sources/opls4-force-field-development-and-validation` is treated as an alias/duplicate and should not be the primary citation.
+`sources/knowledge-graph-sac-kg-framework-overview` is intentionally excluded. For OPLS4, accept either `sources/opls4` or the current re-ingested slug `sources/opls4-force-field-development-and-validation`; citations to OPLS5 should still fail source-hint checks.
 
 ## Case Design
 
