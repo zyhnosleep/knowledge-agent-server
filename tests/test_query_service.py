@@ -863,6 +863,48 @@ def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
     assert any("LFMM" in context.prompt_text for context in contexts)
 
 
+def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="abc",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={"source_slug": "sources/opls5", "source_title": "OPLS5"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=7,
+        text="The Drude model incorporates intramolecular polarizability for metals.",
+        page_label="7",
+        embedding=None,
+    )
+    claim = Claim(
+        id="claim1",
+        project_id="p1",
+        document_id="d1",
+        subject="OPLS5",
+        predicate="mentions",
+        object_text="Drude polarizability",
+        evidence_chunk_id="c1",
+        confidence=0.7,
+        verification_status="needs-review",
+        metadata_json={},
+    )
+    db.add_all([project, document, chunk, claim])
+    db.commit()
+
+    contexts = QueryService(db)._search_claim_evidence_contexts("OPLS5 是什么？", "p1", ["d1"])
+
+    assert contexts == []
+
+
 def test_rag_metric_answer_retargets_conflicting_prose_numbers_to_table_values() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

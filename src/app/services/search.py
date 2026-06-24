@@ -80,6 +80,23 @@ class QueryService:
         "value",
         "values",
     }
+    _CLAIM_ANCHOR_STOP_KEYS = {
+        "about",
+        "article",
+        "difference",
+        "improve",
+        "improved",
+        "improvement",
+        "main",
+        "mechanism",
+        "overview",
+        "paper",
+        "result",
+        "results",
+        "study",
+        "what",
+        "why",
+    }
 
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -451,15 +468,18 @@ class QueryService:
 
         source_page_fields = self._source_page_fields_by_document_id(project_id, document_ids)
         query_terms = self._tokenize(question)
-        selector_terms = {
-            self._normalize_selector(term)
+        selector_terms = [
+            term
             for term in [
                 *self._question_row_selectors(question),
                 *self._extract_generic_table_terms(question),
                 *self._extract_query_facets(question),
             ]
-            if len(self._normalize_selector(term)) >= 3
-        }
+            if self._is_specific_claim_anchor(term)
+        ]
+        selector_keys = {self._normalize_selector(term) for term in selector_terms}
+        if len(selector_keys) < 2:
+            return []
         scored: list[RetrievedContext] = []
         seen_chunk_ids: set[str] = set()
         for claim, chunk in rows:
@@ -469,17 +489,12 @@ class QueryService:
             combined_text = f"{claim_text}\n{chunk.text}"
             overlap = len(query_terms & self._tokenize(combined_text))
             combined_key = self._normalize_selector(combined_text)
-            anchor_matches = sum(1 for term in selector_terms if term in combined_key)
-            if overlap <= 0 and anchor_matches <= 0:
+            anchor_matches = sum(1 for term in selector_keys if term in combined_key)
+            if anchor_matches < 2:
                 continue
             evidence_terms = query_terms | self._tokenize(claim_text)
             evidence = self._window_text(chunk.text, evidence_terms, max_chars=1400, question=question)
-            prompt_text = (
-                "SAC-KG claim hint: "
-                f"{claim.subject} {claim.predicate} {claim.object_text}\n\n"
-                f"Source evidence:\n{evidence}"
-            )
-            score = 18.0 + overlap * 2.0 + anchor_matches * 3.0 + float(claim.confidence or 0.0)
+            score = 12.0 + overlap * 1.5 + anchor_matches * 3.0 + float(claim.confidence or 0.0)
             scored.append(
                 RetrievedContext(
                     citation=Citation(
@@ -490,7 +505,7 @@ class QueryService:
                         page_label=chunk.page_label,
                         excerpt=evidence[:900],
                     ),
-                    prompt_text=prompt_text,
+                    prompt_text=evidence,
                     score=score,
                 )
             )
@@ -2533,6 +2548,16 @@ class QueryService:
     def _is_specific_table_anchor(cls, term: str) -> bool:
         key = cls._normalize_selector(term)
         return bool(key and not cls._is_table_model_term_key(key) and key not in cls._TABLE_BROAD_METRIC_TERM_KEYS)
+
+    @classmethod
+    def _is_specific_claim_anchor(cls, term: str) -> bool:
+        key = cls._normalize_selector(term)
+        return bool(
+            len(key) >= 3
+            and not cls._is_table_model_term_key(key)
+            and key not in cls._TABLE_BROAD_METRIC_TERM_KEYS
+            and key not in cls._CLAIM_ANCHOR_STOP_KEYS
+        )
 
     @classmethod
     def _is_table_model_term_key(cls, key: str) -> bool:
