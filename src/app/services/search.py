@@ -1049,7 +1049,7 @@ class QueryService:
             lexical_overlap = len(self._tokenize(evidence) & self._tokenize(question))
             if coverage <= 0 and lexical_overlap <= 0:
                 continue
-            snippet = self._window_text(evidence, query_terms, max_chars=760, question=question).strip()
+            snippet = self._window_text(evidence, query_terms, max_chars=360, question=question).strip()
             if not snippet:
                 continue
             selected.append((index, snippet, coverage * 4 + lexical_overlap))
@@ -1070,8 +1070,14 @@ class QueryService:
             return None
         citations = [index for index, _ in deduped]
         if self._is_chinese_question(question):
-            parts = [f"证据片段 {ordinal + 1}：{snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
-            answer = "根据原文 RAG 证据，可以直接抽取到以下相关信息：" + "\n\n".join(parts)
+            parts = [
+                (
+                    f"证据片段 {ordinal + 1} 显示该论文的相关机制、参数或验证对象；"
+                    f"为避免误译，关键英文术语按原文保留。原文短摘录：{snippet} [{index}]"
+                )
+                for ordinal, (index, snippet) in enumerate(deduped)
+            ]
+            answer = "根据原文 RAG 证据，可以直接抽取到以下信息；这些片段只来自候选论文的原文 chunk，不使用 wiki 摘要作为证据：" + "\n\n".join(parts)
         else:
             parts = [f"Evidence {ordinal + 1}: {snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
             answer = "The retrieved source evidence directly supports the following points:\n\n" + "\n\n".join(parts)
