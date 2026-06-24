@@ -596,7 +596,7 @@ class QueryService:
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
-            rare_route_bonus = min(rare_route_overlap * 0.35, 1.0)
+            rare_route_bonus = min(rare_route_overlap * 0.6, 1.8)
             if question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
@@ -2282,7 +2282,7 @@ class QueryService:
                 continue
             if term not in missing:
                 missing.append(term)
-            if len(missing) >= 8:
+            if len(missing) >= 12:
                 break
         if not missing:
             return answer_markdown
@@ -2302,6 +2302,7 @@ class QueryService:
             r"\bQM-MM\b",
             r"\bGAlib\b",
             r"\bCMAPs?\b",
+            r"\bside[- ]chain\b",
             r"\b\d+(?:\.\d+)?\s*K\b",
             r"\b\d+(?:\.\d+)?\s*kcal(?:\s*/\s*mol|\s+mol)?\b",
             r"\bBoltzmann\b",
