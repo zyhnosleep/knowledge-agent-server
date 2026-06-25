@@ -361,6 +361,15 @@ class QueryService:
         if document_ids:
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=min(3, MAX_CONTEXTS)))
             contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
+            contexts.extend(
+                self._supplement_profile_term_contexts(
+                    project_id,
+                    document_ids,
+                    contexts,
+                    profile_terms,
+                    limit=2,
+                )
+            )
         if not contexts and not document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
         return self._finalize_contexts(contexts)
@@ -470,6 +479,81 @@ class QueryService:
                 ordered.append(term)
                 seen.add(key)
         return ordered[:96]
+
+    def _supplement_profile_term_contexts(
+        self,
+        project_id: str,
+        document_ids: list[str],
+        contexts: list[RetrievedContext],
+        profile_terms: list[str],
+        limit: int = 2,
+    ) -> list[RetrievedContext]:
+        if not document_ids or not profile_terms:
+            return []
+        evidence_text = "\n".join(self._context_evidence_text(context) for context in contexts)
+        covered_keys = self._tokenize(evidence_text)
+        candidate_terms = [
+            term
+            for term in profile_terms
+            if self._is_supplemental_profile_term(term) and not (self._tokenize(term) & covered_keys)
+        ]
+        if not candidate_terms:
+            return []
+        statement = select(DocumentChunk).join(DocumentChunk.document).where(
+            DocumentChunk.document.has(project_id=project_id),
+            DocumentChunk.document_id.in_(document_ids),
+        )
+        chunks = self.db.scalars(statement).all()
+        source_page_fields = self._source_page_fields_by_document_id(project_id, document_ids)
+        existing_chunk_ids = {context.citation.chunk_id for context in contexts if context.citation.chunk_id}
+        scored: list[RetrievedContext] = []
+        for chunk in chunks:
+            if chunk.id in existing_chunk_ids:
+                continue
+            text_key = self._normalize_selector(chunk.text)
+            matched_terms = [
+                term
+                for term in candidate_terms
+                if self._normalize_selector(term) and self._normalize_selector(term) in text_key
+            ]
+            if not matched_terms:
+                continue
+            query_terms = self._tokenize(" ".join(matched_terms))
+            excerpt = self._window_text(chunk.text, query_terms, max_chars=1000, question=" ".join(matched_terms))
+            score = 3.0 + len(matched_terms) * 1.5
+            scored.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=chunk.document_id,
+                        chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
+                        score=score,
+                        page_label=chunk.page_label,
+                        excerpt=excerpt[:280],
+                    ),
+                    prompt_text=excerpt,
+                    score=score,
+                )
+            )
+        return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
+
+    @classmethod
+    def _is_supplemental_profile_term(cls, term: str) -> bool:
+        value = str(term or "").strip()
+        key = cls._normalize_selector(value)
+        if len(key) < 4 or key in cls._CLAIM_ANCHOR_STOP_KEYS:
+            return False
+        if cls._is_table_model_term_key(key):
+            return False
+        if re.fullmatch(r"(?:ff|opls|charmm|amber|tip)\d+[a-z0-9-]*", value, re.IGNORECASE):
+            return False
+        if re.search(r"[a-z][A-Z]", value):
+            return True
+        if re.fullmatch(r"[A-Z]{3,}[A-Z0-9-]*", value):
+            return True
+        if re.search(r"[-_/]", value) and any(char.isalpha() for char in value):
+            return True
+        return key in {"cmap", "galib", "boltzmann", "population", "barrier", "fitting", "protocol"}
 
     @classmethod
     def _is_profile_retrieval_term(cls, term: str) -> bool:
