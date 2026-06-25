@@ -983,6 +983,61 @@ def test_rag_contexts_boost_rare_profile_terms() -> None:
     assert any(context.citation.chunk_id == "rare" for context in contexts)
 
 
+def test_rag_contexts_add_supplemental_profile_term_evidence() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff19SB",
+        file_name="ff19sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff19sb.pdf",
+        raw_text="ff19SB paper.",
+        metadata_json={
+            "source_slug": "sources/ff19sb",
+            "source_title": "ff19SB",
+            "paper_profile": {
+                "title": "ff19SB",
+                "aliases": ["ff19SB"],
+                "key_terms": ["ff19SB", "OPC", "TIP3P", "CMAP"],
+                "routing_summary": "ff19SB updates backbone parameters.",
+                "source_slug": "sources/ff19sb",
+            },
+        },
+        status="ready",
+    )
+    dominant_chunks = [
+        DocumentChunk(
+            id=f"dominant-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="ff19SB OPC TIP3P water model dominant evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(12)
+    ]
+    cmap_chunk = DocumentChunk(
+        id="cmap",
+        document_id="d1",
+        ordinal=20,
+        text="CMAP correction map evidence describes the amino-acid specific backbone update.",
+        page_label="20",
+        embedding=None,
+    )
+    db.add_all([project, document, *dominant_chunks, cmap_chunk])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "ff19SB 的核心更新是什么？它为什么推荐和 OPC water model 一起使用？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert any(context.citation.chunk_id == "cmap" for context in contexts)
+
+
 def test_finalize_contexts_keeps_more_same_source_evidence() -> None:
     service = QueryService(make_session())
     contexts = [
