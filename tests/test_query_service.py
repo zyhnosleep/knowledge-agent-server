@@ -1162,6 +1162,58 @@ def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> N
     assert cjk_count / (cjk_count + latin_count) >= 0.2
 
 
+def test_supported_term_note_uses_all_selected_contexts_for_profile_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/ff19sb", page_title="ff19SB", page_kind="source_summary", score=5, excerpt="ff19SB OPC TIP3P helical propensity evidence."),
+            prompt_text="ff19SB OPC TIP3P helical propensity evidence.",
+            score=5,
+        ),
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c2", page_slug="sources/ff19sb", page_title="ff19SB", page_kind="source_summary", score=4, excerpt="ff19SB amino-acid specific backbone update."),
+            prompt_text="ff19SB amino-acid specific backbone update.",
+            score=4,
+        ),
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c3", page_slug="sources/ff19sb", page_title="ff19SB", page_kind="source_summary", score=3, excerpt="OPC water model comparison against TIP3P."),
+            prompt_text="OPC water model comparison against TIP3P.",
+            score=3,
+        ),
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c4", page_slug="sources/ff19sb", page_title="ff19SB", page_kind="source_summary", score=2, excerpt="The amino-acid specific CMAP update is evaluated with QM data."),
+            prompt_text="The amino-acid specific CMAP update is evaluated with QM data.",
+            score=2,
+        ),
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "ff19SB 的核心更新是什么？它为什么推荐和 OPC water model 一起使用？",
+        "已有证据说明 ff19SB、OPC、TIP3P、amino-acid specific 和 backbone。",
+        contexts,
+    )
+
+    assert "CMAP" in answer
+    assert "QM" in answer
+
+
+def test_supported_term_note_normalizes_spaced_half_kcal_units() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/ff99sb-ildn", page_title="ff99SB-ILDN", page_kind="source_summary", score=5, excerpt="Boltzmann population fitting keeps minima below 0 . 5 kcal mol and avoids barrier errors."),
+            prompt_text="Boltzmann population fitting keeps minima below 0 . 5 kcal mol and avoids barrier errors.",
+            score=5,
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "ff99SB-ILDN 为什么选择 500 K 的 Boltzmann population fitting，而不是直接拟合能量曲线或室温拟合？",
+        "已有证据说明 Boltzmann、500 K、population 和 barrier。",
+        contexts,
+    )
+
+    assert "0.5 kcal/mol" in answer
+
+
 def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
     service = QueryService(make_session())
     service.ollama = ExplodingOllama()

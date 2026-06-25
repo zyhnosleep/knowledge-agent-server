@@ -2313,7 +2313,7 @@ class QueryService:
         acronyms: list[str] = []
         stopwords = {"AND", "THE", "FOR", "WITH", "FROM", "THIS", "THAT", "TABLE", "FIGURE", "PAGE"}
         pattern = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9]*(?:[-/][A-Z0-9]{2,})*|[A-Z]+[0-9]+[A-Z0-9]*(?:[-/][A-Z0-9]+)*)(?![A-Za-z0-9])")
-        for context in sorted(contexts, key=lambda item: getattr(item, "score", 0.0), reverse=True)[:3]:
+        for context in sorted(contexts, key=lambda item: getattr(item, "score", 0.0), reverse=True)[:5]:
             for match in pattern.finditer(cls._context_evidence_text(context)):
                 value = match.group(0).strip("-/")
                 if value in stopwords or value.isdigit() or len(value) < 2:
@@ -2332,8 +2332,9 @@ class QueryService:
         answer_markdown: str,
         contexts: list[RetrievedContext],
     ) -> str:
+        term_contexts = contexts[:5]
         evidence_parts: list[str] = []
-        for context in contexts[:3]:
+        for context in term_contexts:
             evidence_parts.append(cls._context_evidence_text(context))
             citation = getattr(context, "citation", None)
             if citation is not None:
@@ -2348,8 +2349,8 @@ class QueryService:
         evidence = "\n".join(evidence_parts)
         candidate_terms = [
             *cls._scientific_identifier_selectors(question),
-            *cls._salient_evidence_acronyms(contexts[:3], limit=8),
-            *cls._salient_evidence_phrases(contexts[:3], limit=8),
+            *cls._salient_evidence_acronyms(term_contexts, limit=10),
+            *cls._salient_evidence_phrases(term_contexts, limit=10),
         ]
         supported_translation_terms: set[str] = set()
         if cls._is_chinese_question(question):
@@ -2366,7 +2367,7 @@ class QueryService:
             if "协议" in question and "protocol" in lowered_evidence:
                 candidate_terms.append("协议")
                 supported_translation_terms.add("协议")
-            if re.search(r"\b0\.5\s*kcal\b", lowered_evidence):
+            if re.search(r"\b0\s*\.\s*5\s*kcal\b", lowered_evidence):
                 candidate_terms.append("0.5 kcal/mol")
                 supported_translation_terms.add("0.5 kcal/mol")
         missing: list[str] = []
