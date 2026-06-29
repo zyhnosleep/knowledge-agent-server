@@ -6121,6 +6121,32 @@ def test_evidence_overlaps_question_scientific_terms_true() -> None:
     )
 
 
+def test_evidence_overlap_accepts_source_title_for_profile_term_context() -> None:
+    """Profile-term snippets may omit the force-field name in the excerpt.
+
+    When retrieval selected a source page titled CHARMM36m, the relevance gate
+    should treat that source metadata as grounding instead of returning an
+    insufficient-evidence answer.
+    """
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36m",
+                page_title="charmm36m",
+                page_kind="source_summary",
+                score=73,
+                excerpt="The predicted alphaL probability drops to 1.1% with w = 2 kT.",
+            ),
+            prompt_text="The predicted alphaL probability drops to 1.1% with w = 2 kT.",
+            score=73,
+        )
+    ]
+
+    assert QueryService._evidence_overlaps_question_scientific_terms(
+        "What is the difference between CHARMM36m and CHARMM36?", contexts
+    )
+
+
 def test_evidence_overlaps_question_scientific_terms_false() -> None:
     """Sample evidence about Method A / Method B must not match a CHARMM question."""
     contexts = [

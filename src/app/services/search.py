@@ -2031,11 +2031,33 @@ class QueryService:
         if not specific_terms:
             return True  # nothing specific to gate on
         for ctx in contexts:
-            evidence = cls._context_evidence_text(ctx).lower()
+            evidence = cls._context_relevance_text(ctx).lower()
             for term in specific_terms:
                 if term and len(term) >= 3 and term in evidence:
                     return True
         return False
+
+    @classmethod
+    def _context_relevance_text(cls, context: "RetrievedContext") -> str:
+        """Text used only for relevance gating.
+
+        Profile-term retrieval can select a highly relevant source page while
+        the snippet window omits the source name itself.  Source metadata is
+        safe to use for this coarse relevance check, but remains separate from
+        answer prompting and citation excerpts.
+        """
+        parts = [cls._context_evidence_text(context)]
+        citation = getattr(context, "citation", None)
+        if citation is not None:
+            for value in (
+                getattr(citation, "page_title", None),
+                getattr(citation, "page_slug", None),
+                getattr(citation, "page_label", None),
+            ):
+                clean = str(value or "").strip()
+                if clean and clean not in parts:
+                    parts.append(clean)
+        return "\n\n".join(part for part in parts if part)
 
     @staticmethod
     def _insufficient_evidence_answer(question_terms: set[str] | None = None) -> str:
