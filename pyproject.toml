@@ -19,6 +19,7 @@ dependencies = [
   "redis>=5.1.1",
   "rq>=1.16.2",
   "sqlalchemy>=2.0.36",
+  "sqlite-vec>=0.1.6",
   "trafilatura>=1.12.2",
   "uvicorn[standard]>=0.32.0",
 ]
@@ -28,7 +29,7 @@ dev = [
   "pytest>=8.3.3",
 ]
 mineru = [
-  "mineru[pipeline]>=2.0.0",
+  "mineru[all]>=3.4,<3.5",
 ]
 
 [build-system]

@@ -37,6 +37,7 @@ tmp/
 # Local research/raw document artifacts
 *.pdf
 tmp_kgraph.txt
+server_pull/
 
 # Editor, OS, and local assistant state
 .vscode/

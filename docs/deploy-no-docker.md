@@ -28,7 +28,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install --upgrade pip
 pip install -e .
-# 如果要启用 MinerU PDF 解析，再安装：
+# 如果要启用 MinerU PDF 解析，再安装；当前项目 extra 使用 mineru[all]>=3.4,<3.5：
 # pip install -e ".[mineru]"
 chmod +x scripts/*.sh
 mkdir -p logs run data
@@ -57,7 +57,7 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 DATABASE_URL=sqlite:///./data/app.db
 REDIS_URL=redis://127.0.0.1:6379/0
-QUEUE_JOB_TIMEOUT=3600
+QUEUE_JOB_TIMEOUT=9000
 DATA_DIR=./data
 RAW_DIR=./data/raw
 WIKI_DIR=./data/wiki
@@ -77,7 +77,7 @@ MINERU_BIN=mineru
 MINERU_BACKEND=pipeline
 MINERU_MODEL_SOURCE=modelscope
 MINERU_OUTPUT_DIR=./data/cache/mineru
-MINERU_TIMEOUT=3600
+MINERU_TIMEOUT=7200
 MINIO_ENABLED=false
 EXTERNAL_API_ENABLED=false
 ```
@@ -89,8 +89,8 @@ EXTERNAL_API_ENABLED=false
 - `SQLite` 适合当前轻量协作，不适合高并发写入。
 - 所有命令示例和 `scripts/*.sh` 都按 POSIX `sh` 兼容方式编写，不使用 `source`。
 - 当前版本新增了 PDF 页面渲染依赖；更新代码后请重新执行一次 `pip install -e .`。
-- 如果启用 MinerU，请执行 `pip install -e ".[mineru]"`，并把 `MINERU_ENABLED=true` 写入 `.env`。
-- `QUEUE_JOB_TIMEOUT` 应明显大于 `OLLAMA_REQUEST_TIMEOUT`；如果 PDF 或多模态摄入很慢，可以继续把 `QUEUE_JOB_TIMEOUT` 调到 `7200`。
+- 如果启用 MinerU，请执行 `pip install -e ".[mineru]"`，当前项目 extra 会安装 `mineru[all]>=3.4,<3.5`，并把 `MINERU_ENABLED=true` 写入 `.env`。
+- `QUEUE_JOB_TIMEOUT` 应明显大于 `OLLAMA_REQUEST_TIMEOUT` 和 `MINERU_TIMEOUT`；如果 PDF 或多模态摄入很慢，可以继续调高。
 
 ### 可选：启用 MinerU PDF 解析
 
@@ -110,7 +110,7 @@ MINERU_BIN=mineru
 MINERU_BACKEND=pipeline
 MINERU_MODEL_SOURCE=modelscope
 MINERU_OUTPUT_DIR=./data/cache/mineru
-MINERU_TIMEOUT=3600
+MINERU_TIMEOUT=7200
 MINERU_EXTRA_ARGS=
 ```
 

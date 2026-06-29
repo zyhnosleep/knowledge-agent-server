@@ -45,6 +45,7 @@ from app.services.paper_profile import ensure_paper_profile, ensure_source_ident
 from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
+from app.services.vector_store import ChunkVector, SQLiteVecStore
 from app.services.wiki import WikiRenderer
 from app.services.wiki_quality import build_ingest_quality_report
 
@@ -206,6 +207,23 @@ class IngestionPipeline:
             self._set_progress(run, 30, "chunking", "Replacing document chunks and preparing embeddings.")
             self._replace_chunks(document, parsed.chunks)
 
+            if not settings.sac_kg_enabled:
+                self._set_progress(run, 82, "indexing_rag", "Skipping SAC-KG extraction; RAG chunks and vector index are ready.")
+                document.status = DocumentStatus.ready.value
+                run.status = RunStatus.completed.value
+                run.provider_report = {
+                    **dict(run.provider_report or {}),
+                    "entities": 0,
+                    "claims": 0,
+                    "wiki_pages": 0,
+                    "review_items": 0,
+                    "ingest_quality": quality_report,
+                    "sac_kg_enabled": False,
+                }
+                self._set_progress(run, 100, "completed", "RAG-only ingest completed successfully.")
+                self.db.commit()
+                return run
+
             self._set_progress(run, 45, "extracting", "Generating SAC-KG routing facts with Ollama.")
             extraction = self._extract_document(document, parsed.text)
             ensure_source_identity(document, extraction.title or document.title)
@@ -246,6 +264,7 @@ class IngestionPipeline:
             failed_document = self.db.get(Document, document_id)
             failed_run = self.db.get(PipelineRun, run_id)
             if failed_document is not None:
+                self._clear_document_chunks(failed_document.id)
                 failed_document.status = DocumentStatus.failed.value
             if failed_run is not None:
                 failed_run.status = RunStatus.failed.value
@@ -283,6 +302,7 @@ class IngestionPipeline:
         self.db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).delete()
         texts = [chunk.text for chunk in parsed_chunks]
         embeddings = safe_model_call(lambda: self.ollama.embed(texts), [[] for _ in texts])
+        records: list[DocumentChunk] = []
         for chunk, embedding in zip(parsed_chunks, embeddings, strict=False):
             record = DocumentChunk(
                 document_id=document.id,
@@ -294,7 +314,20 @@ class IngestionPipeline:
                 embedding=embedding or None,
             )
             self.db.add(record)
-        self.db.commit()
+            records.append(record)
+        self.db.flush()
+        SQLiteVecStore(self.db).replace_document_chunks(
+            document.id,
+            [
+                ChunkVector(chunk_id=record.id, document_id=document.id, embedding=record.embedding or [])
+                for record in records
+                if record.embedding
+            ],
+        )
+
+    def _clear_document_chunks(self, document_id: str) -> None:
+        SQLiteVecStore(self.db).delete_document(document_id)
+        self.db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
 
     def _extract_document(self, document: Document, full_text: str) -> DocumentExtraction:
         chunks = self.db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id).order_by(DocumentChunk.ordinal)).all()

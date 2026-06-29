@@ -1,5 +1,8 @@
+import json
 from pathlib import Path
 import subprocess
+
+import pytest
 
 from app.services.ai import DocumentPagePayload
 from app.services import parser
@@ -80,7 +83,13 @@ def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
             "page_idx": 0,
         },
         {"type": "interline_equation", "text": "$F_1 = 2PR / (P + R)$", "page_idx": 0},
-        {"type": "image", "image_caption": ["Figure 1 shows the SAC-KG workflow."], "page_idx": 1},
+        {
+            "type": "image",
+            "image_caption": ["Figure 1 shows the SAC-KG workflow."],
+            "image_note": "Generator, Verifier, and Pruner are connected.",
+            "img_path": "images/figure-1.png",
+            "page_idx": 1,
+        },
     ]
 
     parsed = parser._mineru_content_to_parsed_doc(
@@ -95,7 +104,104 @@ def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
     assert "| Model | F1 |" in intelligence["tables"][0]["markdown"]
     assert intelligence["formulas"][0]["text"] == "$F_1 = 2PR / (P + R)$"
     assert intelligence["figures"][0]["page_label"] == "2"
+    assert intelligence["figures"][0]["caption"] == "Figure 1 shows the SAC-KG workflow."
+    assert intelligence["figures"][0]["note"] == "Generator, Verifier, and Pruner are connected."
+    assert intelligence["figures"][0]["image_path"] == "images/figure-1.png"
+    assert intelligence["figures"][0]["path"] == "images/figure-1.png"
     assert any(chunk.page_label == "1" and "OpenIE6" in chunk.text for chunk in parsed.chunks)
+    assert any(
+        chunk.page_label == "2"
+        and "Figure evidence" in chunk.text
+        and "Generator, Verifier, and Pruner" in chunk.text
+        and "images/figure-1.png" in chunk.text
+        for chunk in parsed.chunks
+    )
+
+
+def test_mineru_real_content_list_v2_fixture_recovers_tables_and_images() -> None:
+    fixture_dir = Path(__file__).resolve().parent / "fixtures" / "mineru" / "knowledge_graph_auto_subset"
+    content_list_path = fixture_dir / "content_list_v2.json"
+    markdown_path = parser._find_mineru_markdown(fixture_dir)
+    if not content_list_path.exists():
+        pytest.skip("MinerU content_list_v2 fixture is not present.")
+    if markdown_path is None:
+        pytest.skip("MinerU markdown fixture is not present.")
+
+    payload = json.loads(content_list_path.read_text(encoding="utf-8"))
+    content_list = parser._normalize_mineru_content_list(payload)
+    page_count = len(payload) if isinstance(payload, list) else 0
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=fixture_dir / "Knowledge graph.pdf",
+        content_list=content_list,
+        page_count=page_count,
+        output_dir=fixture_dir,
+        content_list_path=content_list_path,
+    )
+    parser._augment_mineru_parsed_doc_from_markdown(parsed, markdown_path)
+
+    intelligence = parsed.metadata["document_intelligence"]
+    tables = intelligence["tables"]
+    figures = intelligence["figures"]
+    figure_1 = next((figure for figure in figures if "Figure 1" in str(figure.get("caption") or "")), None)
+    assert parsed.metadata["parser_mode"] == "pdf_mineru"
+    assert tables
+    assert figures
+    assert figure_1 is not None
+
+    image_path = figure_1["image_path"]
+    assert image_path.startswith("images/")
+    assert image_path.endswith(".jpg")
+    assert (fixture_dir / image_path).is_file()
+
+    combined_table_text = "\n".join(str(table.get("markdown") or "") for table in tables)
+    combined_structured_text = json.dumps(intelligence["structured_tables"], ensure_ascii=False)
+    combined_chunk_text = "\n".join(chunk.text for chunk in parsed.chunks)
+    combined_text = "\n".join([combined_table_text, combined_structured_text, combined_chunk_text, parsed.text])
+    assert "Table 5" in combined_text or "SAC-KG ChatGPT" in combined_text
+
+
+def test_mineru_figure_paths_are_kept_within_output_root(tmp_path) -> None:
+    output_dir = tmp_path / "mineru-output"
+    content_dir = output_dir / "auto"
+    content_dir.mkdir(parents=True)
+    content_list_path = content_dir / "content_list.json"
+    content_list_path.write_text("[]", encoding="utf-8")
+
+    safe = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "safe.pdf",
+        content_list=[
+            {
+                "type": "image",
+                "image_caption": "Safe figure",
+                "img_path": "images/safe.png",
+                "page_idx": 0,
+            }
+        ],
+        page_count=1,
+        output_dir=output_dir,
+        content_list_path=content_list_path,
+    )
+    safe_figure = safe.metadata["document_intelligence"]["figures"][0]
+    assert safe_figure["image_path"] == "images/safe.png"
+    assert safe_figure["path"] == "images/safe.png"
+
+    unsafe = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "unsafe.pdf",
+        content_list=[
+            {"type": "image", "image_caption": "Traversal figure", "img_path": "../../secret.png", "page_idx": 0},
+            {"type": "image", "image_caption": "Absolute figure", "img_path": str(tmp_path.parent / "secret.png"), "page_idx": 0},
+            {"type": "image", "image_caption": "Remote figure", "img_path": "https://example.test/figure.png", "page_idx": 0},
+        ],
+        page_count=1,
+        output_dir=output_dir,
+        content_list_path=content_list_path,
+    )
+    unsafe_figures = unsafe.metadata["document_intelligence"]["figures"]
+
+    assert all("image_path" not in figure for figure in unsafe_figures)
+    assert all("path" not in figure for figure in unsafe_figures)
+    assert "../../secret" not in unsafe.text
+    assert "https://example.test" not in unsafe.text
 
 
 def test_html_table_to_markdown_expands_colspan_and_rowspan() -> None:
@@ -152,6 +258,32 @@ def test_parse_pdf_with_mineru_returns_none_when_cli_missing(monkeypatch, tmp_pa
     assert parsed is None
 
 
+def test_build_mineru_command_normalizes_hybrid_backend_and_extra_args(tmp_path) -> None:
+    command = parser._build_mineru_command(
+        mineru_bin="mineru",
+        source_path=tmp_path / "paper.pdf",
+        output_dir=tmp_path / "mineru-output",
+        backend="hybrid",
+        extra_args='--effort high --start-page 0 --lang "ch, en"',
+    )
+
+    assert command[:5] == ["mineru", "-p", str(tmp_path / "paper.pdf"), "-o", str(tmp_path / "mineru-output")]
+    assert command[5:7] == ["-b", "hybrid-engine"]
+    assert command[7:] == ["--effort", "high", "--start-page", "0", "--lang", "ch, en"]
+
+
+def test_build_mineru_command_keeps_pipeline_backend(tmp_path) -> None:
+    command = parser._build_mineru_command(
+        mineru_bin="mineru",
+        source_path=tmp_path / "paper.pdf",
+        output_dir=tmp_path / "mineru-output",
+        backend="pipeline",
+        extra_args="",
+    )
+
+    assert command[5:7] == ["-b", "pipeline"]
+
+
 def test_parse_pdf_with_mineru_reads_content_list(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(parser.settings, "mineru_bin", "mineru")
     monkeypatch.setattr(parser.settings, "mineru_backend", "pipeline")
@@ -164,12 +296,13 @@ def test_parse_pdf_with_mineru_reads_content_list(monkeypatch, tmp_path) -> None
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n")
 
-    def fake_run(command, cwd, env, capture_output, text, timeout, check):
+    def fake_run(command, cwd, env, capture_output, text, encoding, errors, timeout, check):
         pdf_arg = Path(command[command.index("-p") + 1])
         output_dir = Path(command[command.index("-o") + 1])
         assert pdf_arg.is_absolute()
         assert output_dir.is_absolute()
         assert cwd == str(pdf_path.parent.resolve())
+        assert command[command.index("-b") + 1] == "pipeline"
         result_dir = output_dir / "paper" / "auto"
         result_dir.mkdir(parents=True)
         (result_dir / "paper_content_list_v2.json").write_text(

@@ -54,6 +54,10 @@ def normalize_table_cell(cell: str) -> str:
     text = re.sub(r"\\(?:quad|,|;|!|\s)", " ", text)
     text = re.sub(r"\\[A-Za-z]+", "", text)
     text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\b(?:mathbb|mathrm|mathit|mathsf)\s+chi\s*([12])\b", r"χ\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bchi\s*([12])\b", r"χ\1", text, flags=re.IGNORECASE)
+    if re.search(r"\b(?:theta|angle|torsion|chi\s*[12]|χ[12]|Leu|Asp|Asn|Val|Thr|Phe|Tyr)\b", text, flags=re.IGNORECASE):
+        text = re.sub(r"\blle\b", "Ile", text)
     text = _compact_common_model_names(text)
     text = _repair_ocr_numeric_spacing(text)
     text = re.sub(r"\s*/\s*", "/", text)
@@ -63,6 +67,9 @@ def normalize_table_cell(cell: str) -> str:
 def _repair_ocr_numeric_spacing(text: str) -> str:
     text = re.sub(r"\bpm\b", "±", text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", text)
+    text = re.sub(r"(?<![\d.])(\d)\s+(\d)\.(\d)\s+(\d)(?![\d.])", r"\1\2.\3\4", text)
+    text = re.sub(r"(?<![\d.])(\d)\s+(\d)\.(\d+)(?=\s*(?:±|\+/-|$|[^\d.]))", r"\1\2.\3", text)
+    text = re.sub(r"(?<![\d.])(\d)\.(\d)\s+(\d)(?![\d.])", r"\1.\2\3", text)
     text = re.sub(r"(?<!\d)(\d)\s+(\d{2})(?!\d)", r"\1.\2", text)
 
     def join_single_digit_run(match: re.Match[str]) -> str:
@@ -82,6 +89,7 @@ def _compact_latex_group(value: str) -> str:
 
 def _compact_common_model_names(text: str) -> str:
     text = _compact_spaced_uppercase_runs(text)
+    text = re.sub(r"\bC\s+(6|12)\b", r"C\1", text)
     text = re.sub(
         r"\bw\s*/\s*o\s+((?:[A-Za-z]\s*){2,})",
         lambda match: "w/o " + re.sub(r"\s+", "", match.group(1)),
@@ -104,10 +112,24 @@ def _repair_markdown_table_rows(rows: list[list[str]]) -> list[list[str]]:
     rows = [list(row) for row in rows]
     if not rows:
         return rows
+    _repair_residue_ocr_cells(rows)
     _repair_dataset_metric_header(rows)
     _repair_iteration_rowspans(rows)
     width = max(len(row) for row in rows)
     return [row + [""] * (width - len(row)) for row in rows]
+
+
+def _repair_residue_ocr_cells(rows: list[list[str]]) -> None:
+    table_context = " ".join(cell for row in rows[:3] for cell in row)
+    has_residue_angle_context = bool(re.search(r"\b(?:res\.?|residue|amino acid)\b", table_context, flags=re.IGNORECASE)) and bool(
+        re.search(r"\b(?:angle|theta|torsion|chi\s*[12]|χ[12]|alpha|beta|gamma)\b", table_context, flags=re.IGNORECASE)
+    )
+    if not has_residue_angle_context:
+        return
+    for row in rows:
+        for index, cell in enumerate(row):
+            if re.fullmatch(r"lle", cell.strip(), flags=re.IGNORECASE):
+                row[index] = "Ile"
 
 
 def _repair_dataset_metric_header(rows: list[list[str]]) -> None:

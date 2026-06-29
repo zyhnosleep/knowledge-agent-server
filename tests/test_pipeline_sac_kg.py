@@ -247,6 +247,82 @@ def test_process_document_rolls_back_partial_changes_before_marking_failed(monke
     assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 0
 
 
+def test_process_document_cleans_chunks_when_later_extraction_fails(monkeypatch) -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Case", file_name="case.md", sha256="abc", raw_path="raw/case.md")
+    run = PipelineRun(id="r1", project_id="p1", document_id="d1", run_type=RunType.ingest.value, status=RunStatus.queued.value, provider_report={})
+    db.add_all([project, document, run])
+    db.commit()
+
+    from app.services import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module.settings, "sac_kg_enabled", True)
+    monkeypatch.setattr(
+        pipeline_module,
+        "parse_document",
+        lambda path: ParsedDocument(
+            title="Case",
+            text="Parsed text",
+            chunks=[ParsedChunk(ordinal=0, text="Parsed chunk", page_label="1")],
+            metadata={},
+        ),
+    )
+    monkeypatch.setattr(IngestionPipeline, "_extract_document", lambda self, failed_document, full_text: (_ for _ in ()).throw(RuntimeError("extract failure")))
+
+    pipeline = IngestionPipeline(db)
+    pipeline.ollama = FakeEmbeddingOllama()
+
+    with pytest.raises(RuntimeError, match="extract failure"):
+        pipeline.process_document("d1")
+
+    db.expire_all()
+    assert db.get(Document, "d1").status == DocumentStatus.failed.value
+    assert db.get(PipelineRun, "r1").status == RunStatus.failed.value
+    assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 0
+
+
+def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch) -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(id="d1", project_id="p1", title="Case", file_name="case.md", sha256="abc", raw_path="raw/case.md")
+    run = PipelineRun(id="r1", project_id="p1", document_id="d1", run_type=RunType.ingest.value, status=RunStatus.queued.value, provider_report={})
+    db.add_all([project, document, run])
+    db.commit()
+
+    from app.services import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module.settings, "sac_kg_enabled", False)
+    monkeypatch.setattr(
+        pipeline_module,
+        "parse_document",
+        lambda path: ParsedDocument(
+            title="Parsed",
+            text="Parsed text",
+            chunks=[ParsedChunk(ordinal=0, text="Parsed text", page_label="1")],
+            metadata={},
+        ),
+    )
+
+    def fail_if_called(self: IngestionPipeline, processed_document: Document, full_text: str) -> DocumentExtraction:
+        raise AssertionError("SAC-KG extraction should be skipped")
+
+    monkeypatch.setattr(IngestionPipeline, "_extract_document", fail_if_called)
+    pipeline = IngestionPipeline(db)
+    pipeline.ollama = FakeEmbeddingOllama()
+
+    completed = pipeline.process_document("d1")
+
+    db.expire_all()
+    assert completed.status == RunStatus.completed.value
+    assert db.get(Document, "d1").status == DocumentStatus.ready.value
+    assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 1
+    report = db.get(PipelineRun, "r1").provider_report
+    assert report["sac_kg_enabled"] is False
+    assert report["claims"] == 0
+    assert report["progress"]["stage"] == "completed"
+
+
 def test_ensure_growing_entities_reuses_existing_tail_entity() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

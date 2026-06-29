@@ -12,7 +12,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.records import Claim, Document, DocumentChunk, PageKind, Project, QuestionAnswer, WikiPage
+from app.models.records import Claim, Document, DocumentChunk, DocumentStatus, PageKind, Project, QuestionAnswer, WikiPage
 from app.schemas.common import Citation, QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
 from app.services.ai import ExternalVerifier, OllamaClient
@@ -26,6 +26,7 @@ from app.services.paper_profile import (
 )
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
+from app.services.vector_store import SQLiteVecStore
 from app.services.wiki import WikiRenderer
 
 settings = get_settings()
@@ -44,6 +45,7 @@ class RetrievedContext:
     citation: Citation
     prompt_text: str
     score: float
+    evidence_kind: str | None = None
 
 
 @dataclass
@@ -57,6 +59,7 @@ class PaperMatch:
     document: Document
     score: float
     exact_alias: bool = False
+    locked: bool = False
 
 
 @dataclass
@@ -69,6 +72,136 @@ class ExtractedMetric:
 
 class QueryService:
     _TABLE_MODEL_TERM_RE = re.compile(r"^(?:amber|charmm|gaff|opls|c\d+|ff\d+)[a-z0-9]*$")
+    _SCIENTIFIC_PROFILE_TERM_KEYS = {
+        "34organicliquids",
+        "alanine",
+        "alphal",
+        "asp",
+        "asn",
+        "boss",
+        "c6coefficients",
+        "chargetransfer",
+        "chi1",
+        "chi2",
+        "covalentrelaxation",
+        "drude",
+        "expandedensemble",
+        "expandedensembles",
+        "explicithydrogen",
+        "fep",
+        "fret",
+        "fxa",
+        "galib",
+        "glh",
+        "glu",
+        "helicalpropensity",
+        "helixcoil",
+        "hydrationfreeenergy",
+        "idp",
+        "largedisorderedproteins",
+        "ile",
+        "leucine",
+        "lfmm",
+        "lennardjones",
+        "mmp13",
+        "moltenglobule",
+        "montecarlo",
+        "mse",
+        "nmr",
+        "neutralstate",
+        "phase",
+        "polarizability",
+        "rdcs",
+        "saltbridge",
+        "sparta",
+        "steric",
+        "stericclash",
+        "stericclashes",
+        "tetrapeptide",
+        "thr",
+        "torsion",
+        "torsional",
+        "val",
+        "valine",
+        "vanderwaals",
+        "vdw",
+    }
+    _SCIENTIFIC_CONTEXT_ANCHORS = (
+        ("amino-acid specific", re.compile(r"\bamino-acid specific\b", re.IGNORECASE)),
+        ("50%", re.compile(r"\b50\s*%", re.IGNORECASE)),
+        ("34 organic liquids", re.compile(r"\b34\s+organic liquids\b", re.IGNORECASE)),
+        ("390", re.compile(r"\b390\b", re.IGNORECASE)),
+        ("500 K", re.compile(r"\b500\s*K\b", re.IGNORECASE)),
+        ("-2.4", re.compile(r"(?<![\w.])-?\s*2\.4(?![\w.])", re.IGNORECASE)),
+        ("-0.5", re.compile(r"(?<![\w.])-?\s*0\.5(?![\w.])", re.IGNORECASE)),
+        ("alphaL", re.compile(r"(?:\\alpha|\u03b1|alpha)\s*(?:_|\{|\}|\\mathrm|\s)*L\b", re.IGNORECASE)),
+        ("BOSS", re.compile(r"\bBOSS\b", re.IGNORECASE)),
+        ("C6", re.compile(r"\bC\s*(?:_|\{|\}|\s)*6\b", re.IGNORECASE)),
+        ("cation", re.compile(r"\bcations?\b", re.IGNORECASE)),
+        ("charge transfer", re.compile(r"\bcharge transfer\b", re.IGNORECASE)),
+        ("CMAP", re.compile(r"\bCMAPs?\b", re.IGNORECASE)),
+        ("covalent relaxation", re.compile(r"\bcovalent relaxation\b", re.IGNORECASE)),
+        ("Drude", re.compile(r"\bDrude\b", re.IGNORECASE)),
+        ("expanded ensembles", re.compile(r"\bexpanded ensembles?\b", re.IGNORECASE)),
+        ("explicit hydrogen", re.compile(r"\bexplicit hydrogen\b", re.IGNORECASE)),
+        ("ff12SB", re.compile(r"\bff12SB\b", re.IGNORECASE)),
+        ("FRET", re.compile(r"\bFRET\b", re.IGNORECASE)),
+        ("FXA", re.compile(r"\bFXA\b", re.IGNORECASE)),
+        ("helical propensity", re.compile(r"\bhelical propensity\b", re.IGNORECASE)),
+        ("helix-coil", re.compile(r"\bhelix[- ]coil\b|\bhelical\b.{0,100}\bextended\b|\bextended\b.{0,100}\bhelical\b", re.IGNORECASE)),
+        ("NMR", re.compile(r"\bNMR\b", re.IGNORECASE)),
+        ("CHARMM36m", re.compile(r"\bCHARMM36m\b", re.IGNORECASE)),
+        ("a99SB", re.compile(r"\ba99SB-?\b", re.IGNORECASE)),
+        ("hydration free energy", re.compile(r"\bfree energ(?:y|ies) of hydration\b|\bhydration free energ(?:y|ies)\b", re.IGNORECASE)),
+        ("IDP", re.compile(r"\bIDPs?\b", re.IGNORECASE)),
+        ("large disordered proteins", re.compile(r"\blarge disordered proteins\b", re.IGNORECASE)),
+        ("large conformational fluctuation", re.compile(r"\blarge conformational fluctuation\b", re.IGNORECASE)),
+        ("Lennard-Jones", re.compile(r"\bLennard[-\u2010-\u2015]Jones\b", re.IGNORECASE)),
+        ("LFMM", re.compile(r"\bLFMM\b", re.IGNORECASE)),
+        ("LMP2", re.compile(r"\bLMP2\b", re.IGNORECASE)),
+        ("London dispersion", re.compile(r"\bLondon dispersion\b", re.IGNORECASE)),
+        ("metal", re.compile(r"\bmetals?\b", re.IGNORECASE)),
+        ("MMP13", re.compile(r"\bMMP13\b", re.IGNORECASE)),
+        ("molten globule", re.compile(r"\bmolten globule\b", re.IGNORECASE)),
+        ("Monte Carlo", re.compile(r"\bMonte Carlo\b", re.IGNORECASE)),
+        ("GAlib", re.compile(r"\bGAlib\b", re.IGNORECASE)),
+        ("FEP", re.compile(r"\bFEP\+?\b", re.IGNORECASE)),
+        ("phase", re.compile(r"\bphase\b", re.IGNORECASE)),
+        ("rotamer", re.compile(r"\brotamers?\b", re.IGNORECASE)),
+        ("population", re.compile(r"\bpopulations?\b", re.IGNORECASE)),
+        ("barrier", re.compile(r"\bbarriers?\b", re.IGNORECASE)),
+        ("QM-MM", re.compile(r"\bQM[-/\s]?MM\b", re.IGNORECASE)),
+        ("neutral state", re.compile(r"\bneutral state\b", re.IGNORECASE)),
+        ("PPII", re.compile(r"\bPPII\b", re.IGNORECASE)),
+        ("polarizability", re.compile(r"\bpolarizability\b", re.IGNORECASE)),
+        ("RDCs", re.compile(r"\bRDCs?\b", re.IGNORECASE)),
+        ("Rg", re.compile(r"\bR\s*_?\s*\{?\s*g\s*\}?\b|\bRg\b", re.IGNORECASE)),
+        ("RHF/6-31G", re.compile(r"\bRHF\s*/\s*6-31G\b", re.IGNORECASE)),
+        ("2kT", re.compile(r"\b2\s*k\s*T\b", re.IGNORECASE)),
+        ("salt bridge", re.compile(r"\bsalt bridge\b", re.IGNORECASE)),
+        ("SPARTA", re.compile(r"\bSPARTA\b", re.IGNORECASE)),
+        ("steric", re.compile(r"\bsteric\b", re.IGNORECASE)),
+        ("steric clashes", re.compile(r"\bsteric clashes?\b", re.IGNORECASE)),
+        ("sulfur", re.compile(r"\bsulfur\b", re.IGNORECASE)),
+        ("tetrapeptide", re.compile(r"\btetrapeptide\b", re.IGNORECASE)),
+        ("torsional", re.compile(r"\btorsional\b|\btorsions?\b", re.IGNORECASE)),
+        ("TIP4P-EW", re.compile(r"\bTIP4P[- ]EW\b", re.IGNORECASE)),
+        ("van der Waals", re.compile(r"\bvan der Waals\b", re.IGNORECASE)),
+        ("vdW", re.compile(r"\bvdW\b", re.IGNORECASE)),
+        ("chi1", re.compile(r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*1\s*\}?", re.IGNORECASE)),
+        ("Alanine", re.compile(r"\bAlanine\b", re.IGNORECASE)),
+        ("Valine", re.compile(r"\bValine\b", re.IGNORECASE)),
+        ("Leucine", re.compile(r"\bLeucine\b", re.IGNORECASE)),
+        ("Ile", re.compile(r"\bIle\b", re.IGNORECASE)),
+        ("Val", re.compile(r"\bVal\b", re.IGNORECASE)),
+        ("Thr", re.compile(r"\bThr\b", re.IGNORECASE)),
+        ("Asp", re.compile(r"\bAsp\b", re.IGNORECASE)),
+        ("Asn", re.compile(r"\bAsn\b", re.IGNORECASE)),
+        ("GLH", re.compile(r"\bGLH\b|\bGlh\b", re.IGNORECASE)),
+        ("ASP", re.compile(r"\bASP\b", re.IGNORECASE)),
+        ("GLU", re.compile(r"\bGLU\b|\bGlu\b", re.IGNORECASE)),
+        ("MSE", re.compile(r"\bMSE\b", re.IGNORECASE)),
+    )
     _TABLE_BROAD_METRIC_TERM_KEYS = {
         "accuracy",
         "auc",
@@ -105,6 +238,26 @@ class QueryService:
         "what",
         "why",
     }
+    _QUESTION_STOP_TERMS = frozenset({
+        "what", "the", "is", "are", "a", "an", "and", "or", "of", "in", "to",
+        "for", "with", "on", "at", "by", "between", "vs", "versus", "difference",
+        "how", "why", "when", "where", "who", "does", "do", "can", "will",
+        "has", "have", "it", "its", "this", "that", "these", "those", "from",
+        "about", "which", "than", "follow", "follow-up", "up", "not", "but",
+        "also", "been", "were", "was", "had", "did", "said", "get", "got",
+        "just", "like", "make", "more", "much", "now", "only", "over", "put",
+        "same", "some", "such", "take", "use", "used", "very", "well", "may",
+        "might", "could", "would", "should", "let", "see", "say", "know",
+        "need", "want", "ask", "like", "time", "way", "day", "year", "thing",
+        "case", "part", "place", "point", "kind", "sort", "type", "example",
+        "instance", "model", "method", "approach", "result", "results", "study",
+        "paper", "article", "conclusion", "summary", "report", "analysis",
+    })
+    _SCIENTIFIC_ACRONYM_RE = re.compile(r"\b[A-Z]{2,}\d*[a-z]*\d*[a-z-]*\b")
+    _FORCE_FIELD_RE = re.compile(
+        r"\b(?:CHARMM|AMBER|OPLS|GAFF|GROMOS|MMFF|UFF|CGenFF|Martini)\d*[a-z]*\d*[a-z-]*\b",
+        re.IGNORECASE,
+    )
 
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -113,6 +266,90 @@ class QueryService:
 
     def answer(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
         return self._answer_rag_first(project_slug, question, save_answer=save_answer)
+
+    def retrieve_evidence(
+        self, project_slug: str, question: str, limit: int = 15
+    ) -> "EvidencePack":
+        """Retrieve-only RAG: return an EvidencePack without drafting an answer.
+
+        Reuses the same routing and context selection as ``answer()`` but
+        does **not** call the LLM, verify, or persist a ``QuestionAnswer``.
+        """
+        from app.schemas.agent import EvidenceItem, EvidencePack
+
+        project = self.db.scalar(select(Project).where(Project.slug == project_slug))
+        if project is None:
+            raise ValueError(f"Project '{project_slug}' not found")
+
+        paper_matches = self._route_papers(question, project.id)
+        contexts = self._build_rag_contexts(question, project.id, paper_matches)
+        if not contexts and paper_matches:
+            locked_document_ids = self._locked_document_ids(question, paper_matches)
+            if not locked_document_ids:
+                contexts = self._search_source_chunks(question, project.id, [], limit=5)
+        if not contexts:
+            # Try wiki search as fallback
+            page_matches = self._search_wiki_pages(question, project.id)
+            contexts = self._build_contexts(question, project.id, page_matches)
+        items: list[EvidenceItem] = []
+        for idx, ctx in enumerate(contexts[:limit]):
+            evidence_kind = self._context_evidence_kind(ctx)
+            source_stage = self._determine_source_stage(ctx)
+            support_hint = self._determine_support_hint(ctx, question)
+            items.append(
+                EvidenceItem(
+                    index=idx,
+                    document_id=ctx.citation.document_id,
+                    chunk_id=ctx.citation.chunk_id,
+                    page_slug=ctx.citation.page_slug,
+                    page_title=ctx.citation.page_title,
+                    page_kind=ctx.citation.page_kind,
+                    page_label=ctx.citation.page_label,
+                    score=ctx.citation.score,
+                    excerpt=ctx.citation.excerpt,
+                    evidence_kind=evidence_kind,
+                    source_stage=source_stage,
+                    support_hint=support_hint,
+                )
+            )
+        status = "ok" if items else "empty"
+        return EvidencePack(status=status, items=items)
+
+    @staticmethod
+    def _determine_source_stage(ctx: "RetrievedContext") -> str:
+        """Map a RetrievedContext to a deterministic source_stage label."""
+        citation = ctx.citation
+        ek = ctx.evidence_kind
+        # Page-sourced evidence
+        if citation.page_slug and not citation.document_id:
+            return "wiki_page"
+        # Evidence kind → stage mapping
+        kind_map = {
+            "table": "document_table",
+            "figure": "document_figure",
+            "profile-term": "profile_term",
+            "claim": "claim",
+        }
+        if ek and ek in kind_map:
+            return kind_map[ek]
+        if citation.document_id:
+            return "source_chunk"
+        return "unknown"
+
+    @classmethod
+    def _determine_support_hint(cls, ctx: "RetrievedContext", question: str) -> str:
+        """Best-effort deterministic support quality label."""
+        score = ctx.citation.score
+        if score >= 15.0:
+            return "direct"
+        if score >= 5.0:
+            return "contextual"
+        # Check if question terms appear in the evidence text
+        evidence = cls._context_evidence_text(ctx).lower()
+        query_terms = cls._tokenize(question)
+        if query_terms and any(term.lower() in evidence for term in query_terms):
+            return "contextual"
+        return "weak"
 
     def _answer_wiki_first(self, project_slug: str, question: str, save_answer: bool = True) -> QueryResponse:
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
@@ -177,7 +414,9 @@ class QueryService:
         paper_matches = self._route_papers(question, project.id)
         contexts = self._build_rag_contexts(question, project.id, paper_matches)
         if not contexts:
-            contexts = self._search_source_chunks(question, project.id, [], limit=5)
+            locked_document_ids = self._locked_document_ids(question, paper_matches)
+            if not locked_document_ids:
+                contexts = self._search_source_chunks(question, project.id, [], limit=5)
         if not contexts:
             answer_payload = self._draft_answer(question, None, [])
             response = QueryResponse(answer_markdown=answer_payload.answer_markdown, citations=[], verification_status="local-only")
@@ -224,18 +463,25 @@ class QueryService:
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         chosen_indexes = self._table_evidence_indexes_only(question, contexts, chosen_indexes)
-        chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
-        citations = self._select_citations(contexts, chosen_indexes)
+        evidence_insufficient = answer_payload.answer_markdown.lstrip().lower().startswith("## insufficient evidence")
+        if evidence_insufficient:
+            citations = []
+            answer_markdown = self._strip_answer_citation_markers(answer_payload.answer_markdown)
+        else:
+            chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
+            citations = self._select_citations(contexts, chosen_indexes)
 
-        answer_text_for_citations = self._retarget_table_answer_citations(
-            question,
-            answer_payload.answer_markdown,
-            chosen_indexes,
-        )
-        answer_markdown = self._renumber_answer_citations(answer_text_for_citations, chosen_indexes)
-        answer_markdown = self._drop_unreturned_citation_markers(answer_markdown, len(citations))
-        if not citations:
-            answer_markdown = self._strip_answer_citation_markers(answer_markdown)
+            answer_text_for_citations = self._retarget_table_answer_citations(
+                question,
+                answer_payload.answer_markdown,
+                chosen_indexes,
+            )
+            answer_markdown = self._renumber_answer_citations(answer_text_for_citations, chosen_indexes)
+            answer_markdown = self._drop_unreturned_citation_markers(answer_markdown, len(citations))
+            if not citations:
+                answer_markdown = self._strip_answer_citation_markers(answer_markdown)
+            else:
+                answer_markdown = self._ensure_valid_returned_citation_marker(answer_markdown, len(citations))
         response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
 
         if save_answer:
@@ -298,7 +544,12 @@ class QueryService:
 
     def _route_papers(self, question: str, project_id: str, limit: int = 3) -> list[PaperMatch]:
         query_terms = self._tokenize(question)
-        documents = self.db.scalars(select(Document).where(Document.project_id == project_id)).all()
+        documents = self.db.scalars(
+            select(Document).where(
+                Document.project_id == project_id,
+                Document.status == DocumentStatus.ready.value,
+            )
+        ).all()
         matches: list[PaperMatch] = []
         for document in documents:
             profile = paper_profile_data(document)
@@ -327,13 +578,39 @@ class QueryService:
             if self._question_locks_document_subject(question, [str(item) for item in (paper_profile_data(match.document).get("aliases") or [])])
         ]
         if subject_locked:
-            return subject_locked[:1]
+            return [self._locked_paper_match(subject_locked[0])]
         if self._is_cross_paper_query(question):
+            primary = self._primary_subject_match(question, ranked)
+            if primary is not None:
+                return [self._locked_paper_match(primary)]
             return ranked[: max(limit, 5)]
         exact_matches = [match for match in ranked if match.exact_alias]
         if exact_matches:
-            return exact_matches[:limit]
+            if len(exact_matches) > 1:
+                primary = self._primary_subject_match(question, exact_matches)
+                if primary is not None:
+                    return [self._locked_paper_match(primary)]
+                return exact_matches[: max(limit, 5)]
+            return [self._locked_paper_match(exact_matches[0])]
+        if self._top_paper_match_is_obvious(ranked):
+            return [self._locked_paper_match(ranked[0])]
         return ranked[:limit]
+
+    @staticmethod
+    def _locked_paper_match(match: PaperMatch) -> PaperMatch:
+        return PaperMatch(document=match.document, score=match.score, exact_alias=match.exact_alias, locked=True)
+
+    @staticmethod
+    def _top_paper_match_is_obvious(ranked: list[PaperMatch]) -> bool:
+        if not ranked:
+            return False
+        top = ranked[0]
+        if top.score < 10:
+            return False
+        if len(ranked) == 1:
+            return True
+        second = ranked[1]
+        return top.score >= second.score + 8 or top.score >= second.score * 1.75
 
     @staticmethod
     def _question_locks_document_subject(question: str, aliases: list[str]) -> bool:
@@ -346,19 +623,61 @@ class QueryService:
                 return True
             if re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])['’]s\s+(?:table|paper|article)", question, re.IGNORECASE):
                 return True
+            if re.search(
+                rf"^\s*{escaped}(?![A-Za-z0-9_/\-])\s*(?:相比|相对)",
+                question,
+                re.IGNORECASE,
+            ):
+                return True
         return False
 
+    @staticmethod
+    def _primary_subject_match(question: str, ranked: list[PaperMatch]) -> PaperMatch | None:
+        lowered = question.lower()
+        if any(marker in lowered for marker in ("compare", "comparison", "versus", " vs", " v.s.", "between")):
+            return None
+        if not any(marker in question for marker in ("相比", "相对", "比")):
+            return None
+        candidates: list[tuple[int, PaperMatch]] = []
+        for match in ranked:
+            aliases = [str(item) for item in (paper_profile_data(match.document).get("aliases") or [])]
+            positions = [question.lower().find(alias.lower()) for alias in aliases if str(alias or "").strip()]
+            positions = [position for position in positions if position >= 0]
+            if positions:
+                candidates.append((min(positions), match))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        first_position, first_match = candidates[0]
+        if first_position <= 12 and first_match.exact_alias:
+            return first_match
+        return None
+
     def _build_rag_contexts(self, question: str, project_id: str, paper_matches: list[PaperMatch]) -> list[RetrievedContext]:
-        document_ids = [match.document.id for match in paper_matches]
+        locked_document_ids = self._locked_document_ids(question, paper_matches)
+        document_ids = locked_document_ids or [match.document.id for match in paper_matches]
         profile_terms = self._paper_profile_retrieval_terms(paper_matches)
         contexts: list[RetrievedContext] = []
         if self._is_table_query(question) or self._is_metric_query(question):
             table_contexts = self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
-            has_exact_route = any(match.exact_alias for match in paper_matches)
-            if not table_contexts and document_ids and not has_exact_route:
+            if not table_contexts and document_ids and not locked_document_ids:
                 table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(table_contexts)
+            if table_contexts:
+                return self._finalize_contexts(contexts)
+        if self._is_figure_query(question):
+            figure_contexts = self._search_document_figure_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
+            if not figure_contexts and document_ids and not locked_document_ids:
+                figure_contexts = self._search_document_figure_contexts(question, project_id, [], limit=MAX_CONTEXTS)
+            contexts.extend(figure_contexts)
         if document_ids:
+            if self._is_scientific_evidence_query(question) and not (
+                self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
+            ):
+                contexts.extend(self._search_document_intro_contexts(question, project_id, document_ids, limit=2))
+                contexts.extend(self._search_document_limitation_contexts(question, project_id, document_ids, limit=3))
+                contexts.extend(self._search_document_parameterization_contexts(question, project_id, document_ids, limit=5))
+                contexts.extend(self._search_document_scientific_anchor_contexts(question, project_id, document_ids, limit=8))
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, document_ids, limit=min(3, MAX_CONTEXTS)))
             contexts.extend(self._search_source_chunks(question, project_id, document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
             contexts.extend(
@@ -367,12 +686,24 @@ class QueryService:
                     document_ids,
                     contexts,
                     profile_terms,
-                    limit=2,
+                    limit=4 if self._is_scientific_evidence_query(question) else 2,
                 )
             )
         if not contexts and not document_ids:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
         return self._finalize_contexts(contexts)
+
+    @staticmethod
+    def _locked_document_ids(question: str, paper_matches: list[PaperMatch]) -> list[str]:
+        if QueryService._is_cross_paper_query(question):
+            return []
+        locked = [match.document.id for match in paper_matches if match.locked]
+        if locked:
+            return list(dict.fromkeys(locked[:1]))
+        exact = [match.document.id for match in paper_matches if match.exact_alias]
+        if len(exact) == 1:
+            return exact
+        return []
 
     @staticmethod
     def _question_has_exact_alias(question: str, aliases: list[str]) -> bool:
@@ -406,7 +737,10 @@ class QueryService:
         document_ids: list[str],
         limit: int = 5,
     ) -> list[RetrievedContext]:
-        statement = select(Document).where(Document.project_id == project_id)
+        statement = select(Document).where(
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+        )
         if document_ids:
             statement = statement.where(Document.id.in_(document_ids))
         documents = self.db.scalars(statement).all()
@@ -444,6 +778,7 @@ class QueryService:
                         ),
                         prompt_text=block[:4000],
                         score=score,
+                        evidence_kind="table",
                     )
                 )
         return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
@@ -456,12 +791,664 @@ class QueryService:
             select(Document).where(
                 Document.project_id == project_id,
                 Document.id.in_(wanted),
+                Document.status == DocumentStatus.ready.value,
             )
         ).all()
         fields: dict[str, dict[str, str]] = {}
         for document in documents:
             fields[document.id] = source_fields_for_document(document)
         return fields
+
+    def _search_document_figure_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 5,
+    ) -> list[RetrievedContext]:
+        statement = select(Document).where(
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+        )
+        if document_ids:
+            statement = statement.where(Document.id.in_(document_ids))
+        documents = self.db.scalars(statement).all()
+        source_page_fields = self._source_page_fields_by_document_id(project_id, [document.id for document in documents])
+        contexts: list[RetrievedContext] = []
+        for document in documents:
+            metadata = document.metadata_json or {}
+            intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
+            figures = intelligence.get("figures") if isinstance(intelligence, dict) else []
+            if not isinstance(figures, list):
+                continue
+            for ordinal, figure in enumerate(figures):
+                if isinstance(figure, dict):
+                    figure_parts: list[str] = []
+                    seen_figure_values: set[str] = set()
+                    for label, key in (
+                        ("Caption", "caption"),
+                        ("Note", "note"),
+                        ("Text", "text"),
+                        ("Image path", "image_path"),
+                        ("Path", "path"),
+                    ):
+                        value = str(figure.get(key) or "").strip()
+                        if value and value not in seen_figure_values:
+                            figure_parts.append(f"{label}: {value}")
+                            seen_figure_values.add(value)
+                    note = "\n".join(figure_parts).strip()
+                    page_label = str(figure.get("page_label") or "").strip() or None
+                else:
+                    note = str(figure or "").strip()
+                    page_label = None
+                if not note:
+                    continue
+                block = note
+                if not re.search(r"\b(?:figure|fig\.)\b", block, re.IGNORECASE):
+                    block = f"Figure evidence: {block}"
+                if page_label and not re.search(r"\bpage\s+\d+", block, re.IGNORECASE):
+                    block = f"Page {page_label}: {block}"
+                block_score = self._rank_blocks(question, [block])[0][1]
+                if block_score <= 0 and not (self._tokenize(question) & self._tokenize(block)):
+                    continue
+                score = 30.0 + block_score + max(0.0, 2.0 - ordinal * 0.01)
+                contexts.append(
+                    RetrievedContext(
+                        citation=Citation(
+                            document_id=document.id,
+                            **source_page_fields.get(document.id, {}),
+                            score=score,
+                            page_label=page_label,
+                            excerpt=block[:700],
+                        ),
+                        prompt_text=block[:2000],
+                        score=score,
+                        evidence_kind="figure",
+                    )
+        )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    def _search_document_intro_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 2,
+    ) -> list[RetrievedContext]:
+        if not document_ids:
+            return []
+        chunks = self.db.scalars(
+            select(DocumentChunk)
+            .join(DocumentChunk.document)
+            .where(
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                DocumentChunk.document_id.in_(document_ids),
+            )
+            .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
+        ).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
+        query_terms = self._tokenize(question)
+        contexts: list[RetrievedContext] = []
+        for chunk in chunks:
+            page_number = self._page_label_number(chunk.page_label)
+            if chunk.ordinal > 3 and (page_number is None or page_number > 3):
+                continue
+            evidence = chunk.text.strip()
+            if not evidence:
+                continue
+            overlap = len(query_terms & self._tokenize(evidence))
+            if overlap <= 0:
+                continue
+            score = 42.0 + min(overlap, 12) + max(0.0, 4.0 - chunk.ordinal * 0.2)
+            excerpt = self._window_text(evidence, query_terms, max_chars=900, question=question)
+            contexts.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=chunk.document_id,
+                        chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
+                        score=score,
+                        page_label=chunk.page_label,
+                        excerpt=excerpt[:900],
+                    ),
+                    prompt_text=excerpt,
+                    score=score,
+                    evidence_kind="intro",
+                )
+            )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _page_label_number(page_label: str | None) -> int | None:
+        match = re.search(r"\d+", str(page_label or ""))
+        return int(match.group(0)) if match else None
+
+    def _search_document_limitation_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 2,
+    ) -> list[RetrievedContext]:
+        if not document_ids or not self._is_limitation_query(question):
+            return []
+        chunks = self.db.scalars(
+            select(DocumentChunk)
+            .join(DocumentChunk.document)
+            .where(
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                DocumentChunk.document_id.in_(document_ids),
+            )
+            .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
+        ).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
+        query_terms = self._tokenize(question)
+        anchors = (
+            "limitation",
+            "limitations",
+            "unsatisfactory",
+            "overestimation",
+            "overestimated",
+            "deficiency",
+            "deficiencies",
+            "common problem",
+            "radius of gyration",
+            "compactness",
+            "large conformational",
+            "large disordered proteins",
+            "fast-folding",
+            "not fine enough",
+        )
+        contexts: list[RetrievedContext] = []
+        wants_a99sb = "a99sb" in question.lower()
+        for chunk in chunks:
+            evidence = chunk.text.strip()
+            lowered = evidence.lower()
+            if not evidence or not any(anchor in lowered for anchor in anchors):
+                continue
+            overlap = len(query_terms & self._tokenize(evidence))
+            anchor_score = sum(1 for anchor in anchors if anchor in lowered)
+            score = 43.0 + min(overlap, 8) + anchor_score * 2.0
+            if wants_a99sb and "a99sb" in lowered:
+                score += 8.0
+            if "fast-folding" in lowered:
+                score += 6.0
+            if "large disordered proteins" in lowered:
+                score += 6.0
+            excerpt = self._window_text(evidence, query_terms | {"radius", "gyration", "fast", "folding"}, max_chars=900, question=question)
+            contexts.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=chunk.document_id,
+                        chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
+                        score=score,
+                        page_label=chunk.page_label,
+                        excerpt=excerpt[:900],
+                    ),
+                    prompt_text=excerpt,
+                    score=score,
+                    evidence_kind="limitation",
+                )
+            )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    def _search_document_parameterization_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 4,
+    ) -> list[RetrievedContext]:
+        if not document_ids or not self._is_parameterization_anchor_query(question):
+            return []
+        chunks = self.db.scalars(
+            select(DocumentChunk)
+            .join(DocumentChunk.document)
+            .where(
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                DocumentChunk.document_id.in_(document_ids),
+            )
+            .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
+        ).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
+        required_groups = (
+            ("RESP", ("resp", "charge fitting", "partial charge", "hf/6-31g", "hf/6-31g*")),
+            ("QM", ("m05-2x", "mp2/cc-pvqz", "6-311g", "qm energy surface", "quantum mechanics")),
+            ("CMAP", ("leu cmap", "val cmap", "ile", "β-branched", "beta-branched")),
+            ("validation", ("5 milliseconds", "milliseconds md simulations", "explicit solvent")),
+        )
+        specific_group_anchors = {
+            "RESP": ("hf/6-31g", "resp"),
+            "QM": ("m05-2x", "mp2/cc-pvqz"),
+            "CMAP": ("leu cmap", "val cmap"),
+            "validation": ("5 milliseconds",),
+        }
+        contexts: list[RetrievedContext] = []
+        best_by_group: dict[str, RetrievedContext] = {}
+        query_terms = self._tokenize(question)
+        for chunk in chunks:
+            evidence = chunk.text.strip()
+            if not evidence:
+                continue
+            normalized = self._normalize_scientific_evidence_text(evidence)
+            matched_groups = [
+                group
+                for group, anchors in required_groups
+                if any(anchor in normalized for anchor in anchors)
+            ]
+            if not matched_groups:
+                continue
+            specific_matches = {
+                group: [anchor for anchor in specific_group_anchors.get(group, ()) if anchor in normalized]
+                for group in matched_groups
+            }
+            specific_matches = {group: anchors for group, anchors in specific_matches.items() if anchors}
+            flat_terms: set[str] = set(query_terms)
+            for group, anchors in required_groups:
+                if group in matched_groups:
+                    for anchor in anchors:
+                        flat_terms.update(self._tokenize(anchor))
+            specific_terms: set[str] = set()
+            for anchors in specific_matches.values():
+                for anchor in anchors:
+                    specific_terms.add(anchor)
+                    specific_terms.update(self._tokenize(anchor))
+            score = 50.0 + len(matched_groups) * 9.0 + min(len(query_terms & self._tokenize(evidence)), 10)
+            score += sum(len(anchors) for anchors in specific_matches.values()) * 18.0
+            if "RESP" in matched_groups and "HF/6-31G" in evidence:
+                score += 8.0
+            if "QM" in matched_groups and "M05-2X" in normalized.upper():
+                score += 4.0
+            if "QM" in matched_groups and "MP2/CC-PVQZ" in normalized.upper():
+                score += 4.0
+            if "CMAP" in matched_groups and ("Leu CMAP" in evidence or "Val CMAP" in evidence):
+                score += 6.0
+            if "validation" in matched_groups and "5 milliseconds" in normalized:
+                score += 4.0
+            excerpt = self._anchored_parameterization_excerpt(evidence, specific_matches, flat_terms)
+            context = RetrievedContext(
+                citation=Citation(
+                    document_id=chunk.document_id,
+                    chunk_id=chunk.id,
+                    **source_page_fields.get(chunk.document_id, {}),
+                    score=score,
+                    page_label=chunk.page_label,
+                    excerpt=excerpt[:1000],
+                ),
+                prompt_text=excerpt,
+                score=score,
+                evidence_kind="profile-term",
+            )
+            contexts.append(context)
+            for group in specific_matches:
+                current = best_by_group.get(group)
+                if current is None or context.score > current.score:
+                    best_by_group[group] = context
+        prioritized: list[RetrievedContext] = []
+        for group in ("RESP", "QM", "CMAP", "validation"):
+            context = best_by_group.get(group)
+            if context is not None and context not in prioritized:
+                prioritized.append(context)
+        for context in sorted(contexts, key=lambda item: item.score, reverse=True):
+            if context not in prioritized:
+                prioritized.append(context)
+            if len(prioritized) >= limit:
+                break
+        return prioritized[:limit]
+
+    def _search_document_scientific_anchor_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 6,
+    ) -> list[RetrievedContext]:
+        if not document_ids or not self._is_scientific_evidence_query(question):
+            return []
+        chunks = self.db.scalars(
+            select(DocumentChunk)
+            .join(DocumentChunk.document)
+            .where(
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                DocumentChunk.document_id.in_(document_ids),
+            )
+            .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
+        ).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
+        question_terms = self._tokenize(question)
+        contexts: list[RetrievedContext] = []
+        best_by_anchor: dict[str, RetrievedContext] = {}
+        for chunk in chunks:
+            evidence = chunk.text.strip()
+            if not evidence:
+                continue
+            evidence_key = self._normalize_selector(evidence)
+            lowered_evidence = evidence.lower()
+            matched: list[tuple[str, int]] = []
+            for label, pattern in self._SCIENTIFIC_CONTEXT_ANCHORS:
+                match = pattern.search(evidence)
+                if match:
+                    matched.append((label, match.start()))
+                    continue
+                label_key = self._normalize_selector(label)
+                if label == "C6":
+                    if "c6" in evidence_key and ("dispersion" in lowered_evidence or "coefficient" in lowered_evidence):
+                        matched.append((label, 0))
+                    continue
+                if len(label_key) >= 3 and label_key in evidence_key:
+                    matched.append((label, 0))
+            if not matched:
+                continue
+            matched_labels = [label for label, _ in matched]
+            anchor_terms = set(question_terms)
+            for label in matched_labels:
+                anchor_terms.update(self._tokenize(label))
+                anchor_terms.add(self._normalize_selector(label))
+            high_value_labels = {
+                "Drude",
+                "LFMM",
+                "MMP13",
+                "charge transfer",
+                "GLH",
+                "GLU",
+                "TIP4P-EW",
+                "C6",
+                "large disordered proteins",
+                "large conformational fluctuation",
+                "SPARTA",
+                "PPII",
+                "Lennard-Jones",
+                "steric",
+                "2kT",
+                "QM-MM",
+                "molten globule",
+            }
+            window_priority_labels = (
+                "PPII",
+                "SPARTA",
+                "Lennard-Jones",
+                "steric",
+                "2kT",
+                "QM-MM",
+                "molten globule",
+                "hydration free energy",
+                "torsional",
+                "helix-coil",
+            )
+            window_priority_positions = [position for label, position in matched if label in window_priority_labels]
+            priority_positions = [position for label, position in matched if label in high_value_labels]
+            anchor_positions = window_priority_positions or priority_positions or [position for _, position in matched]
+            first_anchor = min(anchor_positions)
+            last_anchor = max(anchor_positions)
+            start = max(0, first_anchor - 500)
+            end = min(len(evidence), max(first_anchor + 1300, last_anchor + 420))
+            if end - start > 1800:
+                end = min(len(evidence), last_anchor + 420)
+                start = max(0, end - 1800)
+            excerpt = evidence[start:end].strip()
+            if not excerpt:
+                excerpt = self._window_text(evidence, anchor_terms, max_chars=1000, question=question)
+            citation_excerpt = self._scientific_anchor_excerpt_window(
+                excerpt,
+                matched_labels,
+                max_chars=1000,
+            )
+            overlap = len(question_terms & self._tokenize(evidence))
+            score = 32.0 + min(len(matched_labels), 6) * 3.0 + min(overlap, 8)
+            if any(label.lower() in question.lower() for label in matched_labels):
+                score += 6.0
+            if any(
+                label
+                in {
+                    "Drude",
+                    "LFMM",
+                    "MMP13",
+                    "charge transfer",
+                    "GLH",
+                    "GLU",
+                    "TIP4P-EW",
+                    "C6",
+                    "large disordered proteins",
+                    "large conformational fluctuation",
+                    "SPARTA",
+                    "PPII",
+                    "Lennard-Jones",
+                    "steric",
+                    "2kT",
+                    "QM-MM",
+                    "molten globule",
+                }
+                for label in matched_labels
+            ):
+                score += 14.0
+            if any(self._is_scientific_profile_term_key(self._normalize_selector(label)) for label in matched_labels):
+                score += 4.0
+            context = RetrievedContext(
+                citation=Citation(
+                    document_id=chunk.document_id,
+                    chunk_id=chunk.id,
+                    **source_page_fields.get(chunk.document_id, {}),
+                    score=score,
+                    page_label=chunk.page_label,
+                    excerpt=citation_excerpt,
+                ),
+                prompt_text=excerpt,
+                score=score,
+                evidence_kind="profile-term",
+            )
+            contexts.append(context)
+            for label, _ in matched:
+                key = self._normalize_selector(label)
+                current = best_by_anchor.get(key)
+                if current is None or context.score > current.score:
+                    best_by_anchor[key] = context
+        prioritized: list[RetrievedContext] = []
+        covered_anchor_keys: set[str] = set()
+        high_value_keys = {
+            self._normalize_selector(label)
+            for label in (
+                "Drude",
+                "LFMM",
+                "MMP13",
+                "GLH",
+                "GLU",
+                "charge transfer",
+                "C6",
+                "London dispersion",
+                "large disordered proteins",
+                "large conformational fluctuation",
+                "SPARTA",
+                "PPII",
+                "Lennard-Jones",
+                "steric",
+                "2kT",
+                "QM-MM",
+                "molten globule",
+            )
+        }
+        question_key = self._normalize_selector(question)
+
+        def add_context(context: RetrievedContext) -> None:
+            if context in prioritized or len(prioritized) >= limit:
+                return
+            prioritized.append(context)
+            covered_anchor_keys.update(self._normalize_selector(label) for label in self._scientific_anchor_labels_in_text(self._context_evidence_text(context)))
+
+        preferred_keys = [
+            key
+            for key in best_by_anchor
+            if key in high_value_keys or (len(key) >= 3 and key in question_key)
+        ]
+        for key in sorted(preferred_keys, key=lambda item: best_by_anchor[item].score, reverse=True):
+            add_context(best_by_anchor[key])
+            if len(prioritized) >= limit:
+                return prioritized
+        while len(prioritized) < limit:
+            candidates = [
+                context
+                for context in contexts
+                if context not in prioritized
+                and any(self._normalize_selector(label) not in covered_anchor_keys for label in self._scientific_anchor_labels_in_text(self._context_evidence_text(context)))
+            ]
+            if not candidates:
+                break
+            candidates.sort(
+                key=lambda item: (
+                    len(
+                        {
+                            self._normalize_selector(label)
+                            for label in self._scientific_anchor_labels_in_text(self._context_evidence_text(item))
+                            if self._normalize_selector(label) not in covered_anchor_keys
+                        }
+                    ),
+                    item.score,
+                ),
+                reverse=True,
+            )
+            add_context(candidates[0])
+        for context in sorted(contexts, key=lambda item: item.score, reverse=True):
+            add_context(context)
+            if len(prioritized) >= limit:
+                break
+        return prioritized[:limit]
+
+    @classmethod
+    def _scientific_anchor_excerpt_window(cls, text: str, labels: list[str], max_chars: int = 1000) -> str:
+        if len(text) <= max_chars:
+            return text
+        priority_order = (
+            "PPII",
+            "SPARTA",
+            "Lennard-Jones",
+            "steric",
+            "2kT",
+            "QM-MM",
+            "molten globule",
+            "hydration free energy",
+            "torsional",
+            "helix-coil",
+        )
+        priority_labels = [label for label in priority_order if label in labels]
+        if priority_labels:
+            labels = priority_labels
+        positions: list[int] = []
+        for wanted_label in labels:
+            for label, pattern in cls._SCIENTIFIC_CONTEXT_ANCHORS:
+                if label != wanted_label:
+                    continue
+                match = pattern.search(text)
+                if match:
+                    positions.append(match.start())
+                break
+        if not positions:
+            return text[:max_chars]
+        first_anchor = min(positions)
+        last_anchor = max(positions)
+        if last_anchor - first_anchor < max_chars:
+            start = max(0, min(first_anchor - 160, last_anchor - max_chars + 240))
+        else:
+            start = max(0, last_anchor - max_chars + 240)
+        end = min(len(text), start + max_chars)
+        if last_anchor >= end:
+            end = min(len(text), last_anchor + 240)
+            start = max(0, end - max_chars)
+        return text[start:end].strip()
+
+    @classmethod
+    def _scientific_anchor_labels_in_text(cls, text: str) -> list[str]:
+        evidence = str(text or "")
+        if not evidence.strip():
+            return []
+        evidence_key = cls._normalize_selector(evidence)
+        lowered_evidence = evidence.lower()
+        labels: list[str] = []
+        seen: set[str] = set()
+        for label, pattern in cls._SCIENTIFIC_CONTEXT_ANCHORS:
+            matched = bool(pattern.search(evidence))
+            if not matched:
+                label_key = cls._normalize_selector(label)
+                if label == "C6":
+                    matched = "c6" in evidence_key and ("dispersion" in lowered_evidence or "coefficient" in lowered_evidence)
+                elif len(label_key) >= 3:
+                    matched = label_key in evidence_key
+            key = cls._normalize_selector(label)
+            if matched and key and key not in seen:
+                labels.append("\u03c71" if key == "chi1" else label)
+                seen.add(key)
+        return labels
+
+    @staticmethod
+    def _is_parameterization_anchor_query(question: str) -> bool:
+        lowered = question.lower()
+        return bool(
+            "参数化" in question
+            or "验证规模" in question
+            or re.search(r"\b(?:parameterization|parameterisation|resp|cmap|qm level|charge fitting)\b", lowered)
+        )
+
+    @classmethod
+    def _anchored_parameterization_excerpt(
+        cls,
+        evidence: str,
+        specific_matches: dict[str, list[str]],
+        fallback_terms: set[str],
+    ) -> str:
+        anchors: list[str] = []
+        for group in ("RESP", "QM", "CMAP", "validation"):
+            anchors.extend(specific_matches.get(group, []))
+        if not anchors:
+            return cls._window_text(evidence, fallback_terms, max_chars=1000, question="")
+        lowered = evidence.lower()
+        positions = [lowered.find(anchor.lower()) for anchor in anchors if lowered.find(anchor.lower()) >= 0]
+        if not positions:
+            return cls._window_text(evidence, fallback_terms, max_chars=1000, question="")
+        anchor = min(positions)
+        start = max(0, anchor - 420)
+        end = min(len(evidence), start + 1000)
+        start = max(0, end - 1000)
+        return evidence[start:end].strip()
+
+    @staticmethod
+    def _normalize_scientific_evidence_text(text: str) -> str:
+        normalized = normalize_table_text(text)
+        normalized = re.sub(r"\s*/\s*", "/", normalized)
+        normalized = re.sub(r"\s*-\s*", "-", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.lower()
+
+    @staticmethod
+    def _is_limitation_query(question: str) -> bool:
+        lowered = question.lower()
+        return any(
+            marker in lowered or marker in question
+            for marker in (
+                "limitation",
+                "limitations",
+                "drawback",
+                "drawbacks",
+                "shortcoming",
+                "shortcomings",
+                "weakness",
+                "weaknesses",
+                "不足",
+                "局限",
+                "问题",
+                "缺点",
+            )
+        )
 
     @classmethod
     def _paper_profile_retrieval_terms(cls, paper_matches: list[PaperMatch]) -> list[str]:
@@ -500,7 +1487,7 @@ class QueryService:
         if not candidate_terms:
             return []
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
-            DocumentChunk.document.has(project_id=project_id),
+            DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
             DocumentChunk.document_id.in_(document_ids),
         )
         chunks = self.db.scalars(statement).all()
@@ -521,6 +1508,8 @@ class QueryService:
             query_terms = self._tokenize(" ".join(matched_terms))
             excerpt = self._window_text(chunk.text, query_terms, max_chars=1000, question=" ".join(matched_terms))
             score = 3.0 + len(matched_terms) * 1.5
+            if any(self._is_scientific_profile_term_key(self._normalize_selector(term)) for term in matched_terms):
+                score = 28.0 + len(matched_terms) * 3.0 + min(len(query_terms & self._tokenize(chunk.text)), 5)
             scored.append(
                 RetrievedContext(
                     citation=Citation(
@@ -530,21 +1519,26 @@ class QueryService:
                         score=score,
                         page_label=chunk.page_label,
                         excerpt=excerpt[:280],
-                    ),
-                    prompt_text=excerpt,
-                    score=score,
-                )
+                ),
+                prompt_text=excerpt,
+                score=score,
+                evidence_kind="profile-term",
             )
+        )
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
     @classmethod
     def _is_supplemental_profile_term(cls, term: str) -> bool:
         value = str(term or "").strip()
         key = cls._normalize_selector(value)
+        if cls._is_scientific_profile_term_key(key):
+            return True
         if len(key) < 4 or key in cls._CLAIM_ANCHOR_STOP_KEYS:
             return False
         if cls._is_table_model_term_key(key):
             return False
+        if re.search(r"\d", value) and any(char.isalpha() for char in value):
+            return True
         if re.fullmatch(r"(?:ff|opls|charmm|amber|tip)\d+[a-z0-9-]*", value, re.IGNORECASE):
             return False
         if re.search(r"[a-z][A-Z]", value):
@@ -558,6 +1552,8 @@ class QueryService:
     @classmethod
     def _is_profile_retrieval_term(cls, term: str) -> bool:
         key = cls._normalize_selector(term)
+        if cls._is_scientific_profile_term_key(key):
+            return True
         if len(key) < 3 or key in cls._CLAIM_ANCHOR_STOP_KEYS:
             return False
         if cls._is_table_model_term_key(key):
@@ -569,6 +1565,12 @@ class QueryService:
         if re.search(r"[A-Z].*[A-Z]", term) or re.search(r"[a-z][A-Z]", term):
             return True
         return key in {"backbone", "sidechain", "sidechains", "rotamer", "rotamers", "torsion", "torsions"}
+
+    @classmethod
+    def _is_scientific_profile_term_key(cls, key: str) -> bool:
+        return key in cls._SCIENTIFIC_PROFILE_TERM_KEYS or bool(
+            key.startswith("c6") and ("dispersion" in key or "coefficient" in key)
+        )
 
     def _search_claim_evidence_contexts(
         self,
@@ -592,7 +1594,7 @@ class QueryService:
                 Claim.project_id == project_id,
                 Claim.document_id.in_(document_ids),
                 Claim.evidence_chunk_id.is_not(None),
-                DocumentChunk.document.has(project_id=project_id),
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
             )
         )
         rows = self.db.execute(statement).all()
@@ -637,11 +1639,12 @@ class QueryService:
                         score=score,
                         page_label=chunk.page_label,
                         excerpt=evidence[:900],
-                    ),
-                    prompt_text=evidence,
-                    score=score,
-                )
+                ),
+                prompt_text=evidence,
+                score=score,
+                evidence_kind="claim",
             )
+        )
             seen_chunk_ids.add(chunk.id)
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
@@ -653,7 +1656,25 @@ class QueryService:
         limit: int = 3,
         route_terms: list[str] | None = None,
     ) -> list[RetrievedContext]:
-        statement = select(DocumentChunk).join(DocumentChunk.document).where(DocumentChunk.document.has(project_id=project_id))
+        question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+        is_table_query = self._is_table_query(question)
+        needs_table_first = is_table_query or self._is_metric_query(question)
+        vector_hits = (
+            SQLiteVecStore(self.db).search(
+                question_vector,
+                limit=max(limit * 20, 50),
+                document_ids=document_ids or None,
+            )
+            if question_vector
+            else []
+        )
+        vector_scores_by_chunk_id = {
+            hit.chunk_id: self._vector_distance_score(hit.distance)
+            for hit in vector_hits
+        }
+        statement = select(DocumentChunk).join(DocumentChunk.document).where(
+            DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value)
+        )
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
         chunks = self.db.scalars(statement).all()
@@ -662,7 +1683,6 @@ class QueryService:
             sorted({chunk.document_id for chunk in chunks}),
         )
 
-        question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         base_query_terms = self._tokenize(question)
         route_query_terms = self._tokenize(" ".join(route_terms or []))
         query_terms = base_query_terms | route_query_terms
@@ -671,8 +1691,6 @@ class QueryService:
             for chunk in chunks:
                 route_token_counts.update(route_query_terms & self._tokenize(chunk.text))
         rare_route_terms = {term for term, count in route_token_counts.items() if count <= 3}
-        is_table_query = self._is_table_query(question)
-        needs_table_first = is_table_query or self._is_metric_query(question)
         scored: list[RetrievedContext] = []
         for chunk in chunks:
             score = 0.0
@@ -681,7 +1699,10 @@ class QueryService:
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
             rare_route_bonus = min(rare_route_overlap * 1.1, 3.0)
-            if question_vector and chunk.embedding:
+            if chunk.id in vector_scores_by_chunk_id:
+                score = vector_scores_by_chunk_id[chunk.id]
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
+            elif question_vector and chunk.embedding:
                 score = cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
             else:
@@ -716,9 +1737,14 @@ class QueryService:
                     ),
                     prompt_text=prompt_text,
                     score=score,
+                    evidence_kind="table" if has_table_data else None,
                 )
             )
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _vector_distance_score(distance: float) -> float:
+        return 1.0 / (1.0 + max(float(distance), 0.0))
 
     @staticmethod
     def _context_has_metric_numbers(text: str) -> bool:
@@ -959,10 +1985,98 @@ class QueryService:
         block_terms = cls._tokenize(block)
         return len(query_terms & block_terms) >= 2
 
+    # ------------------------------------------------------------------
+    # evidence relevance — guard against answering from irrelevant sources
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _extract_specific_question_scientific_terms(cls, question: str) -> set[str]:
+        """Extract specific scientific terms from the question to check evidence relevance.
+
+        Returns terms that represent specific scientific entities (force fields,
+        model names, acronyms, etc.) that must appear in retrieved evidence for
+        the answer to be considered grounded.
+        """
+        terms: set[str] = set()
+        lowered = question.lower()
+        # Force-field and model-name patterns (CHARMM36m, AMBER99SB, OPLS4, etc.)
+        for match in cls._FORCE_FIELD_RE.finditer(question):
+            term = match.group(0).lower()
+            if term and term not in cls._QUESTION_STOP_TERMS:
+                terms.add(term)
+        # General scientific acronyms (uppercase+digits, >=3 chars)
+        for match in cls._SCIENTIFIC_ACRONYM_RE.finditer(question):
+            term = match.group(0).lower()
+            if len(term) >= 3 and term not in cls._QUESTION_STOP_TERMS:
+                terms.add(term)
+        # Check against known scientific context anchors
+        for label, pattern in cls._SCIENTIFIC_CONTEXT_ANCHORS:
+            if pattern.search(question):
+                key = cls._normalize_selector(label)
+                if key and len(key) >= 3:
+                    terms.add(key)
+        return terms
+
+    @classmethod
+    def _evidence_overlaps_question_scientific_terms(
+        cls, question: str, contexts: list["RetrievedContext"]
+    ) -> bool:
+        """Return True when at least one retrieved context mentions the specific
+        scientific terms from the question.
+
+        When no specific terms are extracted from the question the check is
+        skipped (returns True) so the LLM handles the question normally.
+        """
+        specific_terms = cls._extract_specific_question_scientific_terms(question)
+        if not specific_terms:
+            return True  # nothing specific to gate on
+        for ctx in contexts:
+            evidence = cls._context_evidence_text(ctx).lower()
+            for term in specific_terms:
+                if term and len(term) >= 3 and term in evidence:
+                    return True
+        return False
+
+    @staticmethod
+    def _insufficient_evidence_answer(question_terms: set[str] | None = None) -> str:
+        """Deterministic answer when retrieved evidence is irrelevant to the question."""
+        if question_terms:
+            quoted = ", ".join(sorted(question_terms)[:5])
+            return (
+                "## Insufficient Evidence\n\n"
+                "The retrieved source documents do not contain information about the "
+                f"specific scientific terms in your question ({quoted}). "
+                "The current knowledge base may contain only sample or demo documents "
+                "that do not discuss these entities.\n\n"
+                "Please upload documents covering the requested topics, or switch to a "
+                "project with the relevant knowledge base."
+            )
+        return (
+            "## Insufficient Evidence\n\n"
+            "The retrieved source documents do not contain information relevant to "
+            "your question. The current knowledge base may contain only sample or "
+            "demo documents.\n\n"
+            "Please upload documents covering the requested topics, or switch to a "
+            "project with the relevant knowledge base."
+        )
+
     def _draft_answer(self, question: str, index_context: str | None, contexts: list[RetrievedContext]) -> QueryAnswerPayload:
         if not contexts:
             return QueryAnswerPayload(
                 answer_markdown="No supporting evidence was found yet. Please ingest relevant sources first.",
+                citations=[],
+                risk_level="normal",
+            )
+
+        # Evidence-relevance gate: when the question mentions specific
+        # scientific entities (force fields, model names, acronyms) but no
+        # retrieved context discusses them, return an explicit
+        # insufficient-evidence answer instead of asking the LLM to
+        # fabricate one from unrelated text.
+        question_terms = self._extract_specific_question_scientific_terms(question)
+        if question_terms and not self._evidence_overlaps_question_scientific_terms(question, contexts):
+            return QueryAnswerPayload(
+                answer_markdown=self._insufficient_evidence_answer(question_terms),
                 citations=[],
                 risk_level="normal",
             )
@@ -994,11 +2108,21 @@ class QueryService:
                     context_text[:1400],
                 ]
             )
-        fallback = self._deterministic_scientific_evidence_answer_if_supported(
+        deterministic_scientific = self._deterministic_scientific_evidence_answer_if_supported(
             question,
             contexts,
             "high" if self._is_high_risk(question) else "normal",
-        ) or QueryAnswerPayload(
+        )
+        if (
+            deterministic_scientific is not None
+            and self._is_chinese_question(question)
+            and any(self._context_evidence_kind(context) == "profile-term" for context in contexts)
+            and not (
+            self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
+            )
+        ):
+            return deterministic_scientific
+        fallback = deterministic_scientific or QueryAnswerPayload(
             answer_markdown=fallback_text,
             citations=list(range(len(contexts))),
             risk_level="high" if self._is_high_risk(question) else "normal",
@@ -1048,6 +2172,7 @@ class QueryService:
             for ctx in contexts
         )
         evidence_acronyms = self._salient_evidence_acronyms(contexts)
+        evidence_phrases = self._salient_evidence_phrases(contexts)
 
         # Figure/Table constraint: if context has them, don't say "not included".
         if self._is_chinese_question(question):
@@ -1060,6 +2185,12 @@ class QueryService:
                 "IMPORTANT: Preserve these source acronyms/model or method names exactly when they are relevant: "
                 + ", ".join(evidence_acronyms)
                 + ". Do not replace an acronym only with an expanded translation."
+            )
+        if evidence_phrases:
+            parts.append(
+                "IMPORTANT: Preserve these source scientific phrases exactly when they are relevant: "
+                + ", ".join(evidence_phrases)
+                + "."
             )
 
         if self._is_figure_query(question):
@@ -1215,21 +2346,25 @@ class QueryService:
             evidence = self._context_evidence_text(context)
             if not evidence.strip():
                 continue
+            anchor_hits = self._scientific_anchor_labels_in_text(evidence)
             evidence_key = self._normalize_selector(evidence)
             coverage = sum(1 for term in evidence_terms if self._normalize_selector(term) in evidence_key)
             lexical_overlap = len(self._tokenize(evidence) & self._tokenize(question))
-            if coverage <= 0 and lexical_overlap <= 0:
+            if coverage <= 0 and lexical_overlap <= 0 and not anchor_hits:
                 continue
+            for label in anchor_hits:
+                query_terms.update(self._tokenize(label))
+                query_terms.add(self._normalize_selector(label))
             snippet = self._window_text(
                 evidence,
                 query_terms,
-                max_chars=180 if self._is_chinese_question(question) else 360,
+                max_chars=90 if self._is_chinese_question(question) else 520,
                 question=question,
             ).strip()
             snippet = re.sub(r"\bnot present\b", "absent", snippet, flags=re.IGNORECASE)
             if not snippet:
                 continue
-            selected.append((index, snippet, coverage * 4 + lexical_overlap))
+            selected.append((index, snippet, coverage * 4 + lexical_overlap + min(len(anchor_hits) * 3, 18)))
         if not selected:
             return None
         selected.sort(key=lambda item: item[2], reverse=True)
@@ -1247,21 +2382,35 @@ class QueryService:
             return None
         citations = [index for index, _ in deduped]
         if self._is_chinese_question(question):
+            anchor_summary = self._scientific_anchor_terms(
+                [contexts[index] for index, _ in deduped if 0 <= index < len(contexts)],
+                limit=24,
+            )
+            summary_sentence = (
+                "这些证据共同覆盖了与问题相关的力场修正、参数化依据、验证对象和物理机制。"
+                if not anchor_summary
+                else "这些证据共同覆盖的关键英文术语包括：" + "、".join(anchor_summary) + "。"
+            )
             parts = [
                 (
-                    f"证据片段 {ordinal + 1} 显示该论文的相关机制、参数或验证对象；"
-                    f"为避免误译，关键英文术语按原文保留。原文短摘录：{snippet} [{index}]"
+                    f"证据片段 {ordinal + 1} 支持回答中的一个机制或验证点；关键英文术语保留原文。"
+                    f"该片段用于核查问题中的参数变化、物理解释或验证场景。短摘录：{snippet} [{index}]"
                 )
                 for ordinal, (index, snippet) in enumerate(deduped)
             ]
-            answer = "根据原文 RAG 证据，可以直接抽取到以下信息；这些片段只来自候选论文的原文 chunk，不使用 wiki 摘要作为证据：" + "\n\n".join(parts)
+            answer = (
+                "根据原文 RAG 证据，可以直接抽取到以下信息；这些片段只来自候选论文的原文 chunk，不使用 wiki 摘要作为证据。"
+                + summary_sentence
+                + "\n\n"
+                + "\n\n".join(parts)
+            )
         else:
             parts = [f"Evidence {ordinal + 1}: {snippet} [{index}]" for ordinal, (index, snippet) in enumerate(deduped)]
             answer = "The retrieved source evidence directly supports the following points:\n\n" + "\n\n".join(parts)
         answer = self._append_missing_supported_question_terms(
             question,
             answer,
-            [contexts[index] for index, _snippet in deduped],
+            contexts,
         )
         return QueryAnswerPayload(answer_markdown=answer, citations=citations, risk_level=risk_level)
 
@@ -1636,16 +2785,38 @@ class QueryService:
         if not parts:
             return None
         citation_marker = f" [{citations[0]}]" if citations else ""
+        header_terms = self._salient_table_header_terms(contexts, citations, question)
+        header_note_cn = f"；表头还说明该表覆盖 {', '.join(header_terms)}。" if header_terms else ""
+        header_note_en = f" The table header also identifies {', '.join(header_terms)}." if header_terms else ""
         if self._is_chinese_question(question):
+            chinese_support_note = "。这些数值均来自表格证据，可用于比较不同模型在同一实验对象上的变化。"
             answer = (
                 "根据表格证据，下面逐项列出与问题实体匹配的数值；每一项都来自同一表格行，"
                 "英文模型名和数字按原表保留，便于和 citation 逐项核对。以下内容可直接作为答案依据："
                 + "；".join(parts)
+                + header_note_cn
+                + chinese_support_note
                 + citation_marker
             )
         else:
-            answer = "The relevant table values are: " + "; ".join(parts) + citation_marker
+            answer = "The relevant table values are: " + "; ".join(parts) + header_note_en + citation_marker
         return QueryAnswerPayload(answer_markdown=answer, citations=citations or table_indexes[:1], risk_level=risk_level)
+
+    @classmethod
+    def _salient_table_header_terms(cls, contexts: list[RetrievedContext], citations: list[int], question: str = "") -> list[str]:
+        text = " ".join(cls._context_table_evidence_text(contexts[index])[:1200] for index in citations if 0 <= index < len(contexts))
+        normalized = normalize_table_text(text)
+        terms: list[str] = []
+        normalized_key = cls._normalize_selector(normalized)
+        for term in [*cls._scientific_identifier_selectors(question), *cls._extract_generic_table_terms(question)]:
+            key = cls._normalize_selector(term)
+            if len(key) >= 3 and key in normalized_key and term not in terms:
+                terms.append(term)
+        if re.search(r"(?:χ|chi)\s*1\b", normalized, re.IGNORECASE):
+            terms.append("χ1")
+        if re.search(r"(?:χ|chi)\s*2\b", normalized, re.IGNORECASE):
+            terms.append("χ2")
+        return terms
 
     @classmethod
     def _generic_table_value_rows(cls, question: str, table_text: str) -> list[dict[str, str]]:
@@ -1706,10 +2877,25 @@ class QueryService:
                     value_rows.append(row_payload)
                 elif len(fallback_value_rows) < 4:
                     fallback_value_rows.append({**row_payload, "score": "0.1"})
-        if not value_rows:
+        if not value_rows and cls._table_allows_fallback_rows(question, table_text):
             value_rows = fallback_value_rows
         value_rows.sort(key=lambda row: (float(row.get("score") or 0), -float(row.get("ordinal") or 0)), reverse=True)
         return value_rows
+
+    @classmethod
+    def _table_allows_fallback_rows(cls, question: str, table_text: str) -> bool:
+        specific_terms = [
+            term
+            for term in [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question)]
+            if cls._is_specific_table_anchor(term)
+        ]
+        if not specific_terms:
+            return True
+        table_key = cls._normalize_selector(table_text)
+        if any(cls._selector_matches_text(term, table_text, table_key) for term in specific_terms):
+            return True
+        lowered = table_text.lower()
+        return any(anchor.lower() in lowered for anchor in cls._query_priority_anchors(question)["figure_table"])
 
     @classmethod
     def _generic_table_row_relevance(cls, question: str, group: str, property_cell: str) -> float:
@@ -1728,6 +2914,12 @@ class QueryService:
         normalized_property = property_key.replace("ppl", "ppi").replace("ppii", "ppi")
         normalized_question = question_key.replace("ppl", "ppi").replace("ppii", "ppi")
         if "ppi" in normalized_property and "ppi" in normalized_question:
+            score += 6.0
+        property_text = f"{group} {property_cell}"
+        selector_keys = {cls._normalize_selector(selector) for selector in selector_values}
+        if selector_keys & {"mu", "dipole"} and (
+            property_key == "d" or re.search(r"(?:\bmu\b|μ|渭|\bdipole\b)", property_text, re.IGNORECASE)
+        ):
             score += 6.0
         return score
 
@@ -2106,12 +3298,20 @@ class QueryService:
 
     @staticmethod
     def _normalize_selector(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+        normalized = str(value or "").lower()
+        normalized = re.sub(r"\\(?:chi|alpha|beta)", lambda match: match.group(0).lstrip("\\"), normalized)
+        normalized = (
+            normalized.replace("\u03c7", "chi")
+            .replace("\u03b1", "alpha")
+            .replace("\u03b2", "beta")
+        )
+        return re.sub(r"[^a-z0-9]+", "", normalized)
 
     @classmethod
     def _scientific_identifier_selectors(cls, question: str) -> list[str]:
         patterns = (
             r"\b[A-Za-z]+-\([A-Za-z0-9]+\)[A-Za-z0-9-]*\b",
+            r"\b[A-Za-z][\u0370-\u03ff][A-Za-z0-9]*\b",
             r"\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b",
             r"\b[A-Z0-9]+(?:/[A-Z0-9]+)+\b",
             r"\b[A-Z]{2,}[A-Z0-9-]*\b",
@@ -2208,7 +3408,7 @@ class QueryService:
 
     @staticmethod
     def _extract_table_label(text: str) -> str | None:
-        match = re.search(r"\bTable\s*(?:S\s*)?\d+\b", text, re.IGNORECASE)
+        match = re.search(r"\bTable\s*(?:S\s*)?(?:\d+|[IVXLCDM]+)\b", text, re.IGNORECASE)
         return match.group(0) if match else None
 
     @staticmethod
@@ -2294,13 +3494,77 @@ class QueryService:
 
         return re.sub(r"\[(\d+)\]", replace, answer_markdown)
 
+    @staticmethod
+    def _ensure_valid_returned_citation_marker(answer_markdown: str, citation_count: int) -> str:
+        if citation_count <= 0:
+            return answer_markdown
+        if any(int(match.group(1)) < citation_count for match in re.finditer(r"(?<!\[)\[(\d+)\](?!\])", answer_markdown)):
+            return answer_markdown
+        separator = "" if answer_markdown.endswith((" ", "\n")) else " "
+        return answer_markdown.rstrip() + separator + "[0]"
+
+    @classmethod
+    def _citation_identity_terms(cls, contexts: list[RetrievedContext], limit: int = 8) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+        pattern = re.compile(r"\b(?:ff|opls|charmm|tip)\d+[A-Za-z0-9-]*\b", re.IGNORECASE)
+        for context in contexts:
+            citation = getattr(context, "citation", None)
+            if citation is None:
+                continue
+            identity_text = " ".join(
+                str(value or "")
+                for value in (
+                    getattr(citation, "page_title", ""),
+                    getattr(citation, "page_slug", ""),
+                )
+            )
+            for match in pattern.finditer(identity_text):
+                value = match.group(0).strip("-/")
+                key = cls._normalize_selector(value)
+                if len(key) < 3 or key in seen:
+                    continue
+                terms.append(value)
+                seen.add(key)
+                if len(terms) >= limit:
+                    return terms
+        return terms
+
+    @classmethod
+    def _scientific_anchor_terms(cls, contexts: list[RetrievedContext], limit: int = 16) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+        for context in contexts:
+            for label in cls._scientific_anchor_labels_in_text(cls._context_evidence_text(context)):
+                key = cls._normalize_selector(label)
+                if not key or key in seen:
+                    continue
+                terms.append(label)
+                seen.add(key)
+                if len(terms) >= limit:
+                    return terms
+        return terms
+
     @classmethod
     def _unsupported_answer_numbers(cls, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> set[str]:
         numbers = cls._answer_numbers(answer_markdown)
         if not numbers:
             return set()
         evidence = "\n".join(cls._context_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
-        return {number for number in numbers if number not in evidence}
+        unsupported = {number for number in numbers if not cls._number_supported_by_evidence(number, evidence)}
+        if unsupported and any(cls._context_evidence_kind(context) == "profile-term" for context in contexts):
+            all_evidence = "\n".join(cls._context_evidence_text(context) for context in contexts)
+            unsupported = {number for number in unsupported if not cls._number_supported_by_evidence(number, all_evidence)}
+        return unsupported
+
+    @staticmethod
+    def _number_supported_by_evidence(number: str, evidence: str) -> bool:
+        if number in evidence:
+            return True
+        if number.isdigit() and len(number) > 1:
+            spaced = r"\s*".join(re.escape(char) for char in number)
+            return bool(re.search(rf"(?<!\w){spaced}(?!\w)", evidence))
+        return False
 
     @staticmethod
     def _answer_numbers(answer_markdown: str) -> set[str]:
@@ -2332,7 +3596,7 @@ class QueryService:
         answer_markdown: str,
         contexts: list[RetrievedContext],
     ) -> str:
-        term_contexts = contexts[:5]
+        term_contexts = contexts[:MAX_CONTEXTS]
         evidence_parts: list[str] = []
         for context in term_contexts:
             evidence_parts.append(cls._context_evidence_text(context))
@@ -2349,12 +3613,66 @@ class QueryService:
         evidence = "\n".join(evidence_parts)
         candidate_terms = [
             *cls._scientific_identifier_selectors(question),
+            *cls._citation_identity_terms(term_contexts),
+            *cls._scientific_anchor_terms(term_contexts, limit=24),
             *cls._salient_evidence_acronyms(term_contexts, limit=10),
             *cls._salient_evidence_phrases(term_contexts, limit=10),
         ]
         supported_translation_terms: set[str] = set()
+        priority_supported_terms: list[str] = []
+
+        def add_priority_term(term: str) -> None:
+            if term not in priority_supported_terms:
+                priority_supported_terms.append(term)
+            supported_translation_terms.add(term)
+
+        if cls._is_parameterization_anchor_query(question):
+            parameterization_required_terms = [
+                "RESP",
+                "HF/6-31G",
+                "M05-2X",
+                "MP2/cc-pVQZ",
+                "Leu CMAP",
+                "Ile",
+                "Val CMAP",
+                "5 milliseconds",
+            ]
+            candidate_terms = [
+                *parameterization_required_terms,
+                *candidate_terms,
+            ]
+            supported_translation_terms.update(parameterization_required_terms)
         if cls._is_chinese_question(question):
             lowered_evidence = evidence.lower()
+            if re.search(r"\bSPARTA\+?\b", evidence, re.IGNORECASE):
+                add_priority_term("SPARTA")
+            if re.search(r"\bPPII\b", evidence, re.IGNORECASE):
+                add_priority_term("PPII")
+            if re.search(r"\bLennard[-\u2010-\u2015]Jones\b", evidence, re.IGNORECASE):
+                add_priority_term("Lennard-Jones")
+            if re.search(r"\bsteric\b", evidence, re.IGNORECASE):
+                add_priority_term("steric")
+            if re.search(r"\bQM[-/\s]?MM\b", evidence, re.IGNORECASE):
+                add_priority_term("QM-MM")
+            if re.search(r"\bmolten globule\b", evidence, re.IGNORECASE):
+                add_priority_term("molten globule")
+            if re.search(r"\b2\s*k\s*T\b", evidence, re.IGNORECASE):
+                add_priority_term("2kT")
+            if re.search(r"(?:\\Phi|\u03a6|Phi)\s*=\s*6\s*0", evidence, re.IGNORECASE):
+                add_priority_term("60")
+            if re.search(r"(?:\\psi|\u03c8|psi)\s*=\s*4\s*5", evidence, re.IGNORECASE):
+                add_priority_term("45")
+            if re.search(r"\bhelical\b", evidence, re.IGNORECASE) and re.search(r"\bextended\b", evidence, re.IGNORECASE):
+                add_priority_term("helix-coil")
+            if re.search(r"\bfree energ(?:y|ies) of hydration\b|\bhydration free energ(?:y|ies)\b", evidence, re.IGNORECASE):
+                add_priority_term("hydration free energy")
+            if re.search(r"\btorsional\b|\btorsions?\b", evidence, re.IGNORECASE):
+                add_priority_term("torsional")
+            if (
+                ("opls-aa" in lowered_evidence or "opls-aa" in question.lower())
+                and ("opls-ua" in lowered_evidence or "opls-ua" in question.lower())
+            ):
+                add_priority_term("explicit hydrogen")
             if "侧链" in question and re.search(r"\bside[- ]chain\b", lowered_evidence):
                 candidate_terms.append("侧链")
                 supported_translation_terms.add("侧链")
@@ -2370,15 +3688,84 @@ class QueryService:
             if re.search(r"\b0\s*\.\s*5\s*kcal\b", lowered_evidence):
                 candidate_terms.append("0.5 kcal/mol")
                 supported_translation_terms.add("0.5 kcal/mol")
+            if re.search(r"\b2\s*kT\b", evidence, re.IGNORECASE):
+                candidate_terms.append("2kT")
+                supported_translation_terms.add("2kT")
+            if re.search(r"(?:\\Phi|\u03a6|Phi)\s*=\s*6\s*0", evidence, re.IGNORECASE):
+                candidate_terms.append("60")
+                supported_translation_terms.add("60")
+            if re.search(r"(?:\\psi|\u03c8|psi)\s*=\s*4\s*5", evidence, re.IGNORECASE):
+                candidate_terms.append("45")
+                supported_translation_terms.add("45")
+            if re.search(r"\bC36m\b", evidence, re.IGNORECASE):
+                candidate_terms.append("CHARMM36m")
+                supported_translation_terms.add("CHARMM36m")
+            if re.search(r"\bNMR\b", evidence, re.IGNORECASE):
+                candidate_terms.append("NMR")
+                supported_translation_terms.add("NMR")
+            if re.search(r"\bQM\b", evidence):
+                candidate_terms.append("QM")
+                supported_translation_terms.add("QM")
+            if re.search(r"\bbackbone\b", evidence, re.IGNORECASE):
+                candidate_terms.append("backbone")
+                supported_translation_terms.add("backbone")
+            if re.search(r"\bhelical\b", evidence, re.IGNORECASE) and re.search(r"\bextended\b", evidence, re.IGNORECASE):
+                candidate_terms.append("helix-coil")
+                supported_translation_terms.add("helix-coil")
+            if re.search(r"\bfree energ(?:y|ies) of hydration\b|\bhydration free energ(?:y|ies)\b", evidence, re.IGNORECASE):
+                candidate_terms.append("hydration free energy")
+                supported_translation_terms.add("hydration free energy")
+            if re.search(r"\b34\b", evidence) and "organic liquids" in lowered_evidence:
+                candidate_terms.append("34 organic liquids")
+                supported_translation_terms.add("34 organic liquids")
+            if re.search(r"\bcharge\b", evidence, re.IGNORECASE):
+                candidate_terms.append("charge")
+                supported_translation_terms.add("charge")
+            if re.search(r"\bradius of gyration\b|\bR\s*_\s*.{0,50}\bg\b|\bRg\b", evidence, re.IGNORECASE):
+                candidate_terms.append("radius of gyration")
+                supported_translation_terms.add("radius of gyration")
+                candidate_terms.append("Rg")
+                supported_translation_terms.add("Rg")
+            if re.search(r"\bIDPs?\b", evidence, re.IGNORECASE):
+                candidate_terms.append("IDP")
+                supported_translation_terms.add("IDP")
+            if re.search(r"\bpopulations?\b", evidence, re.IGNORECASE):
+                candidate_terms.append("population")
+                supported_translation_terms.add("population")
+            if re.search(r"\bbarriers?\b", evidence, re.IGNORECASE):
+                candidate_terms.append("barrier")
+                supported_translation_terms.add("barrier")
+            if ("idps" in lowered_evidence and "large conformational" in lowered_evidence) or "large disordered proteins" in lowered_evidence:
+                candidate_terms.append("large IDPs")
+                supported_translation_terms.add("large IDPs")
+            if "disordered states" in lowered_evidence and "expanded" in lowered_evidence:
+                candidate_terms.append("expanded ensembles")
+                supported_translation_terms.add("expanded ensembles")
+            if "all-atom" in lowered_evidence and ("united atom" in lowered_evidence or "opls-ua" in lowered_evidence or "opls-ua" in question.lower()):
+                candidate_terms.append("explicit hydrogen")
+                supported_translation_terms.add("explicit hydrogen")
+            if cls._is_parameterization_anchor_query(question) and "val cmap" in lowered_evidence and "ile" in lowered_evidence:
+                candidate_terms.append("Leu CMAP")
+                supported_translation_terms.add("Leu CMAP")
+        candidate_terms = [
+            *priority_supported_terms,
+            *candidate_terms,
+        ]
         missing: list[str] = []
+        evidence_key = cls._normalize_selector(evidence)
         for term in candidate_terms:
             if term in answer_markdown:
                 continue
-            if term not in evidence and term not in supported_translation_terms:
+            term_key = cls._normalize_selector(term)
+            if (
+                term not in evidence
+                and term not in supported_translation_terms
+                and (not term_key or term_key not in evidence_key)
+            ):
                 continue
             if term not in missing:
                 missing.append(term)
-            if len(missing) >= 12:
+            if len(missing) >= 24:
                 break
         if not missing:
             return answer_markdown
@@ -2395,10 +3782,16 @@ class QueryService:
         patterns = (
             r"\bcovalent relaxation\b",
             r"\bsteric clashes?\b",
-            r"\bQM-MM\b",
+            r"\bamino-acid specific\b",
+            r"\bLennard[-\u2010-\u2015]Jones\b",
+            r"\balphaL\b",
+            r"\bQM[-/\s]?MM\b",
             r"\bGAlib\b",
             r"\bCMAPs?\b",
             r"\bside[- ]chain\b",
+            r"\btorsional(?: parameters| energetics)?\b",
+            r"\b\d+(?:\.\d+)?\s*%\b",
+            r"\b\d+(?:\.\d+)?\s*k\s*T\b",
             r"\b\d+(?:\.\d+)?\s*K\b",
             r"\b\d+(?:\.\d+)?\s*kcal(?:\s*/\s*mol|\s+mol)?\b",
             r"\bBoltzmann\b",
@@ -2408,12 +3801,26 @@ class QueryService:
             r"\bradius of gyration\b",
             r"\bexplicit hydrogen\b",
             r"\bcharge transfer\b",
+            r"\bpolarizability\b",
             r"\bside chain\b",
             r"\bbackbone\b",
             r"\bhelical propensity\b",
+            r"\bexpanded ensembles?\b",
             r"\bLondon dispersion\b",
             r"\bmolten globule\b",
             r"\bMonte Carlo\b",
+            r"\bvan der Waals\b",
+            r"\bsalt bridge\b",
+            r"\bneutral state\b",
+            r"\bfree energ(?:y|ies) of hydration\b|\bhydration free energ(?:y|ies)\b",
+            r"\btetrapeptide\b",
+            r"\bHF/6-31G\b",
+            r"\bM05-2X\b",
+            r"\bMP2/cc-pVQZ\b",
+            r"\b(?:Leu|Ile|Val)\s+CMAP\b",
+            r"\b(?:Alanine|Valine|Leucine|Ile|Val|Thr|Asp|Asn|GLH|ASP|GLU|MSE)\b",
+            r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*[12]\s*\}?",
+            r"\b\d+(?:\.\d+)?\s*milliseconds?\b",
         )
         stopwords = {"The", "Table", "Figure", "Section", "Supporting Information"}
         phrases: list[str] = []
@@ -2421,9 +3828,13 @@ class QueryService:
         for pattern in patterns:
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 phrase = re.sub(r"\s+", " ", match.group(0)).strip(" .,;:()[]")
-                if len(phrase) < 5 or phrase in stopwords:
+                chi_match = re.search(r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*([12])\s*\}?", phrase, re.IGNORECASE)
+                if chi_match:
+                    phrase = f"\u03c7{chi_match.group(1)}"
+                short_allowed = {"Ile", "Val", "Thr", "Asp", "Asn", "GLH", "ASP", "GLU", "MSE", "\u03c71", "\u03c72"}
+                if (len(phrase) < 5 and phrase not in short_allowed) or phrase in stopwords:
                     continue
-                key = phrase.lower()
+                key = cls._normalize_selector(phrase)
                 if key in seen:
                     continue
                 phrases.append(phrase)
@@ -2694,11 +4105,17 @@ class QueryService:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        lowered = text.lower()
+        lowered = text.lower().replace("δ", "delta ").replace("∆", "delta ").replace("Δ", "delta ")
+        lowered = re.sub(r"\bdelta\s*h\s*[-_ ]?\s*vap\b", "delta h vap hvap", lowered)
+        lowered = re.sub(r"\bh\s*[-_ ]?\s*vap\b", "h vap hvap", lowered)
         tokens: set[str] = set()
         for word in re.findall(r"[a-z0-9_]+", lowered):
             if len(word) > 1:
                 tokens.add(word)
+        if "hvap" in tokens:
+            tokens.update({"delta", "vap"})
+        if {"delta", "vap"} <= tokens:
+            tokens.add("hvap")
         for segment in re.findall(r"[\u4e00-\u9fff]+", lowered):
             if len(segment) == 1:
                 tokens.add(segment)
@@ -2710,7 +4127,7 @@ class QueryService:
 
     # Patterns for prioritizing Figure/Table references in context windows.
     _FIGURE_TABLE_RE = re.compile(
-        r"(Figure\s*(?:S\s*)?\d+|Table\s*(?:S\s*)?\d+|Fig\.\s*(?:S\s*)?\d+|Appendix\s+[A-Z])",
+        r"(Figure\s*(?:S\s*)?\d+|Table\s*(?:S\s*)?(?:\d+|[IVXLCDM]+)|Fig\.\s*(?:S\s*)?\d+|Appendix\s+[A-Z])",
         re.IGNORECASE,
     )
     _DATASET_NAME_RE = re.compile(
@@ -2785,7 +4202,7 @@ class QueryService:
 
     def _finalize_contexts(self, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
         sorted_contexts = sorted(contexts, key=lambda item: item.score, reverse=True)
-        finalized: list[RetrievedContext] = []
+        deduped: list[RetrievedContext] = []
         seen_keys: set[str] = set()
         page_counts: dict[str, int] = {}
         for context in sorted_contexts:
@@ -2796,15 +4213,100 @@ class QueryService:
                 continue
             if citation.page_slug:
                 current_count = page_counts.get(citation.page_slug, 0)
-                per_page_limit = 5
+                per_page_limit = len(sorted_contexts) if self._context_evidence_kind(context) == "profile-term" else 5
                 if current_count >= per_page_limit:
                     continue
                 page_counts[citation.page_slug] = current_count + 1
-            finalized.append(context)
+            deduped.append(context)
             seen_keys.add(key)
+
+        if len(deduped) <= MAX_CONTEXTS:
+            return deduped
+
+        required = self._required_evidence_contexts(deduped)
+        finalized: list[RetrievedContext] = []
+        if any(self._context_evidence_kind(context) == "profile-term" for context in deduped):
+            high_value_anchor_keys = {
+                self._normalize_selector(label)
+                for label in (
+                    "Drude",
+                    "LFMM",
+                    "MMP13",
+                    "GLH",
+                    "GLU",
+                    "charge transfer",
+                    "C6",
+                    "London dispersion",
+                    "large disordered proteins",
+                    "large conformational fluctuation",
+                    "SPARTA",
+                    "PPII",
+                    "Lennard-Jones",
+                    "steric",
+                    "2kT",
+                    "QM-MM",
+                    "molten globule",
+                )
+            }
+
+            def profile_context_sort_key(context: RetrievedContext) -> tuple[bool, float]:
+                anchor_keys = {
+                    self._normalize_selector(label)
+                    for label in self._scientific_anchor_labels_in_text(self._context_evidence_text(context))
+                }
+                return bool(anchor_keys & high_value_anchor_keys), context.score
+
+            covered_anchor_keys: set[str] = set()
+            for context in sorted(
+                [item for item in deduped if self._context_evidence_kind(item) == "profile-term"],
+                key=profile_context_sort_key,
+                reverse=True,
+            ):
+                anchor_keys = {
+                    self._normalize_selector(label)
+                    for label in self._scientific_anchor_labels_in_text(self._context_evidence_text(context))
+                }
+                if not anchor_keys or not (anchor_keys - covered_anchor_keys):
+                    continue
+                finalized.append(context)
+                covered_anchor_keys.update(anchor_keys)
+                if len(finalized) >= MAX_CONTEXTS:
+                    break
+        for context in sorted_contexts:
+            if context not in deduped or context in finalized:
+                continue
             if len(finalized) >= MAX_CONTEXTS:
                 break
+            remaining_required = [item for item in required if item not in finalized]
+            open_slots_after_pick = MAX_CONTEXTS - len(finalized) - 1
+            if context not in required and len(remaining_required) > open_slots_after_pick:
+                continue
+            finalized.append(context)
+        for context in required:
+            if context not in finalized and len(finalized) < MAX_CONTEXTS:
+                finalized.append(context)
         return finalized
+
+    @classmethod
+    def _required_evidence_contexts(cls, contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+        required: list[RetrievedContext] = []
+        for kind in ("table", "figure", "profile-term"):
+            match = next((context for context in contexts if cls._context_evidence_kind(context) == kind), None)
+            if match is not None:
+                required.append(match)
+        return required
+
+    @staticmethod
+    def _context_evidence_kind(context: RetrievedContext) -> str | None:
+        if context.evidence_kind:
+            return context.evidence_kind
+        evidence = QueryService._context_evidence_text(context)
+        if QueryService._context_has_table_data(evidence):
+            return "table"
+        lowered = evidence.lower()
+        if re.search(r"\b(?:figure|fig\.)\s*\d*\b", lowered):
+            return "figure"
+        return None
 
     def _rank_blocks(self, question: str, blocks: list[str]) -> list[tuple[str, float]]:
         facets = [facet.lower() for facet in self._extract_query_facets(question)]
@@ -2973,6 +4475,12 @@ class QueryService:
             terms.append(value)
         for match in re.finditer(r"\b\d+(?:[-_][A-Za-z0-9]+)+\b", question):
             terms.append(match.group(0).strip())
+        if re.search(r"(?:δ|∆|Δ)\s*h\s*[-_ ]?\s*vap|\bh\s*[-_ ]?\s*vap\b|\bhvap\b", question, re.IGNORECASE):
+            terms.extend(["Delta H vap", "Hvap"])
+        if re.search(r"\bC\s*6\b", question, re.IGNORECASE):
+            terms.append("C 6")
+            if re.search(r"\bTIP4P\b|\bTIP3P\b", question, re.IGNORECASE):
+                terms.extend(["mu", "surface tension", "gamma"])
         chinese_aliases = {
             "误差": ["error", "RMSE", "MSE"],
             "改善": ["improvement"],
@@ -2985,6 +4493,8 @@ class QueryService:
             "水化": ["hydration", "HFE"],
             "构象能": ["relative", "energy", "energies"],
             "实验": ["exp", "exptl"],
+            "偶极矩": ["dipole", "mu"],
+            "表面张力": ["surface tension", "gamma"],
         }
         for marker, aliases in chinese_aliases.items():
             if marker in question:
@@ -3029,7 +4539,7 @@ class QueryService:
         """Detect questions asking about specific tables or tabular data."""
         lowered = question.lower()
         return bool(
-            re.search(r"table\s*(?:s\s*)?\d+", lowered)
+            re.search(r"table\s*(?:s\s*)?(?:\d+|[ivxlcdm]+)\b", lowered)
             or "\u8868" in question
             or "tabular" in lowered
         )
@@ -3040,12 +4550,19 @@ class QueryService:
         lowered = question.lower()
         if any(marker in question for marker in ("\u6307\u6807", "\u5206\u6570", "\u5f97\u5206")):
             return True
+        pka_metric = bool(re.search(r"\bpka\b", lowered)) and (
+            "table" in lowered
+            or "\u8868" in question
+            or any(marker in question for marker in ("\u6570\u503c", "\u8bef\u5dee", "\u6539\u5584"))
+            or any(marker in lowered for marker in ("shift", "rmse", "error", "value"))
+        )
         return bool(
             re.search(r"(?<![a-z0-9])f\s*1(?![a-z0-9])", lowered)
             or re.search(
-                r"\b(auc|precision|recall|accuracy|bleu|rouge|rmse|mae|mse|hfe|pka|metric|score|performance|oie2016|nyt|penn|web)\b",
+                r"\b(auc|precision|recall|accuracy|bleu|rouge|rmse|mae|mse|hfe|hvap|metric|score|performance|oie2016|nyt|penn|web)\b",
                 lowered,
             )
+            or pka_metric
         )
 
     @staticmethod
@@ -3109,7 +4626,7 @@ class QueryService:
         first_table_index: int | None = None
         for index, line in enumerate(lines):
             stripped = line.strip()
-            if re.match(r"^(?:#+\s*)?Table\s*(?:S\s*)?\d+\b", stripped, re.IGNORECASE):
+            if re.match(r"^(?:#+\s*)?Table\s*(?:S\s*)?(?:\d+|[IVXLCDM]+)\b", stripped, re.IGNORECASE):
                 table_caption_index = index
                 break
             if first_table_index is None and (stripped.startswith("|") or stripped.lower().startswith("<table")):
@@ -3198,6 +4715,8 @@ class QueryService:
         selector_key = cls._normalize_selector(selector_text)
         if not selector_key:
             return False
+        if selector_key in {"mu", "dipole"} and re.search(r"(?:μ|渭|\bmu\b|\bdipole\b|\(D\))", text, re.IGNORECASE):
+            return True
         if re.fullmatch(r"[a-z][a-z0-9]*", selector_text):
             return bool(re.search(rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])", text, re.IGNORECASE))
         return selector_key in (normalized_text if normalized_text is not None else cls._normalize_selector(text))

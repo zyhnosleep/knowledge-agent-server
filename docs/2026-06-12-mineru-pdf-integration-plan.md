@@ -16,7 +16,7 @@
 - 输出解析优先读取 `content_list_v2.json`，再 fallback 到旧 `content_list.json`；解析结果统一映射到现有 `ParsedDocument`、`ParsedChunk` 和 `metadata.document_intelligence`。
 - 表格、公式、图注被写入现有 `document_intelligence.tables/formulas/figures`，后续 wiki 渲染、检索、问答接口不需要改协议。
 - 新增配置项：`MINERU_ENABLED`、`MINERU_BIN`、`MINERU_BACKEND`、`MINERU_MODEL_SOURCE`、`MINERU_OUTPUT_DIR`、`MINERU_TIMEOUT`、`MINERU_EXTRA_ARGS`。
-- 依赖改为可选安装：`pip install -e ".[mineru]"`，其中 `mineru` extra 使用 `mineru[pipeline]`，不是旧的 `magic-pdf[full]`。
+- 依赖改为可选安装：`pip install -e ".[mineru]"`，其中项目 `mineru` extra 使用 `mineru[all]>=3.4,<3.5`，不是旧的 `magic-pdf[full]`。
 
 ## Server Deployment Notes
 
@@ -28,6 +28,8 @@ cd ~/llm_wiki_server
 pip install -U pip
 pip install -e ".[mineru]"
 ```
+
+这里的项目 extra 会安装 `mineru[all]>=3.4,<3.5`，用于保留 MinerU 的完整 pipeline、OCR、版面、表格、公式和本地模型相关能力。
 
 `.env` 建议启用：
 

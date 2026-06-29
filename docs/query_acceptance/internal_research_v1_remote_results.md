@@ -4,7 +4,7 @@ Run date: 2026-06-24
 
 Environment:
 
-- Remote host: `zhangyh@192.168.31.20`
+- Remote host: `<private-lan-host>`
 - Repository path: `~/llm_wiki_server`
 - API: `http://127.0.0.1:8000`
 - Benchmark: `benchmarks/query/internal_research_v1.json`

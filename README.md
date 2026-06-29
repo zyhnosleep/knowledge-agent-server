@@ -88,7 +88,7 @@ APP_HOST=0.0.0.0
 APP_PORT=8000
 DATABASE_URL=sqlite:///./data/app.db
 REDIS_URL=redis://127.0.0.1:6379/0
-QUEUE_JOB_TIMEOUT=3600
+QUEUE_JOB_TIMEOUT=9000
 DATA_DIR=./data
 RAW_DIR=./data/raw
 WIKI_DIR=./data/wiki
@@ -108,7 +108,7 @@ MINERU_BIN=mineru
 MINERU_BACKEND=pipeline
 MINERU_MODEL_SOURCE=modelscope
 MINERU_OUTPUT_DIR=./data/cache/mineru
-MINERU_TIMEOUT=3600
+MINERU_TIMEOUT=7200
 MINIO_ENABLED=false
 EXTERNAL_API_ENABLED=false
 ```
@@ -136,7 +136,7 @@ EXTERNAL_API_ENABLED=false
 - `MINERU_ENABLED=true` 时，PDF 会先走本地 MinerU CLI；MinerU 失败或未安装时会自动回退到现有 PDF 链路。
 - `OLLAMA_KEEP_ALIVE=5m` 用于避免 Ollama 长时间占用 3090 显存；大批量 MinerU 解析前可临时调成 `0`。
 - 更新到当前版本后，需要重新执行 `pip install -e .`，因为新增了 PDF 渲染依赖 `PyMuPDF`。
-- 如果启用 MinerU，需要执行 `pip install -e ".[mineru]"`，并确保服务器可运行 `mineru` 命令。
+- 如果启用 MinerU，需要执行 `pip install -e ".[mineru]"`；当前项目 extra 会安装 `mineru[all]>=3.4,<3.5`，并确保服务器可运行 `mineru` 命令。
 - `QUEUE_JOB_TIMEOUT` 应明显大于 `OLLAMA_REQUEST_TIMEOUT`；PDF 和多模态摄入通常比 txt/md 慢很多。
 - 摄入等待期间可以用 `tail -f logs/worker.log` 看阶段日志，或用 `python scripts/watch_ingest_progress.py` 在终端显示动态进度条。
 

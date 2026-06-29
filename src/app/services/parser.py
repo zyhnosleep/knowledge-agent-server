@@ -126,11 +126,13 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
     run_dir = output_root / f"{slugify(source_path.stem) or 'document'}-{uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    command = [mineru_bin, "-p", str(source_path), "-o", str(run_dir)]
-    if settings.mineru_backend:
-        command.extend(["-b", settings.mineru_backend])
-    if settings.mineru_extra_args:
-        command.extend(shlex.split(settings.mineru_extra_args))
+    command = _build_mineru_command(
+        mineru_bin=mineru_bin,
+        source_path=source_path,
+        output_dir=run_dir,
+        backend=settings.mineru_backend,
+        extra_args=settings.mineru_extra_args,
+    )
 
     env = os.environ.copy()
     if settings.mineru_model_source:
@@ -144,6 +146,8 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=settings.mineru_timeout,
             check=False,
         )
@@ -201,8 +205,45 @@ def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None
 def _resolve_mineru_binary(value: str) -> str | None:
     candidate = Path(value).expanduser()
     if candidate.exists():
-        return str(candidate)
-    return shutil.which(value)
+        return str(candidate.resolve())
+    resolved = shutil.which(value)
+    if resolved:
+        return resolved
+    if candidate.name != value:
+        return shutil.which(candidate.name)
+    return None
+
+
+def _build_mineru_command(
+    *,
+    mineru_bin: str,
+    source_path: Path,
+    output_dir: Path,
+    backend: str | None,
+    extra_args: str,
+) -> list[str]:
+    command = [mineru_bin, "-p", str(source_path), "-o", str(output_dir)]
+    normalized_backend = _normalize_mineru_backend(backend)
+    if normalized_backend:
+        command.extend(["-b", normalized_backend])
+    if extra_args:
+        command.extend(shlex.split(extra_args))
+    return command
+
+
+def _normalize_mineru_backend(value: str | None) -> str | None:
+    backend = (value or "").strip()
+    if not backend:
+        return None
+    aliases = {
+        "hybrid": "hybrid-engine",
+        "hybrid_engine": "hybrid-engine",
+        "vlm": "vlm-engine",
+        "vlm_engine": "vlm-engine",
+        "vlm_http_client": "vlm-http-client",
+        "hybrid_http_client": "hybrid-http-client",
+    }
+    return aliases.get(backend.lower(), backend)
 
 
 def _find_mineru_content_list(output_dir: Path) -> Path | None:
@@ -345,12 +386,16 @@ def _mineru_content_to_parsed_doc(
                 formulas.append({"page_label": page_label, "text": formula})
                 block_text = formula
         elif content_type in {"image", "figure"} or "image" in content_type or "figure" in content_type:
-            caption = _mineru_caption_text(item, "image_caption", "chart_caption", "caption", "content")
-            image_path = _mineru_first_text(item, "img_path", "image_path", "path")
-            block_text = caption or image_path
+            figure = _mineru_figure_metadata(
+                item,
+                page_label=page_label,
+                output_dir=output_dir,
+                content_list_path=content_list_path,
+            )
+            block_text = _mineru_figure_chunk_text(figure)
             if block_text:
                 stats["figures"] += 1
-                figures.append({"page_label": page_label, "note": block_text})
+                figures.append(figure)
         else:
             block_text = _mineru_first_text(item, "text", "paragraph_content", "content", "md_content")
             if block_text:
@@ -399,7 +444,7 @@ def _mineru_content_to_parsed_doc(
         "document_intelligence": {
             "enabled": True,
             "engine": "mineru",
-            "backend": settings.mineru_backend,
+            "backend": _normalize_mineru_backend(settings.mineru_backend),
             "output_dir": str(output_dir) if output_dir else None,
             "content_list_path": str(content_list_path) if content_list_path else None,
             "page_outputs": page_outputs,
@@ -513,12 +558,90 @@ def _mineru_caption_text(item: dict, *keys: str) -> str:
     return " ".join(parts).strip()
 
 
+def _mineru_figure_metadata(
+    item: dict,
+    *,
+    page_label: str,
+    output_dir: Path | None,
+    content_list_path: Path | None,
+) -> dict:
+    caption = _mineru_caption_text(item, "image_caption", "chart_caption", "figure_caption", "caption")
+    note = _mineru_caption_text(item, "note", "image_note", "figure_note", "description", "alt_text", "text")
+    asset_path = _safe_mineru_asset_path(
+        _mineru_first_text(item, "img_path", "image_path", "path", "image_url"),
+        output_dir=output_dir,
+        content_list_path=content_list_path,
+    )
+    metadata = {
+        "page_label": page_label,
+        "caption": caption,
+        "note": note or caption or asset_path,
+        "image_path": asset_path,
+        "path": asset_path,
+    }
+    return {key: value for key, value in metadata.items() if value}
+
+
+def _mineru_figure_chunk_text(figure: dict) -> str:
+    parts = ["Figure evidence"]
+    page_label = str(figure.get("page_label") or "").strip()
+    caption = str(figure.get("caption") or "").strip()
+    note = str(figure.get("note") or "").strip()
+    image_path = str(figure.get("image_path") or "").strip()
+    path = str(figure.get("path") or "").strip()
+    if page_label and page_label != "?":
+        parts.append(f"Page: {page_label}")
+    if caption:
+        parts.append(f"Caption: {caption}")
+    if note and note != caption:
+        parts.append(f"Note: {note}")
+    if image_path:
+        parts.append(f"Image path: {image_path}")
+    if path and path != image_path:
+        parts.append(f"Path: {path}")
+    return "\n".join(parts).strip() if len(parts) > 1 else ""
+
+
+def _safe_mineru_asset_path(
+    image_path: str,
+    *,
+    output_dir: Path | None,
+    content_list_path: Path | None,
+) -> str:
+    value = image_path.strip()
+    if not value or "://" in value:
+        return ""
+    path = Path(value)
+    bases = [base.resolve() for base in (content_list_path.parent if content_list_path else None, output_dir) if base is not None]
+    if path.is_absolute():
+        for base in bases:
+            try:
+                return path.resolve().relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return ""
+    if not bases:
+        return "" if ".." in path.parts else path.as_posix()
+    for base in bases:
+        candidate = (base / path).resolve()
+        try:
+            return candidate.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return ""
+
+
 def _mineru_lookup_value(item: dict, key: str) -> object:
     if key in item:
         return item.get(key)
     content = item.get("content")
     if isinstance(content, dict) and key in content:
         return content.get(key)
+    if isinstance(content, dict):
+        for source_key in ("image_source", "img_source", "image"):
+            source = content.get(source_key)
+            if isinstance(source, dict) and key in source:
+                return source.get(key)
     return None
 
 
@@ -535,6 +658,9 @@ def _stringify_mineru_value(value: object) -> str:
         for key in (
             "text",
             "content",
+            "path",
+            "image_path",
+            "img_path",
             "title_content",
             "paragraph_content",
             "math_content",

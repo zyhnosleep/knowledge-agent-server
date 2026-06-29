@@ -11,10 +11,97 @@ PROFILE_VERSION = "paper-profile-v1"
 
 PROFILE_TERM_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)*\b")
 PROFILE_NUMERIC_UNIT_RE = re.compile(
-    r"(?<![\w.])\d+(?:\.\d+)?\s*(?:K|kcal(?:\s*/\s*mol|\s+mol)?|fs|ps|ns|us|A)(?![\w/])",
+    r"(?<![\w.])\d+(?:\.\d+)?\s*(?:%|kT|K|kcal(?:\s*/\s*mol|\s+mol)?|fs|ps|ns|us|A)(?![\w/])",
     re.IGNORECASE,
 )
 TABLE_LABEL_RE = re.compile(r"\bTable\s*\d+\b", re.IGNORECASE)
+PROFILE_PHRASE_PATTERNS = (
+    re.compile(r"\bamino-acid specific\b", re.IGNORECASE),
+    re.compile(r"\bC6\s+(?:coefficients?|dispersion|parameters?)\b", re.IGNORECASE),
+    re.compile(r"\bcharge transfer\b", re.IGNORECASE),
+    re.compile(r"\bcovalent relaxation\b", re.IGNORECASE),
+    re.compile(r"\bexplicit hydrogen\b", re.IGNORECASE),
+    re.compile(r"\bexpanded ensembles?\b", re.IGNORECASE),
+    re.compile(r"\bhelical propensity\b", re.IGNORECASE),
+    re.compile(r"\bhydration free energy\b", re.IGNORECASE),
+    re.compile(r"\bLennard-Jones\b", re.IGNORECASE),
+    re.compile(r"\bmolten globule\b", re.IGNORECASE),
+    re.compile(r"\bMonte Carlo\b", re.IGNORECASE),
+    re.compile(r"\bneutral state\b", re.IGNORECASE),
+    re.compile(r"\bsalt bridge\b", re.IGNORECASE),
+    re.compile(r"\bsteric clashes?\b", re.IGNORECASE),
+    re.compile(r"\bvan der Waals\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+organic liquids\b", re.IGNORECASE),
+)
+PROFILE_CHI_RE = re.compile(r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*([12])\s*\}?", re.IGNORECASE)
+
+CANONICAL_SOURCE_IDENTITIES = (
+    {
+        "source_slug": "sources/charmm36m-force-field",
+        "source_title": "CHARMM36m Force Field",
+        "aliases": ("CHARMM36m", "charmm36m.pdf", "CHARMM36m protein force field"),
+    },
+    {
+        "source_slug": "sources/charmm36-force-field-refinement-for-proteins",
+        "source_title": "CHARMM36 Force Field Refinement for Proteins",
+        "aliases": ("CHARMM36", "charmm36.pdf", "CHARMM36 force field refinement for proteins"),
+    },
+    {
+        "source_slug": "sources/charmm36idpsff",
+        "source_title": "CHARMM36IDPSFF",
+        "aliases": ("CHARMM36IDPSFF", "charmm36idpsff.pdf"),
+    },
+    {
+        "source_slug": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+        "source_title": "ff19SB Amino-Acid-Specific Protein Backbone Parameters",
+        "aliases": ("ff19SB", "ff19sb.pdf", "amino-acid-specific protein backbone parameters"),
+    },
+    {
+        "source_slug": "sources/opls5-force-field-development-and-validation",
+        "source_title": "OPLS5 Force Field Development and Validation",
+        "aliases": ("OPLS5", "opls5.pdf", "OPLS5 force field development and validation"),
+    },
+    {
+        "source_slug": "sources/opls4-force-field-development-and-validation",
+        "source_title": "OPLS4 Force Field Development and Validation",
+        "aliases": ("OPLS4", "opls4.pdf", "OPLS4 force field development and validation"),
+    },
+    {
+        "source_slug": "sources/ff14sb",
+        "source_title": "ff14SB",
+        "aliases": ("ff14SB", "ff14sb.pdf", "AMBER ff14SB"),
+    },
+    {
+        "source_slug": "sources/ff99sb-disp",
+        "source_title": "ff99SB-disp",
+        "aliases": ("ff99SB-disp", "ff99sb-disp.pdf", "TIP4P-D"),
+    },
+    {
+        "source_slug": "sources/ff99sb-ildn",
+        "source_title": "ff99SB-ILDN",
+        "aliases": ("ff99SB-ILDN", "ff99sb-ildn.pdf"),
+    },
+    {
+        "source_slug": "sources/opls-aa-force-field-development-and-validation",
+        "source_title": "OPLS-AA Force Field Development and Validation",
+        "aliases": ("OPLS-AA", "opls-aa.pdf", "OPLS AA force field development and validation"),
+    },
+    {
+        "source_slug": "sources/gaff2-force-field",
+        "source_title": "GAFF2 Force Field",
+        "aliases": ("GAFF2", "gaff2.pdf", "general amber force field 2"),
+    },
+    {
+        "source_slug": "sources/cgenff-program-for-charmm-general-force-field",
+        "source_title": "CGenFF Program for CHARMM General Force Field",
+        "aliases": ("CGenFF", "cgenff.pdf", "CHARMM General Force Field"),
+    },
+    {
+        "source_slug": "sources/tip4p-fb-water-model",
+        "source_title": "TIP4P-FB Water Model",
+        "aliases": ("TIP4P-FB", "tip4p-fb.pdf", "TIP4P FB"),
+    },
+)
 
 
 @dataclass
@@ -56,14 +143,18 @@ def ensure_paper_profile(document: Document) -> dict:
 
 def paper_profile_data(document: Document) -> dict:
     metadata = dict(document.metadata_json or {})
+    _ensure_source_identity(document, metadata)
     existing = metadata.get("paper_profile")
     if isinstance(existing, dict) and existing.get("profile_version") == PROFILE_VERSION and existing.get("routing_summary"):
+        document.metadata_json = metadata
         return existing
     return build_paper_profile(document).to_dict()
 
 
 def paper_profile_retrieval_terms(document: Document) -> list[str]:
     metadata = dict(document.metadata_json or {})
+    _ensure_source_identity(document, metadata)
+    document.metadata_json = metadata
     existing = metadata.get("paper_profile") if isinstance(metadata.get("paper_profile"), dict) else {}
     existing_terms = existing.get("key_terms") if isinstance(existing, dict) and isinstance(existing.get("key_terms"), list) else []
     aliases = existing.get("aliases") if isinstance(existing, dict) and isinstance(existing.get("aliases"), list) else []
@@ -106,13 +197,18 @@ def build_paper_profile(document: Document) -> PaperProfile:
     metadata = document.metadata_json or {}
     title = strip_upload_prefix(document.title or document.file_name or "Untitled document")
     clean_title = _clean_title(title)
-    source_slug = str(metadata.get("source_slug") or metadata.get("page_slug") or "").strip() or source_slug_for_title(clean_title)
+    canonical_identity = _canonical_source_identity(document, metadata, preferred_title=clean_title)
+    source_slug = (
+        str(canonical_identity.get("source_slug") if canonical_identity else metadata.get("source_slug") or metadata.get("page_slug") or "").strip()
+        or source_slug_for_title(clean_title)
+    )
     intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
     tables = intelligence.get("tables") if isinstance(intelligence, dict) else []
     figures = intelligence.get("figures") if isinstance(intelligence, dict) else []
     title_text = "\n".join(part for part in (clean_title, str(document.file_name or "")) if part)
     text = _profile_source_text(document, title_text=title_text, tables=tables, figures=figures)
-    aliases = _ordered_unique([clean_title, *_title_aliases(title)])
+    canonical_aliases = list(canonical_identity.get("aliases", [])) if canonical_identity else []
+    aliases = _ordered_unique([clean_title, *canonical_aliases, *_title_aliases(title)])
     table_terms = [match.group(0).replace(" ", " ") for match in TABLE_LABEL_RE.finditer(_join_table_text(tables))]
     figure_terms = [match.group(0).replace(" ", " ") for match in re.finditer(r"\b(?:Figure|Fig\.)\s*\d+\b", _join_figure_text(figures), re.IGNORECASE)]
     key_terms = _ordered_unique([*aliases, *table_terms, *figure_terms, *_keyword_terms(text)])[:48]
@@ -163,7 +259,7 @@ def alias_in_text(alias: str, text: str) -> bool:
     if not alias or not text:
         return False
     escaped = re.escape(alias)
-    return bool(re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])", text, re.IGNORECASE))
+    return bool(re.search(rf"(?<![A-Za-z0-9_\-]){escaped}(?![A-Za-z0-9_\-])", text, re.IGNORECASE))
 
 
 def _title_aliases(title: str) -> list[str]:
@@ -209,31 +305,55 @@ def _keyword_terms(text: str) -> list[str]:
         "author",
     }
     domain_terms = {
+        "alphal",
         "backbone",
         "barrier",
         "boltzmann",
+        "chargetransfer",
+        "covalentrelaxation",
         "cmap",
+        "drude",
+        "expandedensemble",
+        "expandedensembles",
+        "explicithydrogen",
+        "fret",
         "helical",
+        "helicalpropensity",
+        "hydrationfreeenergy",
+        "idp",
         "fitting",
+        "lennardjones",
+        "moltenglobule",
+        "montecarlo",
+        "neutralstate",
+        "polarizability",
         "population",
         "propensity",
         "protocol",
         "protocols",
+        "saltbridge",
         "restraint",
         "restraints",
         "rotamer",
         "rotamers",
         "sidechain",
         "side-chain",
+        "steric",
+        "stericclash",
+        "stericclashes",
+        "tetrapeptide",
         "torsion",
         "torsions",
+        "vanderwaals",
+        "vdw",
     }
     candidates: dict[str, tuple[str, float, int]] = {}
 
     def add_candidate(token: str, position: int) -> None:
         token = re.sub(r"\s+", " ", token).strip()
         normalized = token.lower()
-        compact = normalized.replace("-", "").replace("_", "").replace("/", "").replace(" ", "")
+        normalized_key = normalized.replace("\u03c7", "chi")
+        compact = re.sub(r"[^a-z0-9]+", "", normalized_key)
         if len(compact) < 3 or normalized in stopwords:
             return
         if compact.startswith(("author", "department", "university")):
@@ -275,6 +395,11 @@ def _keyword_terms(text: str) -> list[str]:
 
     for match in PROFILE_NUMERIC_UNIT_RE.finditer(text):
         add_candidate(match.group(0), match.start())
+    for match in PROFILE_PHRASE_PATTERNS:
+        for phrase_match in match.finditer(text):
+            add_candidate(phrase_match.group(0), phrase_match.start())
+    for match in PROFILE_CHI_RE.finditer(text):
+        add_candidate(f"\u03c7{match.group(1)}", match.start())
     for match in PROFILE_TERM_RE.finditer(text):
         add_candidate(match.group(0), match.start())
     ranked = sorted(candidates.values(), key=lambda item: (-item[1], item[2], item[0].lower()))
@@ -361,8 +486,53 @@ def _first_sentence(text: str) -> str:
 
 def _ensure_source_identity(document: Document, metadata: dict, preferred_title: str | None = None) -> None:
     title = strip_upload_prefix(preferred_title or document.title or document.file_name or "Untitled document")
+    canonical_identity = _canonical_source_identity(document, metadata, preferred_title=title)
+    if canonical_identity is not None:
+        metadata["source_slug"] = str(canonical_identity["source_slug"])
+        metadata.setdefault("source_title", str(canonical_identity["source_title"]))
+        profile = metadata.get("paper_profile")
+        if isinstance(profile, dict):
+            profile["source_slug"] = str(canonical_identity["source_slug"])
+            existing_aliases = profile.get("aliases") if isinstance(profile.get("aliases"), list) else []
+            profile["aliases"] = _ordered_unique([*[str(alias) for alias in existing_aliases], *canonical_identity.get("aliases", [])])
+        return
     metadata.setdefault("source_slug", source_slug_for_title(title))
     metadata.setdefault("source_title", _clean_title(title))
+
+
+def _canonical_source_identity(document: Document, metadata: dict, preferred_title: str | None = None) -> dict | None:
+    profile = metadata.get("paper_profile") if isinstance(metadata.get("paper_profile"), dict) else {}
+    primary_identity_text = "\n".join(
+        part
+        for part in (
+            preferred_title or "",
+            document.title or "",
+            document.file_name or "",
+            document.raw_path or "",
+            str(metadata.get("source_title") or ""),
+            str(profile.get("title") or ""),
+        )
+        if part
+    )
+    primary_identity_key = _canonical_match_key(primary_identity_text)
+    for identity in CANONICAL_SOURCE_IDENTITIES:
+        for alias in identity["aliases"]:
+            alias_key = _canonical_match_key(str(alias))
+            if not alias_key:
+                continue
+            if _canonical_alias_key_matches(alias_key, primary_identity_key):
+                return identity
+    return None
+
+
+def _canonical_alias_key_matches(alias_key: str, identity_key: str) -> bool:
+    if len(alias_key) <= 12:
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(alias_key)}(?![a-z0-9])", identity_key))
+    return alias_key in identity_key
+
+
+def _canonical_match_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
 def _ordered_unique(values: list[str]) -> list[str]:

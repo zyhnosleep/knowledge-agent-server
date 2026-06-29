@@ -5,7 +5,7 @@ from app.db.session import Base
 from app.models.records import Claim, Document, DocumentChunk, Project, QuestionAnswer, WikiPage
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
+from app.services.search import MAX_CONTEXTS, ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
 from app.schemas.common import Citation
 from app.services.table_normalization import normalize_table_text
 
@@ -138,6 +138,40 @@ def test_query_service_uses_wiki_page_context_and_returns_page_citation() -> Non
     assert response.citations[0].page_slug == "sources/medical-case"
     assert response.citations[0].page_title == "Medical Case Summary"
     assert "follow-up in two weeks" in fake_ollama.last_prompt.lower()
+
+
+def test_source_chunk_search_ignores_failed_documents() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    ready_document = Document(
+        id="ready",
+        project_id="p1",
+        title="Ready Paper",
+        file_name="ready.md",
+        sha256="ready",
+        raw_path="raw/ready.md",
+        status="ready",
+    )
+    failed_document = Document(
+        id="failed",
+        project_id="p1",
+        title="Failed Paper",
+        file_name="failed.md",
+        sha256="failed",
+        raw_path="raw/failed.md",
+        status="failed",
+    )
+    ready_chunk = DocumentChunk(id="ready-chunk", document_id="ready", ordinal=0, text="unrelated stable content", embedding=None)
+    failed_chunk = DocumentChunk(id="failed-chunk", document_id="failed", ordinal=0, text="unique failed evidence token", embedding=None)
+    db.add_all([project, ready_document, failed_document, ready_chunk, failed_chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+
+    contexts = service._search_source_chunks("unique failed evidence token", "p1", [], limit=5)
+
+    assert contexts == []
 
 
 def test_search_wiki_pages_prioritizes_exact_source_identifier_over_body_overlap() -> None:
@@ -799,6 +833,251 @@ def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() 
     assert "91.2" in contexts[0].citation.excerpt
 
 
+def test_charmm36m_table_query_locks_scope_and_uses_canonical_source_slug() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    charmm36 = make_table_document(
+        id="charmm36",
+        title="CHARMM36 force field",
+        source_slug="sources/charmm36",
+        table_markdown=(
+            "Table 2: CHARMM36 IDP RMSD metrics.\n"
+            "| Model | IDP RMSD |\n"
+            "| --- | --- |\n"
+            "| CHARMM36 | 9.9 |"
+        ),
+        raw_text="CHARMM36 force field refinement for proteins.",
+    )
+    charmm36.file_name = "charmm36.pdf"
+    charmm36m = make_table_document(
+        id="charmm36m",
+        title="CHARMM36m protein force field",
+        source_slug="sources/charmm36m",
+        table_markdown=(
+            "Table 2: CHARMM36m IDP RMSD metrics.\n"
+            "| Model | IDP RMSD |\n"
+            "| --- | --- |\n"
+            "| CHARMM36m | 1.2 |"
+        ),
+        raw_text="CHARMM36m improves intrinsically disordered protein ensembles.",
+    )
+    charmm36m.file_name = "charmm36m.pdf"
+    opls5 = make_table_document(
+        id="opls5",
+        title="OPLS5 Force Field Development and Validation",
+        source_slug="sources/opls5",
+        table_markdown=(
+            "Table 2: OPLS5 unrelated metrics.\n"
+            "| Model | IDP RMSD |\n"
+            "| --- | --- |\n"
+            "| OPLS5 | 5.5 |"
+        ),
+        raw_text="OPLS5 force field development and validation.",
+    )
+    opls5.file_name = "opls5.pdf"
+    db.add_all([project, charmm36, charmm36m, opls5])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+    service.ollama.payload = QueryAnswerPayload(
+        answer_markdown="Table 2 reports CHARMM36m IDP RMSD as 1.2 [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+
+    response = service.answer("demo", "What does CHARMM36m Table 2 report for IDP RMSD?", save_answer=False)
+
+    assert response.citations
+    assert {citation.document_id for citation in response.citations} == {"charmm36m"}
+    assert {citation.page_slug for citation in response.citations} == {"sources/charmm36m-force-field"}
+    assert all("CHARMM36 | 9.9" not in citation.excerpt for citation in response.citations)
+    assert all("OPLS5 | 5.5" not in citation.excerpt for citation in response.citations)
+    assert "Table 2" in response.citations[0].excerpt
+    assert "| Model | IDP RMSD |" in response.citations[0].excerpt
+    assert "| CHARMM36m | 1.2 |" in response.citations[0].excerpt
+
+
+def test_scientific_overview_retrieval_includes_intro_chunks_for_locked_document() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="charmm36",
+        project_id="p1",
+        title="CHARMM36 force field",
+        file_name="charmm36.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36.pdf",
+        raw_text="CHARMM36 force field refinement.",
+        metadata_json={"source_slug": "sources/charmm36"},
+        status="ready",
+    )
+    db.add_all(
+        [
+            project,
+            document,
+            DocumentChunk(
+                id="intro",
+                document_id="charmm36",
+                ordinal=0,
+                text=(
+                    "While the quality of the current CHARMM22/CMAP additive force field was demonstrated, "
+                    "NMR spectroscopy and folding simulations showed helical and extended-state limitations."
+                ),
+                page_label="1",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="later",
+                document_id="charmm36",
+                ordinal=8,
+                text="A later table reports side-chain parameter RMSD values.",
+                page_label="31",
+                embedding=[0.0, 1.0],
+            ),
+        ]
+    )
+    db.commit()
+
+    contexts = QueryService(db)._search_document_intro_contexts(
+        "CHARMM36 protein force field 修正 CHARMM22/CMAP 的什么问题？用了哪些 NMR 验证策略？",
+        "p1",
+        ["charmm36"],
+    )
+
+    assert contexts
+    assert contexts[0].evidence_kind == "intro"
+    assert "CHARMM22/CMAP" in contexts[0].citation.excerpt
+    assert "NMR" in contexts[0].citation.excerpt
+
+
+def test_limitation_query_retrieval_includes_radius_and_large_conformational_evidence() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="idpsff",
+        project_id="p1",
+        title="CHARMM36IDPSFF",
+        file_name="charmm36idpsff.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36idpsff.pdf",
+        raw_text="CHARMM36IDPSFF.",
+        metadata_json={"source_slug": "sources/charmm36idpsff"},
+        status="ready",
+    )
+    db.add_all(
+        [
+            project,
+            document,
+            DocumentChunk(
+                id="radius",
+                document_id="idpsff",
+                ordinal=6,
+                text=(
+                    "Comparison with a99SB- reported some deficiencies. "
+                    "The radius of gyration of large disordered proteins shows remaining limitations."
+                ),
+                page_label="7",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="generic",
+                document_id="idpsff",
+                ordinal=1,
+                text="General setup information.",
+                page_label="2",
+                embedding=[0.0, 1.0],
+            ),
+        ]
+    )
+    db.commit()
+
+    contexts = QueryService(db)._search_document_limitation_contexts(
+        "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？它在哪些场景仍有不足？",
+        "p1",
+        ["idpsff"],
+    )
+
+    assert contexts
+    assert contexts[0].evidence_kind == "limitation"
+    assert "a99SB" in contexts[0].citation.excerpt
+    assert "radius of gyration" in contexts[0].citation.excerpt
+    assert "large disordered proteins" in contexts[0].citation.excerpt
+
+
+def test_parameterization_query_retrieval_collects_distributed_ff19sb_anchors() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="ff19sb",
+        project_id="p1",
+        title="ff19SB",
+        file_name="ff19sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff19sb.pdf",
+        raw_text="ff19SB.",
+        metadata_json={"source_slug": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters"},
+        status="ready",
+    )
+    db.add_all(
+        [
+            project,
+            document,
+            DocumentChunk(
+                id="validation",
+                document_id="ff19sb",
+                ordinal=0,
+                text="To extensively validate ff19SB parameters, the authors performed a total of ~5 milliseconds MD simulations in explicit solvent.",
+                page_label="1",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="cmap",
+                document_id="ff19sb",
+                ordinal=1,
+                text="Leu CMAP was fit and applied to long nonpolar side chains. Val CMAP was fit and applied to both Val and Ile for beta-branched side chains.",
+                page_label="27",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="qm",
+                document_id="ff19sb",
+                ordinal=2,
+                text="M05-2X/6-311G** is reasonably accurate relative to MP2/cc-pVQZ at reproducing relative energy.",
+                page_label="30",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="resp",
+                document_id="ff19sb",
+                ordinal=3,
+                text="The original RESP method used charge fitting; HF/6-31G* was used for geometry optimization.",
+                page_label="30",
+                embedding=[1.0, 0.0],
+            ),
+        ]
+    )
+    db.commit()
+
+    contexts = QueryService(db)._search_document_parameterization_contexts(
+        "ff19SB 的参数化策略中，RESP charge fitting、QM level、CMAP 分配和验证规模有哪些具体锚点？",
+        "p1",
+        ["ff19sb"],
+    )
+    combined = " ".join(context.citation.excerpt for context in contexts)
+
+    assert len(contexts) >= 4
+    assert "RESP" in combined
+    assert "HF/6-31G" in combined
+    assert "M05-2X" in combined
+    assert "MP2/cc-pVQZ" in combined
+    assert "Leu CMAP" in combined
+    assert "Val CMAP" in combined
+    assert "Ile" in combined
+    assert "5 milliseconds" in combined
+
+
 def test_rag_contexts_include_sac_kg_claim_evidence_chunks() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1038,6 +1317,764 @@ def test_rag_contexts_add_supplemental_profile_term_evidence() -> None:
     assert any(context.citation.chunk_id == "cmap" for context in contexts)
 
 
+def test_rag_contexts_keep_scientific_phrase_supplements() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff14SB",
+        file_name="ff14sb.pdf",
+        sha256="abc",
+        raw_path="raw/ff14sb.pdf",
+        raw_text="ff14SB paper.",
+        metadata_json={
+            "source_slug": "sources/ff14sb",
+            "source_title": "ff14SB",
+            "paper_profile": {
+                "title": "ff14SB",
+                "aliases": ["ff14SB"],
+                "key_terms": ["ff14SB"],
+                "routing_summary": "ff14SB mechanism update.",
+                "source_slug": "sources/ff14sb",
+            },
+        },
+        status="ready",
+    )
+    dominant_chunks = [
+        DocumentChunk(
+            id=f"dominant-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="ff14SB backbone dominant evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(12)
+    ]
+    mechanism_chunk = DocumentChunk(
+        id="mechanism",
+        document_id="d1",
+        ordinal=20,
+        text="The ff14SB update uses covalent relaxation to remove steric clashes before phase fitting.",
+        page_label="20",
+        embedding=None,
+    )
+    db.add_all([project, document, *dominant_chunks, mechanism_chunk])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_rag_contexts(
+        "ff14SB 的 mechanism 是什么？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+
+    assert any(context.citation.chunk_id == "mechanism" for context in contexts)
+    constraints = service._build_answer_constraints("ff14SB 的 mechanism 是什么？", contexts)
+    assert "covalent relaxation" in constraints
+    assert "steric clashes" in constraints
+
+
+def test_scientific_anchor_contexts_match_latex_spaced_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="ff99SB-disp",
+        file_name="ff99sb-disp.pdf",
+        sha256="abc",
+        raw_path="raw/ff99sb-disp.pdf",
+        raw_text="ff99SB-disp paper.",
+        metadata_json={"source_slug": "sources/ff99sb-disp", "source_title": "ff99SB-disp"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c1",
+        document_id="d1",
+        ordinal=0,
+        text=(
+            "TIP4P-D changes the water dispersion coefficient C _ { 6 } by 50%. "
+            "A related table reports \\alpha _ { \\mathrm { L } } propensity."
+        ),
+        page_label="2",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "为什么 TIP4P-D 改善 IDP 构象采样？",
+        "p1",
+        ["d1"],
+    )
+    evidence = "\n".join(context.citation.excerpt for context in contexts)
+
+    assert "C _ { 6 }" in evidence
+    assert "50%" in evidence
+    assert "\\alpha" in evidence
+
+
+def test_scientific_anchor_contexts_keep_unique_high_value_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="abc",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={"source_slug": "sources/opls5", "source_title": "OPLS5"},
+        status="ready",
+    )
+    dominant = [
+        DocumentChunk(
+            id=f"dominant-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="OPLS5 Drude polarizability cation-pi validation repeated evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(8)
+    ]
+    lfmm = DocumentChunk(
+        id="lfmm",
+        document_id="d1",
+        ordinal=20,
+        text="The metal workflow uses LFMM and includes MMP13 near-complex benchmark systems.",
+        page_label="20",
+        embedding=None,
+    )
+    db.add_all([project, document, *dominant, lfmm])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "为什么 OPLS5 对 polarizability-sensitive/cation-pi 和金属体系更准确？",
+        "p1",
+        ["d1"],
+        limit=4,
+    )
+
+    assert any(context.citation.chunk_id == "lfmm" for context in contexts)
+
+
+def test_scientific_anchor_contexts_keep_large_idp_limitation_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="CHARMM36IDPSFF",
+        file_name="charmm36idpsff.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36idpsff.pdf",
+        raw_text="CHARMM36IDPSFF paper.",
+        metadata_json={"source_slug": "sources/charmm36idpsff", "source_title": "CHARMM36IDPSFF"},
+        status="ready",
+    )
+    dominant = [
+        DocumentChunk(
+            id=f"idp-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="CHARMM36IDPSFF IDP CMAP PPII repeated evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(8)
+    ]
+    limitation = DocumentChunk(
+        id="large-idp",
+        document_id="d1",
+        ordinal=20,
+        text="Limitations remain for the radius of gyration of large disordered proteins and fast-folding proteins.",
+        page_label="20",
+        embedding=None,
+    )
+    db.add_all([project, document, *dominant, limitation])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "CHARMM36IDPSFF 在哪些场景仍有不足？",
+        "p1",
+        ["d1"],
+        limit=4,
+    )
+
+    assert any(context.citation.chunk_id == "large-idp" for context in contexts)
+
+
+def test_scientific_anchor_contexts_keep_expected_mechanism_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="CHARMM36m",
+        file_name="charmm36m.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36m.pdf",
+        raw_text="CHARMM36m paper.",
+        metadata_json={"source_slug": "sources/charmm36m", "source_title": "CHARMM36m"},
+        status="ready",
+    )
+    dominant = [
+        DocumentChunk(
+            id=f"cmap-{index}",
+            document_id="d1",
+            ordinal=index,
+            text="CHARMM36m CMAP alphaL PPII repeated evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(8)
+    ]
+    steric = DocumentChunk(
+        id="steric",
+        document_id="d1",
+        ordinal=20,
+        text="The mechanism reduces a steric clash using refined Lennard-Jones parameters.",
+        page_label="20",
+        embedding=None,
+    )
+    cmap = DocumentChunk(
+        id="cmap-window",
+        document_id="d1",
+        ordinal=21,
+        text="The C36m CMAP uses w = 2kT around \\Phi = 6 0 and \\psi = 4 5.",
+        page_label="21",
+        embedding=None,
+    )
+    db.add_all([project, document, *dominant, steric, cmap])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "CHARMM36m 如何修正 alphaL 和 CMAP？",
+        "p1",
+        ["d1"],
+        limit=5,
+    )
+    evidence = "\n".join(context.citation.excerpt for context in contexts)
+
+    assert "steric" in evidence
+    assert "Lennard-Jones" in evidence
+    assert "2kT" in evidence
+
+
+def test_scientific_anchor_labels_normalize_ocr_and_unicode_variants() -> None:
+    labels = QueryService._scientific_anchor_labels_in_text(
+        "The evidence mentions helical and extended conformations, Lennard–Jones terms, "
+        "QM/MM differences, w = 2 k T, free energies of hydration, and torsional parameters."
+    )
+
+    assert "helix-coil" in labels
+    assert "Lennard-Jones" in labels
+    assert "QM-MM" in labels
+    assert "2kT" in labels
+    assert "hydration free energy" in labels
+    assert "torsional" in labels
+
+
+def test_scientific_anchor_excerpt_window_prioritizes_ppii_when_late_anchors_exist() -> None:
+    text = (
+        "Earlier context. " * 30
+        + "The CMAP modification reduced the energy barrier between PPII and the right-handed a-helix region. "
+        + "Middle context. " * 90
+        + "Later limitations mention large disordered proteins and fast-folding proteins."
+    )
+
+    excerpt = QueryService._scientific_anchor_excerpt_window(
+        text,
+        ["IDP", "large disordered proteins", "PPII"],
+        max_chars=500,
+    )
+
+    assert "PPII" in excerpt
+    assert "large disordered proteins" not in excerpt
+
+
+def test_scientific_anchor_context_keeps_ppii_before_late_limitation_anchor() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="CHARMM36IDPSFF",
+        file_name="charmm36idpsff.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36idpsff.pdf",
+        raw_text="CHARMM36IDPSFF paper.",
+        metadata_json={"source_slug": "sources/charmm36idpsff", "source_title": "CHARMM36IDPSFF"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="ppii-late-limitation",
+        document_id="d1",
+        ordinal=1,
+        text=(
+            "CHARMM36IDPSFF originates from CHARMM36m with CMAP modifications. "
+            "It reduced the energy barrier between PPII and the right-handed a-helix region. "
+            + "Intervening IDP validation text. " * 90
+            + "Limitations remain for large disordered proteins and fast-folding proteins."
+        ),
+        page_label="3",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "CHARMM36IDPSFF 是从哪个力场发展来的？它主要针对哪类蛋白体系做了什么修改？",
+        "p1",
+        ["d1"],
+        limit=1,
+    )
+
+    evidence = QueryService._context_evidence_text(contexts[0])
+    assert "PPII" in evidence
+
+
+def test_scientific_anchor_excerpt_prioritizes_early_high_value_anchor() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="CHARMM36IDPSFF",
+        file_name="charmm36idpsff.pdf",
+        sha256="abc",
+        raw_path="raw/charmm36idpsff.pdf",
+        raw_text="CHARMM36IDPSFF paper.",
+        metadata_json={"source_slug": "sources/charmm36idpsff", "source_title": "CHARMM36IDPSFF"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="ppii",
+        document_id="d1",
+        ordinal=1,
+        text=(
+            "The CMAP update reduces the energy barrier between PPII and the right-handed alpha-helix region. "
+            + "background sentence. " * 120
+            + "The same evidence later discusses IDPs and disordered proteins."
+        ),
+        page_label="3",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？",
+        "p1",
+        ["d1"],
+        limit=1,
+    )
+
+    assert contexts
+    assert "PPII" in contexts[0].prompt_text
+    assert "PPII" in contexts[0].citation.excerpt
+
+
+def test_scientific_anchor_excerpt_keeps_late_anchor_in_same_chunk() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="OPLS4",
+        file_name="opls4.pdf",
+        sha256="abc",
+        raw_path="raw/opls4.pdf",
+        raw_text="OPLS4 paper.",
+        metadata_json={"source_slug": "sources/opls4", "source_title": "OPLS4"},
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="glh",
+        document_id="d1",
+        ordinal=4,
+        text=(
+            "The pKa validation shows a neutral state bias and MSE over ASP and GLU. "
+            + "background sentence. " * 80
+            + "The starkest change is seen for GLH, where the predominant state changes with chi1 rotamers."
+        ),
+        page_label="4",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    contexts = QueryService(db)._search_document_scientific_anchor_contexts(
+        "OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？",
+        "p1",
+        ["d1"],
+        limit=2,
+    )
+
+    assert contexts
+    assert "GLH" in contexts[0].citation.excerpt
+
+
+def test_finalize_contexts_preserves_distinct_scientific_anchor_groups() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"polar-{index}",
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=100 - index,
+                page_label=str(index),
+                excerpt="OPLS5 polarizability and cation-pi evidence.",
+            ),
+            prompt_text="OPLS5 polarizability and cation-pi evidence.",
+            score=100 - index,
+            evidence_kind="profile-term",
+        )
+        for index in range(12)
+    ]
+    contexts.extend(
+        [
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id="drude",
+                    page_slug="sources/opls5",
+                    page_title="OPLS5",
+                    page_kind="source_summary",
+                    score=80,
+                    page_label="6",
+                    excerpt="The Drude parameters model intramolecular polarizability.",
+                ),
+                prompt_text="The Drude parameters model intramolecular polarizability.",
+                score=80,
+                evidence_kind="profile-term",
+            ),
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id="lfmm",
+                    page_slug="sources/opls5",
+                    page_title="OPLS5",
+                    page_kind="source_summary",
+                    score=70,
+                    page_label="14",
+                    excerpt="The metal workflow uses LFMM and MMP13 near-complex benchmark systems.",
+                ),
+                prompt_text="The metal workflow uses LFMM and MMP13 near-complex benchmark systems.",
+                score=70,
+                evidence_kind="profile-term",
+            ),
+        ]
+    )
+
+    finalized = service._finalize_contexts(contexts)
+    evidence = "\n".join(context.citation.excerpt for context in finalized)
+
+    assert len(finalized) == MAX_CONTEXTS
+    assert "Drude" in evidence
+    assert "LFMM" in evidence
+    assert "MMP13" in evidence
+
+
+def test_finalize_contexts_prioritizes_high_value_scientific_anchors() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"generic-{index}",
+                page_slug="sources/charmm36m",
+                page_title="CHARMM36m",
+                page_kind="source_summary",
+                score=100 - index,
+                page_label=str(index),
+                excerpt="CHARMM36m CMAP alphaL PPII repeated profile evidence.",
+            ),
+            prompt_text="CHARMM36m CMAP alphaL PPII repeated profile evidence.",
+            score=100 - index,
+            evidence_kind="profile-term",
+        )
+        for index in range(12)
+    ]
+    contexts.extend(
+        [
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id="steric",
+                    page_slug="sources/charmm36m",
+                    page_title="CHARMM36m",
+                    page_kind="source_summary",
+                    score=70,
+                    page_label="5",
+                    excerpt="The mechanism reduces a steric clash using refined Lennard-Jones parameters.",
+                ),
+                prompt_text="The mechanism reduces a steric clash using refined Lennard-Jones parameters.",
+                score=70,
+                evidence_kind="profile-term",
+            ),
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id="2kt",
+                    page_slug="sources/charmm36m",
+                    page_title="CHARMM36m",
+                    page_kind="source_summary",
+                    score=69,
+                    page_label="5",
+                    excerpt="The C36m CMAP uses w = 2kT around \\Phi = 6 0 and \\psi = 4 5.",
+                ),
+                prompt_text="The C36m CMAP uses w = 2kT around \\Phi = 6 0 and \\psi = 4 5.",
+                score=69,
+                evidence_kind="profile-term",
+            ),
+        ]
+    )
+
+    finalized = service._finalize_contexts(contexts)
+    evidence = "\n".join(context.citation.excerpt for context in finalized)
+
+    assert "steric" in evidence
+    assert "Lennard-Jones" in evidence
+    assert "2kT" in evidence
+
+
+def test_pka_bias_mechanism_is_not_metric_query() -> None:
+    assert not QueryService._is_metric_query("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？")
+    assert QueryService._is_metric_query("OPLS4 的 pKa 和 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？")
+
+
+def test_supported_term_note_uses_citation_identity_and_anchor_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff99sb-disp",
+                page_title="ff99SB-disp",
+                page_kind="source_summary",
+                score=10,
+                excerpt="TIP4P-D improves IDP ensembles through London dispersion and FRET/Rg validation.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "为什么 TIP4P-D 改善 IDP 构象采样？",
+        "已有证据说明 TIP4P-D。",
+        contexts,
+    )
+
+    assert "ff99SB-disp" in answer
+    assert "IDP" in answer
+    assert "London dispersion" in answer
+    assert "FRET" in answer
+    assert "Rg" in answer
+
+
+def test_supported_term_note_adds_expanded_ensembles_from_expanded_disordered_states() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff99sb-disp",
+                page_title="ff99SB-disp",
+                page_kind="source_summary",
+                score=10,
+                excerpt="TIP4P-D simulations result in disordered states that are substantially more expanded.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "为什么 TIP4P-D 改善 IDP 构象采样？",
+        "已有证据说明 TIP4P-D 和 disordered states。",
+        contexts,
+    )
+
+    assert "expanded ensembles" in answer
+
+
+def test_supported_term_note_adds_polarizability_when_supported() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=10,
+                excerpt="The Drude parameters describe molecular polarizability for cation-pi systems.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "为什么 OPLS5 对 polarizability-sensitive/cation-pi 体系更准确？",
+        "已有证据说明 Drude 和 cation。",
+        contexts,
+    )
+
+    assert "polarizability" in answer
+
+
+def test_supported_term_note_adds_radius_of_gyration_from_rg_symbol() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36idpsff",
+                page_title="CHARMM36IDPSFF",
+                page_kind="source_summary",
+                score=10,
+                excerpt="Disordered protein validation reports R _ { \\mathrm { g } } agreement against experiment.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "CHARMM36IDPSFF 在哪些场景仍有不足？",
+        "已有证据说明 IDP validation。",
+        contexts,
+    )
+
+    assert "radius of gyration" in answer
+    assert "Rg" in answer
+
+
+def test_supported_term_note_normalizes_plural_and_spaced_scientific_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff99sb-ildn",
+                page_title="ff99SB-ILDN",
+                page_kind="source_summary",
+                score=10,
+                excerpt="IDPs show populations separated by 2 kT barriers in the validation evidence.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "这些机制如何影响 IDP 构象采样？",
+        "已有证据说明 validation。",
+        contexts,
+    )
+
+    assert "IDP" in answer
+    assert "population" in answer
+    assert "barrier" in answer
+    assert "2kT" in answer
+
+
+def test_supported_term_note_normalizes_phi_psi_split_digits() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36m",
+                page_title="CHARMM36m",
+                page_kind="source_summary",
+                score=10,
+                excerpt="The CMAP revision is localized around \\Phi = 6 0 and \\psi = 4 5.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "CHARMM36m 的 CMAP 修改区域是什么？",
+        "已有证据说明 CMAP。",
+        contexts,
+    )
+
+    assert "60" in answer
+    assert "45" in answer
+
+
+def test_supported_term_note_adds_supported_benchmark_atoms_from_evidence_variants() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "C36m validation uses NMR observables and backbone fitting. "
+                    "The data set includes 34 entries for organic liquids and charge refinements."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "这个方法的验证和参数化依据是什么？",
+        "已有证据说明 validation。",
+        contexts,
+    )
+
+    for term in ("CHARMM36m", "NMR", "backbone", "34 organic liquids", "charge"):
+        assert term in answer
+
+
+def test_supported_term_note_adds_scientific_synonym_atoms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "The mechanism balances helical and extended conformations using QM target data. "
+                    "The liquid data include free energies of hydration."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "这些参数化证据说明什么？",
+        "已有证据说明构象平衡和液相数据。",
+        contexts,
+    )
+
+    assert "helix-coil" in answer
+    assert "QM" in answer
+    assert "hydration free energy" in answer
+
+
+def test_ensure_valid_returned_citation_marker_appends_first_citation_when_missing() -> None:
+    assert QueryService._ensure_valid_returned_citation_marker("已有证据说明机制。", 2).endswith(" [0]")
+    assert QueryService._ensure_valid_returned_citation_marker("已有证据说明机制。[1]", 2) == "已有证据说明机制。[1]"
+    assert QueryService._ensure_valid_returned_citation_marker("已有证据说明机制。", 0) == "已有证据说明机制。"
+
+
 def test_finalize_contexts_keeps_more_same_source_evidence() -> None:
     service = QueryService(make_session())
     contexts = [
@@ -1120,6 +2157,33 @@ def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> N
     assert "LFMM" in answer.answer_markdown
     assert answer.citations
     assert contexts[answer.citations[0]].citation.chunk_id == "c1"
+
+
+def test_draft_answer_uses_deterministic_scientific_evidence_without_llm_call() -> None:
+    service = QueryService(make_session())
+    service.ollama = CountingFakeOllama()
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="c1",
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=10,
+                excerpt="OPLS5 uses a Drude model for intramolecular polarizability and LFMM metal systems.",
+            ),
+            prompt_text="OPLS5 uses a Drude model for intramolecular polarizability and LFMM metal systems.",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = service._draft_answer("OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？", None, contexts)
+
+    assert service.ollama.generate_calls == 0
+    assert "Drude" in answer.answer_markdown
+    assert "LFMM" in answer.answer_markdown
 
 
 def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> None:
@@ -1560,6 +2624,198 @@ def test_route_papers_locks_subject_before_de_table_phrase() -> None:
     assert [match.document.title for match in matches] == ["opls5"]
 
 
+def test_route_papers_locks_primary_subject_before_comparison_phrase() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    idpsff = make_table_document(
+        id="idpsff",
+        title="CHARMM36IDPSFF",
+        source_slug="sources/charmm36idpsff",
+        table_markdown="Table 1.\n| Row | C36IDPSFF |\n| --- | --- |\n| value | IDP |",
+        raw_text="CHARMM36IDPSFF was designed for IDP simulations.",
+    )
+    idpsff.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "CHARMM36IDPSFF",
+        "one_sentence": "CHARMM36IDPSFF paper.",
+        "routing_summary": "Aliases: CHARMM36IDPSFF.",
+        "aliases": ["CHARMM36IDPSFF", "C36IDPSFF"],
+        "key_terms": ["CHARMM36IDPSFF", "C36IDPSFF", "CHARMM36m", "a99SB"],
+        "source_slug": "sources/charmm36idpsff",
+    }
+    charmm36m = make_table_document(
+        id="charmm36m",
+        title="CHARMM36m",
+        source_slug="sources/charmm36m",
+        table_markdown="Table 1.\n| Row | CHARMM36m |\n| --- | --- |\n| value | globular |",
+        raw_text="CHARMM36m validated peptides and IDPs.",
+    )
+    charmm36m.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "CHARMM36m",
+        "one_sentence": "CHARMM36m paper.",
+        "routing_summary": "Aliases: CHARMM36m.",
+        "aliases": ["CHARMM36m"],
+        "key_terms": ["CHARMM36m", "CHARMM36IDPSFF", "a99SB"],
+        "source_slug": "sources/charmm36m",
+    }
+    db.add_all([idpsff, charmm36m])
+    db.commit()
+
+    matches = QueryService(db)._route_papers(
+        "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？",
+        "p1",
+    )
+
+    assert [(match.document.id, match.locked) for match in matches] == [("idpsff", True)]
+
+
+def test_route_papers_locks_tip4p_d_to_ff99sb_disp() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    disp = Document(
+        id="disp",
+        project_id="p1",
+        title="ff99SB-disp",
+        file_name="ff99sb-disp.pdf",
+        sha256="disp",
+        raw_path="raw/ff99sb-disp.pdf",
+        raw_text="TIP4P-D improves disordered protein ensembles.",
+        metadata_json={},
+        status="ready",
+    )
+    ff19 = Document(
+        id="ff19",
+        project_id="p1",
+        title="ff19SB",
+        file_name="ff19sb.pdf",
+        sha256="ff19",
+        raw_path="raw/ff19sb.pdf",
+        raw_text="ff19SB discusses TIP3P, TIP4P-EW, and TIP4P/2005 comparisons.",
+        metadata_json={},
+        status="ready",
+    )
+    db.add_all([disp, ff19])
+    db.commit()
+
+    matches = QueryService(db)._route_papers(
+        "为什么 TIP4P-D 比 TIP3P/TIP4P-EW/TIP4P/2005 更能改善 IDP 构象采样？",
+        "p1",
+    )
+
+    assert [(match.document.id, match.locked) for match in matches] == [("disp", True)]
+
+
+def test_route_papers_locks_chinese_primary_subject_with_bi_comparison() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    opls4 = make_table_document(
+        id="opls4",
+        title="OPLS4",
+        source_slug="sources/opls4",
+        table_markdown="Table 1.\n| Row | OPLS4 |\n| --- | --- |\n| value | 4 |",
+        raw_text="OPLS4 force field paper.",
+    )
+    opls4.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "OPLS4",
+        "one_sentence": "OPLS4 paper.",
+        "routing_summary": "Aliases: OPLS4.",
+        "aliases": ["OPLS4"],
+        "key_terms": ["OPLS4", "OPLS5"],
+        "source_slug": "sources/opls4",
+    }
+    opls5 = make_table_document(
+        id="opls5",
+        title="OPLS5",
+        source_slug="sources/opls5",
+        table_markdown="Table 1.\n| Row | OPLS5 |\n| --- | --- |\n| value | 5 |",
+        raw_text="OPLS5 force field paper.",
+    )
+    opls5.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "OPLS5",
+        "one_sentence": "OPLS5 paper.",
+        "routing_summary": "Aliases: OPLS5.",
+        "aliases": ["OPLS5"],
+        "key_terms": ["OPLS5", "OPLS4"],
+        "source_slug": "sources/opls5",
+    }
+    db.add_all([opls4, opls5])
+    db.commit()
+
+    matches = QueryService(db)._route_papers(
+        "为什么 OPLS5 对 polarizability-sensitive/cation-pi 和金属体系比 OPLS4 更准确？",
+        "p1",
+    )
+
+    assert [(match.document.id, match.locked) for match in matches] == [("opls5", True)]
+
+
+def test_route_papers_keeps_explicit_compare_queries_multi_document() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    left = make_table_document(
+        id="left",
+        title="OPLS4",
+        source_slug="sources/opls4",
+        table_markdown="Table 1.\n| Row | OPLS4 |\n| --- | --- |\n| value | 4 |",
+        raw_text="OPLS4 force field paper.",
+    )
+    left.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "OPLS4",
+        "one_sentence": "OPLS4 paper.",
+        "routing_summary": "Aliases: OPLS4.",
+        "aliases": ["OPLS4"],
+        "key_terms": ["OPLS4", "OPLS5"],
+        "source_slug": "sources/opls4",
+    }
+    right = make_table_document(
+        id="right",
+        title="OPLS5",
+        source_slug="sources/opls5",
+        table_markdown="Table 1.\n| Row | OPLS5 |\n| --- | --- |\n| value | 5 |",
+        raw_text="OPLS5 force field paper.",
+    )
+    right.metadata_json["paper_profile"] = {
+        "profile_version": "paper-profile-v1",
+        "title": "OPLS5",
+        "one_sentence": "OPLS5 paper.",
+        "routing_summary": "Aliases: OPLS5.",
+        "aliases": ["OPLS5"],
+        "key_terms": ["OPLS5", "OPLS4"],
+        "source_slug": "sources/opls5",
+    }
+    db.add_all([left, right])
+    db.commit()
+
+    matches = QueryService(db)._route_papers("Compare OPLS4 and OPLS5.", "p1")
+
+    assert {match.document.id for match in matches} == {"left", "right"}
+    assert not any(match.locked for match in matches)
+
+    versus_matches = QueryService(db)._route_papers("OPLS4 versus OPLS5.", "p1")
+
+    assert {match.document.id for match in versus_matches} == {"left", "right"}
+    assert not any(match.locked for match in versus_matches)
+
+    vs_matches = QueryService(db)._route_papers("OPLS4 vs. OPLS5 differences.", "p1")
+
+    assert {match.document.id for match in vs_matches} == {"left", "right"}
+    assert not any(match.locked for match in vs_matches)
+
+    slash_matches = QueryService(db)._route_papers("OPLS4/OPLS5 differences.", "p1")
+
+    assert {match.document.id for match in slash_matches} == {"left", "right"}
+    assert not any(match.locked for match in slash_matches)
+
+    and_matches = QueryService(db)._route_papers("OPLS4 and OPLS5 differences.", "p1")
+
+    assert {match.document.id for match in and_matches} == {"left", "right"}
+    assert not any(match.locked for match in and_matches)
+
+
 def test_explicit_table_query_does_not_use_prose_metric_chunk_as_table_evidence() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1815,6 +3071,7 @@ def test_is_figure_query_detects_figure_questions() -> None:
 
 def test_is_table_query_detects_table_questions() -> None:
     assert QueryService._is_table_query("Table 2 鐨勭粨鏋滄槸浠€涔堬紵")
+    assert QueryService._is_table_query("ff99SB-ILDN Table I lists which modified torsions?")
     assert QueryService._is_table_query("OPLS5 \u7684\u8868\u683c\u4e2d\u6709\u54ea\u4e9b\u6570\u503c\uff1f")
     assert QueryService._is_table_query("What are the results in table 5?")
     assert not QueryService._is_table_query("What is the abstract about?")
@@ -2155,6 +3412,28 @@ def test_unsupported_answer_numbers_uses_citation_excerpt_as_evidence() -> None:
     ]
 
     unsupported = service._unsupported_answer_numbers("OIE2016 F1=74.7", contexts, [0])
+
+    assert unsupported == set()
+
+
+def test_unsupported_answer_numbers_accepts_spaced_digits_in_profile_contexts() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36m",
+                page_title="CHARMM36m",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="The CMAP region is around \\Phi = 6 0 and \\psi = 4 5.",
+            ),
+            prompt_text="",
+            score=10.0,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    unsupported = service._unsupported_answer_numbers("The answer mentions 60 and 45.", contexts, [0])
 
     assert unsupported == set()
 
@@ -3571,6 +4850,31 @@ def test_rank_blocks_uses_generic_aliases_for_multi_table_selection() -> None:
     assert ranked[0][0] == aromatic_hfe
 
 
+def test_rank_blocks_prefers_delta_hvap_table_over_heat_capacity_table() -> None:
+    service = QueryService(make_session())
+    hvap_table = (
+        "Table 7. OPLS-AA Energetic Results for Liquid Hydrocarbons and Alcohols.\n"
+        "| liquid | T | calcd Delta H vap | exptl Delta H vap |\n"
+        "| --- | --- | --- | --- |\n"
+        "| butane | -0.50 | 5.44 | 5.35 |\n"
+        "| methanol | 25.00 | 8.86 | 8.94 |"
+    )
+    heat_capacity_table = (
+        "Table 11. OPLS-AA Heat Capacities and Compressibilities for Liquid Hydrocarbons and Alcohols.\n"
+        "| liquid | T | Cp calcd | Cp exptl |\n"
+        "| --- | --- | --- | --- |\n"
+        "| butane | -0.50 | 31.0 | 31.8 |\n"
+        "| methanol | 25.00 | 26.0 | 19.5 |"
+    )
+
+    ranked = service._rank_blocks(
+        "OPLS-AA 的表格中，butane 构象能和 methanol ΔHvap 如何体现与 6-31G/实验的一致性？",
+        [heat_capacity_table, hvap_table],
+    )
+
+    assert ranked[0][0] == hvap_table
+
+
 def test_rank_blocks_prefers_binding_table_over_generic_rmse_table() -> None:
     service = QueryService(make_session())
     generic_rmse = (
@@ -3715,6 +5019,71 @@ def test_generic_table_answer_keeps_late_binding_table_when_earlier_tables_have_
     assert "1.12" in answer.answer_markdown
 
 
+def test_rag_table_query_returns_structured_tables_before_profile_terms() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    table4 = (
+        "Table 4. Acetate pKa shift.\n"
+        "| System | Exp. | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| Acetate-guanidinium | -0.136 | -0.26 | -0.14 |"
+    )
+    binding_table = (
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 | OPLS4 | OPLS5 | OPLS5 |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| PerturbationClass | No.cmpds | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+        "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+        "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |"
+    )
+    document = Document(
+        id="opls5",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="opls5",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 paper.",
+        metadata_json={
+            "source_slug": "sources/opls5-force-field-development-and-validation",
+            "source_title": "OPLS5",
+            "document_intelligence": {
+                "tables": [
+                    {"markdown": table4, "page_label": "19"},
+                    {"markdown": binding_table, "page_label": "21"},
+                ]
+            },
+        },
+        status="ready",
+    )
+    profile_chunks = [
+        DocumentChunk(
+            id=f"profile-{index}",
+            document_id="opls5",
+            ordinal=index,
+            text="OPLS5 Drude polarizability cation charge transfer LFMM profile evidence.",
+            page_label=str(index),
+            embedding=None,
+        )
+        for index in range(6)
+    ]
+    db.add_all([project, document, *profile_chunks])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts(
+        "OPLS5 的表格中，盐桥 pKa shift 和 binding RMSE 相比 OPLS4 有哪些数值改善？",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+    )
+    evidence = "\n".join(context.citation.excerpt for context in contexts)
+
+    assert contexts
+    assert all(context.evidence_kind == "table" for context in contexts)
+    assert "Table 7" in evidence
+    assert "1.18" in evidence
+    assert "1.12" in evidence
+
+
 def test_table_block_match_requires_multiple_anchors_for_multi_anchor_question() -> None:
     wrong_table = (
         "Table 9: Scalar coupling values.\n"
@@ -3836,6 +5205,231 @@ def test_table_block_excerpt_keeps_table_caption_after_page_heading() -> None:
     assert "### Page" not in excerpt
     assert "Ala5" in excerpt
     assert "51.9" in excerpt
+
+
+def test_table_citation_excerpt_normalizes_ildn_table_i_symbols_and_residue_ocr() -> None:
+    block = (
+        "Table I Table I<sub>List</sub> <sub>of</sub> <sub>Modified</sub> <sub>Parameters</sub> "
+        "<sub>for</sub> <sub>the</sub> \\mathbb { \\chi } _ { 1 } and \\chi _ { 2 } "
+        "Torsion Potentials in Selected Amino Acids of the Amber ff99SB Force Field\n"
+        "| Res. | Angle | theta 0 | mathsf k 1 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| lle | mathsf N - C ^alpha - C ^beta - C ^gamma 2 | 0.0 | 0.195 |\n"
+        "| Leu | mathsf C - C ^alpha - C ^beta - C ^gamma | 0.0 | 0.571 |\n"
+        "| Asp | mathsf N - C ^alpha - C ^beta - C ^gamma | 0.0 | -2.635 |\n"
+        "| Asn | C ^alpha - C ^beta - C ^gamma - O ^delta | 0.0 | 0.423 |"
+    )
+
+    excerpt = QueryService._table_citation_excerpt(
+        block,
+        "ff99SB-ILDN 的 Table I 列出了哪些残基/角度的修改参数？theta0 的设置是什么？",
+    )
+
+    assert "Table I" in excerpt
+    assert "Ile" in excerpt
+    assert "Leu" in excerpt
+    assert "Asp" in excerpt
+    assert "Asn" in excerpt
+    assert "theta 0" in excerpt
+    assert "0.0" in excerpt
+    assert "χ1" in excerpt
+    assert "χ2" in excerpt
+
+
+def test_table_normalization_does_not_rewrite_lle_without_residue_context() -> None:
+    normalized = normalize_table_text("| word | value |\n| --- | --- |\n| lle | 3 |")
+
+    assert "| lle | 3 |" in normalized
+    assert "Ile" not in normalized
+
+
+def test_generic_table_answer_includes_salient_ildn_header_symbols() -> None:
+    service = QueryService(make_session())
+    question = "ff99SB-ILDN 的 Table I 列出了哪些残基/角度的修改参数？theta0 的设置是什么？"
+    block = (
+        "Table I Table I<sub>List</sub> <sub>of</sub> <sub>Modified</sub> <sub>Parameters</sub> "
+        "<sub>for</sub> <sub>the</sub> \\mathbb { \\chi } _ { 1 } and \\chi _ { 2 } "
+        "Torsion Potentials in Selected Amino Acids of the Amber ff99SB Force Field\n"
+        "| Res. | Angle | theta 0 | mathsf k 1 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| lle | mathsf N - C ^alpha - C ^beta - C ^gamma 2 | 0.0 | 0.195 |\n"
+        "| Leu | mathsf C - C ^alpha - C ^beta - C ^gamma | 0.0 | 0.571 |\n"
+        "| Asp | mathsf N - C ^alpha - C ^beta - C ^gamma | 0.0 | -2.635 |\n"
+        "| Asn | C ^alpha - C ^beta - C ^gamma - O ^delta | 0.0 | 0.423 |"
+    )
+    excerpt = QueryService._table_citation_excerpt(block, question)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff99sb-ildn", page_title="ff99SB-ILDN", page_kind="source_summary", score=10, excerpt=excerpt),
+            prompt_text=block,
+            score=10,
+            evidence_kind="table",
+        )
+    ]
+
+    answer = service._deterministic_generic_table_answer(question, contexts, [0], "normal")
+
+    assert answer is not None
+    assert "Ile" in answer.answer_markdown
+    assert "Leu" in answer.answer_markdown
+    assert "Asp" in answer.answer_markdown
+    assert "Asn" in answer.answer_markdown
+    assert "theta 0" in answer.answer_markdown
+    assert "0.0" in answer.answer_markdown
+    assert "χ1" in answer.answer_markdown
+    assert "χ2" in answer.answer_markdown
+
+
+def test_scientific_answer_appends_supported_intro_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36-force-field-refinement-for-proteins",
+                page_title="CHARMM36 Force Field",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "While the current CHARMM22/CMAP force field was useful, "
+                    "NMR spectroscopy and folding simulations showed limitations."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="intro",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "CHARMM36 蛋白力场主要想修正 CHARMM22/CMAP 的什么问题？它用了哪些参数化和验证策略？",
+        "已有证据说明相关问题。",
+        contexts,
+    )
+
+    assert "CHARMM36" in answer
+    assert "CHARMM22/CMAP" in answer
+    assert "NMR" in answer
+
+
+def test_scientific_answer_appends_large_idps_when_supported_by_evidence() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36idpsff",
+                page_title="CHARMM36IDPSFF",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "Classical force fields perform better for folded proteins than IDPs with a large "
+                    "conformational fluctuation; the paper also evaluates radius of gyration and fast-folding systems."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="intro",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？它在哪些场景仍有不足？",
+        "已有证据说明 CHARMM36m、a99SB、radius of gyration 和 fast-folding。",
+        contexts,
+    )
+
+    assert "large IDPs" in answer
+
+
+def test_scientific_answer_prioritizes_supported_high_value_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/example",
+                page_title="Example",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "The paper rebalances helical and extended conformations, uses the SPARTA+ algorithm, "
+                    "reduces the barrier between PPII and right-handed helix, discusses Lennard–Jones and steric effects, "
+                    "reports QM/MM differences, molten globule states, w = 2 k T around \\Phi = 6 0 and \\psi = 4 5, "
+                    "evaluates free energies of hydration, and fits torsional parameters."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "为什么这些力场修改能改善采样？",
+        "已有证据说明相关机制。",
+        contexts,
+    )
+
+    for term in (
+        "helix-coil",
+        "SPARTA",
+        "PPII",
+        "Lennard-Jones",
+        "steric",
+        "QM-MM",
+        "molten globule",
+        "2kT",
+        "60",
+        "45",
+        "hydration free energy",
+        "torsional",
+    ):
+        assert term in answer
+
+
+def test_scientific_answer_appends_explicit_hydrogen_for_opls_aa_ua_contrast() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls-aa-force-field-development-and-validation",
+                page_title="OPLS-AA",
+                page_kind="source_summary",
+                score=10,
+                excerpt="OPLS-AA improves transferability relative to OPLS-UA through charge and torsional validation.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "为什么 OPLS-AA 的显式氢和液体性质验证能改善相对 OPLS-UA 的可转移性？",
+        "已有证据说明 charge 和 torsional validation。",
+        contexts,
+    )
+
+    assert "explicit hydrogen" in answer
+
+
+def test_scientific_answer_does_not_mark_question_only_identifiers_as_evidence() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36idpsff",
+                page_title="CHARMM36IDPSFF",
+                page_kind="source_summary",
+                score=10,
+                excerpt="CHARMM36IDPSFF originates from CHARMM36m and is evaluated on IDP systems.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="intro",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？",
+        "已有证据说明 CHARMM36IDPSFF 和 CHARMM36m。",
+        contexts,
+    )
+
+    assert "a99SB" not in answer
 
 
 def test_table_block_excerpt_labels_table_evidence_when_caption_lacks_table_word() -> None:
@@ -4347,6 +5941,330 @@ def test_table_normalization_repairs_spaced_decimal_and_uncertainty_values() -> 
     assert "0.46" in normalized
 
 
+def test_table_normalization_repairs_split_decimal_digits_around_uncertainty() -> None:
+    normalized = normalize_table_text("| System | Exp. | Calc |\n| --- | --- | --- |\n| ACTR | 2 5.0 0 ± 1.0 0 ^60 | 1 3.0 7 ± 0.0 9 |")
+
+    assert "25.00 ± 1.00 ^60" in normalized
+    assert "13.07 ± 0.09" in normalized
+
+
+def test_table_normalization_repairs_single_split_digit_before_decimal() -> None:
+    normalized = normalize_table_text("| System | Exp. | Calc |\n| --- | --- | --- |\n| Aβ40 | 1 2.0 ± 1.3 | 11.53 ± 0.13 |")
+
+    assert "12.0 ± 1.3" in normalized
+
+
+def test_charmm36idpsff_rg_answer_keeps_beta40_and_actr_rows() -> None:
+    service = QueryService(make_session())
+    question = "CHARMM36IDPSFF 的 Rg 表格中，Aβ40 和 ACTR 的实验值与模拟值分别是多少？"
+    table = (
+        "Table 8. Average radius of gyration Rg.\n"
+        "| Systems | Exp. | C36IDPSFF |\n"
+        "| --- | --- | --- |\n"
+        "| Aβ40 | 12.0 | 11.53 ± 0.08 |\n"
+        "| ACTR (71 aa) | 2 5.0 0 ± 1.0 0 ^60 | 1 3.0 7 ± 0.0 9 |"
+    )
+    excerpt = QueryService._table_citation_excerpt(table, question)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/charmm36idpsff", page_title="CHARMM36IDPSFF", page_kind="source_summary", score=1, excerpt=excerpt),
+            prompt_text=table,
+            score=1,
+            evidence_kind="table",
+        )
+    ]
+
+    answer = service._deterministic_table_answer(question, contexts, [0], "normal")
+
+    assert "Aβ40" in excerpt
+    assert "12.0" in excerpt
+    assert "11.53" in excerpt
+    assert "ACTR" in excerpt
+    assert "25.00" in excerpt
+    assert "13.07" in excerpt
+    assert "Aβ40" in answer.answer_markdown
+    assert "ACTR" in answer.answer_markdown
+    assert "25.00" in answer.answer_markdown
+    assert "13.07" in answer.answer_markdown
+
+
+def test_water_model_parameter_answer_ignores_unmatched_fallback_table_rows() -> None:
+    service = QueryService(make_session())
+    question = "TIP4P-D 在水模型参数表中相对 TIP3P 的 C6、偶极矩和表面张力数值是什么？"
+    simulation_conditions = (
+        "Simulation conditions of all tested peptides and proteins.\n"
+        "| System | Length | Force fields/water models |\n"
+        "| --- | --- | --- |\n"
+        "| ALA5 | 5aa | C36IDPSFF |\n"
+        "| Aβ40 | 40 aa | C36IDPSFF/disp-water |"
+    )
+    water_parameters = (
+        "Table 1. Parameters and Physical Properties of Selected Commonly Used Water Models and TIP4P-D\n"
+        "|  | Expt | TIP3P | SPC/E | TIP4P-EW | TIP4P/2005 | TIP4P-D |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        "| μ (D) | > 2.6 | 2.35 | 2.35 | 2.32 | 2.305 | 2.403 |\n"
+        "| C6 | 622 | 595 | 625 | 653 | 736 | 900 |\n"
+        "| surface tension | 72.0 | 47.8 | 63.6 | 65.7 | 69.3 | 71.2 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/charmm36idpsff", page_title="CHARMM36IDPSFF", page_kind="source_summary", score=2, excerpt=simulation_conditions),
+            prompt_text=simulation_conditions,
+            score=2,
+            evidence_kind="table",
+        ),
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff99sb-disp", page_title="ff99SB-disp", page_kind="source_summary", score=1, excerpt=QueryService._table_citation_excerpt(water_parameters, question)),
+            prompt_text=water_parameters,
+            score=1,
+            evidence_kind="table",
+        ),
+    ]
+
+    answer = service._deterministic_table_answer(question, contexts, [0, 1], "normal")
+
+    assert "Table 1" in answer.answer_markdown
+    assert "TIP4P-D 900" in answer.answer_markdown
+    assert "TIP3P 595" in answer.answer_markdown
+    assert "TIP4P-D 2.403" in answer.answer_markdown
+    assert "TIP3P 2.35" in answer.answer_markdown
+    assert "TIP4P-D 71.2" in answer.answer_markdown
+    assert "TIP3P 47.8" in answer.answer_markdown
+    assert "ALA5" not in answer.answer_markdown
+
+
+def test_table_normalization_repairs_mineru_spaced_lj_parameter_labels() -> None:
+    normalized = normalize_table_text(
+        "| Parameter | TIP3P | TIP4P-D |\n"
+        "| --- | --- | --- |\n"
+        "| C 6 ( mathrm k c a l m o l ^-1 mathring A ^6 ) | 595 | 900 |\n"
+        "| C _ { 12 } ( mathrm k c a l m o l ^-1 mathring A ^12 ) | 582 000 | 904 657 |"
+    )
+
+    assert "C6 (" in normalized
+    assert "C12 (" in normalized
+
+
+def test_supported_term_note_appends_ff19sb_parameterization_anchors() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+                page_title="ff19SB",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "RESP charge fitting used HF/6-31G electrostatic potentials. "
+                    "The QM reference used M05-2X and MP2/cc-pVQZ energy surfaces. "
+                    "Leu CMAP, Ile, and Val CMAP assignments were validated for 5 milliseconds."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "ff19SB 的参数化策略中，RESP charge fitting、QM level、CMAP 分配和验证规模有哪些具体锚点？",
+        "已有证据说明 RESP、QM 和 CMAP。",
+        contexts,
+    )
+
+    for term in ("HF/6-31G", "M05-2X", "MP2/cc-pVQZ", "Leu CMAP", "Ile", "Val CMAP", "5 milliseconds"):
+        assert term in answer
+
+
 def test_needs_source_evidence_does_not_treat_chinese_cite_as_raw_request() -> None:
     assert not QueryService(make_session())._needs_source_evidence("What conclusions do the ablation studies draw? Please cite Table 2.")
     assert QueryService(make_session())._needs_source_evidence("Please provide source evidence.")
+
+
+# ------------------------------------------------------------------
+# evidence relevance gate — sample document detection and rejection
+# ------------------------------------------------------------------
+
+
+def test_extract_specific_question_scientific_terms_extracts_force_fields() -> None:
+    terms = QueryService._extract_specific_question_scientific_terms(
+        "What is the difference between CHARMM36m and CHARMM36?"
+    )
+    assert "charmm36m" in terms
+    assert "charmm36" in terms
+
+
+def test_extract_specific_question_scientific_terms_extracts_amber() -> None:
+    terms = QueryService._extract_specific_question_scientific_terms(
+        "How does AMBER99SB compare to OPLS4?"
+    )
+    assert "amber99sb" in terms
+    assert "opls4" in terms
+
+
+def test_extract_specific_question_scientific_terms_returns_empty_for_generic() -> None:
+    terms = QueryService._extract_specific_question_scientific_terms(
+        "What is the main result of this paper?"
+    )
+    assert not terms  # "result", "paper" are stop terms
+
+
+def test_evidence_overlaps_question_scientific_terms_true() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/ff", page_title="FF", page_kind="source_summary", score=10, excerpt="CHARMM36m uses..."),
+            prompt_text="CHARMM36m uses a modified backbone CMAP correction.",
+            score=10,
+        )
+    ]
+    assert QueryService._evidence_overlaps_question_scientific_terms(
+        "What is the difference between CHARMM36m and CHARMM36?", contexts
+    )
+
+
+def test_evidence_overlaps_question_scientific_terms_false() -> None:
+    """Sample evidence about Method A / Method B must not match a CHARMM question."""
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/sample", page_title="Sample", page_kind="source_summary", score=5, excerpt="Method A improves..."),
+            prompt_text="Method A improves control stability. Method B is simpler but slower.",
+            score=5,
+        )
+    ]
+    assert not QueryService._evidence_overlaps_question_scientific_terms(
+        "What is the difference between CHARMM36m and CHARMM36?", contexts
+    )
+
+
+def test_evidence_overlaps_skips_when_no_specific_terms() -> None:
+    """Generic questions with no specific scientific terms skip the gate."""
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/x", page_title="X", page_kind="source_summary", score=5, excerpt="generic text"),
+            prompt_text="generic text",
+            score=5,
+        )
+    ]
+    # Should return True (skip gate) when no specific terms are in the question
+    assert QueryService._evidence_overlaps_question_scientific_terms(
+        "What does this paper conclude?", contexts
+    )
+
+
+def test_draft_answer_returns_insufficient_evidence_for_charmm_on_sample() -> None:
+    """When asking about CHARMM36m/CHARMM36 but evidence is only Method A/B demo text,
+    the draft answer must return the insufficient-evidence message, not call the LLM."""
+    db = make_session()
+    service = QueryService(db)
+    # Use ExplodingOllama — if the LLM is called, the test fails
+    service.ollama = ExplodingOllama()
+
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d-sample",
+                chunk_id="c-s",
+                score=2.0,
+                excerpt="Method A improves control stability.",
+            ),
+            prompt_text="Method A improves control stability. Method B is simpler but slower.",
+            score=2.0,
+        )
+    ]
+
+    payload = service._draft_answer(
+        "What is the difference between CHARMM36m and CHARMM36?",
+        None,
+        contexts,
+    )
+    assert "Insufficient Evidence" in payload.answer_markdown
+    assert "CHARMM" in payload.answer_markdown.lower() or "specific scientific" in payload.answer_markdown.lower()
+    assert payload.citations == []
+    # Must NOT contain the sample text
+    assert "Method A" not in payload.answer_markdown
+    assert "control stability" not in payload.answer_markdown
+
+
+def test_answer_returns_no_citations_for_irrelevant_scientific_sample() -> None:
+    """The public answer path must not attach sample citations to insufficient-evidence answers."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d-sample",
+        project_id="p1",
+        title="sample",
+        file_name="sample.txt",
+        sha256="sha-sample",
+        raw_path="raw/sample.txt",
+        raw_text="Method A improves control stability. Method B is simpler but slower.",
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c-sample",
+        document_id="d-sample",
+        ordinal=0,
+        page_label="1",
+        text="Method A improves control stability. Method B is simpler but slower.",
+        embedding=[1.0, 0.0],
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = ExplodingOllama()
+
+    response = service.answer(
+        "demo",
+        "What is the difference between CHARMM36m and CHARMM36?",
+        save_answer=False,
+    )
+
+    assert "Insufficient Evidence" in response.answer_markdown
+    assert response.citations == []
+    assert "[0]" not in response.answer_markdown
+    assert "Method A" not in response.answer_markdown
+
+
+def test_draft_answer_calls_llm_when_evidence_is_relevant() -> None:
+    """When evidence actually mentions the force field, the LLM should be called normally."""
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="CHARMM36m improves backbone CMAP over CHARMM36.",
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d-real",
+                chunk_id="c-r",
+                score=15.0,
+                excerpt="CHARMM36m backbone CMAP correction...",
+            ),
+            prompt_text="CHARMM36m uses a modified backbone CMAP correction compared to CHARMM36.",
+            score=15.0,
+        )
+    ]
+
+    payload = service._draft_answer(
+        "What is the difference between CHARMM36m and CHARMM36?",
+        None,
+        contexts,
+    )
+    # With relevant evidence, the LLM answer should NOT be an insufficient-evidence message
+    assert "Insufficient Evidence" not in payload.answer_markdown
+    assert "CHARMM36m" in payload.answer_markdown
+
+
+def test_insufficient_evidence_answer_includes_terms() -> None:
+    answer = QueryService._insufficient_evidence_answer({"charmm36m", "charmm36"})
+    assert "Insufficient Evidence" in answer
+    assert "upload" in answer.lower() or "relevant" in answer.lower()
+
+
+def test_insufficient_evidence_answer_without_terms() -> None:
+    answer = QueryService._insufficient_evidence_answer(None)
+    assert "Insufficient Evidence" in answer
+    assert "upload" in answer.lower() or "relevant" in answer.lower()

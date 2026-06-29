@@ -1,0 +1,60 @@
+[
+  [
+    {
+      "type": "title",
+      "content": {
+        "title_content": [
+          {
+            "type": "text",
+            "content": "SAC-KG: Exploiting Large Language Models as Skilled Automatic Constructors for Domain Knowledge Graphs"
+          }
+        ],
+        "level": 1
+      }
+    },
+    {
+      "type": "paragraph",
+      "content": {
+        "paragraph_content": [
+          {
+            "type": "text",
+            "content": "SAC-KG consists of three components: Generator, Verifier, and Pruner."
+          }
+        ]
+      }
+    }
+  ],
+  [
+    {
+      "type": "image",
+      "content": {
+        "image_source": {
+          "path": "images/01ebc9a0d495114ae5f0b02517d96c7a95457410ac9d9608b62389feae03862d.jpg"
+        },
+        "image_caption": [
+          {
+            "type": "text",
+            "content": "Figure 1: An example of input and output of the SAC-KG framework."
+          }
+        ],
+        "image_footnote": []
+      }
+    },
+    {
+      "type": "table",
+      "content": {
+        "image_source": {
+          "path": "images/4a99720df3944a737059cc28bfa3c65aece7342082479103f136b647a85bf848.jpg"
+        },
+        "table_caption": [
+          {
+            "type": "text",
+            "content": "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets."
+          }
+        ],
+        "table_footnote": [],
+        "html": "<table><tr><td>Model</td><td colspan=\"2\">OIE2016</td><td colspan=\"2\">WEB</td><td colspan=\"2\">NYT</td><td colspan=\"2\">PENN</td></tr><tr><td></td><td>F1</td><td>AUC</td><td>F1</td><td>AUC</td><td>F1</td><td>AUC</td><td>F1</td><td>AUC</td></tr><tr><td>OpenIE 6 (2020)</td><td>55.3</td><td>61.1</td><td>61.1</td><td>64.9</td><td>30.7</td><td>55.2</td><td>54.2</td><td>63.1</td></tr><tr><td>$\\mathbf { S } \\mathbf { A } \\mathbf { C } \\mathbf { - } \\mathbf { K } \\mathbf { G } _ { \\mathrm { C h a t G P T } }$</td><td>74.7</td><td>73.2</td><td>96.6</td><td>95.7</td><td>88.8</td><td>87.3</td><td>91.1</td><td>90.1</td></tr></table>"
+      }
+    }
+  ]
+]

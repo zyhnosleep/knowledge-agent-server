@@ -197,3 +197,71 @@ class QuestionAnswer(Base, TimestampMixin):
     citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
     risk_level: Mapped[str] = mapped_column(String(20), default="normal")
     verification_status: Mapped[str] = mapped_column(String(40), default="local-only")
+
+
+class ConversationTurn(Base):
+    __tablename__ = "conversation_turns"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    turn_index: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str] = mapped_column(String(20))  # "user" | "agent" | "tool"
+    content: Mapped[str] = mapped_column(Text)
+    tool_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    tool_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tool_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    step_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConversationSession(Base):
+    __tablename__ = "conversation_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_slug: Mapped[str] = mapped_column(String(120), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AgentTraceRun(Base):
+    __tablename__ = "agent_trace_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    request_id: Mapped[str] = mapped_column(String(36), index=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    project_slug: Mapped[str] = mapped_column(String(120))
+    query: Mapped[str] = mapped_column(Text)
+    constraints: Mapped[dict] = mapped_column(JSON, default=dict)
+    route: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    final_answer: Mapped[str] = mapped_column(Text)
+    citations: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20))
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    provider: Mapped[str] = mapped_column(String(40), default="local")
+    model: Mapped[str] = mapped_column(String(120), default="local-fallback")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    tool_calls: Mapped[int] = mapped_column(Integer, default=0)
+    step_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    steps: Mapped[list["AgentTraceStep"]] = relationship(back_populates="run", cascade="all, delete-orphan",
+                                                          order_by="AgentTraceStep.step_id")
+
+
+class AgentTraceStep(Base):
+    __tablename__ = "agent_trace_steps"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_trace_runs.id"), index=True)
+    step_id: Mapped[int] = mapped_column(Integer)
+    step_type: Mapped[str] = mapped_column(String(40))
+    summary: Mapped[str] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tool_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    tool_ok: Mapped[bool | None] = mapped_column(nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    run: Mapped["AgentTraceRun"] = relationship(back_populates="steps")
