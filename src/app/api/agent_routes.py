@@ -7,7 +7,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.session import get_db
@@ -102,6 +102,32 @@ def agent_query(
     return response
 
 
+def _run_executor_in_thread(
+    session_factory: sessionmaker, payload: AgentQueryRequest
+) -> tuple[AgentQueryResponse, str | None]:
+    """Run the blocking AgentExecutor in a worker thread with its own session.
+
+    Returns ``(response, persist_error)``.  When *persist_error* is not
+    ``None`` the caller should emit a persistence-error SSE event but the
+    *response* itself is still valid (steps, final answer, etc.).
+    """
+    db = session_factory()
+    try:
+        executor = _build_executor(db)
+        response = executor.execute(payload)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            return (response, "Failed to persist conversation/trace.")
+        return (response, None)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 @agent_router.post("/query/stream")
 async def agent_query_stream(
     payload: AgentQueryRequest, request: Request, db: Session = Depends(get_db)
@@ -110,6 +136,10 @@ async def agent_query_stream(
 
     Returns ``text/event-stream``.  Events: start, heartbeat, step,
     warning, final, error, done.
+
+    The synchronous ``AgentExecutor`` runs via ``asyncio.to_thread`` so
+    concurrent stream requests overlap instead of serializing on the
+    event loop.
     """
     if not settings.agent_enabled:
         raise HTTPException(
@@ -117,9 +147,13 @@ async def agent_query_stream(
             detail="Agent service is not enabled. Set AGENT_ENABLED=true.",
         )
 
+    # Derive a thread-safe session factory from the injected session's
+    # bind so tests that override the DB engine still work.
+    bind = db.get_bind()
+    SessionFactory = sessionmaker(bind=bind, autoflush=False, autocommit=False, future=True)
+
     async def event_generator():
         try:
-            executor = _build_executor(db)
             yield _sse_event("start", {"status": "processing"})
 
             # Emit a heartbeat before the synchronous executor call so
@@ -127,10 +161,13 @@ async def agent_query_stream(
             # executor blocks for a while.
             yield _sse_heartbeat()
 
-            # Run executor synchronously (the executor is synchronous;
-            # we stream results step by step after it completes — this
-            # is step-level streaming, not token-by-token).
-            response = executor.execute(_apply_server_constraint_defaults(payload))
+            # Run the blocking executor off the event loop so concurrent
+            # requests overlap instead of serializing.
+            response, persist_error = await asyncio.to_thread(
+                _run_executor_in_thread,
+                SessionFactory,
+                _apply_server_constraint_defaults(payload),
+            )
 
             # Emit each step as it's available
             for step in response.steps:
@@ -145,14 +182,11 @@ async def agent_query_stream(
             final_data = _build_final_event(response)
             yield _sse_event("final", final_data)
 
-            try:
-                db.commit()
-            except Exception:
-                db.rollback()
+            if persist_error:
                 yield _sse_event(
                     "error",
                     {
-                        "message": "Failed to persist conversation/trace.",
+                        "message": persist_error,
                         "error_type": "persistence_error",
                     },
                 )
@@ -163,10 +197,6 @@ async def agent_query_stream(
 
         except Exception as exc:
             logger.exception("Agent stream failed")
-            try:
-                db.rollback()
-            except Exception:
-                pass
             yield _sse_event(
                 "error",
                 {"message": str(exc), "error_type": type(exc).__name__},

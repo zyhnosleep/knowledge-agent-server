@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Iterator
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -387,3 +390,102 @@ def test_stream_final_event_has_enriched_summary_fields(monkeypatch) -> None:
         assert "step_id" in item
         assert "step_type" in item
         assert "summary" in item
+
+
+# ---------------------------------------------------------------------------
+# Concurrency regression test
+# ---------------------------------------------------------------------------
+
+
+def test_stream_concurrent_requests_do_not_serialize(monkeypatch) -> None:
+    """Two concurrent stream requests overlap instead of serializing.
+
+    Before the ``asyncio.to_thread`` fix the synchronous executor call
+    blocked the event loop, forcing concurrent requests to queue up behind
+    each other.  This test monkeypatches ``AgentExecutor.execute`` to sleep
+    for roughly one second and then fires two requests concurrently.  When
+    the executor runs off the event loop the total wall time should be
+    close to one second (< 1.8 s); when requests serialize it will be
+    roughly two seconds.
+    """
+    # -- in-memory SQLite shared across threads --------------------------------
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    db = SessionFactory()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    # -- monkeypatch AgentExecutor.execute to block ~1 s -----------------------
+    from app.schemas.agent import (
+        AgentQueryResponse,
+        AgentRouteDecision,
+        AgentStep,
+        AgentUsage,
+    )
+
+    def _slow_execute(self, request):
+        time.sleep(1.0)
+        return AgentQueryResponse(
+            request_id="req-x",
+            session_id="ses-x",
+            status="completed",
+            final_answer="concurrent ok",
+            steps=[
+                AgentStep(step_id=1, step_type="route", summary="routed"),
+            ],
+            usage=AgentUsage(),
+            route=AgentRouteDecision(route="simple_rag"),
+            warnings=[],
+            trace_id="trace-x",
+            answer_provider="local",
+            answer_model="local-test",
+        )
+
+    monkeypatch.setattr(
+        "app.services.agent_executor.AgentExecutor.execute",
+        _slow_execute,
+    )
+
+    # -- build ASGI app --------------------------------------------------------
+    app = FastAPI()
+    app.include_router(agent_router, prefix="/api/agent")
+
+    def _override_db() -> Iterator[Session]:
+        yield db
+
+    app.dependency_overrides[get_db] = _override_db
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    # -- fire two concurrent requests via asyncio.run --------------------------
+    async def _run_concurrent():
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            t0 = time.perf_counter()
+            r1, r2 = await asyncio.gather(
+                client.post(
+                    "/api/agent/query/stream",
+                    json={"project_slug": "demo", "query": "hello 1"},
+                ),
+                client.post(
+                    "/api/agent/query/stream",
+                    json={"project_slug": "demo", "query": "hello 2"},
+                ),
+            )
+            elapsed = time.perf_counter() - t0
+        return r1, r2, elapsed
+
+    r1, r2, elapsed = asyncio.run(_run_concurrent())
+
+    assert r1.status_code == 200, f"Request 1 returned {r1.status_code}"
+    assert r2.status_code == 200, f"Request 2 returned {r2.status_code}"
+    assert elapsed < 1.8, (
+        f"Expected concurrent wall time < 1.8 s but took {elapsed:.2f} s "
+        f"- requests appear to be serialized on the event loop"
+    )
