@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import routes
 from app.api.routes import router
 from app.db.session import Base, get_db
-from app.models.records import Document, PipelineRun, Project, ReviewItem
+from app.models.records import Document, DocumentChunk, PipelineRun, Project, ReviewItem
 from app.services.filesystem import InvalidStoragePathError, UploadTooLargeError
 
 
@@ -119,3 +119,99 @@ def test_ingest_upload_maps_storage_errors(monkeypatch) -> None:
     monkeypatch.setattr(routes, "save_upload", invalid_path)
     response = client.post("/api/ingest/upload", files={"file": ("paper.pdf", b"content", "application/pdf")})
     assert response.status_code == 400
+
+
+def test_pipeline_dashboard_returns_topic_cards_and_business_runs() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="CHARMM 力场研究")
+    ready_doc = Document(
+        id="d1",
+        project_id=project.id,
+        title="CHARMM36m Force Field Review",
+        file_name="CHARMM36m_Force_Field_Review.pdf",
+        sha256="sha1",
+        raw_path="raw/charmm.pdf",
+        status="ready",
+    )
+    processing_doc = Document(
+        id="d2",
+        project_id=project.id,
+        title="protein_ligand_binding_parameters.md",
+        file_name="protein_ligand_binding_parameters.md",
+        sha256="sha2",
+        raw_path="raw/protein.md",
+        status="processing",
+    )
+    db.add_all(
+        [
+            project,
+            ready_doc,
+            processing_doc,
+            PipelineRun(
+                id="r1",
+                project_id=project.id,
+                document_id=ready_doc.id,
+                status="completed",
+                provider_report={"progress": {"percent": 100, "stage": "completed", "message": "Done."}},
+            ),
+            PipelineRun(
+                id="r2",
+                project_id=project.id,
+                document_id=processing_doc.id,
+                status="running",
+                provider_report={"progress": {"percent": 45, "stage": "chunking", "message": "正在解析切片"}},
+            ),
+        ]
+    )
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/pipeline/dashboard?project_slug=demo")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["service_status"] == "ok"
+    assert payload["topics"][0]["title"] == "CHARMM 力场研究"
+    assert payload["topics"][0]["document_count"] == 2
+    assert payload["topics"][0]["completed_count"] == 1
+    assert payload["topics"][0]["processing_count"] == 1
+    assert payload["topics"][0]["progress_percent"] == 72
+    assert payload["runs"][0]["document_title"] == "protein_ligand_binding_parameters.md"
+    assert payload["runs"][0]["status"] == "running"
+    assert payload["runs"][0]["progress"]["stage"] == "chunking"
+    assert payload["runs"][1]["document_title"] == "CHARMM36m Force Field Review"
+
+
+def test_document_source_route_returns_sorted_chunks_for_source_drawer() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="CHARMM36m Force Field Review",
+        file_name="CHARMM36m_Force_Field_Review.pdf",
+        sha256="sha1",
+        raw_path="raw/charmm.pdf",
+        raw_text="Full source text fallback.",
+        status="ready",
+    )
+    db.add_all(
+        [
+            project,
+            document,
+            DocumentChunk(id="c2", document_id=document.id, ordinal=2, page_label="3", text="Third chunk."),
+            DocumentChunk(id="c1", document_id=document.id, ordinal=1, page_label="2", text="First visible chunk."),
+        ]
+    )
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/documents/d1/source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["document_title"] == "CHARMM36m Force Field Review"
+    assert payload["chunks"][0]["chunk_id"] == "c1"
+    assert payload["chunks"][0]["label"] == "RAG Chunk #01"
+    assert payload["chunks"][0]["page_label"] == "2"
+    assert payload["chunks"][0]["text"] == "First visible chunk."

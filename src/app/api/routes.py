@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.records import Document, PipelineRun, Project, ReviewItem
+from app.models.records import Document, DocumentChunk, PipelineRun, Project, ReviewItem
 from app.schemas.common import (
     DocumentRead,
     HealthResponse,
@@ -33,6 +33,138 @@ def _validated_project_slug(project_slug: str) -> str:
         return safe_project_slug(project_slug)
     except InvalidStoragePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _clamped_percent(value: object, fallback: int = 0) -> int:
+    try:
+        percent = int(value)
+    except (TypeError, ValueError):
+        percent = fallback
+    return max(0, min(percent, 100))
+
+
+def _progress_from_run(run: PipelineRun | None, document: Document | None = None) -> dict:
+    if run is not None:
+        report = run.provider_report or {}
+        progress = report.get("progress") if isinstance(report, dict) else None
+        progress = progress if isinstance(progress, dict) else {}
+        return {
+            "percent": _clamped_percent(progress.get("percent"), _status_default_percent(run.status)),
+            "stage": str(progress.get("stage") or run.status),
+            "message": str(progress.get("message") or run.notes or ""),
+        }
+    if document is None:
+        return {"percent": 0, "stage": "unknown", "message": ""}
+    return {
+        "percent": _status_default_percent(document.status),
+        "stage": document.status,
+        "message": "",
+    }
+
+
+def _status_default_percent(status: str) -> int:
+    if status in {"ready", "completed"}:
+        return 100
+    if status in {"processing", "running"}:
+        return 50
+    if status in {"pending", "queued"}:
+        return 5
+    if status == "failed":
+        return 100
+    return 0
+
+
+def _business_status(document: Document | None, run: PipelineRun | None = None) -> str:
+    raw_status = run.status if run is not None else (document.status if document is not None else "unknown")
+    if raw_status in {"ready", "completed"}:
+        return "completed"
+    if raw_status in {"pending", "processing", "queued", "running"}:
+        return "processing" if raw_status == "processing" else raw_status
+    if raw_status == "failed":
+        return "failed"
+    return raw_status
+
+
+def _status_label(status: str) -> str:
+    return {
+        "queued": "Queued",
+        "running": "Processing",
+        "processing": "Processing",
+        "completed": "Completed",
+        "failed": "Failed",
+    }.get(status, status.title())
+
+
+def _build_pipeline_topic(
+    project: Project,
+    documents: list[Document],
+    latest_runs_by_document: dict[str, PipelineRun],
+) -> dict:
+    document_count = len(documents)
+    completed_count = 0
+    processing_count = 0
+    failed_count = 0
+    percents: list[int] = []
+
+    for document in documents:
+        run = latest_runs_by_document.get(document.id)
+        status = _business_status(document, run)
+        progress = _progress_from_run(run, document)
+        percents.append(progress["percent"])
+        if status == "completed":
+            completed_count += 1
+        elif status == "failed":
+            failed_count += 1
+        elif status in {"pending", "processing", "queued", "running"}:
+            processing_count += 1
+
+    if failed_count:
+        status = "failed"
+        status_label = f"{failed_count} 篇解析异常"
+    elif processing_count:
+        status = "processing"
+        status_label = f"{processing_count} 篇正在处理"
+    elif completed_count:
+        status = "ready"
+        status_label = "已就绪"
+    else:
+        status = "empty"
+        status_label = "暂无文献"
+
+    progress_percent = int(sum(percents) / len(percents)) if percents else 0
+    parsing_rate = int(completed_count * 100 / document_count) if document_count else 0
+    return {
+        "id": project.id,
+        "slug": project.slug,
+        "title": project.name,
+        "document_count": document_count,
+        "completed_count": completed_count,
+        "processing_count": processing_count,
+        "failed_count": failed_count,
+        "progress_percent": progress_percent,
+        "parsing_rate": parsing_rate,
+        "status": status,
+        "status_label": status_label,
+    }
+
+
+def _build_pipeline_run_item(run: PipelineRun, document: Document | None) -> dict:
+    status = _business_status(document, run)
+    progress = _progress_from_run(run, document)
+    return {
+        "id": run.id,
+        "document_id": run.document_id,
+        "document_title": document.title if document is not None else "未关联文档",
+        "file_name": document.file_name if document is not None else None,
+        "status": status,
+        "status_label": _status_label(status),
+        "run_type": run.run_type,
+        "notes": run.notes,
+        "progress": progress,
+        "action_available": bool(document and status == "completed"),
+        "created_at": run.created_at.isoformat(),
+        "updated_at": run.updated_at.isoformat(),
+    }
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -113,6 +245,67 @@ def list_documents(
     ]
 
 
+@router.get("/pipeline/dashboard", response_model=dict)
+def get_pipeline_dashboard(
+    project_slug: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict:
+    project_statement = select(Project).order_by(Project.created_at.desc())
+    if project_slug:
+        project_statement = project_statement.where(Project.slug == _validated_project_slug(project_slug))
+    projects = db.scalars(project_statement.limit(limit)).all()
+    project_ids = [project.id for project in projects]
+
+    documents: list[Document] = []
+    runs: list[PipelineRun] = []
+    if project_ids:
+        documents = db.scalars(
+            select(Document)
+            .where(Document.project_id.in_(project_ids))
+            .order_by(Document.updated_at.desc(), Document.created_at.desc())
+        ).all()
+        runs = db.scalars(
+            select(PipelineRun)
+            .where(PipelineRun.project_id.in_(project_ids))
+            .order_by(PipelineRun.updated_at.desc(), PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .limit(limit)
+        ).all()
+
+    documents_by_project: dict[str, list[Document]] = {}
+    documents_by_id = {document.id: document for document in documents}
+    for document in documents:
+        documents_by_project.setdefault(document.project_id, []).append(document)
+
+    latest_runs_by_document: dict[str, PipelineRun] = {}
+    for run in runs:
+        if run.document_id and run.document_id not in latest_runs_by_document:
+            latest_runs_by_document[run.document_id] = run
+
+    topics = [
+        _build_pipeline_topic(project, documents_by_project.get(project.id, []), latest_runs_by_document)
+        for project in projects
+    ]
+    run_items = [_build_pipeline_run_item(run, documents_by_id.get(run.document_id or "")) for run in runs]
+    completed_count = sum(1 for item in run_items if item["status"] == "completed")
+    processing_count = sum(1 for item in run_items if item["status"] in {"queued", "running"})
+    failed_count = sum(1 for item in run_items if item["status"] == "failed")
+
+    return {
+        "service_status": "ok",
+        "topics": topics,
+        "runs": run_items,
+        "totals": {
+            "topic_count": len(topics),
+            "document_count": len(documents),
+            "run_count": len(run_items),
+            "completed_count": completed_count,
+            "processing_count": processing_count,
+            "failed_count": failed_count,
+        },
+    }
+
+
 @router.get("/documents/{document_id}", response_model=DocumentRead)
 def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRead:
     document = db.get(Document, document_id)
@@ -126,6 +319,53 @@ def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRea
         sha256=document.sha256,
         metadata_json=document.metadata_json,
     )
+
+
+@router.get("/documents/{document_id}/source", response_model=dict)
+def get_document_source(document_id: str, db: Session = Depends(get_db)) -> dict:
+    document = db.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    chunks = db.scalars(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == document.id)
+        .order_by(DocumentChunk.ordinal.asc())
+    ).all()
+    chunk_items = [
+        {
+            "chunk_id": chunk.id,
+            "label": f"RAG Chunk #{index:02d}",
+            "ordinal": chunk.ordinal,
+            "page_label": chunk.page_label,
+            "heading": chunk.heading,
+            "text": chunk.text,
+            "token_estimate": chunk.token_estimate,
+        }
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    fallback_preview = (document.raw_text or "").strip()
+    if not chunk_items and fallback_preview:
+        chunk_items.append(
+            {
+                "chunk_id": None,
+                "label": "RAG Chunk #01",
+                "ordinal": 1,
+                "page_label": None,
+                "heading": None,
+                "text": fallback_preview[:2400],
+                "token_estimate": max(1, len(fallback_preview) // 4),
+            }
+        )
+
+    return {
+        "document_id": document.id,
+        "document_title": document.title,
+        "file_name": document.file_name,
+        "status": document.status,
+        "raw_preview": fallback_preview[:2400],
+        "chunks": chunk_items,
+    }
 
 
 @router.get("/documents/{document_id}/quality", response_model=dict)
