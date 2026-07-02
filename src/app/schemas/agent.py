@@ -181,3 +181,27 @@ class ToolSpec(BaseModel):
     auth_scope: list[str] = Field(default_factory=lambda: ["tool:invoke"])
     side_effect_level: str = "none"  # "none" | "read" | "write"
     timeout_ms: int = 15000
+
+
+class AgentSessionRead(BaseModel):
+    """Read-only summary of an Agent conversation session."""
+
+    id: str
+    project_slug: str
+    turn_count: int
+    created_at: str
+    updated_at: str
+    expires_at: str
+
+
+class AgentTurnRead(BaseModel):
+    """A single ordered turn inside an Agent conversation session."""
+
+    turn_index: int
+    role: str
+    content: str
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    tool_result: str | None = None
+    step_type: str | None = None
+    created_at: str

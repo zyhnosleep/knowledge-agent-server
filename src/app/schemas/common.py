@@ -20,8 +20,11 @@ class ProjectRead(BaseModel):
 
 class IngestResponse(BaseModel):
     document_id: str
+    project_id: str
+    project_slug: str
     run_id: str
     status: str
+    document_title: str
 
 
 class DocumentRead(BaseModel):

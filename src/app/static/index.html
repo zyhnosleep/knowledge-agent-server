@@ -854,6 +854,66 @@
         background: var(--surface-soft);
       }
 
+      .markdown-panel {
+        margin-bottom: 22px;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fbfdff;
+      }
+
+      .markdown-panel h3 {
+        margin: 0 0 12px;
+        font-size: 16px;
+        color: var(--muted);
+      }
+
+      .markdown-panel pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.75;
+        font-size: 14px;
+      }
+
+      .chat-messages {
+        width: 100%;
+        max-height: 360px;
+        overflow: auto;
+        display: grid;
+        gap: 12px;
+      }
+
+      .message {
+        padding: 14px;
+        border-radius: 8px;
+        background: #fff;
+        border: 1px solid var(--line);
+      }
+
+      .message.user {
+        background: #eef2ff;
+        border-color: #c7d2fe;
+      }
+
+      .message.tool {
+        background: #f8fafc;
+        border-style: dashed;
+      }
+
+      .message strong {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+
+      .message div {
+        line-height: 1.65;
+        white-space: pre-wrap;
+      }
+
       @media (max-width: 1180px) {
         .runs-layout,
         .files-grid {
@@ -945,7 +1005,7 @@
 
         <div class="profile">
           <strong>张宇恒 Plus</strong>
-          <span>internal-research</span>
+          <span id="activeProjectLabel">internal-research</span>
         </div>
       </aside>
 
@@ -956,15 +1016,14 @@
         </header>
 
         <section class="view chat-view" data-view="chat" hidden>
-          <aside class="recents" aria-label="最近记录">
-            <button class="recent-card active" type="button">CHARMM36m 力场差异分析</button>
-            <button class="recent-card" type="button">E-R 图绘制指南</button>
-            <button class="recent-card" type="button">Git 连接错误排查</button>
+          <aside class="recents" id="sessionList" aria-label="会话历史">
+            <button class="recent-card active" type="button" id="newChatButton">新聊天</button>
           </aside>
           <div class="chat-center">
             <h1>构建科研级对话交互</h1>
+            <div class="chat-messages" id="chatMessages"></div>
             <form class="composer" id="queryForm">
-              <textarea id="questionInput" rows="1" placeholder="询问论文、文档或 Agent 能力...">CHARMM36m 和 CHARMM36 的区别？</textarea>
+              <textarea id="questionInput" rows="1" placeholder="询问论文、文档或 Agent 能力..."></textarea>
               <select id="queryMode" aria-label="查询模式">
                 <option value="agent">Agent</option>
                 <option value="rag">普通 RAG</option>
@@ -992,7 +1051,11 @@
                 <h2>上传文档</h2>
               </div>
               <form class="upload-form" id="uploadForm" style="padding: 22px;">
-                <label>Project Slug<input id="projectSlug" type="text" value="internal-research" /></label>
+                <label>Topic
+                  <select id="uploadTopicSelect"></select>
+                </label>
+                <label id="newTopicSlugLabel" hidden>New slug<input id="newTopicSlug" type="text" placeholder="my-topic" /></label>
+                <label id="newTopicNameLabel" hidden>New name<input id="newTopicName" type="text" placeholder="My Topic" /></label>
                 <label>File<input id="fileInput" type="file" /></label>
                 <button class="primary-button" id="uploadButton" type="submit">提交</button>
               </form>
@@ -1093,6 +1156,14 @@
         { color: "#7c3aed", soft: "#ede9fe", icon: "K" },
         { color: "#d97706", soft: "#fef3c7", icon: "R" }
       ];
+      var activeProjectSlug = "internal-research";
+      var activeProjectName = "Internal Research";
+      var activeSessionId = null;
+      var projects = [];
+
+      function makeSessionId() {
+        return "sess-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      }
 
       function $(id) {
         return document.getElementById(id);
@@ -1110,6 +1181,7 @@
         history.replaceState(null, "", "#" + name);
         if (name === "files") loadDocuments();
         if (name === "runs") loadPipelineDashboard();
+        if (name === "chat") loadAgentSessions();
       }
 
       function parseMaybeJson(text) {
@@ -1143,6 +1215,21 @@
         $("answerText").textContent = text;
       }
 
+      function appendMessage(role, content, meta) {
+        var box = $("chatMessages");
+        if (!box) return;
+        var div = document.createElement("div");
+        div.className = "message " + role;
+        var label = document.createElement("strong");
+        label.textContent = meta ? role + " · " + meta : role;
+        var body = document.createElement("div");
+        body.textContent = content || "";
+        div.appendChild(label);
+        div.appendChild(body);
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+
       function parseSSE(chunk) {
         var event = {};
         chunk.split("\n").forEach(function (line) {
@@ -1153,10 +1240,13 @@
       }
 
       function runAgent(question) {
+        var sessionId = activeSessionId || makeSessionId();
+        activeSessionId = sessionId;
+        appendMessage("user", question);
         var payload = {
-          project_slug: "internal-research",
+          project_slug: activeProjectSlug,
           query: question,
-          session_id: null,
+          session_id: sessionId,
           constraints: { max_steps: 8, max_tool_calls: 5, budget_tokens: 20000, timeout_seconds: 180 }
         };
         return fetch("/api/agent/query/stream", {
@@ -1195,17 +1285,25 @@
             var answer = data && (data.answer_markdown || data.final_answer) ? (data.answer_markdown || data.final_answer) : "未返回答案。";
             var route = data && data.route && data.route.route ? data.route.route : "agent";
             showAnswer(["Agent", route], answer);
+            appendMessage("agent", answer);
+            if (data && data.session_id) {
+              activeSessionId = data.session_id;
+              loadAgentSessions();
+            }
           });
         });
       }
 
       function runRag(question) {
+        appendMessage("user", question);
         return fetchJson("/api/query", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_slug: "internal-research", question: question, save_answer: true })
+          body: JSON.stringify({ project_slug: activeProjectSlug, question: question, save_answer: true })
         }).then(function (data) {
-          showAnswer(["RAG", data.verification_status || "local-only"], data.answer_markdown || "未返回答案。");
+          var answer = data.answer_markdown || "未返回答案。";
+          showAnswer(["RAG", data.verification_status || "local-only"], answer);
+          appendMessage("agent", answer);
         });
       }
 
@@ -1242,20 +1340,23 @@
         });
       }
 
-      function renderTopics(topics) {
+      function renderTopicCards(activeTopic) {
         var grid = $("pipelineTopicGrid");
         grid.replaceChildren();
-        if (!topics.length) {
+        if (!projects.length) {
           var empty = document.createElement("div");
           empty.className = "empty";
           empty.textContent = "暂无运行主题";
           grid.appendChild(empty);
           return;
         }
-        topics.forEach(function (topic, index) {
+        projects.forEach(function (project, index) {
           var accent = topicAccents[index % topicAccents.length];
+          var isActive = project.slug === activeProjectSlug;
           var card = document.createElement("article");
-          card.className = "topic-card" + (index === 0 ? " active" : "");
+          card.id = "topic-card-" + project.slug;
+          card.className = "topic-card" + (isActive ? " active" : "");
+          card.style.cursor = "pointer";
           card.style.setProperty("--accent-color", accent.color);
           card.style.setProperty("--accent-soft", accent.soft);
           card.innerHTML = [
@@ -1268,14 +1369,35 @@
             '<div class="topic-foot"><span class="status-badge"></span><button class="action-link" type="button">进入详情</button></div>'
           ].join("");
           card.querySelector(".topic-icon").textContent = accent.icon;
-          card.querySelector("h3").textContent = topic.title;
-          card.querySelector(".topic-meta").textContent = "文献数量: " + topic.document_count + " 篇 | 解析率: " + topic.parsing_rate + "%";
-          card.querySelector(".progress-bar").style.setProperty("--progress", (topic.progress_percent || 0) + "%");
-          var badge = card.querySelector(".status-badge");
-          badge.textContent = topic.status_label || topic.status;
-          setStatusBadgeVars(badge, topic.status);
+          card.querySelector("h3").textContent = project.name;
+          card.querySelector(".topic-meta").textContent = project.slug;
+          card.addEventListener("click", function () {
+            setActiveProject(project.slug, project.name);
+          });
           grid.appendChild(card);
         });
+        if (activeTopic) updateActiveTopicCard(activeTopic);
+      }
+
+      function updateActiveTopicCard(topic) {
+        var card = $("topic-card-" + topic.slug);
+        if (!card) return;
+        card.querySelector(".topic-meta").textContent = "文献数量: " + topic.document_count + " 篇 | 解析率: " + topic.parsing_rate + "%";
+        card.querySelector(".progress-bar").style.setProperty("--progress", (topic.progress_percent || 0) + "%");
+        var badge = card.querySelector(".status-badge");
+        badge.textContent = topic.status_label || topic.status;
+        setStatusBadgeVars(badge, topic.status);
+      }
+
+      function setActiveProject(slug, name) {
+        activeProjectSlug = slug;
+        activeProjectName = name || slug;
+        $("activeProjectLabel").textContent = activeProjectName;
+        renderUploadTopicSelect();
+        renderTopicCards();
+        loadPipelineDashboard();
+        loadDocuments();
+        loadAgentSessions();
       }
 
       function renderRuns(runs) {
@@ -1332,9 +1454,11 @@
       }
 
       function loadPipelineDashboard() {
-        return fetchJson("/api/pipeline/dashboard?project_slug=internal-research").then(function (data) {
+        return fetchJson("/api/pipeline/dashboard?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=200").then(function (data) {
+          var activeTopic = (data.topics || [])[0];
           renderMetrics(data.totals || {});
-          renderTopics(data.topics || []);
+          renderTopicCards(activeTopic);
+          if (activeTopic) updateActiveTopicCard(activeTopic);
           renderRuns(data.runs || []);
           if (data.runs && data.runs.length) {
             var firstReady = data.runs.find(function (run) { return run.action_available && run.document_id; });
@@ -1359,13 +1483,25 @@
 
       function renderSource(data) {
         var chunks = data.chunks || [];
+        var markdown = data.markdown || "";
         var body = $("sourceDrawerBody");
         body.replaceChildren();
-        if (!chunks.length) {
+        if (!markdown && !chunks.length) {
           var empty = document.createElement("div");
           empty.className = "empty";
           empty.textContent = "暂无可预览原文";
           body.appendChild(empty);
+          return;
+        }
+        if (markdown) {
+          var panel = document.createElement("div");
+          panel.className = "markdown-panel";
+          panel.innerHTML = '<h3>完整原文 / Markdown</h3><pre></pre>';
+          panel.querySelector("pre").textContent = markdown;
+          body.appendChild(panel);
+        }
+        if (!chunks.length) {
+          $("sourceDrawerFoot").textContent = data.document_title || "";
           return;
         }
         var current = document.createElement("article");
@@ -1398,7 +1534,7 @@
       }
 
       function loadDocuments() {
-        return fetchJson("/api/documents").then(function (docs) {
+        return fetchJson("/api/documents?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=50").then(function (docs) {
           var box = $("documentsBox");
           box.replaceChildren();
           if (!Array.isArray(docs) || !docs.length) {
@@ -1430,6 +1566,109 @@
           .replace(/'/g, "&#039;");
       }
 
+      function loadProjects() {
+        return fetchJson("/api/projects?limit=200").then(function (data) {
+          projects = Array.isArray(data) ? data : [];
+          if (projects.length && !projects.find(function (p) { return p.slug === activeProjectSlug; })) {
+            activeProjectSlug = projects[0].slug;
+            activeProjectName = projects[0].name;
+            $("activeProjectLabel").textContent = activeProjectName;
+          }
+          renderUploadTopicSelect();
+          renderTopicCards();
+          if (activeView === "runs") loadPipelineDashboard();
+          if (activeView === "files") loadDocuments();
+          if (activeView === "chat") loadAgentSessions();
+        }).catch(function (err) {
+          console.error("Failed to load projects", err);
+        });
+      }
+
+      function renderUploadTopicSelect() {
+        var select = $("uploadTopicSelect");
+        if (!select) return;
+        select.replaceChildren();
+        var newOpt = document.createElement("option");
+        newOpt.value = "new";
+        newOpt.textContent = "+ New topic";
+        select.appendChild(newOpt);
+        projects.forEach(function (project) {
+          var opt = document.createElement("option");
+          opt.value = project.slug;
+          opt.textContent = project.name;
+          opt.dataset.name = project.name;
+          if (project.slug === activeProjectSlug) opt.selected = true;
+          select.appendChild(opt);
+        });
+        toggleNewTopicInputs();
+      }
+
+      function toggleNewTopicInputs() {
+        var isNew = $("uploadTopicSelect").value === "new";
+        $("newTopicSlugLabel").hidden = !isNew;
+        $("newTopicNameLabel").hidden = !isNew;
+      }
+
+      function loadAgentSessions() {
+        return fetchJson("/api/agent/sessions?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=20").then(function (sessions) {
+          renderSessions(sessions);
+        }).catch(function (err) {
+          console.error("Failed to load sessions", err);
+        });
+      }
+
+      function renderSessions(sessions) {
+        var list = $("sessionList");
+        list.replaceChildren();
+        var newBtn = document.createElement("button");
+        newBtn.className = "recent-card" + (!activeSessionId ? " active" : "");
+        newBtn.type = "button";
+        newBtn.id = "newChatButton";
+        newBtn.textContent = "新聊天";
+        newBtn.addEventListener("click", startNewChat);
+        list.appendChild(newBtn);
+        (sessions || []).forEach(function (session) {
+          var btn = document.createElement("button");
+          btn.className = "recent-card" + (session.id === activeSessionId ? " active" : "");
+          btn.type = "button";
+          btn.textContent = session.id.slice(0, 24);
+          btn.title = session.id;
+          btn.addEventListener("click", function () { selectSession(session.id); });
+          list.appendChild(btn);
+        });
+      }
+
+      function startNewChat() {
+        activeSessionId = null;
+        var box = $("chatMessages");
+        if (box) box.replaceChildren();
+        $("answerPanel").hidden = true;
+        $("questionInput").value = "";
+        $("questionInput").focus();
+        renderSessions([]);
+        loadAgentSessions();
+      }
+
+      function selectSession(sessionId) {
+        activeSessionId = sessionId;
+        fetchJson("/api/agent/sessions/" + encodeURIComponent(sessionId) + "/turns").then(function (turns) {
+          renderTurns(turns);
+          $("answerPanel").hidden = true;
+          loadAgentSessions();
+        }).catch(function (err) {
+          showAnswer(["error"], err.message || String(err));
+        });
+      }
+
+      function renderTurns(turns) {
+        var box = $("chatMessages");
+        if (!box) return;
+        box.replaceChildren();
+        (turns || []).forEach(function (turn) {
+          appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type);
+        });
+      }
+
       document.querySelectorAll("[data-view-target]").forEach(function (button) {
         button.addEventListener("click", function () {
           setView(button.dataset.viewTarget);
@@ -1457,20 +1696,48 @@
         });
       });
 
+      $("uploadTopicSelect").addEventListener("change", toggleNewTopicInputs);
+
       $("uploadForm").addEventListener("submit", function (event) {
         event.preventDefault();
         var file = $("fileInput").files[0];
         if (!file) return;
+        var select = $("uploadTopicSelect");
+        var slug, name;
+        if (select.value === "new") {
+          slug = $("newTopicSlug").value.trim() || "new-topic";
+          name = $("newTopicName").value.trim() || slug;
+        } else {
+          slug = select.value;
+          var opt = select.options[select.selectedIndex];
+          name = opt.dataset.name || slug;
+        }
+        activeProjectSlug = slug;
+        activeProjectName = name;
+        $("activeProjectLabel").textContent = name;
         var data = new FormData();
         data.append("file", file);
         $("uploadButton").disabled = true;
         fetchJson(
-          "/api/ingest/upload?project_slug=" + encodeURIComponent($("projectSlug").value) + "&project_name=Internal%20Research",
+          "/api/ingest/upload?project_slug=" + encodeURIComponent(slug) + "&project_name=" + encodeURIComponent(name),
           { method: "POST", body: data }
-        ).then(function () {
-          loadDocuments();
-          loadPipelineDashboard();
-          setView("runs");
+        ).then(function (res) {
+          activeProjectSlug = res.project_slug || slug;
+          activeProjectName = name;
+          $("activeProjectLabel").textContent = activeProjectName;
+          if (!projects.some(function (project) { return project.slug === activeProjectSlug; })) {
+            projects.unshift({ slug: activeProjectSlug, name: activeProjectName });
+          }
+          renderUploadTopicSelect();
+          renderTopicCards();
+          return loadProjects().catch(function (err) {
+            console.error("Failed to refresh projects after upload", err);
+          }).then(function () {
+            loadDocuments();
+            loadPipelineDashboard();
+            loadAgentSessions();
+            setView("runs");
+          });
         }).catch(function (err) {
           alert(err.message || String(err));
         }).finally(function () {
@@ -1485,6 +1752,7 @@
         $("healthStatus").style.color = "var(--red)";
       });
 
+      loadProjects();
       setView((location.hash || "#runs").slice(1));
     </script>
   </body>

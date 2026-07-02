@@ -40,7 +40,7 @@ from app.services.ai import (
     cosine_similarity,
     safe_model_call,
 )
-from app.services.filesystem import compute_sha256, display_title_from_path, slugify, strip_upload_prefix
+from app.services.filesystem import compute_sha256, display_title_from_path, looks_like_internal_sample, readable_title_from_path, slugify, strip_upload_prefix
 from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
 from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
@@ -193,7 +193,7 @@ class IngestionPipeline:
 
             self._set_progress(run, 15, "parsing", "Parsing document and building page/snippet structure.")
             parsed = parse_document(Path(document.raw_path))
-            document.title = parsed.title or document.title
+            document.title = self._resolve_document_title(parsed, document)
             document.raw_text = parsed.text
             merged_metadata = dict(document.metadata_json or {})
             merged_metadata.update(parsed.metadata)
@@ -272,6 +272,38 @@ class IngestionPipeline:
                 self._set_progress(failed_run, 100, "failed", str(exc))
             self.db.commit()
             raise
+
+    def _resolve_document_title(self, parsed, document: Document) -> str:
+        """Choose the best display title for a document.
+
+        Preference order:
+        1. A non-empty title supplied by the parser (e.g. MinerU or metadata).
+        2. A title found in the parsed metadata.
+        3. The existing sanitized filename, unless it is just an internal
+           UUID/hash sample name.
+        4. A generic fallback.
+
+        Internal UUID/hash/sample identifiers are never promoted to the
+        primary display title when a human-readable alternative exists.
+        """
+        candidates: list[str] = []
+        if parsed.title and not looks_like_internal_sample(parsed.title):
+            candidates.append(parsed.title.strip())
+        metadata_title = (parsed.metadata or {}).get("title")
+        if metadata_title and not looks_like_internal_sample(metadata_title):
+            candidates.append(str(metadata_title).strip())
+        existing_title = document.title or readable_title_from_path(Path(document.raw_path))
+        if existing_title and not looks_like_internal_sample(existing_title):
+            candidates.append(existing_title.strip())
+        if candidates:
+            return candidates[0]
+        # Final fallback: anything we have, stripped of the upload UUID prefix.
+        fallback = strip_upload_prefix(
+            document.title or document.file_name or Path(document.raw_path).stem or ""
+        ).strip()
+        if fallback and not looks_like_internal_sample(fallback):
+            return fallback
+        return "Untitled document"
 
     def _set_progress(self, run: PipelineRun, percent: int, stage: str, message: str) -> None:
         report = dict(run.provider_report or {})

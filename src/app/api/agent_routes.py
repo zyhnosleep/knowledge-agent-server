@@ -7,11 +7,13 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.schemas.agent import AgentConstraints, AgentQueryRequest, AgentQueryResponse
+from app.models.records import ConversationSession
+from app.schemas.agent import AgentConstraints, AgentQueryRequest, AgentQueryResponse, AgentSessionRead, AgentTurnRead
 from app.services.agent_executor import AgentExecutor
 from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
@@ -255,6 +257,65 @@ def get_agent_trace(
     if trace is None:
         raise HTTPException(status_code=404, detail="Trace not found.")
     return trace
+
+
+@agent_router.get("/sessions", response_model=list[AgentSessionRead])
+def list_agent_sessions(
+    project_slug: str | None = Query(None, description="Project slug to filter by"),
+    limit: int = Query(50, ge=1, le=200, description="Max sessions to return"),
+    offset: int = Query(0, ge=0, description="Number of sessions to skip"),
+    db: Session = Depends(get_db),
+):
+    """List Agent conversation sessions, newest first.
+
+    Sessions are read-only here; creation and updates happen through the
+    Agent query endpoints.
+    """
+    stmt = select(ConversationSession).order_by(ConversationSession.updated_at.desc())
+    if project_slug is not None:
+        stmt = stmt.where(ConversationSession.project_slug == project_slug)
+    rows = db.scalars(stmt.offset(offset).limit(limit)).all()
+    memory = ConversationMemory(db)
+    return [
+        AgentSessionRead(
+            id=row.id,
+            project_slug=row.project_slug,
+            turn_count=memory.turn_count(row.id),
+            created_at=row.created_at.isoformat(),
+            updated_at=row.updated_at.isoformat(),
+            expires_at=row.expires_at.isoformat(),
+        )
+        for row in rows
+    ]
+
+
+@agent_router.get("/sessions/{session_id}/turns", response_model=list[AgentTurnRead])
+def get_agent_session_turns(
+    session_id: str,
+    db: Session = Depends(get_db),
+):
+    """Return ordered turns for a single Agent conversation session."""
+    session = db.get(ConversationSession, session_id)
+    if session is None:
+        # Also allow sessions that have turns but no session row yet.
+        if ConversationMemory(db).turn_count(session_id) == 0:
+            raise HTTPException(status_code=404, detail="Session not found.")
+
+    memory = ConversationMemory(db)
+    turns = memory.get_history(session_id)
+    return [
+        AgentTurnRead(
+            turn_index=turn.turn_index,
+            role=turn.role,
+            content=turn.content,
+            tool_name=turn.tool_name,
+            tool_args=turn.tool_args,
+            tool_result=turn.tool_result,
+            step_type=turn.step_type,
+            created_at=(turn.created_at.isoformat() if turn.created_at else ""),
+        )
+        for turn in turns
+    ]
 
 
 def _sse_event(event: str, data: dict) -> str:

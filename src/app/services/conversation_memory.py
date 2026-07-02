@@ -23,6 +23,7 @@ class TurnRecord:
     tool_args: dict | None = None
     tool_result: str | None = None
     step_type: str | None = None
+    created_at: datetime | None = None
 
 
 class ConversationMemory:
@@ -89,6 +90,7 @@ class ConversationMemory:
                 tool_args=row.tool_args,
                 tool_result=row.tool_result,
                 step_type=row.step_type,
+                created_at=row.created_at,
             )
             for row in rows
         ]

@@ -12,6 +12,13 @@ from app.core.config import get_settings
 settings = get_settings()
 UPLOAD_PREFIX_PATTERN = re.compile(r"^[0-9a-f]{32}-(.+)$", re.IGNORECASE)
 PROJECT_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,119}$")
+# Heuristic for filenames that are just UUIDs, hashes, or other internal sample
+# identifiers rather than human-readable document titles.
+INTERNAL_SAMPLE_PATTERN = re.compile(r"^[0-9a-f]{24,}$", re.IGNORECASE)
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 class StoragePathError(ValueError):
@@ -40,6 +47,26 @@ def strip_upload_prefix(value: str) -> str:
 
 def display_title_from_path(path: Path) -> str:
     return strip_upload_prefix(path.stem)
+
+
+def looks_like_internal_sample(value: str) -> bool:
+    """Return True when *value* looks like a UUID/hash sample name, not a title."""
+    text = strip_upload_prefix(str(value)).strip()
+    if not text:
+        return True
+    if UUID_PATTERN.fullmatch(text):
+        return True
+    if INTERNAL_SAMPLE_PATTERN.fullmatch(re.sub(r"[^0-9a-fA-F]", "", text)):
+        return True
+    return False
+
+
+def readable_title_from_path(path: Path) -> str | None:
+    """Return a human-readable title from *path* or None if it is just an internal id."""
+    title = display_title_from_path(path)
+    if looks_like_internal_sample(title):
+        return None
+    return title
 
 
 def compute_sha256(path: Path) -> str:

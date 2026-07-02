@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.records import Document, DocumentChunk, PipelineRun, Project, ReviewItem
+from app.models.records import Document, DocumentChunk, PageKind, PipelineRun, Project, ReviewItem, WikiPage
 from app.schemas.common import (
     DocumentRead,
     HealthResponse,
@@ -120,16 +120,16 @@ def _build_pipeline_topic(
 
     if failed_count:
         status = "failed"
-        status_label = f"{failed_count} 篇解析异常"
+        status_label = f"{failed_count} documents failed"
     elif processing_count:
         status = "processing"
-        status_label = f"{processing_count} 篇正在处理"
+        status_label = f"{processing_count} documents processing"
     elif completed_count:
         status = "ready"
-        status_label = "已就绪"
+        status_label = "Ready"
     else:
         status = "empty"
-        status_label = "暂无文献"
+        status_label = "No documents"
 
     progress_percent = int(sum(percents) / len(percents)) if percents else 0
     parsing_rate = int(completed_count * 100 / document_count) if document_count else 0
@@ -148,22 +148,26 @@ def _build_pipeline_topic(
     }
 
 
-def _build_pipeline_run_item(run: PipelineRun, document: Document | None) -> dict:
+def _build_pipeline_run_item(run: PipelineRun | None, document: Document | None, project: Project | None = None) -> dict:
     status = _business_status(document, run)
     progress = _progress_from_run(run, document)
+    created_at = run.created_at.isoformat() if run is not None else (document.updated_at.isoformat() if document is not None else "")
+    updated_at = run.updated_at.isoformat() if run is not None else created_at
     return {
-        "id": run.id,
-        "document_id": run.document_id,
-        "document_title": document.title if document is not None else "未关联文档",
+        "id": run.id if run is not None else None,
+        "document_id": document.id if document is not None else (run.document_id if run is not None else None),
+        "document_title": document.title if document is not None else "Unlinked document",
         "file_name": document.file_name if document is not None else None,
+        "project_slug": project.slug if project is not None else (document.project.slug if document is not None and document.project is not None else None),
+        "project_title": project.name if project is not None else (document.project.name if document is not None and document.project is not None else None),
         "status": status,
         "status_label": _status_label(status),
-        "run_type": run.run_type,
-        "notes": run.notes,
+        "run_type": run.run_type if run is not None else None,
+        "notes": run.notes if run is not None else None,
         "progress": progress,
         "action_available": bool(document and status == "completed"),
-        "created_at": run.created_at.isoformat(),
-        "updated_at": run.updated_at.isoformat(),
+        "created_at": created_at,
+        "updated_at": updated_at,
     }
 
 
@@ -210,12 +214,19 @@ async def ingest_upload(
     except InvalidStoragePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     pipeline = IngestionPipeline(db)
-    _, document, run = pipeline.register_document(safe_slug, project_name, saved_path)
+    project, document, run = pipeline.register_document(safe_slug, project_name, saved_path)
     if run.status != "completed":
         result = JobDispatcher().enqueue_or_run("app.workers.jobs.run_document_ingestion", document.id)
         if isinstance(result, str):
             db.refresh(run)
-    return IngestResponse(document_id=document.id, run_id=run.id, status=run.status)
+    return IngestResponse(
+        document_id=document.id,
+        project_id=project.id,
+        project_slug=project.slug,
+        run_id=run.id,
+        status=run.status,
+        document_title=document.title,
+    )
 
 
 @router.get("/documents", response_model=list[DocumentRead])
@@ -256,37 +267,46 @@ def get_pipeline_dashboard(
         project_statement = project_statement.where(Project.slug == _validated_project_slug(project_slug))
     projects = db.scalars(project_statement.limit(limit)).all()
     project_ids = [project.id for project in projects]
+    project_map = {project.id: project for project in projects}
 
     documents: list[Document] = []
-    runs: list[PipelineRun] = []
     if project_ids:
         documents = db.scalars(
             select(Document)
             .where(Document.project_id.in_(project_ids))
-            .order_by(Document.updated_at.desc(), Document.created_at.desc())
-        ).all()
-        runs = db.scalars(
-            select(PipelineRun)
-            .where(PipelineRun.project_id.in_(project_ids))
-            .order_by(PipelineRun.updated_at.desc(), PipelineRun.created_at.desc(), PipelineRun.id.desc())
+            .order_by(Document.updated_at.desc(), Document.created_at.desc(), Document.id.desc())
             .limit(limit)
         ).all()
 
+    document_ids = [document.id for document in documents]
     documents_by_project: dict[str, list[Document]] = {}
-    documents_by_id = {document.id: document for document in documents}
     for document in documents:
         documents_by_project.setdefault(document.project_id, []).append(document)
 
+    # One run item per document: pick the latest run for each document.
     latest_runs_by_document: dict[str, PipelineRun] = {}
-    for run in runs:
-        if run.document_id and run.document_id not in latest_runs_by_document:
-            latest_runs_by_document[run.document_id] = run
+    if document_ids:
+        runs = db.scalars(
+            select(PipelineRun)
+            .where(PipelineRun.document_id.in_(document_ids))
+            .order_by(PipelineRun.updated_at.desc(), PipelineRun.created_at.desc(), PipelineRun.id.desc())
+        ).all()
+        for run in runs:
+            if run.document_id and run.document_id not in latest_runs_by_document:
+                latest_runs_by_document[run.document_id] = run
 
     topics = [
         _build_pipeline_topic(project, documents_by_project.get(project.id, []), latest_runs_by_document)
         for project in projects
     ]
-    run_items = [_build_pipeline_run_item(run, documents_by_id.get(run.document_id or "")) for run in runs]
+    run_items = [
+        _build_pipeline_run_item(
+            latest_runs_by_document.get(document.id),
+            document,
+            project_map.get(document.project_id),
+        )
+        for document in documents
+    ]
     completed_count = sum(1 for item in run_items if item["status"] == "completed")
     processing_count = sum(1 for item in run_items if item["status"] in {"queued", "running"})
     failed_count = sum(1 for item in run_items if item["status"] == "failed")
@@ -319,6 +339,20 @@ def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRea
         sha256=document.sha256,
         metadata_json=document.metadata_json,
     )
+
+
+def _build_document_markdown(document: Document, chunks: list[DocumentChunk], db: Session) -> str:
+    """Return the best complete Markdown/source body available for a document."""
+    pages = db.scalars(
+        select(WikiPage)
+        .where(WikiPage.project_id == document.project_id, WikiPage.kind == PageKind.source_summary.value)
+    ).all()
+    for page in pages:
+        if document.id in (page.source_document_ids or []):
+            return page.markdown_content
+    if document.raw_text:
+        return document.raw_text
+    return "\n\n".join(chunk.text for chunk in chunks)
 
 
 @router.get("/documents/{document_id}/source", response_model=dict)
@@ -364,6 +398,7 @@ def get_document_source(document_id: str, db: Session = Depends(get_db)) -> dict
         "file_name": document.file_name,
         "status": document.status,
         "raw_preview": fallback_preview[:2400],
+        "markdown": _build_document_markdown(document, chunks, db),
         "chunks": chunk_items,
     }
 

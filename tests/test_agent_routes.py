@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from datetime import datetime, timedelta
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -11,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.agent_routes import agent_router
 from app.core.config import get_settings
 from app.db.session import Base, get_db
-from app.models.records import Project
+from app.models.records import ConversationSession, ConversationTurn, Project
 
 
 def make_session() -> Session:
@@ -541,3 +543,106 @@ def test_list_traces_no_session_id_returns_all_matching() -> None:
     r = client.get("/api/agent/traces?project_slug=demo")
     assert r.status_code == 200
     assert len(r.json()["traces"]) == 2
+
+
+def test_list_agent_sessions_by_project() -> None:
+    """GET /api/agent/sessions lists sessions filtered by project_slug."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.add_all(
+        [
+            ConversationSession(
+                id="sess-a",
+                project_slug="demo",
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            ),
+            ConversationSession(
+                id="sess-b",
+                project_slug="demo",
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            ),
+            ConversationSession(
+                id="sess-c",
+                project_slug="other",
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            ),
+        ]
+    )
+    db.commit()
+
+    client = make_client(db)
+    r = client.get("/api/agent/sessions?project_slug=demo")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 2
+    assert {s["id"] for s in data} == {"sess-a", "sess-b"}
+    for session in data:
+        assert session["project_slug"] == "demo"
+        assert "turn_count" in session
+        assert "created_at" in session
+        assert "updated_at" in session
+        assert "expires_at" in session
+
+
+def test_get_agent_session_turns_ordered() -> None:
+    """GET /api/agent/sessions/{id}/turns returns ordered turns."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.add(
+        ConversationSession(
+            id="sess-turns",
+            project_slug="demo",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+        )
+    )
+    db.add_all(
+        [
+            ConversationTurn(
+                id="t1",
+                session_id="sess-turns",
+                turn_index=0,
+                role="user",
+                content="hello",
+                created_at=datetime.utcnow(),
+            ),
+            ConversationTurn(
+                id="t2",
+                session_id="sess-turns",
+                turn_index=1,
+                role="agent",
+                content="hi there",
+                created_at=datetime.utcnow(),
+            ),
+            ConversationTurn(
+                id="t3",
+                session_id="sess-turns",
+                turn_index=2,
+                role="tool",
+                content="result",
+                tool_name="rag.answer",
+                step_type="tool_call",
+                created_at=datetime.utcnow(),
+            ),
+        ]
+    )
+    db.commit()
+
+    client = make_client(db)
+    r = client.get("/api/agent/sessions/sess-turns/turns")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 3
+    assert [t["turn_index"] for t in data] == [0, 1, 2]
+    assert [t["role"] for t in data] == ["user", "agent", "tool"]
+    assert data[2]["tool_name"] == "rag.answer"
+    assert data[2]["step_type"] == "tool_call"
+
+
+def test_get_agent_session_turns_unknown_session_returns_404() -> None:
+    """GET /api/agent/sessions/{id}/turns returns 404 for an empty unknown session."""
+    db = make_session()
+    client = make_client(db)
+    r = client.get("/api/agent/sessions/no-such-session/turns")
+    assert r.status_code == 404
