@@ -6511,6 +6511,57 @@ def test_overview_query_keeps_chinese_body_without_spaces() -> None:
     assert "避免其他知识污染" in contexts[0].citation.excerpt
 
 
+def test_overview_query_filters_long_appendix_tables() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="BOD",
+        file_name="bod.pdf",
+        sha256="abc",
+        raw_path="raw/bod.pdf",
+        raw_text="BOD paper text.",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-abstract",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text=(
+                "Abstract\n\nBlack-box distillation creates student large language models by learning from "
+                "a proprietary teacher model's text outputs. We introduce Generative Adversarial Distillation "
+                "as an on-policy framework for adaptive feedback."
+            ),
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-table",
+            document_id="d1",
+            ordinal=80,
+            page_label="15",
+            text=(
+                "Table 6: Extended automatic evaluation results.\n\n"
+                "| Model | Method | LMSYS | Dolly |\n"
+                "| --- | --- | --- | --- |\n"
+                + "| GPT-5-Chat | Teacher | 51.7 | 49.8 |\n" * 30
+            ),
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts("这篇文章讲了什么", "p1", [])
+
+    assert contexts
+    assert contexts[0].citation.chunk_id == "c-abstract"
+    assert all(context.citation.chunk_id != "c-table" for context in contexts)
+    assert "Generative Adversarial Distillation" in contexts[0].citation.excerpt
+
+
 def test_overview_query_multi_document_without_lock_does_not_mix_documents() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

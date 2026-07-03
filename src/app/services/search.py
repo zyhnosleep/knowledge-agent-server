@@ -996,7 +996,11 @@ class QueryService:
             if QueryService._is_heading_only_text(chunk.text):
                 continue
             evidence = chunk.text.strip()
-            score = 35.0 + min(len(evidence) / 200.0, 8.0)
+            if QueryService._context_has_table_data(evidence):
+                continue
+            score = QueryService._overview_chunk_score(chunk, evidence)
+            if score <= 0:
+                continue
             excerpt = evidence[:900]
             contexts.append(
                 RetrievedContext(
@@ -1013,47 +1017,35 @@ class QueryService:
                     evidence_kind="overview",
                 )
             )
-        # Prefer early (intro/abstract) and late (conclusion) chunks, plus a
-        # middle method chunk, so the summary is representative.
-        document_chunks: dict[str, list[DocumentChunk]] = {}
-        for chunk in chunks:
-            if QueryService._is_heading_only_text(chunk.text):
-                continue
-            document_chunks.setdefault(chunk.document_id, []).append(chunk)
-        prioritized: list[RetrievedContext] = []
-        for doc_id, doc_chunks in document_chunks.items():
-            if not doc_chunks:
-                continue
-            intro = doc_chunks[:2]
-            conclusion = doc_chunks[-2:]
-            middle_start = len(doc_chunks) // 3
-            middle_end = min(middle_start + 2, len(doc_chunks) * 2 // 3)
-            method = doc_chunks[middle_start:middle_end]
-            picked_ids = list(dict.fromkeys([chunk.id for chunk in intro + method + conclusion]))
-            by_id = {context.citation.chunk_id: context for context in contexts}
-            for chunk_id in picked_ids:
-                context = by_id.get(chunk_id)
-                if context is not None and context not in prioritized:
-                    # Boost representative positions without changing the
-                    # filtered-out heading logic.
-                    bonus = 0.0
-                    if chunk_id in {chunk.id for chunk in intro}:
-                        bonus = 8.0
-                    elif chunk_id in {chunk.id for chunk in conclusion}:
-                        bonus = 6.0
-                    elif chunk_id in {chunk.id for chunk in method}:
-                        bonus = 3.0
-                    prioritized.append(
-                        RetrievedContext(
-                            citation=context.citation.model_copy(update={"score": context.score + bonus}),
-                            prompt_text=context.prompt_text,
-                            score=context.score + bonus,
-                            evidence_kind=context.evidence_kind,
-                        )
-                    )
-        if prioritized:
-            return sorted(prioritized, key=lambda item: item.score, reverse=True)[:limit]
         return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _overview_chunk_score(chunk: DocumentChunk, evidence: str) -> float:
+        """Score prose chunks that are useful for a document-level summary."""
+        lowered = evidence.lower()
+        head = lowered[:240]
+        score = 20.0
+        page_number = QueryService._page_label_number(chunk.page_label)
+        if page_number is not None and page_number <= 2:
+            score += 28.0
+        if chunk.ordinal <= 8:
+            score += max(0.0, 18.0 - chunk.ordinal * 1.5)
+        if "abstract" in head:
+            score += 26.0
+        if re.search(r"(?:^|\n)#+\s*(?:\d+(?:\.\d+)?\s*)?introduction\b|\bintroduction\b", head):
+            score += 20.0
+        if re.search(r"\bwe\s+(?:introduce|propose|present|develop|study|show|demonstrate)\b", lowered):
+            score += 18.0
+        if re.search(r"\b(?:method|approach|framework|algorithm|model)\b", lowered):
+            score += 8.0
+        if re.search(r"\b(?:conclusion|conclusions)\b", head):
+            score += 14.0
+        if re.search(r"\b(?:appendix|references|acknowledgements?)\b", head):
+            score -= 18.0
+        if re.search(r"\btable\s+\d+\b", head):
+            score -= 16.0
+        score += min(len(evidence) / 500.0, 4.0)
+        return score
 
     @staticmethod
     def _page_label_number(page_label: str | None) -> int | None:
