@@ -80,6 +80,21 @@ def _positive_int(value: int, fallback: int) -> int:
     return value if isinstance(value, int) and value > 0 else fallback
 
 
+def _assert_session_project(session_id: str | None, project_slug: str, db: Session) -> None:
+    """Raise if an existing session belongs to a different project."""
+    if not session_id:
+        return
+    session = db.get(ConversationSession, session_id)
+    if session is not None and session.project_slug != project_slug:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Session {session_id} belongs to project {session.project_slug}; "
+                f"cannot be used for project {project_slug}."
+            ),
+        )
+
+
 @agent_router.post("/query", response_model=AgentQueryResponse)
 def agent_query(
     payload: AgentQueryRequest, db: Session = Depends(get_db)
@@ -93,6 +108,8 @@ def agent_query(
             status_code=503,
             detail="Agent service is not enabled. Set AGENT_ENABLED=true.",
         )
+
+    _assert_session_project(payload.session_id, payload.project_slug, db)
 
     executor = _build_executor(db)
     response = executor.execute(_apply_server_constraint_defaults(payload))
@@ -148,6 +165,8 @@ async def agent_query_stream(
             status_code=503,
             detail="Agent service is not enabled. Set AGENT_ENABLED=true.",
         )
+
+    _assert_session_project(payload.session_id, payload.project_slug, db)
 
     # Derive a thread-safe session factory from the injected session's
     # bind so tests that override the DB engine still work.
@@ -276,30 +295,43 @@ def list_agent_sessions(
         stmt = stmt.where(ConversationSession.project_slug == project_slug)
     rows = db.scalars(stmt.offset(offset).limit(limit)).all()
     memory = ConversationMemory(db)
-    return [
-        AgentSessionRead(
-            id=row.id,
-            project_slug=row.project_slug,
-            turn_count=memory.turn_count(row.id),
-            created_at=row.created_at.isoformat(),
-            updated_at=row.updated_at.isoformat(),
-            expires_at=row.expires_at.isoformat(),
+    sessions: list[AgentSessionRead] = []
+    for row in rows:
+        first_user_turn = memory.first_user_turn(row.id)
+        sessions.append(
+            AgentSessionRead(
+                id=row.id,
+                project_slug=row.project_slug,
+                preview=(first_user_turn.content if first_user_turn else row.id),
+                turn_count=memory.turn_count(row.id),
+                created_at=row.created_at.isoformat(),
+                updated_at=row.updated_at.isoformat(),
+                expires_at=row.expires_at.isoformat(),
+            )
         )
-        for row in rows
-    ]
+    return sessions
 
 
 @agent_router.get("/sessions/{session_id}/turns", response_model=list[AgentTurnRead])
 def get_agent_session_turns(
     session_id: str,
+    project_slug: str | None = Query(None, description="Project slug to scope access"),
     db: Session = Depends(get_db),
 ):
-    """Return ordered turns for a single Agent conversation session."""
+    """Return ordered turns for a single Agent conversation session.
+
+    When *project_slug* is provided, the session must belong to that
+    project; otherwise a 404 is returned to prevent cross-topic turn
+    restoration.
+    """
     session = db.get(ConversationSession, session_id)
     if session is None:
-        # Also allow sessions that have turns but no session row yet.
         if ConversationMemory(db).turn_count(session_id) == 0:
             raise HTTPException(status_code=404, detail="Session not found.")
+        if project_slug is not None:
+            raise HTTPException(status_code=404, detail="Session not found.")
+    elif project_slug is not None and session.project_slug != project_slug:
+        raise HTTPException(status_code=404, detail="Session not found.")
 
     memory = ConversationMemory(db)
     turns = memory.get_history(session_id)

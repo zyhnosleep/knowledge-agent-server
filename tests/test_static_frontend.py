@@ -57,6 +57,24 @@ def test_active_project_state_exists() -> None:
     assert "activeProjectLabel" in html
 
 
+def test_topic_card_chat_action_referenced() -> None:
+    html = _html()
+    assert "enterTopicChat" in html
+    assert "进入对话" in html
+    assert "chatContextLabel" in html
+    assert 'setView("chat", { skipSessionLoad: true })' in html
+
+
+def test_select_session_includes_project_slug() -> None:
+    html = _html()
+    assert '/turns?project_slug=" + encodeURIComponent(activeProjectSlug)' in html
+
+
+def test_session_list_uses_preview() -> None:
+    html = _html()
+    assert "session.preview" in html
+
+
 def test_upload_refreshes_project_list_after_new_topic() -> None:
     html = _html()
     assert "projects.unshift" in html

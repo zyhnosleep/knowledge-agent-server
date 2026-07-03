@@ -107,6 +107,31 @@ class ConversationMemory:
             or 0
         )
 
+    def first_user_turn(self, session_id: str) -> TurnRecord | None:
+        """Return the first user turn for *session_id*, if any."""
+        statement = (
+            select(ConversationTurn)
+            .where(
+                ConversationTurn.session_id == session_id,
+                ConversationTurn.role == "user",
+            )
+            .order_by(ConversationTurn.turn_index.asc())
+            .limit(1)
+        )
+        row = self._db.scalar(statement)
+        if row is None:
+            return None
+        return TurnRecord(
+            turn_index=row.turn_index,
+            role=row.role,
+            content=row.content,
+            tool_name=row.tool_name,
+            tool_args=row.tool_args,
+            tool_result=row.tool_result,
+            step_type=row.step_type,
+            created_at=row.created_at,
+        )
+
     def compact_history(self, session_id: str, max_turns: int) -> int:
         """Delete oldest turns so at most *max_turns* remain.
 
@@ -147,9 +172,15 @@ class ConversationMemory:
     ) -> None:
         """Create or update a conversation session with an expiry time.
 
-        Sets ``expires_at = now + ttl_days``.
+        Sets ``expires_at = now + ttl_days``.  An existing session is never
+        silently rebound to a different project.
         """
         existing = self._db.get(ConversationSession, session_id)
+        if existing is not None and existing.project_slug != project_slug:
+            raise ValueError(
+                f"Session {session_id} belongs to project {existing.project_slug}; "
+                f"cannot rebind to project {project_slug}."
+            )
         expires_at = datetime.utcnow() + timedelta(days=ttl_days)
         if existing:
             existing.expires_at = expires_at

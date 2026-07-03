@@ -4,6 +4,8 @@ from collections.abc import Iterator
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -14,6 +16,7 @@ from app.api.agent_routes import agent_router
 from app.core.config import get_settings
 from app.db.session import Base, get_db
 from app.models.records import ConversationSession, ConversationTurn, Project
+from app.services.conversation_memory import ConversationMemory
 
 
 def make_session() -> Session:
@@ -640,9 +643,113 @@ def test_get_agent_session_turns_ordered() -> None:
     assert data[2]["step_type"] == "tool_call"
 
 
-def test_get_agent_session_turns_unknown_session_returns_404() -> None:
-    """GET /api/agent/sessions/{id}/turns returns 404 for an empty unknown session."""
+def test_list_agent_sessions_includes_preview() -> None:
+    """Session list returns a human-readable preview from the first user turn."""
     db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.add(
+        ConversationSession(
+            id="sess-preview",
+            project_slug="demo",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+        )
+    )
+    db.add(
+        ConversationTurn(
+            id="t1",
+            session_id="sess-preview",
+            turn_index=0,
+            role="user",
+            content="first user question",
+            created_at=datetime.utcnow(),
+        )
+    )
+    db.add(
+        ConversationSession(
+            id="sess-empty",
+            project_slug="demo",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+        )
+    )
+    db.commit()
+
     client = make_client(db)
-    r = client.get("/api/agent/sessions/no-such-session/turns")
-    assert r.status_code == 404
+    r = client.get("/api/agent/sessions?project_slug=demo")
+    assert r.status_code == 200
+    data = r.json()
+    previews = {s["id"]: s["preview"] for s in data}
+    assert previews["sess-preview"] == "first user question"
+    assert previews["sess-empty"] == "sess-empty"
+
+
+def test_get_agent_session_turns_project_scoped() -> None:
+    """Turns endpoint rejects cross-topic access when project_slug is provided."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.add(
+        ConversationSession(
+            id="sess-other",
+            project_slug="other",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+        )
+    )
+    db.add(
+        ConversationTurn(
+            id="t1",
+            session_id="sess-other",
+            turn_index=0,
+            role="user",
+            content="hello",
+            created_at=datetime.utcnow(),
+        )
+    )
+    db.commit()
+
+    client = make_client(db)
+    # Matching project returns turns
+    r1 = client.get("/api/agent/sessions/sess-other/turns?project_slug=other")
+    assert r1.status_code == 200
+    assert len(r1.json()) == 1
+
+    # Mismatched project returns 404
+    r2 = client.get("/api/agent/sessions/sess-other/turns?project_slug=demo")
+    assert r2.status_code == 404
+
+
+def test_agent_query_rejects_cross_topic_session_reuse(monkeypatch) -> None:
+    """Agent query endpoints refuse to append turns to a different-project session."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    memory = ConversationMemory(db)
+    memory.touch_session("shared-sess", project_slug="demo", ttl_days=30)
+    db.commit()
+
+    monkeypatch.setattr(
+        "app.services.rag_adapter.RAGAdapter.answer",
+        lambda self, db, project_slug, question: _stub_answer("ignored"),
+    )
+
+    client = make_client(db)
+    response = client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "other",
+            "query": "hello?",
+            "session_id": "shared-sess",
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_touch_session_does_not_rebind_to_different_project() -> None:
+    """ConversationMemory.touch_session raises when rebounding would change project."""
+    db = make_session()
+    memory = ConversationMemory(db)
+    memory.touch_session("rebind-sess", project_slug="demo", ttl_days=30)
+    db.commit()
+
+    with pytest.raises(ValueError):
+        memory.touch_session("rebind-sess", project_slug="other", ttl_days=30)

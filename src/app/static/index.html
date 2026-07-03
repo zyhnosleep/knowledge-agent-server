@@ -1021,6 +1021,7 @@
           </aside>
           <div class="chat-center">
             <h1>构建科研级对话交互</h1>
+            <p class="muted" id="chatContextLabel">Internal Research</p>
             <div class="chat-messages" id="chatMessages"></div>
             <form class="composer" id="queryForm">
               <textarea id="questionInput" rows="1" placeholder="询问论文、文档或 Agent 能力..."></textarea>
@@ -1169,7 +1170,8 @@
         return document.getElementById(id);
       }
 
-      function setView(name) {
+      function setView(name, options) {
+        options = options || {};
         if (!document.querySelector('[data-view="' + name + '"]')) name = "runs";
         activeView = name;
         document.querySelectorAll("[data-view]").forEach(function (view) {
@@ -1181,7 +1183,10 @@
         history.replaceState(null, "", "#" + name);
         if (name === "files") loadDocuments();
         if (name === "runs") loadPipelineDashboard();
-        if (name === "chat") loadAgentSessions();
+        if (name === "chat") {
+          updateChatContextLabel();
+          if (!options.skipSessionLoad) loadAgentSessions();
+        }
       }
 
       function parseMaybeJson(text) {
@@ -1366,11 +1371,16 @@
             "</div>",
             '<div class="topic-meta"></div>',
             '<div class="progress-track"><div class="progress-bar"></div></div>',
-            '<div class="topic-foot"><span class="status-badge"></span><button class="action-link" type="button">进入详情</button></div>'
+            '<div class="topic-foot"><span class="status-badge"></span><button class="action-link" type="button">进入对话</button></div>'
           ].join("");
           card.querySelector(".topic-icon").textContent = accent.icon;
           card.querySelector("h3").textContent = project.name;
           card.querySelector(".topic-meta").textContent = project.slug;
+          var chatAction = card.querySelector(".action-link");
+          chatAction.addEventListener("click", function (event) {
+            event.stopPropagation();
+            enterTopicChat(project.slug, project.name);
+          });
           card.addEventListener("click", function () {
             setActiveProject(project.slug, project.name);
           });
@@ -1398,6 +1408,31 @@
         loadPipelineDashboard();
         loadDocuments();
         loadAgentSessions();
+      }
+
+      function updateChatContextLabel() {
+        var label = $("chatContextLabel");
+        if (!label) return;
+        label.textContent = activeProjectName || activeProjectSlug;
+      }
+
+      function enterTopicChat(slug, name) {
+        activeProjectSlug = slug;
+        activeProjectName = name || slug;
+        $("activeProjectLabel").textContent = activeProjectName;
+        activeSessionId = null;
+        renderUploadTopicSelect();
+        renderTopicCards();
+        updateChatContextLabel();
+        setView("chat", { skipSessionLoad: true });
+        loadAgentSessions().then(function (sessions) {
+          renderSessions(sessions);
+          if (sessions && sessions.length) {
+            selectSession(sessions[0].id);
+          } else {
+            startNewChat();
+          }
+        });
       }
 
       function renderRuns(runs) {
@@ -1631,8 +1666,9 @@
           var btn = document.createElement("button");
           btn.className = "recent-card" + (session.id === activeSessionId ? " active" : "");
           btn.type = "button";
-          btn.textContent = session.id.slice(0, 24);
-          btn.title = session.id;
+          var label = session.preview || session.id.slice(0, 24);
+          btn.textContent = label.length > 28 ? label.slice(0, 28) + "…" : label;
+          btn.title = session.id + (session.preview ? " — " + session.preview : "");
           btn.addEventListener("click", function () { selectSession(session.id); });
           list.appendChild(btn);
         });
@@ -1651,7 +1687,9 @@
 
       function selectSession(sessionId) {
         activeSessionId = sessionId;
-        fetchJson("/api/agent/sessions/" + encodeURIComponent(sessionId) + "/turns").then(function (turns) {
+        fetchJson(
+          "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/turns?project_slug=" + encodeURIComponent(activeProjectSlug)
+        ).then(function (turns) {
           renderTurns(turns);
           $("answerPanel").hidden = true;
           loadAgentSessions();
