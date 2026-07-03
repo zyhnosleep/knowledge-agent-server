@@ -285,7 +285,7 @@ class QueryService:
         contexts = self._build_rag_contexts(question, project.id, paper_matches)
         if not contexts and paper_matches:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
-            if not locked_document_ids:
+            if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
         if not contexts:
             # Try wiki search as fallback
@@ -415,7 +415,7 @@ class QueryService:
         contexts = self._build_rag_contexts(question, project.id, paper_matches)
         if not contexts:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
-            if not locked_document_ids:
+            if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
         if not contexts:
             answer_payload = self._draft_answer(question, None, [])
@@ -657,7 +657,15 @@ class QueryService:
         locked_document_ids = self._locked_document_ids(question, paper_matches)
         document_ids = locked_document_ids or [match.document.id for match in paper_matches]
         profile_terms = self._paper_profile_retrieval_terms(paper_matches)
+        is_overview = QueryService._is_document_overview_query(question)
+        overview_document_ids = self._overview_document_ids(question, project_id, paper_matches) if is_overview else None
         contexts: list[RetrievedContext] = []
+        if overview_document_ids:
+            contexts.extend(
+                self._search_document_overview_contexts(question, project_id, overview_document_ids, limit=MAX_CONTEXTS)
+            )
+            if contexts:
+                return self._finalize_contexts(contexts)
         if self._is_table_query(question) or self._is_metric_query(question):
             table_contexts = self._search_document_table_contexts(question, project_id, document_ids, limit=MAX_CONTEXTS)
             if not table_contexts and document_ids and not locked_document_ids:
@@ -670,7 +678,7 @@ class QueryService:
             if not figure_contexts and document_ids and not locked_document_ids:
                 figure_contexts = self._search_document_figure_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(figure_contexts)
-        if document_ids:
+        if document_ids and not is_overview:
             if self._is_scientific_evidence_query(question) and not (
                 self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
             ):
@@ -689,7 +697,7 @@ class QueryService:
                     limit=4 if self._is_scientific_evidence_query(question) else 2,
                 )
             )
-        if not contexts and not document_ids:
+        if not contexts and not document_ids and not is_overview:
             contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
         return self._finalize_contexts(contexts)
 
@@ -704,6 +712,41 @@ class QueryService:
         if len(exact) == 1:
             return exact
         return []
+
+    def _single_ready_document_id(self, project_id: str) -> list[str] | None:
+        """Return the only ready document in a project, or None if not exactly one."""
+        rows = self.db.scalars(
+            select(Document).where(
+                Document.project_id == project_id,
+                Document.status == DocumentStatus.ready.value,
+            )
+        ).all()
+        if len(rows) == 1:
+            return [rows[0].id]
+        return None
+
+    def _overview_document_ids(
+        self,
+        question: str,
+        project_id: str,
+        paper_matches: list[PaperMatch],
+    ) -> list[str] | None:
+        """Resolve target document IDs for a document-overview query.
+
+        Only returns a target when safe: an exact/locked paper match already
+        selected a document, or the project contains exactly one ready
+        document. Otherwise returns None so overview retrieval does not
+        silently mix or pick an arbitrary document.
+        """
+        if not QueryService._is_document_overview_query(question):
+            return None
+        locked = self._locked_document_ids(question, paper_matches)
+        if locked:
+            return locked
+        exact = [match.document.id for match in paper_matches if match.exact_alias]
+        if len(exact) == 1:
+            return exact
+        return self._single_ready_document_id(project_id)
 
     @staticmethod
     def _question_has_exact_alias(question: str, aliases: list[str]) -> bool:
@@ -919,6 +962,97 @@ class QueryService:
                     evidence_kind="intro",
                 )
             )
+        return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
+
+    def _search_document_overview_contexts(
+        self,
+        question: str,
+        project_id: str,
+        document_ids: list[str],
+        limit: int = 5,
+    ) -> list[RetrievedContext]:
+        """Retrieve substantive overview chunks for a single target document.
+
+        Selects abstract/introduction, method, and conclusion chunks while
+        dropping heading-only fragments such as "Conclusion" or "Related Work".
+        """
+        if not document_ids:
+            return []
+        chunks = self.db.scalars(
+            select(DocumentChunk)
+            .join(DocumentChunk.document)
+            .where(
+                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                DocumentChunk.document_id.in_(document_ids),
+            )
+            .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
+        ).all()
+        source_page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk in chunks}),
+        )
+        contexts: list[RetrievedContext] = []
+        for chunk in chunks:
+            if QueryService._is_heading_only_text(chunk.text):
+                continue
+            evidence = chunk.text.strip()
+            score = 35.0 + min(len(evidence) / 200.0, 8.0)
+            excerpt = evidence[:900]
+            contexts.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=chunk.document_id,
+                        chunk_id=chunk.id,
+                        **source_page_fields.get(chunk.document_id, {}),
+                        score=score,
+                        page_label=chunk.page_label,
+                        excerpt=excerpt,
+                    ),
+                    prompt_text=evidence[:1600],
+                    score=score,
+                    evidence_kind="overview",
+                )
+            )
+        # Prefer early (intro/abstract) and late (conclusion) chunks, plus a
+        # middle method chunk, so the summary is representative.
+        document_chunks: dict[str, list[DocumentChunk]] = {}
+        for chunk in chunks:
+            if QueryService._is_heading_only_text(chunk.text):
+                continue
+            document_chunks.setdefault(chunk.document_id, []).append(chunk)
+        prioritized: list[RetrievedContext] = []
+        for doc_id, doc_chunks in document_chunks.items():
+            if not doc_chunks:
+                continue
+            intro = doc_chunks[:2]
+            conclusion = doc_chunks[-2:]
+            middle_start = len(doc_chunks) // 3
+            middle_end = min(middle_start + 2, len(doc_chunks) * 2 // 3)
+            method = doc_chunks[middle_start:middle_end]
+            picked_ids = list(dict.fromkeys([chunk.id for chunk in intro + method + conclusion]))
+            by_id = {context.citation.chunk_id: context for context in contexts}
+            for chunk_id in picked_ids:
+                context = by_id.get(chunk_id)
+                if context is not None and context not in prioritized:
+                    # Boost representative positions without changing the
+                    # filtered-out heading logic.
+                    bonus = 0.0
+                    if chunk_id in {chunk.id for chunk in intro}:
+                        bonus = 8.0
+                    elif chunk_id in {chunk.id for chunk in conclusion}:
+                        bonus = 6.0
+                    elif chunk_id in {chunk.id for chunk in method}:
+                        bonus = 3.0
+                    prioritized.append(
+                        RetrievedContext(
+                            citation=context.citation.model_copy(update={"score": context.score + bonus}),
+                            prompt_text=context.prompt_text,
+                            score=context.score + bonus,
+                            evidence_kind=context.evidence_kind,
+                        )
+                    )
+        if prioritized:
+            return sorted(prioritized, key=lambda item: item.score, reverse=True)[:limit]
         return sorted(contexts, key=lambda item: item.score, reverse=True)[:limit]
 
     @staticmethod
@@ -4586,6 +4720,68 @@ class QueryService:
             )
             or pka_metric
         )
+
+    @staticmethod
+    def _is_document_overview_query(question: str) -> bool:
+        """Detect generic document-overview questions with no specific facet.
+
+        These questions ask what a paper/article is about but do not name a
+        table, figure, metric, or scientific entity. They are matched against
+        substantive overview chunks only when a single document can be safely
+        identified (exact/locked match or exactly one ready document).
+        """
+        lowered = question.lower()
+        chinese_overview = bool(
+            re.search(r"\u8fd9\u7bc7.{0,6}(?:\u6587\u7ae0|\u8bba\u6587|\u6587\u732e)", question)
+            or re.search(r"(?:\u603b\u7ed3|\u6982\u62ec|\u7b80\u8ff0|\u6982\u8ff0|\u4ecb\u7ecd|\u5927\u610f|\u4e3b\u65e8|\u4e3b\u9898)", question)
+            or re.search(r"(?:\u8bb2|\u8bf4|\u8c08|\u5199).{0,2}\u4e86?\u4ec0\u4e48", question)
+        )
+        english_overview = bool(
+            re.search(r"\bsummarize\b", lowered)
+            or re.search(r"\boverview\b", lowered)
+            or re.search(r"\bwhat\s+is\s+(?:this|the)\s+(?:paper|article|document)\s+about\b", lowered)
+            or re.search(r"\bwhat\s+does\s+(?:this|the)\s+(?:paper|article|document)\s+(?:discuss|cover|talk\s+about)\b", lowered)
+            or re.search(r"\bmain\s+(?:content|points?|idea|contribution)", lowered)
+        )
+        if not (chinese_overview or english_overview):
+            return False
+        # Exclude queries that already have a more specific routing path.
+        if (
+            QueryService._is_table_query(question)
+            or QueryService._is_metric_query(question)
+            or QueryService._is_figure_query(question)
+            or QueryService._is_scientific_evidence_query(question)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _is_heading_only_text(text: str) -> bool:
+        """Return True when a chunk text is just a section heading or label."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        non_heading_lines = [
+            line.strip()
+            for line in stripped.splitlines()
+            if line.strip() and not re.match(r"^#+\s+", line.strip())
+        ]
+        substantive = "\n".join(non_heading_lines).strip()
+        cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", substantive))
+        if substantive and len(substantive) >= 50 and (len(substantive.split()) >= 8 or cjk_chars >= 20):
+            return False
+        if len(stripped) < 50:
+            return True
+        words = stripped.split()
+        if len(words) < 8:
+            return True
+        if re.fullmatch(
+            r"(?:abstract|introduction|conclusion|related work|methods?|methodology|results?|discussion|references?|acknowledgements?|appendix)(?:\s+\d+)?\s*",
+            stripped,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
 
     @staticmethod
     def _extract_figure_blocks(markdown: str) -> list[str]:

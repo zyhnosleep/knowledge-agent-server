@@ -6294,3 +6294,411 @@ def test_insufficient_evidence_answer_without_terms() -> None:
     answer = QueryService._insufficient_evidence_answer(None)
     assert "Insufficient Evidence" in answer
     assert "upload" in answer.lower() or "relevant" in answer.lower()
+
+
+def test_overview_query_single_document_retrieves_substantive_chunks() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Sample Paper",
+        file_name="sample.pdf",
+        sha256="abc",
+        raw_path="raw/sample.pdf",
+        raw_text="Sample paper text.",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-intro",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="This paper proposes a novel method for improving force field accuracy using neural networks.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-heading",
+            document_id="d1",
+            ordinal=1,
+            page_label="1",
+            text="Related Work",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-method",
+            document_id="d1",
+            ordinal=2,
+            page_label="2",
+            text="We train the model on a large dataset of quantum mechanical calculations and evaluate on benchmark sets.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-conclusion-heading",
+            document_id="d1",
+            ordinal=5,
+            page_label="5",
+            text="Conclusion",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-conclusion-text",
+            document_id="d1",
+            ordinal=6,
+            page_label="5",
+            text="The results demonstrate significant improvements over baseline methods and suggest future directions.",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_rag_contexts("这篇文章讲了什么", "p1", [])
+
+    assert contexts
+    chunk_ids = {context.citation.chunk_id for context in contexts}
+    assert "c-heading" not in chunk_ids
+    assert "c-conclusion-heading" not in chunk_ids
+    assert "c-intro" in chunk_ids
+    assert "c-method" in chunk_ids or "c-conclusion-text" in chunk_ids
+    assert all(context.evidence_kind == "overview" for context in contexts)
+
+
+def test_overview_query_english_single_document_retrieves_substantive_chunks() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Sample Paper",
+        file_name="sample.pdf",
+        sha256="abc",
+        raw_path="raw/sample.pdf",
+        raw_text="Sample paper text.",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-abstract",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="We present a new approach to protein force field parameterization that reduces errors by 30 percent.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-intro",
+            document_id="d1",
+            ordinal=1,
+            page_label="1",
+            text="Previous force fields relied on hand-tuned parameters, which limited transferability across chemistries.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-method",
+            document_id="d1",
+            ordinal=3,
+            page_label="2",
+            text="Our method uses automated optimization against quantum mechanical and experimental observables.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-results",
+            document_id="d1",
+            ordinal=4,
+            page_label="3",
+            text="Benchmarks show consistent improvement across diverse test sets including proteins and small molecules.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-conclusion",
+            document_id="d1",
+            ordinal=6,
+            page_label="4",
+            text="The automated framework provides a scalable path toward next-generation force fields.",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_rag_contexts("summarize this paper", "p1", [])
+
+    assert contexts
+    assert all(len(context.citation.excerpt) >= 50 for context in contexts)
+    assert any("30 percent" in context.citation.excerpt for context in contexts)
+    assert any("automated" in context.citation.excerpt for context in contexts)
+    assert all(context.evidence_kind == "overview" for context in contexts)
+
+
+def test_overview_query_keeps_markdown_heading_with_substantive_body() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Markdown Paper",
+        file_name="markdown.pdf",
+        sha256="abc",
+        raw_path="raw/markdown.pdf",
+        raw_text="Markdown paper text.",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-heading-only",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="### Introduction",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-heading-body",
+            document_id="d1",
+            ordinal=1,
+            page_label="1",
+            text=(
+                "### Introduction\n\n"
+                "Black-box distillation creates student large language models by learning from a proprietary "
+                "teacher model's text outputs, and this paper introduces an adversarial on-policy training loop."
+            ),
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts("这篇论文讲了什么", "p1", [])
+
+    chunk_ids = {context.citation.chunk_id for context in contexts}
+    assert "c-heading-only" not in chunk_ids
+    assert "c-heading-body" in chunk_ids
+    assert any("Black-box distillation" in context.citation.excerpt for context in contexts)
+
+
+def test_overview_query_keeps_chinese_body_without_spaces() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Chinese Paper",
+        file_name="chinese.pdf",
+        sha256="abc",
+        raw_path="raw/chinese.pdf",
+        raw_text="Chinese paper text.",
+        status="ready",
+    )
+    chunk = DocumentChunk(
+        id="c-cn",
+        document_id="d1",
+        ordinal=0,
+        page_label="1",
+        text="本文提出一种面向科研文献问答的检索增强方法，通过限定专题内的单篇文档证据来避免其他知识污染，并优先使用摘要、引言和结论中的正文内容。",
+        embedding=None,
+    )
+    db.add_all([project, document, chunk])
+    db.commit()
+
+    contexts = QueryService(db)._build_rag_contexts("这篇文章讲了什么", "p1", [])
+
+    assert contexts
+    assert contexts[0].citation.chunk_id == "c-cn"
+    assert "避免其他知识污染" in contexts[0].citation.excerpt
+
+
+def test_overview_query_multi_document_without_lock_does_not_mix_documents() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc1 = Document(
+        id="d1",
+        project_id="p1",
+        title="Paper One",
+        file_name="one.pdf",
+        sha256="one",
+        raw_path="raw/one.pdf",
+        raw_text="one",
+        status="ready",
+    )
+    doc2 = Document(
+        id="d2",
+        project_id="p1",
+        title="Paper Two",
+        file_name="two.pdf",
+        sha256="two",
+        raw_path="raw/two.pdf",
+        raw_text="two",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c1",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="Paper one introduces a method for improving accuracy.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c2",
+            document_id="d2",
+            ordinal=0,
+            page_label="1",
+            text="Paper two studies a different problem in detail.",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, doc1, doc2, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    contexts = service._build_rag_contexts("这篇文章讲了什么", "p1", [])
+
+    assert contexts == []
+
+
+def test_overview_query_locked_document_uses_target_document() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc1 = Document(
+        id="d1",
+        project_id="p1",
+        title="Target Paper",
+        file_name="target.pdf",
+        sha256="target",
+        raw_path="raw/target.pdf",
+        raw_text="target",
+        status="ready",
+    )
+    doc2 = Document(
+        id="d2",
+        project_id="p1",
+        title="Other Paper",
+        file_name="other.pdf",
+        sha256="other",
+        raw_path="raw/other.pdf",
+        raw_text="other",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-target",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="Target paper presents the main algorithm and validation results.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-other",
+            document_id="d2",
+            ordinal=0,
+            page_label="1",
+            text="Other paper discusses unrelated background material.",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, doc1, doc2, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    matches = [PaperMatch(document=doc1, score=20.0, exact_alias=True, locked=True)]
+    contexts = service._build_rag_contexts("Target Paper 讲了什么", "p1", matches)
+
+    assert contexts
+    assert all(context.citation.document_id == "d1" for context in contexts)
+    assert any("Target paper" in context.citation.excerpt for context in contexts)
+    assert all(context.evidence_kind == "overview" for context in contexts)
+
+
+def test_retrieve_evidence_overview_query_returns_substantive_chunks() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Sample",
+        file_name="sample.pdf",
+        sha256="abc",
+        raw_path="raw/sample.pdf",
+        raw_text="sample",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-abstract",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="We introduce a neural network approach to force field development.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-heading",
+            document_id="d1",
+            ordinal=1,
+            page_label="1",
+            text="Methods",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    pack = service.retrieve_evidence("demo", "What is this paper about?")
+
+    assert pack.status == "ok"
+    assert len(pack.items) > 0
+    assert all(item.evidence_kind == "overview" for item in pack.items)
+    assert all(item.excerpt != "Methods" for item in pack.items)
+
+
+def test_answer_overview_query_prompt_uses_substantive_chunks() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Sample",
+        file_name="sample.pdf",
+        sha256="abc",
+        raw_path="raw/sample.pdf",
+        raw_text="sample",
+        status="ready",
+    )
+    chunks = [
+        DocumentChunk(
+            id="c-abstract",
+            document_id="d1",
+            ordinal=0,
+            page_label="1",
+            text="We introduce a neural network approach to force field development.",
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="c-heading",
+            document_id="d1",
+            ordinal=1,
+            page_label="1",
+            text="Methods",
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+    response = service.answer("demo", "What is this paper about?", save_answer=False)
+
+    assert response.citations
+    assert all(citation.document_id == "d1" for citation in response.citations)
+    assert "neural network" in fake_ollama.last_prompt.lower()
+    assert "Methods" not in fake_ollama.last_prompt
