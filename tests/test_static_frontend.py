@@ -80,3 +80,100 @@ def test_upload_refreshes_project_list_after_new_topic() -> None:
     assert "projects.unshift" in html
     assert "Failed to refresh projects after upload" in html
     assert "return loadProjects().catch" in html
+
+
+# New coverage for the dark-themed chat redesign.
+
+
+def test_dark_theme_colors_present() -> None:
+    html = _html()
+    assert "#0b0f17" in html or "#111827" in html
+
+
+def test_session_list_is_in_sidebar_not_chat_page() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    sidebar = soup.select_one(".sidebar")
+    assert sidebar is not None
+    assert sidebar.select_one("#sessionList") is not None
+    chat_view = soup.select_one('[data-view="chat"]')
+    assert chat_view is not None
+    assert chat_view.select_one("#sessionList") is None
+
+
+def test_chat_page_has_wide_central_surface_and_composer() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    chat_view = soup.select_one('[data-view="chat"]')
+    assert chat_view is not None
+    assert chat_view.select_one(".chat-surface") is not None
+    assert chat_view.select_one(".composer") is not None
+    assert chat_view.select_one(".recents") is None
+    assert "height: calc(100dvh - 64px)" in html
+    assert "overflow: hidden" in html
+    assert "min-height: 150px" in html
+    assert "min-height: 94px" in html
+    assert "overflow-wrap: break-word" in html
+
+
+def test_composer_hint_text() -> None:
+    html = _html()
+    assert "问点难的，让我多想一步" in html
+
+
+def test_attachment_upload_and_delete_endpoints_referenced() -> None:
+    html = _html()
+    assert "/api/agent/sessions/" in html
+    assert "/attachments?project_slug=" in html
+    assert "/attachments/" in html
+    assert "attachment_id" in html
+
+
+def test_plus_button_opens_hidden_file_input() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.select_one("#attachmentButton") is not None
+    file_input = soup.select_one("#attachmentInput")
+    assert file_input is not None
+    assert file_input.get("type") == "file"
+    assert file_input.get("multiple") is not None
+    assert file_input.get("hidden") is not None
+    assert "files.forEach(uploadAttachment)" in html
+
+
+def test_enter_sends_and_shift_enter_newline_and_ime_safe() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    question_input = soup.select_one("#questionInput")
+    assert question_input is not None
+    assert question_input.get("aria-label") == "输入问题"
+    assert 'event.key === "Enter"' in html
+    assert "!event.shiftKey" in html
+    assert "!event.isComposing" in html
+
+
+def test_thinking_steps_ui_referenced() -> None:
+    html = _html()
+    assert "thinkingFeed" in html
+    assert "appendThinking" in html
+    assert "clearThinking" in html
+    assert "thinking-step" in html
+    assert "Array.isArray(data.steps)" in html
+
+
+def test_start_new_chat_clears_state() -> None:
+    html = _html()
+    assert "function startNewChat" in html
+    assert "activeSessionId = null" in html
+    assert "activeAttachments = []" in html
+    assert "clearThinking" in html
+    assert "renderAttachments" in html
+
+
+def test_select_session_loads_turns_and_attachments() -> None:
+    html = _html()
+    assert '/turns?project_slug=" + encodeURIComponent(activeProjectSlug)' in html
+    assert "/attachments?project_slug=" in html
+    assert "function loadSessionAttachments" in html
+    assert "loadSessionAttachments()" in html
+    assert "function selectSession" in html

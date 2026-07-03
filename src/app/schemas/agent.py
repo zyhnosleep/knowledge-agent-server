@@ -206,3 +206,38 @@ class AgentTurnRead(BaseModel):
     tool_result: str | None = None
     step_type: str | None = None
     created_at: str
+
+
+class AttachmentChunkRead(BaseModel):
+    """A single chunk from a session-scoped temporary attachment."""
+
+    id: str
+    ordinal: int
+    heading: str | None = None
+    page_label: str | None = None
+    text: str
+    token_estimate: int
+
+
+class AttachmentRead(BaseModel):
+    """Summary of a session-scoped temporary attachment."""
+
+    id: str
+    session_id: str
+    project_slug: str
+    file_name: str
+    title: str | None = None
+    sha256: str
+    byte_size: int
+    status: str
+    chunk_count: int
+    created_at: str
+    updated_at: str
+
+
+class AttachmentUploadResponse(BaseModel):
+    """Response body for POST /api/agent/sessions/{id}/attachments."""
+
+    attachment: AttachmentRead
+    chunks: list[AttachmentChunkRead]
+    message: str = "Attachment stored for this session."

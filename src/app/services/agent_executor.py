@@ -24,6 +24,7 @@ from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
 from app.services.rag_adapter import RAGAdapter, _INSUFFICIENT_EVIDENCE_RE
+from app.services.session_attachments import retrieve_session_attachment_evidence
 from app.services.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -261,6 +262,19 @@ class AgentExecutor:
                 session_id,
             )
 
+            # ---- session-scoped temporary attachments ----
+            session_attachment_pack = self._run_retrieve_session_attachments(
+                request.project_slug,
+                request.query,
+                constraints,
+                steps,
+                usage,
+                session_id,
+            )
+            evidence_pack = self._merge_evidence_pack(
+                evidence_pack, session_attachment_pack, max_items=15
+            )
+
             answer_text, citations, tool_calls_used = self._run_rag_answer(
                 request.project_slug,
                 request.query,
@@ -270,12 +284,22 @@ class AgentExecutor:
                 session_id,
             )
             tool_calls = tool_calls_used
+            attachment_citations = self._session_attachment_citations(evidence_pack)
+            if attachment_citations:
+                citations = self._merge_citations(citations, attachment_citations)
 
             # ---- detect insufficient evidence ----
             _evidence_insufficient = bool(
                 answer_text and _INSUFFICIENT_EVIDENCE_RE.search(answer_text)
             )
-            if _evidence_insufficient:
+            if attachment_citations and (_evidence_insufficient or not answer_text.strip()):
+                answer_text = self._draft_session_attachment_answer(
+                    request.query, attachment_citations
+                )
+                warnings.append(
+                    "Answered from temporary attachments scoped to this session."
+                )
+            elif _evidence_insufficient:
                 warnings.append(
                     "Insufficient evidence — retrieved documents do not contain "
                     "information relevant to the query terms. Consider uploading "
@@ -1032,6 +1056,181 @@ class AgentExecutor:
             return "\n".join(parts[-6:])  # last 6 turns max
         except Exception:
             return ""
+
+    def _run_retrieve_session_attachments(
+        self,
+        project_slug: str,
+        question: str,
+        constraints: AgentConstraints,
+        steps: list[AgentStep],
+        usage: AgentUsage,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """Retrieve evidence from session-scoped temporary attachments.
+
+        Returns a dict evidence pack or None when limits are hit. Adds a
+        visible ``retrieve`` step so the trace shows the attachment lookup.
+        """
+        if usage.tool_calls >= constraints.max_tool_calls:
+            return None
+        if len(steps) >= constraints.max_steps:
+            return None
+
+        t0 = time.monotonic()
+        pack = retrieve_session_attachment_evidence(
+            self._db, project_slug, session_id, question, limit=5
+        )
+        latency = int((time.monotonic() - t0) * 1000)
+
+        item_count = len(pack.items)
+        if item_count == 0:
+            # No attachments for this session; do not consume a step or tool call.
+            return None
+
+        usage.tool_calls += 1
+        step_id = len(steps)
+        step = AgentStep(
+            step_id=step_id,
+            step_type="retrieve",
+            summary=(
+                f"session_attachment.retrieve returned {item_count} item(s) "
+                f"for session {session_id}"
+            ),
+            latency_ms=latency,
+            tool_name="session_attachment.retrieve",
+            tool_ok=pack.status != "project_not_found",
+            metadata={
+                "status": pack.status,
+                "evidence_count": item_count,
+                "source_stages": ["session_attachment"],
+                "evidence_kinds": ["session_attachment"],
+            },
+        )
+        steps.append(step)
+        self._memory.add_turn(
+            session_id,
+            role="tool",
+            content=f"Retrieved {item_count} session attachment evidence item(s)",
+            tool_name="session_attachment.retrieve",
+            tool_args={"project_slug": project_slug, "question": question},
+            tool_result=str(item_count),
+            step_type="retrieve",
+        )
+        return pack.model_dump()
+
+    def _merge_evidence_pack(
+        self,
+        base_pack: dict[str, Any] | None,
+        session_pack: dict[str, Any] | None,
+        max_items: int = 15,
+    ) -> dict[str, Any]:
+        """Merge session attachment evidence into the base evidence pack.
+
+        Preserves base status semantics while appending attachment items and
+        renumbering indexes deterministically.
+        """
+        base = dict(base_pack) if base_pack else {"status": "empty", "items": []}
+        items = list(base.get("items", []))
+        if session_pack and session_pack.get("items"):
+            items.extend(session_pack["items"])
+        # Renumber indexes deterministically.
+        for idx, item in enumerate(items, start=1):
+            item["index"] = idx
+        # Cap total items to avoid overwhelming the synthesizer.
+        if len(items) > max_items:
+            items = items[:max_items]
+        # If either side found evidence, status is ok.
+        status = base.get("status", "empty")
+        if status in ("empty", None) and session_pack and session_pack.get("status") == "ok":
+            status = "ok"
+        if status == "project_not_found" and items:
+            status = "ok"
+        return {"status": status, "items": items}
+
+    @staticmethod
+    def _session_attachment_citations(
+        evidence_pack: dict[str, Any] | None,
+    ) -> list[Citation]:
+        """Convert session attachment evidence items into normal citations."""
+        if not evidence_pack or not evidence_pack.get("items"):
+            return []
+        citations: list[Citation] = []
+        for item in evidence_pack["items"]:
+            if item.get("source_stage") != "session_attachment":
+                continue
+            excerpt = str(item.get("excerpt") or "").strip()
+            if not excerpt:
+                continue
+            citations.append(
+                Citation(
+                    document_id=item.get("document_id"),
+                    chunk_id=item.get("chunk_id"),
+                    page_slug=item.get("page_slug"),
+                    page_title=item.get("page_title"),
+                    page_kind=item.get("page_kind") or "session_attachment",
+                    score=float(item.get("score") or 0.0),
+                    page_label=item.get("page_label"),
+                    excerpt=excerpt,
+                )
+            )
+        return citations
+
+    @staticmethod
+    def _merge_citations(
+        base_citations: list[Citation],
+        attachment_citations: list[Citation],
+    ) -> list[Citation]:
+        """Append attachment citations without duplicating identical chunks."""
+        merged = list(base_citations)
+        seen = {
+            (
+                c.page_kind,
+                c.document_id,
+                c.chunk_id,
+                c.page_title,
+                c.excerpt,
+            )
+            for c in merged
+        }
+        for citation in attachment_citations:
+            key = (
+                citation.page_kind,
+                citation.document_id,
+                citation.chunk_id,
+                citation.page_title,
+                citation.excerpt,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(citation)
+        return merged
+
+    @staticmethod
+    def _draft_session_attachment_answer(
+        question: str,
+        citations: list[Citation],
+        max_items: int = 3,
+    ) -> str:
+        """Build a deterministic extractive answer from session-only files."""
+        if not citations:
+            return ""
+        lines = [
+            "根据当前对话临时文件，我先从原文中定位到这些相关内容：",
+            "",
+        ]
+        for idx, citation in enumerate(citations[:max_items], start=1):
+            title = citation.page_title or citation.document_id or "临时文件"
+            excerpt = " ".join(citation.excerpt.split())
+            if len(excerpt) > 700:
+                excerpt = excerpt[:700].rstrip() + "..."
+            lines.append(f"{idx}. **{title}**：{excerpt}")
+        if len(citations) > max_items:
+            lines.append(f"\n还有 {len(citations) - max_items} 段相关原文未展开。")
+        lines.append(
+            "\n以上只使用当前对话的临时附件，不会引用其他专题或会话里的文档。"
+        )
+        return "\n".join(lines)
 
 
 def _estimate_tokens(text: str) -> int:

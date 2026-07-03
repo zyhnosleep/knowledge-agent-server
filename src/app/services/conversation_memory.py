@@ -195,10 +195,12 @@ class ConversationMemory:
         self._db.flush()
 
     def purge_expired_sessions(self) -> int:
-        """Delete expired sessions and their conversation turns.
+        """Delete expired sessions and their conversation turns and attachments.
 
         Returns the number of sessions deleted.
         """
+        from app.services.session_attachments import delete_attachments_for_session
+
         now = datetime.utcnow()
         # Find expired session ids
         result = self._db.execute(
@@ -209,11 +211,12 @@ class ConversationMemory:
         if not expired_ids:
             return 0
 
-        # Delete turns and sessions one-by-one for SQLite compatibility.
+        # Delete turns, attachments, and sessions one-by-one for SQLite compatibility.
         # SQLAlchemy text() does not expand tuples for IN clauses on
         # SQLite, so a batch DELETE WHERE id IN :ids is not portable.
         count = 0
         for sid in expired_ids:
+            delete_attachments_for_session(self._db, sid)
             self._db.execute(
                 text("DELETE FROM conversation_turns WHERE session_id = :sid"),
                 {"sid": sid},

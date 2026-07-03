@@ -5,20 +5,37 @@ import json
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.records import ConversationSession
-from app.schemas.agent import AgentConstraints, AgentQueryRequest, AgentQueryResponse, AgentSessionRead, AgentTurnRead
+from app.models.records import ConversationSession, SessionAttachment, SessionAttachmentChunk
+from app.schemas.agent import (
+    AgentConstraints,
+    AgentQueryRequest,
+    AgentQueryResponse,
+    AgentSessionRead,
+    AgentTurnRead,
+    AttachmentChunkRead,
+    AttachmentRead,
+    AttachmentUploadResponse,
+)
 from app.services.agent_executor import AgentExecutor
 from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
+from app.services.filesystem import InvalidStoragePathError, UploadTooLargeError
 from app.services.rag_adapter import RAGAdapter
+from app.services.repositories import get_or_create_project
+from app.services.session_attachments import (
+    delete_session_attachment,
+    get_session_attachment,
+    list_session_attachments,
+    save_session_attachment,
+)
 from app.services.tool_registry import ToolRegistry
 
 agent_router = APIRouter()
@@ -388,3 +405,146 @@ def _build_final_event(response: AgentQueryResponse) -> dict:
         "step_summary": step_summary,
     })
     return final_data
+
+
+# ------------------------------------------------------------------
+# Session-scoped temporary attachments
+# ------------------------------------------------------------------
+
+
+def _ensure_session_for_attachments(
+    db: Session, session_id: str, project_slug: str
+) -> ConversationSession:
+    """Return existing session or create/touch one for the given project_slug.
+
+    Raises HTTPException when an existing session belongs to a different project.
+    """
+    existing = db.get(ConversationSession, session_id)
+    if existing is not None and existing.project_slug != project_slug:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Session {session_id} belongs to project {existing.project_slug}; "
+                f"cannot be used for project {project_slug}."
+            ),
+        )
+    memory = ConversationMemory(db)
+    memory.touch_session(
+        session_id,
+        project_slug=project_slug,
+        ttl_days=settings.agent_conversation_ttl_days,
+    )
+    db.flush()
+    return db.get(ConversationSession, session_id)
+
+
+def _assert_session_project_match(
+    db: Session, session_id: str, project_slug: str
+) -> None:
+    """Raise 404 if the session does not exist or belongs to a different project."""
+    session = db.get(ConversationSession, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session.project_slug != project_slug:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+
+def _attachment_to_read(attachment: SessionAttachment) -> AttachmentRead:
+    return AttachmentRead(
+        id=attachment.id,
+        session_id=attachment.session_id,
+        project_slug=attachment.session.project_slug,
+        file_name=attachment.file_name,
+        title=attachment.title,
+        sha256=attachment.sha256,
+        byte_size=attachment.byte_size,
+        status=attachment.status,
+        chunk_count=len(attachment.chunks),
+        created_at=(attachment.created_at.isoformat() if attachment.created_at else ""),
+        updated_at=(attachment.updated_at.isoformat() if attachment.updated_at else ""),
+    )
+
+
+def _chunk_to_read(chunk: SessionAttachmentChunk) -> AttachmentChunkRead:
+    return AttachmentChunkRead(
+        id=chunk.id,
+        ordinal=chunk.ordinal,
+        heading=chunk.heading,
+        page_label=chunk.page_label,
+        text=chunk.text,
+        token_estimate=chunk.token_estimate,
+    )
+
+
+@agent_router.post("/sessions/{session_id}/attachments", response_model=AttachmentUploadResponse)
+async def upload_session_attachment(
+    session_id: str,
+    project_slug: str = Query(..., description="Project slug that owns the session"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> AttachmentUploadResponse:
+    """Upload a temporary attachment scoped to an Agent conversation session.
+
+    Creates/touches the session for the provided project_slug if missing so the
+    frontend can attach files before the first message is sent. The uploaded
+    file is parsed into chunks and stored in session attachment tables; no
+    Project Document row is created.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File name is required.")
+
+    project = get_or_create_project(db, project_slug, project_slug)
+    _ensure_session_for_attachments(db, session_id, project_slug)
+
+    try:
+        attachment, chunks = await save_session_attachment(
+            db,
+            project_id=project.id,
+            project_slug=project_slug,
+            session_id=session_id,
+            upload=file,
+        )
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except InvalidStoragePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to save session attachment")
+        raise HTTPException(status_code=500, detail=f"Failed to process attachment: {exc}") from exc
+
+    db.commit()
+    db.refresh(attachment)
+    return AttachmentUploadResponse(
+        attachment=_attachment_to_read(attachment),
+        chunks=[_chunk_to_read(c) for c in chunks],
+    )
+
+
+@agent_router.get("/sessions/{session_id}/attachments", response_model=list[AttachmentRead])
+def list_session_attachments_route(
+    session_id: str,
+    project_slug: str = Query(..., description="Project slug that owns the session"),
+    db: Session = Depends(get_db),
+) -> list[AttachmentRead]:
+    """List temporary attachment summaries for the session/project."""
+    _assert_session_project_match(db, session_id, project_slug)
+    attachments = list_session_attachments(db, session_id, project_slug=project_slug)
+    return [_attachment_to_read(a) for a in attachments]
+
+
+@agent_router.delete("/sessions/{session_id}/attachments/{attachment_id}")
+def delete_session_attachment_route(
+    session_id: str,
+    attachment_id: str,
+    project_slug: str = Query(..., description="Project slug that owns the session"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Delete a session attachment and its chunks, plus best-effort stored file."""
+    _assert_session_project_match(db, session_id, project_slug)
+    attachment = get_session_attachment(db, attachment_id)
+    if attachment is None or attachment.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+
+    delete_session_attachment(db, attachment)
+    db.commit()
+    return {"deleted": True, "attachment_id": attachment_id}

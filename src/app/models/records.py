@@ -223,6 +223,39 @@ class ConversationSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    attachments: Mapped[list["SessionAttachment"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+
+
+class SessionAttachment(Base, TimestampMixin):
+    __tablename__ = "session_attachments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("conversation_sessions.id"), index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    storage_path: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    byte_size: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(40), default="ready")
+
+    session: Mapped["ConversationSession"] = relationship(back_populates="attachments")
+    chunks: Mapped[list["SessionAttachmentChunk"]] = relationship(back_populates="attachment", cascade="all, delete-orphan")
+
+
+class SessionAttachmentChunk(Base, TimestampMixin):
+    __tablename__ = "session_attachment_chunks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    attachment_id: Mapped[str] = mapped_column(ForeignKey("session_attachments.id"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    heading: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    page_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    text: Mapped[str] = mapped_column(Text)
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
+
+    attachment: Mapped["SessionAttachment"] = relationship(back_populates="chunks")
+
 
 class AgentTraceRun(Base):
     __tablename__ = "agent_trace_runs"
