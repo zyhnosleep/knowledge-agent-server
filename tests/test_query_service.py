@@ -507,6 +507,42 @@ def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
     assert response.citations[0].page_slug == "sources/two"
 
 
+def test_wiki_first_answer_appends_supported_evidence_anchors() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    wiki_page = WikiPage(
+        id="w1",
+        project_id="p1",
+        slug="sources/method-paper",
+        title="Method Paper",
+        kind="source_summary",
+        markdown_path="wiki/demo/sources/method-paper.md",
+        markdown_content=(
+            "# Method Paper\n\n"
+            "The evidence reports an ABCD validation signal, charge transfer, "
+            "and a -1.5 kcal/mol binding shift."
+        ),
+        source_document_ids=["d1"],
+        metadata_json={"verified_claim_count": 2, "key_terms": ["validation", "charge transfer"]},
+    )
+    db.add_all([project, wiki_page])
+    db.commit()
+
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(answer_markdown="The method is supported by validation evidence.", citations=[0], risk_level="normal")
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+
+    response = service._answer_wiki_first("demo", "How does the validation mechanism work?", save_answer=False)
+
+    assert "ABCD" in response.answer_markdown
+    assert "charge transfer" in response.answer_markdown
+    assert "-1.5 kcal/mol" in response.answer_markdown
+    assert "[0]" in response.answer_markdown
+    assert response.citations[0].page_slug == "sources/method-paper"
+
+
 def test_query_service_promotes_raw_chunk_citations_to_wiki_pages_when_source_evidence_not_requested() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -2067,6 +2103,130 @@ def test_supported_term_note_adds_scientific_synonym_atoms() -> None:
     assert "helix-coil" in answer
     assert "QM" in answer
     assert "hydration free energy" in answer
+
+
+def test_supported_term_note_adds_generic_evidence_anchors_with_citation_marker() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "The evidence compares an ABCD validation target, a -2.4 kcal/mol energy shift, "
+                    "charge transfer, and van der Waals contacts."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "How does the method explain the validation mechanism?",
+        "The method uses direct validation evidence.",
+        contexts,
+    )
+
+    assert "ABCD" in answer
+    assert "-2.4 kcal/mol" in answer
+    assert "charge transfer" in answer
+    assert "van der Waals" in answer
+    assert answer.rstrip().endswith("[0]")
+
+
+def test_supported_term_note_does_not_add_question_only_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt="The evidence discusses ABCD validation but does not mention the requested comparator.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "How does ABCD compare with XYZQ?",
+        "The answer discusses ABCD.",
+        contexts,
+    )
+
+    assert "ABCD" in answer
+    assert "XYZQ" not in answer
+
+
+def test_supported_term_note_scans_late_returned_contexts() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=20 - index,
+                excerpt=f"General validation evidence {index}.",
+            ),
+            prompt_text="",
+            score=20 - index,
+            evidence_kind="profile-term",
+        )
+        for index in range(MAX_CONTEXTS)
+    ]
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=1,
+                excerpt="A later returned source context reports WXYZ validation and van der Waals contacts.",
+            ),
+            prompt_text="",
+            score=1,
+            evidence_kind="profile-term",
+        )
+    )
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "How does the scientific validation mechanism work?",
+        "The answer discusses validation evidence.",
+        contexts,
+    )
+
+    assert "WXYZ" in answer
+    assert "van der Waals" in answer
+
+
+def test_supported_term_note_normalizes_ocr_spaced_mol_inverse_quantity() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/method-paper",
+                page_title="Method Paper",
+                page_kind="source_summary",
+                score=10,
+                excerpt="The fit reaches sub-kcal mol accuracy and stays below 0 . 5 kcal mol ^ { - 1 }.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "How accurate is the fitted scientific mechanism?",
+        "The answer says the fit is accurate.",
+        contexts,
+    )
+
+    assert "0.5 kcal/mol" in answer
 
 
 def test_ensure_valid_returned_citation_marker_appends_first_citation_when_missing() -> None:

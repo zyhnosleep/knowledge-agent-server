@@ -373,6 +373,12 @@ class QueryService:
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         answer_payload = self._repair_unsupported_numeric_answer(question, index_context, contexts, answer_payload, chosen_indexes)
         answer_payload = self._repair_missing_table_answer(question, index_context, contexts, answer_payload)
+        if self._should_append_supported_evidence_terms(question, contexts):
+            answer_payload.answer_markdown = self._append_missing_supported_question_terms(
+                question,
+                answer_payload.answer_markdown,
+                contexts,
+            )
         answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
@@ -453,7 +459,7 @@ class QueryService:
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         answer_payload = self._repair_unsupported_numeric_answer(question, None, contexts, answer_payload, chosen_indexes)
         answer_payload = self._repair_missing_table_answer(question, None, contexts, answer_payload)
-        if not (self._is_table_query(question) or self._is_metric_query(question)):
+        if self._should_append_supported_evidence_terms(question, contexts):
             answer_payload.answer_markdown = self._append_missing_supported_question_terms(
                 question,
                 answer_payload.answer_markdown,
@@ -1274,7 +1280,7 @@ class QueryService:
                     if "c6" in evidence_key and ("dispersion" in lowered_evidence or "coefficient" in lowered_evidence):
                         matched.append((label, 0))
                     continue
-                if len(label_key) >= 3 and label_key in evidence_key:
+                if len(label_key) >= 4 and label_key in evidence_key:
                     matched.append((label, 0))
             if not matched:
                 continue
@@ -1371,7 +1377,7 @@ class QueryService:
                     page_label=chunk.page_label,
                     excerpt=citation_excerpt,
                 ),
-                prompt_text=excerpt,
+                prompt_text=evidence,
                 score=score,
                 evidence_kind="profile-term",
             )
@@ -1508,7 +1514,7 @@ class QueryService:
                 label_key = cls._normalize_selector(label)
                 if label == "C6":
                     matched = "c6" in evidence_key and ("dispersion" in lowered_evidence or "coefficient" in lowered_evidence)
-                elif len(label_key) >= 3:
+                elif len(label_key) >= 4:
                     matched = label_key in evidence_key
             key = cls._normalize_selector(label)
             if matched and key and key not in seen:
@@ -3725,7 +3731,7 @@ class QueryService:
         acronyms: list[str] = []
         stopwords = {"AND", "THE", "FOR", "WITH", "FROM", "THIS", "THAT", "TABLE", "FIGURE", "PAGE"}
         pattern = re.compile(r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9]*(?:[-/][A-Z0-9]{2,})*|[A-Z]+[0-9]+[A-Z0-9]*(?:[-/][A-Z0-9]+)*)(?![A-Za-z0-9])")
-        for context in sorted(contexts, key=lambda item: getattr(item, "score", 0.0), reverse=True)[:5]:
+        for context in sorted(contexts, key=lambda item: getattr(item, "score", 0.0), reverse=True):
             for match in pattern.finditer(cls._context_evidence_text(context)):
                 value = match.group(0).strip("-/")
                 if value in stopwords or value.isdigit() or len(value) < 2:
@@ -3738,13 +3744,70 @@ class QueryService:
         return acronyms
 
     @classmethod
+    def _salient_evidence_quantities(cls, contexts: list[RetrievedContext], limit: int = 10) -> list[str]:
+        seen: set[str] = set()
+        quantities: list[str] = []
+        unit_pattern = (
+            r"%|"
+            r"k\s*T|"
+            r"kcal(?:\s*/\s*mol|\s+mol)?|"
+            r"kJ(?:\s*/\s*mol|\s+mol)?|"
+            r"K|"
+            r"milliseconds?|ms|ns|ps|"
+            r"angstroms?|Angstroms?|\u00c5"
+        )
+        pattern = re.compile(rf"(?<![\w.])[-+]?\d+(?:\.\d+)?\s*(?:{unit_pattern})(?!\w)", re.IGNORECASE)
+        for context in sorted(contexts, key=lambda item: getattr(item, "score", 0.0), reverse=True):
+            evidence_text = cls._normalize_spaced_scientific_quantities(cls._context_evidence_text(context))
+            for match in pattern.finditer(evidence_text):
+                value = re.sub(r"\s+", " ", match.group(0)).strip()
+                value = re.sub(r"\s*/\s*", "/", value)
+                value = re.sub(r"\bk\s*T\b", "kT", value, flags=re.IGNORECASE)
+                key = cls._normalize_selector(value)
+                if not key or key in seen:
+                    continue
+                quantities.append(value)
+                seen.add(key)
+                if len(quantities) >= limit:
+                    return quantities
+        return quantities
+
+    @staticmethod
+    def _normalize_spaced_scientific_quantities(text: str) -> str:
+        normalized = str(text or "")
+        normalized = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", normalized)
+        normalized = re.sub(
+            r"\b(kcal|kJ)\s+(?:\\mathrm\s*\{\s*)?m\s*o\s*l\s*(?:\}\s*)?\^\s*\{?\s*-\s*1\s*\}?",
+            r"\1/mol",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            r"\b(kcal|kJ)\s+mol(?:\s*\^\s*\{?\s*-\s*1\s*\}?)?",
+            r"\1/mol",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        return normalized
+
+    @classmethod
+    def _should_append_supported_evidence_terms(cls, question: str, contexts: list[RetrievedContext]) -> bool:
+        if not contexts or cls._is_table_query(question) or cls._is_metric_query(question):
+            return False
+        if cls._is_scientific_evidence_query(question) or cls._is_parameterization_anchor_query(question):
+            return True
+        if cls._scientific_identifier_selectors(question):
+            return True
+        return bool(cls._salient_evidence_quantities(contexts[:MAX_CONTEXTS], limit=1))
+
+    @classmethod
     def _append_missing_supported_question_terms(
         cls,
         question: str,
         answer_markdown: str,
         contexts: list[RetrievedContext],
     ) -> str:
-        term_contexts = contexts[:MAX_CONTEXTS]
+        term_contexts = contexts
         evidence_parts: list[str] = []
         for context in term_contexts:
             evidence_parts.append(cls._context_evidence_text(context))
@@ -3762,8 +3825,9 @@ class QueryService:
         candidate_terms = [
             *cls._scientific_identifier_selectors(question),
             *cls._citation_identity_terms(term_contexts),
-            *cls._scientific_anchor_terms(term_contexts, limit=24),
+            *cls._scientific_anchor_terms(term_contexts, limit=48),
             *cls._salient_evidence_acronyms(term_contexts, limit=10),
+            *cls._salient_evidence_quantities(term_contexts, limit=10),
             *cls._salient_evidence_phrases(term_contexts, limit=10),
         ]
         supported_translation_terms: set[str] = set()
@@ -3913,7 +3977,7 @@ class QueryService:
                 continue
             if term not in missing:
                 missing.append(term)
-            if len(missing) >= 24:
+            if len(missing) >= 48:
                 break
         if not missing:
             return answer_markdown
@@ -3921,6 +3985,8 @@ class QueryService:
             note = "证据中的关键术语还包括：" + "、".join(missing) + "。"
         else:
             note = "Key evidence terms also include: " + ", ".join(missing) + "."
+        if term_contexts and not re.search(r"\[(\d+)\]\s*$", note):
+            note += " [0]"
         separator = "\n\n" if answer_markdown.strip() else ""
         return answer_markdown.rstrip() + separator + note
 
