@@ -456,3 +456,84 @@ def test_document_title_prefers_metadata_title_over_hash_filename() -> None:
     )
     fallback = pipeline._resolve_document_title(parsed_no_human, hash_document)
     assert "Untitled" in fallback
+
+
+def test_list_runs_supports_project_slug_filter_and_enriched_fields() -> None:
+    db = make_session()
+    topic_a = Project(id="p1", slug="topic-a", name="Topic A")
+    topic_b = Project(id="p2", slug="topic-b", name="Topic B")
+    db.add_all([topic_a, topic_b])
+    for project in (topic_a, topic_b):
+        for index in range(2):
+            document = Document(
+                id=f"{project.id}-d{index}",
+                project_id=project.id,
+                title=f"{project.name} Doc {index}",
+                file_name=f"{project.slug}-{index}.pdf",
+                sha256=f"{project.id}-sha{index}",
+                raw_path=f"raw/{project.slug}-{index}.pdf",
+                status="ready",
+            )
+            db.add(document)
+            db.add(
+                PipelineRun(
+                    id=f"{project.id}-r{index}",
+                    project_id=project.id,
+                    document_id=document.id,
+                    status="completed",
+                    run_type="ingest",
+                    notes="done",
+                    provider_report={"progress": {"percent": 100, "stage": "completed", "message": "Done."}},
+                )
+            )
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/runs?project_slug=topic-a")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) == 2
+    for item in data:
+        assert item["project_slug"] == "topic-a"
+        assert item["project_title"] == "Topic A"
+        assert "document_title" in item
+        assert "file_name" in item
+        assert "status_label" in item
+        assert "progress" in item
+        assert item["progress"]["percent"] == 100
+        assert "provider_report" in item
+        assert item["action_available"] is True
+        assert "created_at" in item
+        assert "updated_at" in item
+        assert item["run_type"] == "ingest"
+
+    # Unknown project slug returns an empty list.
+    assert client.get("/api/runs?project_slug=unknown").json() == []
+
+    # Limit/offset validation and pagination still apply.
+    assert len(client.get("/api/runs?limit=1&offset=0").json()) == 1
+    assert len(client.get("/api/runs?limit=1&offset=1").json()) == 1
+    assert client.get("/api/runs?limit=201").status_code == 422
+
+
+def test_document_source_includes_project_identity() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo Project")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="Source Doc",
+        file_name="source.pdf",
+        sha256="sha1",
+        raw_path="raw/source.pdf",
+        status="ready",
+    )
+    db.add_all([project, document])
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/documents/d1/source")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project_slug"] == "demo"
+    assert payload["project_title"] == "Demo Project"

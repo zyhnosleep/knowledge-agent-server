@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -177,3 +178,78 @@ def test_select_session_loads_turns_and_attachments() -> None:
     assert "function loadSessionAttachments" in html
     assert "loadSessionAttachments()" in html
     assert "function selectSession" in html
+
+
+def test_topic_switch_clears_stale_session_and_attachments() -> None:
+    html = _html()
+    match = re.search(r"function setActiveProject\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "activeSessionId = null" in body
+    assert "activeAttachments = []" in body
+    assert "renderAttachments()" in body
+
+
+def test_enter_topic_chat_clears_session_and_attachments() -> None:
+    html = _html()
+    match = re.search(r"function enterTopicChat\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "activeSessionId = null" in body
+    assert "activeAttachments = []" in body
+
+
+def test_load_projects_clears_session_when_switching_topic() -> None:
+    html = _html()
+    match = re.search(
+        r"if \(projects\.length && !projects\.find\(.*?\}\)\) \{(.*?)\}",
+        html,
+        re.S,
+    )
+    assert match is not None
+    body = match.group(1)
+    assert "activeSessionId = null" in body
+    assert "activeAttachments = []" in body
+
+
+def test_touched_views_use_readable_chinese_strings() -> None:
+    html = _html()
+    labels = [
+        "运行追踪",
+        "原文回溯",
+        "暂无运行记录",
+        "暂无文档",
+        "正在读取原文",
+        "暂无可预览原文",
+        "上传文档",
+        "提交",
+        "新聊天",
+        "历史会话",
+        "输入问题",
+        "发送",
+        "添加临时文件",
+        "问点难的，让我多想一步",
+    ]
+    for label in labels:
+        assert label in html, f"Missing readable Chinese label: {label}"
+
+
+def test_no_common_mojibake_fragments_in_touched_labels() -> None:
+    html = _html()
+    mojibake_fragments = [
+        "Ã©",
+        "Ã¨",
+        "Ã ",
+        "Ã¢",
+        "Ã§",
+        "Ã¯",
+        "Ã¥",
+        "Ã¤",
+        "Ã¶",
+        "Ã¼",
+        "Ã±",
+        "Â",
+        "�",
+    ]
+    for fragment in mojibake_fragments:
+        assert fragment not in html, f"Found mojibake fragment {fragment!r}"

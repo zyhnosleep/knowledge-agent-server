@@ -1700,6 +1700,9 @@
         activeProjectSlug = slug;
         activeProjectName = name || slug;
         $("activeProjectLabel").textContent = activeProjectName;
+        activeSessionId = null;
+        activeAttachments = [];
+        renderAttachments();
         renderUploadTopicSelect();
         renderTopicCards();
         loadPipelineDashboard();
@@ -1718,6 +1721,8 @@
         activeProjectName = name || slug;
         $("activeProjectLabel").textContent = activeProjectName;
         activeSessionId = null;
+        activeAttachments = [];
+        renderAttachments();
         renderUploadTopicSelect();
         renderTopicCards();
         updateChatContextLabel();
@@ -1904,6 +1909,9 @@
           if (projects.length && !projects.find(function (p) { return p.slug === activeProjectSlug; })) {
             activeProjectSlug = projects[0].slug;
             activeProjectName = projects[0].name;
+            activeSessionId = null;
+            activeAttachments = [];
+            renderAttachments();
             $("activeProjectLabel").textContent = activeProjectName;
           }
           renderUploadTopicSelect();
@@ -2173,6 +2181,9 @@
         }
         activeProjectSlug = slug;
         activeProjectName = name;
+        activeSessionId = null;
+        activeAttachments = [];
+        renderAttachments();
         $("activeProjectLabel").textContent = name;
         var data = new FormData();
         data.append("file", file);

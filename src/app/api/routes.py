@@ -164,6 +164,7 @@ def _build_pipeline_run_item(run: PipelineRun | None, document: Document | None,
         "status_label": _status_label(status),
         "run_type": run.run_type if run is not None else None,
         "notes": run.notes if run is not None else None,
+        "provider_report": run.provider_report if run is not None else None,
         "progress": progress,
         "action_available": bool(document and status == "completed"),
         "created_at": created_at,
@@ -396,6 +397,8 @@ def get_document_source(document_id: str, db: Session = Depends(get_db)) -> dict
         "document_id": document.id,
         "document_title": document.title,
         "file_name": document.file_name,
+        "project_slug": document.project.slug if document.project is not None else None,
+        "project_title": document.project.name if document.project is not None else None,
         "status": document.status,
         "raw_preview": fallback_preview[:2400],
         "markdown": _build_document_markdown(document, chunks, db),
@@ -413,21 +416,38 @@ def get_document_quality(document_id: str, db: Session = Depends(get_db)) -> dic
 
 @router.get("/runs", response_model=list[dict])
 def list_runs(
+    project_slug: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    runs = db.scalars(select(PipelineRun).order_by(PipelineRun.created_at.desc()).limit(limit).offset(offset)).all()
+    statement = select(PipelineRun).order_by(PipelineRun.created_at.desc())
+    project = None
+    if project_slug:
+        project = db.scalar(select(Project).where(Project.slug == _validated_project_slug(project_slug)))
+        if project is None:
+            return []
+        statement = statement.where(PipelineRun.project_id == project.id)
+    runs = db.scalars(statement.limit(limit).offset(offset)).all()
+
+    document_ids = {run.document_id for run in runs if run.document_id}
+    project_ids = {run.project_id for run in runs if run.project_id}
+    if project is not None:
+        project_ids.add(project.id)
+
+    documents: dict[str, Document] = {}
+    projects: dict[str, Project] = {}
+    if document_ids:
+        documents = {doc.id: doc for doc in db.scalars(select(Document).where(Document.id.in_(document_ids))).all()}
+    if project_ids:
+        projects = {proj.id: proj for proj in db.scalars(select(Project).where(Project.id.in_(project_ids))).all()}
+
     return [
-        {
-            "id": run.id,
-            "document_id": run.document_id,
-            "status": run.status,
-            "run_type": run.run_type,
-            "notes": run.notes,
-            "provider_report": run.provider_report,
-            "created_at": run.created_at.isoformat(),
-        }
+        _build_pipeline_run_item(
+            run,
+            documents.get(run.document_id),
+            projects.get(run.project_id),
+        )
         for run in runs
     ]
 
