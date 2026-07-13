@@ -182,6 +182,7 @@ def test_retrieve_attachment_evidence_is_session_scoped() -> None:
     assert pack.items[0].page_title == "demo.txt"
     assert pack.items[0].source_stage == "session_attachment"
     assert pack.items[0].evidence_kind == "session_attachment"
+    assert pack.items[0].attachment_id == "a1"
     assert pack.items[0].support_hint == "direct"
     assert pack.items[0].page_kind == "session_attachment"
 
@@ -340,8 +341,14 @@ def test_executor_answers_from_attachment_when_rag_is_insufficient() -> None:
     assert "generative adversarial distillation" in response.final_answer
     assert "当前对话" in response.final_answer
     assert response.citations
-    assert response.citations[0].page_kind == "session_attachment"
-    assert response.citations[0].page_title == "BOD"
+    attachment_citations = [
+        citation
+        for citation in response.citations
+        if citation.page_kind == "session_attachment"
+    ]
+    assert attachment_citations
+    assert attachment_citations[0].page_title == "BOD"
+    assert attachment_citations[0].attachment_id == "a1"
     assert any("temporary attachments" in w for w in response.warnings)
 
 

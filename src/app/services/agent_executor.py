@@ -1179,6 +1179,7 @@ class AgentExecutor:
                 Citation(
                     document_id=item.get("document_id"),
                     chunk_id=item.get("chunk_id"),
+                    attachment_id=item.get("attachment_id"),
                     page_slug=item.get("page_slug"),
                     page_title=item.get("page_title"),
                     page_kind=item.get("page_kind") or "session_attachment",

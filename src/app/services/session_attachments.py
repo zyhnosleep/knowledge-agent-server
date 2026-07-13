@@ -217,6 +217,7 @@ def retrieve_session_attachment_evidence(
                 index=index,
                 document_id=None,
                 chunk_id=chunk.id,
+                attachment_id=attachment.id,
                 page_slug=None,
                 page_title=attachment.title or attachment.file_name,
                 page_kind="session_attachment",
