@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -97,8 +99,16 @@ def test_list_traces_by_session() -> None:
     assert traces_b[0]["final_answer"] == "a2"
 
 
-def test_list_traces_newest_first() -> None:
+def test_list_traces_newest_first(monkeypatch) -> None:
     """list_traces returns newest traces first."""
+    import app.services.agent_trace_store as trace_store_module
+
+    class FrozenDateTime:
+        @classmethod
+        def utcnow(cls) -> datetime:
+            return datetime(2026, 7, 13, 12, 0, 0)
+
+    monkeypatch.setattr(trace_store_module, "datetime", FrozenDateTime)
     db = make_db()
     store = AgentTraceStore(db)
     trace_id_1 = store.persist_run(

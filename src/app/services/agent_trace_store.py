@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.models.records import AgentTraceRun, AgentTraceStep
@@ -51,6 +51,9 @@ class AgentTraceStore:
         """Persist a complete Agent run and its steps. Returns the trace_id."""
         trace_id = str(uuid4())
         now = datetime.utcnow()
+        latest_created_at = self._db.scalar(select(func.max(AgentTraceRun.created_at)))
+        if latest_created_at is not None and now <= latest_created_at:
+            now = latest_created_at + timedelta(microseconds=1)
 
         run = AgentTraceRun(
             id=trace_id,
