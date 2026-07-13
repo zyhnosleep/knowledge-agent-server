@@ -1516,3 +1516,36 @@ ssh llm-wiki-server
 3. 执行标题回填 dry-run，抽查真实论文标题与 source slug 未发生耦合变化，再正式回填。
 4. 将本地改动形成明确提交并推送，服务器按提交同步和重启；记录本地、GitHub、服务器三端 commit 与服务状态。
 5. 重新运行 full30，验收 `passed >= 27`、`failed <= 3`、失败均有 attribution，且 source/citation gate 不退化。
+
+## 2026-07-13 第 4-5 阶段最终验收
+
+### 1. 第 4 阶段：RAG 质量
+
+- 科学术语证据匹配已统一规范化 evidence 与 question，补充了显式论文标题识别。
+- TIP4P-D/ff99sb-disp 路由已区分“论文引入该对象”与“其他论文仅提及该对象”，显式论文别名优先于推断路由。
+- 本地 `tests/test_query_service.py`：`185 passed`；本地完整测试：`708 passed`。
+- 服务器最终 full30 artifact：`tmp/full30_post_concurrency_20260713_1900/`。
+- full30 结果：`30 completed / 28 passed / 2 failed`，overall gate 为 `passed`。
+- 两个剩余失败均归因到 answer stage：
+  - `charmm36_overview`：答案缺少 `CHARMM22`，来源和引用正确。
+  - `ff99sb_disp_overview`：答案缺少 `London dispersion`，来源和引用正确。
+- 最终门槛全部满足：`passed >= 27`、`failed <= 3`、所有失败均有 attribution。
+
+### 2. 第 5 阶段：并发会话与临时附件
+
+- `AgentExecutor` 会在进入检索、RAG answer 和合成等长耗时步骤前提交短事务，避免 SQLite 写锁贯穿整个请求。
+- 明确要求只使用当前附件时，执行路径只检索当前 session 附件，跳过项目检索、`rag.answer` 和 `answer.synthesize`。
+- `attachment_id` 已从附件 EvidenceItem 贯通到 response citation、conversation turn 和 trace citation。
+- 真实服务器双会话并发验收：
+  - alpha：约 `433 ms`，`status=completed`，答案包含 `helios-314159` 与 `crimson`。
+  - beta：约 `211 ms`，`status=completed`，答案包含 `selene-271828` 与 `cobalt`。
+  - 两个响应都只有一条当前 session 的 `session_attachment` 引用，`attachment_id` 非空且正确。
+  - 两个响应的 steps 均无 `rag.retrieve_evidence`、`rag.answer` 和 `answer.synthesize`，finalize metadata 为 `source_scope=session_attachments_only`、`project_rag_skipped=true`。
+  - 本轮服务器日志无新增 `database is locked`、HTTP 500 或 Agent timeout。
+
+### 3. 发布状态
+
+- 业务代码验收基线为提交 `7157c15`；GitHub、服务器工作树与运行中 API 的业务代码一致。
+- 服务器 Agent/附件聚焦测试：`69 passed`；Query 服务测试：`185 passed`。
+- API 重启后 `GET /api/health` 返回 HTTP 200。
+- 本地测试页面继续通过 `http://127.0.0.1:8011` 访问服务器。
