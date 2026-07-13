@@ -1290,3 +1290,229 @@ cat tmp/full30_query_gate_enterprise_hardening_20260628/query_attribution.json
 - 增强 synthesis 的 query-aware anchor selection，让答案更稳定覆盖 benchmark 中要求的具体术语/数值，例如 `NMR`、`0.5 kcal/mol`、`van der Waals`、`GLH`、`FXA`、`-2.4`。
 - 保持 retrieval/source/citation gate 不放松，不改 benchmark，不用硬编码 case 答案。
 - 目标从 `25/30` 提升到 `27/30`，并把 answer-stage failure 从 5 降到 3 或更少。
+
+## 2026-07-06 聊天模块隔离与临时附件最新进展补充
+
+### 今日目标
+
+- 回顾 6.27 之后到当前窗口的项目上下文，补齐本轮前端/后端重构进展、同步状态、验证结果和遇到的问题。
+- 围绕用户提出的“每个专题卡片进入独立聊天，不被其他卡片知识污染”的目标，落实会话级知识隔离、聊天历史入口、Agent 过程展示和临时文件上传能力。
+- 完成本地、GitHub、服务器三端同步，并确认当前是否具备并发操作基础。
+
+### 今日完成
+
+#### 1. 代码/配置变更
+
+- 已完成一次可部署提交：`4b9caea Implement dark chat with session attachments`。
+- 后端新增会话级临时附件能力：
+  - 新增 `SessionAttachment`、`SessionAttachmentChunk` 数据表模型。
+  - 新增会话附件上传、列表、删除接口。
+  - 临时附件按 `project_slug + session_id` 隔离，只在当前会话内参与检索与回答。
+  - `AgentExecutor` 会先检索正式 RAG 证据，再合并当前会话附件证据；当正式 RAG 不足但附件证据存在时，可以基于附件生成确定性摘要式回答。
+  - 会话过期清理时同步删除附件记录与落盘文件。
+- 前端完成聊天界面重构：
+  - 左侧侧边栏下半区放置历史会话列表，支持点击恢复之前的聊天。
+  - 聊天主界面改为更接近图三的大面积深色对话布局。
+  - 输入框改为底部大 composer，支持 Enter 发送、Shift+Enter 换行。
+  - 发送成功后清空输入框，提示语保持为“问点难的，让我多想一步”。
+  - 新增加号按钮，可给当前会话添加临时文件；文件只影响该会话。
+  - 新增公开 Agent 过程展示区，展示 route/retrieve/synthesize/verify 等工具步骤摘要，但不暴露模型私有 CoT。
+- 服务器连接方式已稳定：
+  - SSH alias：`llm-wiki-server`
+  - 实际目标：`zhangyh@192.168.31.20`
+  - 私钥：`D:/codex_ssh/llm_wiki_server_ed25519`
+  - 服务器项目路径：`/home/zhangyh/llm_wiki_server`
+
+#### 2. 验证结果
+
+- 本地测试：
+
+```powershell
+D:/Miniconda3/python.exe -m pytest tests/test_session_attachments.py tests/test_agent_executor.py tests/test_agent_routes.py tests/test_agent_streaming.py tests/test_static_frontend.py -q
+# 108 passed in 78.63s
+```
+
+- 服务器测试：
+
+```text
+tests/test_session_attachments.py + tests/test_static_frontend.py
+# 30 passed, 117 warnings in 1.93s
+```
+
+- 服务器运行状态：
+
+```text
+API: 0.0.0.0:8000
+worker: running
+redis: 127.0.0.1:6379
+ollama: http://127.0.0.1:11435
+health: {"status":"ok","app_name":"LLM Wiki Server"}
+```
+
+- 数据库检查：
+
+```text
+session_attachments
+session_attachment_chunks
+```
+
+- 浏览器验证：
+  - 深色聊天界面已渲染。
+  - 左侧历史会话区域可见。
+  - 底部大输入框可见。
+  - Enter 可以发送。
+  - 发送后输入框清空。
+  - 提示语显示“问点难的，让我多想一步”。
+  - Agent 过程步骤会显示在 `thinkingFeed`。
+
+- 三端同步：
+  - 本地当前提交：`4b9caea`
+  - GitHub 已 push 成功。
+  - 服务器已 `git pull --ff-only origin main` 到 `4b9caea`。
+  - 服务已重启并通过健康检查。
+
+#### 3. 遇到的问题
+
+- 用户最初在运行页看到的文档标题仍有样例化/slug 化痕迹，例如 `8b4b...-sample`，这说明运行追踪页仍需继续核对“真实标题字段”的来源和展示优先级。
+- 运行追踪页显示数量曾只有 2 篇，而用户预期应有 10 篇；本轮主要收敛聊天与会话附件，运行列表的真实数量统计、分页/过滤和项目作用域仍需要单独复查。
+- 专题卡片最初统一显示 `Internal Research`，与“上传者希望归入哪个专题就进入哪个专题”的需求不一致；当前会话隔离能力已具备，但专题创建、专题选择和卡片聚合语义还需要继续产品化。
+- “明明右侧有原文，但 Agent 回答说没有正文”的根因，是旧链路没有把当前会话/当前卡片里的临时或局部文章证据稳定注入 Agent 检索上下文；本轮通过 session attachment retrieval 解决了会话临时材料的注入问题。
+- 前端重构过程中发现 `loadSessionAttachments is not defined`，已补齐会话切换时的附件加载函数并通过浏览器回归。
+- codex-with-cc 子线程多次触发 `agent thread limit reached`，因此按插件约定使用 trusted local terminal fallback，并保留 WorkflowId/TaskId/Role/Scope 等元数据完成实现、复核和 final verifier。
+- 前端质量复核曾指出长文本可能溢出、输入框缺少可访问性标签；已补充 `overflow-wrap` 与 `aria-label`。
+- GitHub 远端查询曾偶发 TLS EOF，但 push 成功且服务器能从 GitHub 拉到 `4b9caea`，因此不影响本轮同步结论。
+- 服务器脚本缺少可执行位时，使用 `sh scripts/start_api.sh`、`sh scripts/start_worker.sh`、`sh scripts/status.sh` 可以稳定启动；暂未改动服务器历史遗留的未跟踪文件。
+- 当前仓库本地仍有未提交的本地工件：`.codex/`、`output/`；这些不是本轮功能代码，未纳入提交。
+
+#### 4. 解决方案/结论
+
+- 当前已经具备“会话级知识隔离”的核心基础：聊天历史、临时附件、附件分块、附件检索和 Agent 证据合成都按 session/project scoped。
+- 当前支持并发操作的基础，但不能直接宣称已经完成生产级高并发：
+  - API 层、会话表、附件表和 `session_id` 隔离支持多个会话同时存在。
+  - 不同会话的临时附件不会互相污染。
+  - Redis worker 架构支持后台任务队列。
+  - 但当前服务器仍是 SQLite、本地模型和有限 worker 资源，真实多用户高并发上传/解析/问答还需要压力测试和 worker 并发策略确认。
+- 当前“公开 Agent 思考过程”采取的是安全实现：展示工具调用与阶段摘要，不展示模型私有 chain-of-thought。
+- 当前更适合定义为“专题独立对话与临时文件 RAG 的可用版本”，下一步应继续补文档库真实上传闭环、运行页真实数据和专题归属流程。
+
+### 关键文件
+
+- `src/app/models/records.py`
+- `src/app/schemas/agent.py`
+- `src/app/services/session_attachments.py`
+- `src/app/services/agent_executor.py`
+- `src/app/services/conversation_memory.py`
+- `src/app/api/agent_routes.py`
+- `src/app/static/index.html`
+- `tests/test_session_attachments.py`
+- `tests/test_static_frontend.py`
+
+### 当前结论
+
+- 本轮最重要的交付不是单纯改 UI，而是把“一个卡片/一个专题/一个会话内的知识不污染其他会话”这条主线落到了后端数据模型、API、Agent 检索和前端交互里。
+- 本地、GitHub、服务器已经对齐到 `4b9caea`，服务器服务已启动并可通过本地转发测试。
+- 会话级临时文件已经具备接口和 UI 入口，适合下一轮用真实 PDF/Markdown 做端到端浏览器验收。
+
+### 明日/下一步建议
+
+1. 用真实 PDF 在浏览器里走一遍“专题卡片进入对话 -> 加号上传临时文件 -> 提问 -> 引用临时文件回答”的端到端验收。
+2. 单独修运行页：真实文章标题、真实文档数量、运行记录分页/过滤、文档与专题作用域。
+3. 单独修文档库：上传后解析 PDF/表格/图片说明并生成完整 Markdown，再切块入库，确保与历史 pipeline 一致。
+4. 把专题卡片的“进入对话”路径做成正式产品路径：每个专题有自己的默认 session、历史 session 和隔离证据池。
+5. 做一次轻量并发验证：两个浏览器会话同时上传不同临时文件并提问，确认回答不会串证据。
+
+### 备注
+
+- 服务器快捷连接：
+
+```powershell
+ssh llm-wiki-server
+```
+
+- 如需本地访问服务器服务，仍可使用端口转发；若 `8011` 绑定失败，优先检查本地端口占用或换用新端口。
+
+## 2026-07-13 项目进展与问题汇总
+
+### 1. 当前总体进度
+
+- 当前 Git 基线为 `35aaf02 Improve evidence-backed query answer completion`，远端 `origin/main` 与本地提交基线一致。
+- full30 的上一轮稳定结果为 `25/30`。已提交的 answer-stage completeness 改进采用通用证据机制：从当前检索 evidence/context/citation 中识别缩写、专业短语、数值和单位等科学锚点，在答案遗漏且证据明确支持时补充，并保持合法引用。
+- 运行时代码未写入 benchmark case id、expected terms、论文 slug 或固定失败样例答案；benchmark 仍只用于评估。
+- 当前工作区存在一批尚未提交的后续功能修改，覆盖单篇文献对话、真实文献标题、PDF 原文访问、专题/文献/会话删除、作用域隔离及对应测试。这些改动需要完成整体验收后再形成正式提交。
+
+### 2. 已完成或已落地的功能
+
+#### 2.1 非硬编码答案完整性改进
+
+- `src/app/services/search.py` 已实现基于当前证据的通用锚点补全，不从 benchmark expectation 反向决定答案。
+- 补全逻辑要求锚点来自本次有效上下文，并与问题、证据及引用相关；不能跨文档借词，也不能把只出现在 query、但未出现在 evidence 的词补入答案。
+- `tests/test_query_service.py` 已增加缩写、数值/单位、专业短语、无证据不补、多来源引用隔离等通用测试。
+
+#### 2.2 单篇文献作用域对话
+
+- Query、RAG adapter、Agent tool、Agent executor、会话模型和前端请求均已增加可选 `document_id`。
+- 用户可从单篇文章进入对话；该会话绑定 `project_slug + document_id`，检索和引用被限制在该文献范围内。
+- 专题级会话与单篇文献会话分开列出。已有 session 不能被静默重绑定到另一个专题或文献，避免历史对话串库。
+- 会话恢复时会恢复文献作用域和真实标题；在单篇文献对话中点击“新聊天”会保留当前文献范围。
+
+#### 2.3 来源标题与引用展示
+
+- RAG 与 Agent 返回内容不再依赖面向用户的技术路由标签来说明来源。
+- 前端正文会去除数字 citation marker，并单独渲染“来源文献”列表，优先展示数据库中的真实文献标题。
+- citation 仍保留 `document_id` 等结构化字段用于归属和跳转，展示层只呈现用户可理解的真实标题。
+- 新增 `scripts/backfill_document_titles.py`，用于从已有元数据回填历史文档标题；脚本保持 source slug 稳定，不以特定论文名硬编码。
+
+#### 2.4 PDF 原文回溯
+
+- 后端新增 `GET /api/documents/{document_id}/file`，按项目作用域校验后返回数据库所记录的原始文件。
+- 当原文件是 PDF 时，前端原文抽屉直接嵌入 PDF，并支持页码定位及新窗口打开，不再把 MinerU/Markdown 解析文本作为主要阅读界面。
+- 若原文件不存在、路径越界或项目不匹配，接口返回受控错误，不暴露任意服务器文件。
+
+#### 2.5 删除能力与数据清理
+
+- 已增加专题、文献、Agent 会话的删除入口和后端 `DELETE` 接口，并在 UI 中加入确认步骤。
+- 删除会话时同步清理 turns、附件、附件分块和相关 trace。
+- 删除文献时同步清理向量索引、文档分块、运行记录、claims/reviews、关联问答、文献会话、相关 trace、只属于该文献的 wiki source page，以及未被其他文档共用的原始文件。
+- 删除专题时清理其文献及关联数据；文件删除前会检查是否仍被其他 Document 引用。
+
+### 3. 最近故障、排查与结论
+
+#### 3.1 页面“被清空、按钮点不了”
+
+- 现象：`8011` 页面统计变为 0、专题卡片不渲染、按钮全部无法点击，看起来像数据被删除。
+- 根因：`src/app/static/index.html` 中 `renderRuns` 的函数声明丢失，后续 `return` 落到函数外，引发浏览器 `SyntaxError: Illegal return statement`。整个内联脚本停止执行，因此数据加载和事件绑定都没有发生。
+- 修复：恢复 `function renderRuns(runs) { ... }` 包装，并新增使用 `node --check` 的静态回归测试，防止缺括号、缺函数声明等语法错误再次让整个页面失效。
+- 数据结论：数据库没有被清空。排查时 `agent` 专题仍返回 2 篇文档/2 条运行，`internal-research` 仍返回 10 篇文档/10 条运行。`Agent` 作为大小写不同的 slug 查询会返回 0，实际 slug 是小写 `agent`。
+
+#### 3.2 本地与服务器同步容易产生误判
+
+- 本地没有完整数据分块、Ollama 和真实运行数据，因此只靠本地单元测试不能证明真实问答效果；涉及检索质量、模型回答和数据库内容时，必须连接内网服务器验证。
+- 当前采用服务器 API/worker/Redis/Ollama 提供真实能力，本地通过 `127.0.0.1:8011` SSH 转发访问。`8012` 按用户要求关闭，不作为当前入口。
+- 最近的前端语法修复已同步到服务器，并确认服务器静态测试 `46 passed`；通过 `8011` 读取的 HTML 已包含修复后的 `renderRuns`。
+- 但当前大量后续功能仍处于未提交工作区状态。此前执行的是选择性文件同步，不应把“服务器已有部分文件”误认为“本地、GitHub、服务器已形成同一个正式提交”。下一次发布必须重新核对 Git commit、服务器文件哈希、数据库迁移和服务进程版本。
+
+#### 3.3 标题与历史数据问题
+
+- 历史数据中部分 `Document.title` 仍可能是文件名、UUID 或 slug，导致界面即使按 title 展示也不是真实论文标题。
+- 需要先以通用元数据优先级回填真实标题，再验证新 ingest 是否从 PDF 元数据/解析结果持续写入正确标题。
+- 标题回填必须与 source slug 解耦，避免改显示标题时破坏已有 wiki 路径、引用或检索索引。
+
+#### 3.4 删除操作的风险
+
+- 删除已从“只删卡片”升级为硬删除关联数据，影响范围较大，必须继续验证事务回滚、共享原文件保护、wiki 多来源页面更新、trace/answer 引用清理和删除后的统计刷新。
+- UI 确认框只能降低误操作概率，不能替代后端作用域校验。所有删除接口仍需严格校验 `project_slug` 与资源归属。
+
+### 4. 当前验证状态
+
+- 已知通过：前端内联脚本 `node --check`、本地 `tests/test_static_frontend.py`（46 passed）、服务器 `tests/test_static_frontend.py`（46 passed）、本地 `compileall`、`git diff --check`。
+- 已完成浏览器/API 核验：`internal-research` 显示 10 篇/10 条运行，`agent` 显示 2 篇/2 条运行；“查看原文”和“对话”按钮可点击。
+- 尚不能宣称整批未提交功能已完成发布验收：需要跑 Query、Agent、删除级联、会话附件、文档作用域和 API 的组合回归，并在服务器真实数据上做端到端验证。
+- full30 在非硬编码 completeness 提交后的目标仍为至少 `27/30`，但当前上下文没有可信的新一轮 full30 结果，因此仍以最近确认的 `25/30` 为记录值。
+
+### 5. 下一阶段建议顺序
+
+1. 跑完整相关回归，重点覆盖文档级 RAG/Agent 隔离、会话恢复、附件作用域、三个删除接口和 PDF 文件访问安全。
+2. 在服务器备份数据库后，用真实专题、真实 PDF 和真实会话做端到端验收；逐项确认删除后的文件、向量、wiki、run、trace、turn 和 attachment 均符合预期。
+3. 执行标题回填 dry-run，抽查真实论文标题与 source slug 未发生耦合变化，再正式回填。
+4. 将本地改动形成明确提交并推送，服务器按提交同步和重启；记录本地、GitHub、服务器三端 commit 与服务状态。
+5. 重新运行 full30，验收 `passed >= 27`、`failed <= 3`、失败均有 attribution，且 source/citation gate 不退化。

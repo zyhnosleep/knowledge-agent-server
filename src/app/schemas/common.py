@@ -40,11 +40,13 @@ class QueryRequest(BaseModel):
     project_slug: str
     question: str
     save_answer: bool = True
+    document_id: str | None = None
 
 
 class Citation(BaseModel):
     document_id: str | None = None
     chunk_id: str | None = None
+    attachment_id: str | None = None
     page_slug: str | None = None
     page_title: str | None = None
     page_kind: str | None = None

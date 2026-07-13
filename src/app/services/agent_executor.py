@@ -91,6 +91,7 @@ class AgentExecutor:
             session_id,
             project_slug=request.project_slug,
             ttl_days=settings.agent_conversation_ttl_days,
+            document_id=request.document_id,
         )
         self._memory.purge_expired_sessions()
 
@@ -256,6 +257,7 @@ class AgentExecutor:
             evidence_pack = self._run_retrieve_evidence(
                 request.project_slug,
                 request.query,
+                request.document_id,
                 constraints,
                 steps,
                 usage,
@@ -278,6 +280,7 @@ class AgentExecutor:
             answer_text, citations, tool_calls_used = self._run_rag_answer(
                 request.project_slug,
                 request.query,
+                request.document_id,
                 constraints,
                 steps,
                 usage,
@@ -367,6 +370,7 @@ class AgentExecutor:
                 retry_answer, retry_citations, retry_calls = self._run_rag_answer(
                     request.project_slug,
                     request.query,
+                    request.document_id,
                     constraints,
                     steps,
                     usage,
@@ -415,6 +419,7 @@ class AgentExecutor:
                 role="agent",
                 content=answer_text[:4000],
                 step_type="finalize",
+                citations=[c.model_dump() for c in citations],
             )
 
             total_elapsed = int((time.monotonic() - t_start) * 1000)
@@ -616,6 +621,7 @@ class AgentExecutor:
         self,
         project_slug: str,
         question: str,
+        document_id: str | None,
         constraints: AgentConstraints,
         steps: list[AgentStep],
         usage: AgentUsage,
@@ -640,13 +646,16 @@ class AgentExecutor:
 
         step_id = len(steps)
         t0 = time.monotonic()
+        tool_args: dict[str, Any] = {
+            "project_slug": project_slug,
+            "question": question,
+            "limit": 15,
+        }
+        if document_id is not None:
+            tool_args["document_id"] = document_id
         tool_result = self._tools.call_tool(
             "rag.retrieve_evidence",
-            {
-                "project_slug": project_slug,
-                "question": question,
-                "limit": 15,
-            },
+            tool_args,
             ctx={"db": self._db},
         )
         latency = int((time.monotonic() - t0) * 1000)
@@ -687,6 +696,7 @@ class AgentExecutor:
                     "source_stages": source_stages,
                     "support_hints": support_hints,
                     "status": pack_status,
+                    "document_id": document_id,
                 },
             )
             steps.append(step)
@@ -695,7 +705,7 @@ class AgentExecutor:
                 role="tool",
                 content=f"Retrieved {evidence_count} evidence items",
                 tool_name="rag.retrieve_evidence",
-                tool_args={"project_slug": project_slug, "question": question},
+                tool_args=tool_args,
                 tool_result=str(evidence_count),
                 step_type="retrieve",
             )
@@ -721,6 +731,7 @@ class AgentExecutor:
         self,
         project_slug: str,
         question: str,
+        document_id: str | None,
         constraints: AgentConstraints,
         steps: list[AgentStep],
         usage: AgentUsage,
@@ -739,12 +750,15 @@ class AgentExecutor:
 
         step_id = len(steps)
         t0 = time.monotonic()
+        tool_args: dict[str, Any] = {
+            "project_slug": project_slug,
+            "question": question,
+        }
+        if document_id is not None:
+            tool_args["document_id"] = document_id
         tool_result = self._tools.call_tool(
             "rag.answer",
-            {
-                "project_slug": project_slug,
-                "question": question,
-            },
+            tool_args,
             ctx={"db": self._db},
         )
         latency = int((time.monotonic() - t0) * 1000)
@@ -777,7 +791,7 @@ class AgentExecutor:
                 latency_ms=latency,
                 tool_name="rag.answer",
                 tool_ok=True,
-                metadata={"answer_chars": len(answer_text)},
+                metadata={"answer_chars": len(answer_text), "document_id": document_id},
             )
         else:
             answer_text = ""
@@ -800,7 +814,7 @@ class AgentExecutor:
             role="tool",
             content=answer_text[:2000],
             tool_name="rag.answer",
-            tool_args={"project_slug": project_slug, "question": question},
+            tool_args=tool_args,
             tool_result=answer_text[:4000],
             step_type="tool_call",
         )

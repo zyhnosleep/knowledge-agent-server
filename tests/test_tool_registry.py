@@ -130,7 +130,7 @@ def test_builtin_rag_answer_registered() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse
             return QueryResponse(
                 answer_markdown="fake answer",
@@ -163,7 +163,7 @@ def test_builtin_rag_answer_call() -> None:
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
             return QueryResponse(
                 answer_markdown="fake answer text",
@@ -198,7 +198,7 @@ def test_call_tool_missing_db_context() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -221,7 +221,7 @@ def test_builtins_include_answer_verify() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -236,7 +236,7 @@ def test_answer_verify_tool_call_ok() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -273,7 +273,7 @@ def test_rag_answer_citation_includes_page_kind_and_page_label() -> None:
     db = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
             return QueryResponse(
                 answer_markdown="test",
@@ -308,7 +308,7 @@ def test_answer_verify_is_read_only() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -326,10 +326,10 @@ def test_builtins_include_retrieve_evidence() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             from app.schemas.agent import EvidencePack
             return EvidencePack(status="ok", items=[])
 
@@ -363,10 +363,10 @@ def test_retrieve_evidence_tool_call_ok() -> None:
     from app.schemas.agent import EvidenceItem, EvidencePack
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             return EvidencePack(
                 status="ok",
                 items=[
@@ -418,10 +418,10 @@ def test_retrieve_evidence_tool_accepts_optional_limit() -> None:
     call_args = {}
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             call_args["limit"] = limit
             from app.schemas.agent import EvidencePack
             return EvidencePack(status="ok", items=[])
@@ -444,10 +444,10 @@ def test_retrieve_evidence_tool_is_read_only() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             from app.schemas.agent import EvidencePack
             return EvidencePack(status="ok", items=[])
 
@@ -461,10 +461,10 @@ def test_retrieve_evidence_tool_requires_project_slug() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -481,10 +481,10 @@ def test_retrieve_evidence_tool_missing_db_context() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -507,7 +507,7 @@ def test_answer_synthesize_schema_includes_evidence_pack() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -526,7 +526,7 @@ def test_answer_synthesize_accepts_evidence_pack_in_call() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -560,7 +560,7 @@ def test_answer_synthesize_without_evidence_pack_still_works() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())
@@ -580,7 +580,7 @@ def test_answer_synthesize_evidence_pack_invalid_type_rejected() -> None:
     reg = ToolRegistry()
 
     class FakeRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             pass
 
     reg._register_builtins(FakeRAG())

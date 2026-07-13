@@ -120,39 +120,24 @@ def test_alias_in_text_uses_boundaries_for_near_names() -> None:
     assert not alias_in_text("ff99SB", "The ff99SB-disp model improves IDP ensembles.")
 
 
-def test_force_field_source_identity_uses_canonical_benchmark_slugs() -> None:
-    cases = [
-        ("charmm36.pdf", "CHARMM36 force field", "sources/charmm36-force-field-refinement-for-proteins"),
-        ("charmm36idpsff.pdf", "CHARMM36IDPSFF", "sources/charmm36idpsff"),
-        ("charmm36m.pdf", "CHARMM36m protein force field", "sources/charmm36m-force-field"),
-        ("ff14sb.pdf", "ff14SB parameter update", "sources/ff14sb"),
-        ("ff19sb.pdf", "ff19SB protein backbone parameters", "sources/ff19sb-amino-acid-specific-protein-backbone-parameters"),
-        ("ff99sb-disp.pdf", "ff99SB-disp force field", "sources/ff99sb-disp"),
-        ("tip4p-d.pdf", "TIP4P-D water model", "sources/ff99sb-disp"),
-        ("ff99sb-ildn.pdf", "ff99SB-ILDN force field", "sources/ff99sb-ildn"),
-        ("opls-aa.pdf", "OPLS-AA force field development", "sources/opls-aa-force-field-development-and-validation"),
-        ("opls4.pdf", "OPLS4 force field development", "sources/opls4-force-field-development-and-validation"),
-        ("opls5.pdf", "OPLS5 force field development", "sources/opls5-force-field-development-and-validation"),
-    ]
+def test_source_identity_preserves_existing_source_slug_without_fixed_maps() -> None:
+    document = Document(
+        id="uploaded-known-title",
+        project_id="p1",
+        title="CHARMM36 force field",
+        file_name="charmm36.pdf",
+        sha256="sha",
+        raw_path="raw/charmm36.pdf",
+        raw_text="A paper whose title resembles a known source.",
+        metadata_json={"source_slug": "sources/uploaded-charmm36"},
+        status="ready",
+    )
 
-    for file_name, title, expected_slug in cases:
-        document = Document(
-            id=file_name,
-            project_id="p1",
-            title=title,
-            file_name=file_name,
-            sha256=file_name,
-            raw_path=f"raw/{file_name}",
-            raw_text=f"{title} benchmark paper.",
-            metadata_json={"source_slug": f"sources/{file_name.removesuffix('.pdf')}"},
-            status="ready",
-        )
+    profile = ensure_paper_profile(document)
+    fields = source_fields_for_document(document)
 
-        profile = ensure_paper_profile(document)
-        fields = source_fields_for_document(document)
-
-        assert profile["source_slug"] == expected_slug
-        assert fields["page_slug"] == expected_slug
+    assert profile["source_slug"] == "sources/uploaded-charmm36"
+    assert fields["page_slug"] == "sources/uploaded-charmm36"
 
 
 def test_unknown_source_identity_keeps_generic_slug_behavior() -> None:
@@ -173,7 +158,7 @@ def test_unknown_source_identity_keeps_generic_slug_behavior() -> None:
     assert fields["page_slug"] == "sources/novel-simulation-method"
 
 
-def test_canonical_source_identity_does_not_match_body_mentions_only() -> None:
+def test_source_identity_does_not_match_body_mentions_only() -> None:
     document = Document(
         id="comparison",
         project_id="p1",
@@ -194,7 +179,7 @@ def test_canonical_source_identity_does_not_match_body_mentions_only() -> None:
     assert fields["page_slug"] == "sources/independent-comparison-study"
 
 
-def test_canonical_source_identity_does_not_match_profile_alias_mentions_only() -> None:
+def test_source_identity_does_not_match_profile_alias_mentions_only() -> None:
     document = Document(
         id="comparison",
         project_id="p1",

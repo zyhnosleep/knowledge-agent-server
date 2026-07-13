@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -245,3 +246,90 @@ def test_purge_expired_sessions_batch_delete_works() -> None:
     assert deleted == 3
     for i in range(3):
         assert db.get(ConversationSession, f"expired-{i}") is None
+
+
+def test_sqlite_migration_adds_document_id_and_citations_columns() -> None:
+    """Old schema without document_id/citations is upgraded idempotently."""
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    # Create only the original schema subset.
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE conversation_sessions (
+                id TEXT PRIMARY KEY,
+                project_slug TEXT NOT NULL,
+                expires_at DATETIME NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE conversation_turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+
+    # Run the migration helpers directly against this engine.
+    import app.db.session as session_module
+    original_engine = session_module.engine
+    original_url = session_module.settings.database_url
+    session_module.engine = engine
+    session_module.settings.database_url = "sqlite:///:memory:"
+    try:
+        session_module._ensure_sqlite_columns()
+        session_module._ensure_sqlite_indexes()
+    finally:
+        session_module.engine = original_engine
+        session_module.settings.database_url = original_url
+
+    db = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
+    db.execute(
+        text(
+            "INSERT INTO conversation_sessions (id, project_slug, document_id, expires_at) "
+            "VALUES ('s1', 'demo', 'd1', :now)"
+        ),
+        {"now": datetime.utcnow()},
+    )
+    db.execute(
+        text(
+            "INSERT INTO conversation_turns (id, session_id, turn_index, role, content, created_at) "
+            "VALUES ('t1', 's1', 0, 'user', 'hello', :now)"
+        ),
+        {"now": datetime.utcnow()},
+    )
+    db.commit()
+
+
+def test_turn_citations_round_trip() -> None:
+    """Structured citations are stored and restored on conversation turns."""
+    db, memory = make_memory()
+    citation = {"document_id": "d1", "chunk_id": "c1", "excerpt": "excerpt"}
+    memory.add_turn(
+        "s1",
+        role="agent",
+        content="answer",
+        step_type="finalize",
+        citations=[citation],
+    )
+    db.commit()
+
+    history = memory.get_history("s1")
+    assert len(history) == 1
+    assert history[0].citations == [citation]
+
+
+def test_document_scope_rebind_is_rejected() -> None:
+    """touch_session rejects changing an existing session's document scope."""
+    db, memory = make_memory()
+    memory.touch_session("scoped", project_slug="demo", ttl_days=30, document_id="d1")
+    db.commit()
+
+    with pytest.raises(ValueError):
+        memory.touch_session("scoped", project_slug="demo", ttl_days=30, document_id="d2")

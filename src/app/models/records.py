@@ -27,15 +27,6 @@ class DocumentStatus(str, Enum):
     failed = "failed"
 
 
-class PageKind(str, Enum):
-    source_summary = "source_summary"
-    entity = "entity"
-    concept = "concept"
-    synthesis = "synthesis"
-    comparison = "comparison"
-    query_answer = "query_answer"
-
-
 class ReviewSeverity(str, Enum):
     low = "low"
     medium = "medium"
@@ -71,7 +62,6 @@ class Project(Base, TimestampMixin):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     documents: Mapped[list["Document"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    wiki_pages: Mapped[list["WikiPage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     entities: Mapped[list["Entity"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
@@ -111,23 +101,6 @@ class DocumentChunk(Base, TimestampMixin):
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
 
-class WikiPage(Base, TimestampMixin):
-    __tablename__ = "wiki_pages"
-    __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_wiki_pages_project_slug"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
-    slug: Mapped[str] = mapped_column(String(255), index=True)
-    title: Mapped[str] = mapped_column(String(255))
-    kind: Mapped[str] = mapped_column(String(40), default=PageKind.source_summary.value)
-    markdown_path: Mapped[str] = mapped_column(Text)
-    markdown_content: Mapped[str] = mapped_column(Text)
-    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    project: Mapped["Project"] = relationship(back_populates="wiki_pages")
-
-
 class Entity(Base, TimestampMixin):
     __tablename__ = "entities"
     __table_args__ = (UniqueConstraint("project_id", "name", name="uq_entities_project_name"),)
@@ -164,7 +137,6 @@ class ReviewItem(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True)
-    wiki_page_id: Mapped[str | None] = mapped_column(ForeignKey("wiki_pages.id"), nullable=True)
     claim_id: Mapped[str | None] = mapped_column(ForeignKey("claims.id"), nullable=True)
     title: Mapped[str] = mapped_column(String(255))
     detail: Mapped[str] = mapped_column(Text)
@@ -211,6 +183,7 @@ class ConversationTurn(Base):
     tool_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tool_result: Mapped[str | None] = mapped_column(Text, nullable=True)
     step_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    citations: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -219,6 +192,7 @@ class ConversationSession(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     project_slug: Mapped[str] = mapped_column(String(120), index=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

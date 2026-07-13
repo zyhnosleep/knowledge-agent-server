@@ -15,7 +15,16 @@ from sqlalchemy.pool import StaticPool
 from app.api.agent_routes import agent_router
 from app.core.config import get_settings
 from app.db.session import Base, get_db
-from app.models.records import ConversationSession, ConversationTurn, Project
+from app.models.records import (
+    AgentTraceRun,
+    AgentTraceStep,
+    ConversationSession,
+    ConversationTurn,
+    Document,
+    Project,
+    SessionAttachment,
+    SessionAttachmentChunk,
+)
 from app.services.conversation_memory import ConversationMemory
 
 
@@ -77,7 +86,7 @@ def test_agent_enabled_with_valid_payload_returns_200(monkeypatch) -> None:
     from app.schemas.common import QueryResponse, Citation
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="route test answer",
                 citations=[
@@ -95,7 +104,9 @@ def test_agent_enabled_with_valid_payload_returns_200(monkeypatch) -> None:
     # Make RAGAdapter produce a real response
     monkeypatch.setattr(
         "app.services.rag_adapter.RAGAdapter.answer",
-        lambda self, db, project_slug, question: StubRAG().answer(db, project_slug, question),
+        lambda self, db, project_slug, question, document_id=None: StubRAG().answer(
+            db, project_slug, question, document_id=document_id
+        ),
     )
 
     response = client.post(
@@ -178,7 +189,7 @@ def test_agent_response_has_required_shape(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="shape test",
                 citations=[],
@@ -187,7 +198,9 @@ def test_agent_response_has_required_shape(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "app.services.rag_adapter.RAGAdapter.answer",
-        lambda self, db, project_slug, question: StubRAG().answer(db, project_slug, question),
+        lambda self, db, project_slug, question, document_id=None: StubRAG().answer(
+            db, project_slug, question, document_id=document_id
+        ),
     )
 
     client = make_client(db)
@@ -278,7 +291,7 @@ def test_agent_response_includes_route_and_warnings(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="v2a test",
                 citations=[],
@@ -287,7 +300,9 @@ def test_agent_response_includes_route_and_warnings(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "app.services.rag_adapter.RAGAdapter.answer",
-        lambda self, db, project_slug, question: StubRAG().answer(db, project_slug, question),
+        lambda self, db, project_slug, question, document_id=None: StubRAG().answer(
+            db, project_slug, question, document_id=document_id
+        ),
     )
 
     client = make_client(db)
@@ -588,6 +603,15 @@ def test_list_agent_sessions_by_project() -> None:
         assert "expires_at" in session
 
 
+def test_list_agent_sessions_requires_project_slug() -> None:
+    db = make_session()
+    client = make_client(db)
+
+    r = client.get("/api/agent/sessions")
+
+    assert r.status_code == 422
+
+
 def test_get_agent_session_turns_ordered() -> None:
     """GET /api/agent/sessions/{id}/turns returns ordered turns."""
     db = make_session()
@@ -633,7 +657,7 @@ def test_get_agent_session_turns_ordered() -> None:
     db.commit()
 
     client = make_client(db)
-    r = client.get("/api/agent/sessions/sess-turns/turns")
+    r = client.get("/api/agent/sessions/sess-turns/turns?project_slug=demo")
     assert r.status_code == 200
     data = r.json()
     assert len(data) == 3
@@ -641,6 +665,15 @@ def test_get_agent_session_turns_ordered() -> None:
     assert [t["role"] for t in data] == ["user", "agent", "tool"]
     assert data[2]["tool_name"] == "rag.answer"
     assert data[2]["step_type"] == "tool_call"
+
+
+def test_get_agent_session_turns_requires_project_slug() -> None:
+    db = make_session()
+    client = make_client(db)
+
+    r = client.get("/api/agent/sessions/sess-turns/turns")
+
+    assert r.status_code == 422
 
 
 def test_list_agent_sessions_includes_preview() -> None:
@@ -718,6 +751,168 @@ def test_get_agent_session_turns_project_scoped() -> None:
     assert r2.status_code == 404
 
 
+def test_get_agent_session_turns_enforces_document_scope() -> None:
+    """Document-scoped sessions cannot be restored from project-only scope."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha Paper",
+        file_name="alpha.pdf",
+        sha256="sha-a",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    db.add_all([project, document])
+    memory = ConversationMemory(db)
+    memory.touch_session(
+        "doc-turns", project_slug="demo", ttl_days=30, document_id="d-a"
+    )
+    memory.add_turn("doc-turns", role="user", content="hello")
+    db.commit()
+
+    client = make_client(db)
+    project_only = client.get("/api/agent/sessions/doc-turns/turns?project_slug=demo")
+    assert project_only.status_code == 404
+
+    document_scoped = client.get(
+        "/api/agent/sessions/doc-turns/turns?project_slug=demo&document_id=d-a"
+    )
+    assert document_scoped.status_code == 200
+    assert len(document_scoped.json()) == 1
+
+
+def test_session_attachments_enforce_document_scope() -> None:
+    """Attachment routes require the same project/document scope as the session."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha Paper",
+        file_name="alpha.pdf",
+        sha256="sha-a",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    session = ConversationSession(
+        id="doc-attachments",
+        project_slug="demo",
+        document_id="d-a",
+        expires_at=datetime.utcnow() + timedelta(days=30),
+    )
+    attachment = SessionAttachment(
+        id="attachment-doc",
+        session_id="doc-attachments",
+        project_id="p1",
+        file_name="note.txt",
+        storage_path="/dev/null",
+        sha256="sha",
+        byte_size=10,
+    )
+    db.add_all([project, document, session, attachment])
+    db.commit()
+
+    client = make_client(db)
+    project_only = client.get(
+        "/api/agent/sessions/doc-attachments/attachments?project_slug=demo"
+    )
+    assert project_only.status_code == 404
+
+    scoped = client.get(
+        "/api/agent/sessions/doc-attachments/attachments?project_slug=demo&document_id=d-a"
+    )
+    assert scoped.status_code == 200
+    assert scoped.json()[0]["id"] == "attachment-doc"
+
+    delete_mismatch = client.delete(
+        "/api/agent/sessions/doc-attachments/attachments/attachment-doc?project_slug=demo"
+    )
+    assert delete_mismatch.status_code == 404
+
+    delete_scoped = client.delete(
+        "/api/agent/sessions/doc-attachments/attachments/attachment-doc?project_slug=demo&document_id=d-a"
+    )
+    assert delete_scoped.status_code == 200
+    assert db.get(SessionAttachment, "attachment-doc") is None
+
+
+def test_delete_agent_session_cleans_turns_attachments_and_traces(monkeypatch, tmp_path) -> None:
+    """DELETE /api/agent/sessions/{id} hard-deletes session-scoped data."""
+    import app.services.session_attachments as attachment_mod
+
+    monkeypatch.setattr(attachment_mod.settings, "raw_dir", tmp_path)
+    attachment_path = tmp_path / "demo" / "__sessions__" / "sess-delete" / "paper.pdf"
+    attachment_path.parent.mkdir(parents=True)
+    attachment_path.write_bytes(b"attachment")
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add_all(
+        [
+            project,
+            ConversationSession(
+                id="sess-delete",
+                project_slug="demo",
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            ),
+            ConversationTurn(
+                id="turn-delete",
+                session_id="sess-delete",
+                turn_index=0,
+                role="user",
+                content="hello",
+                created_at=datetime.utcnow(),
+            ),
+            SessionAttachment(
+                id="attachment-delete",
+                session_id="sess-delete",
+                project_id=project.id,
+                file_name="paper.pdf",
+                storage_path=str(attachment_path),
+                sha256="sha",
+                byte_size=10,
+            ),
+            SessionAttachmentChunk(id="attachment-chunk-delete", attachment_id="attachment-delete", ordinal=0, text="chunk"),
+            AgentTraceRun(
+                id="trace-delete",
+                request_id="req",
+                session_id="sess-delete",
+                project_slug="demo",
+                query="q",
+                constraints={},
+                final_answer="a",
+                citations=[],
+                warnings=[],
+                status="completed",
+            ),
+            AgentTraceStep(id="trace-step-delete", run_id="trace-delete", step_id=1, step_type="route", summary="route"),
+        ]
+    )
+    db.commit()
+    client = make_client(db)
+
+    missing_scope = client.delete("/api/agent/sessions/sess-delete")
+    assert missing_scope.status_code == 422
+    assert db.get(ConversationSession, "sess-delete") is not None
+
+    mismatch = client.delete("/api/agent/sessions/sess-delete?project_slug=other")
+    assert mismatch.status_code == 404
+    assert db.get(ConversationSession, "sess-delete") is not None
+
+    response = client.delete("/api/agent/sessions/sess-delete?project_slug=demo")
+    assert response.status_code == 200
+    assert response.json()["turns_deleted"] == 1
+    assert db.get(ConversationSession, "sess-delete") is None
+    assert db.get(ConversationTurn, "turn-delete") is None
+    assert db.get(SessionAttachment, "attachment-delete") is None
+    assert db.get(SessionAttachmentChunk, "attachment-chunk-delete") is None
+    assert db.get(AgentTraceRun, "trace-delete") is None
+    assert db.get(AgentTraceStep, "trace-step-delete") is None
+    assert not attachment_path.exists()
+
+
 def test_agent_query_rejects_cross_topic_session_reuse(monkeypatch) -> None:
     """Agent query endpoints refuse to append turns to a different-project session."""
     db = make_session()
@@ -753,3 +948,139 @@ def test_touch_session_does_not_rebind_to_different_project() -> None:
 
     with pytest.raises(ValueError):
         memory.touch_session("rebind-sess", project_slug="other", ttl_days=30)
+
+
+def test_agent_query_rejects_foreign_document() -> None:
+    """Scoped agent query rejects document IDs outside the project."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    other_project = Project(id="p2", slug="other", name="Other")
+    other_doc = Document(
+        id="d-other",
+        project_id="p2",
+        title="Other",
+        file_name="other.pdf",
+        sha256="sha",
+        raw_path="raw/other.pdf",
+        status="ready",
+    )
+    db.add_all([project, other_project, other_doc])
+    db.commit()
+
+    client = make_client(db)
+    response = client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "demo",
+            "query": "hello?",
+            "document_id": "d-other",
+        },
+    )
+    assert response.status_code == 404
+
+
+def test_agent_query_rejects_session_document_rebind() -> None:
+    """A session cannot be reused across project/document scope boundaries."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc_a = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha",
+        file_name="alpha.pdf",
+        sha256="sha-a",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    doc_b = Document(
+        id="d-b",
+        project_id="p1",
+        title="Beta",
+        file_name="beta.pdf",
+        sha256="sha-b",
+        raw_path="raw/beta.pdf",
+        status="ready",
+    )
+    db.add_all([project, doc_a, doc_b])
+    db.commit()
+
+    memory = ConversationMemory(db)
+    memory.touch_session(
+        "scoped-sess", project_slug="demo", ttl_days=30, document_id="d-a"
+    )
+    db.commit()
+
+    client = make_client(db)
+    response = client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "demo",
+            "query": "hello?",
+            "session_id": "scoped-sess",
+            "document_id": "d-b",
+        },
+    )
+    assert response.status_code == 409
+
+    doc_to_project = client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "demo",
+            "query": "hello?",
+            "session_id": "scoped-sess",
+        },
+    )
+    assert doc_to_project.status_code == 409
+
+    memory.touch_session("project-sess", project_slug="demo", ttl_days=30)
+    db.commit()
+    project_to_doc = client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "demo",
+            "query": "hello?",
+            "session_id": "project-sess",
+            "document_id": "d-a",
+        },
+    )
+    assert project_to_doc.status_code == 409
+
+
+def test_session_list_returns_document_scope_and_title() -> None:
+    """Session list exposes document scope type, document_id, and title."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha Paper",
+        file_name="alpha.pdf",
+        sha256="sha",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    db.add_all([project, doc])
+    memory = ConversationMemory(db)
+    memory.touch_session(
+        "doc-sess", project_slug="demo", ttl_days=30, document_id="d-a"
+    )
+    memory.touch_session("proj-sess", project_slug="demo", ttl_days=30)
+    db.commit()
+
+    client = make_client(db)
+    response = client.get("/api/agent/sessions?project_slug=demo")
+    assert response.status_code == 200
+    data = response.json()
+    by_id = {item["id"]: item for item in data}
+    assert "doc-sess" not in by_id
+    assert by_id["proj-sess"]["scope_type"] == "project"
+    assert by_id["proj-sess"]["document_id"] is None
+
+    doc_response = client.get("/api/agent/sessions?project_slug=demo&document_id=d-a")
+    assert doc_response.status_code == 200
+    doc_data = doc_response.json()
+    assert len(doc_data) == 1
+    assert doc_data[0]["id"] == "doc-sess"
+    assert doc_data[0]["scope_type"] == "document"
+    assert doc_data[0]["document_id"] == "d-a"
+    assert doc_data[0]["document_title"] == "Alpha Paper"

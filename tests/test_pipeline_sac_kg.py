@@ -20,7 +20,6 @@ from app.models.records import (
 from app.services.ai import DocumentAnalysisPayload, DocumentExtraction, ExtractedClaim, GeneratedTriple, HeadAnalysisPayload, VerificationPayload
 from app.services.parser import ParsedChunk, ParsedDocument
 from app.services.pipeline import IngestionPipeline
-from app.services.wiki import WikiRenderer
 
 
 class FakeVerifier:
@@ -85,44 +84,6 @@ def make_session() -> Session:
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
 
-
-def test_fallback_generator_preserves_followup_fact_in_source_wiki() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(
-        id="d1",
-        project_id="p1",
-        title="随访记录",
-        file_name="case.md",
-        sha256="abc",
-        raw_path="raw/case.md",
-        raw_text="患者诊断为高血压。医生建议患者在3个月后进行复查，并继续当前治疗方案。",
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text=document.raw_text,
-        page_label="1",
-        embedding=None,
-    )
-    db.add_all([project, document, chunk])
-    db.commit()
-
-    pipeline = IngestionPipeline(db)
-    pipeline.verifier = FakeVerifier()
-    extraction = pipeline._fallback_analysis(document, document.raw_text or "", pipeline._select_generation_contexts(document, document.raw_text or "", [chunk]))
-    normalized = pipeline._analysis_to_extraction(document, extraction)
-    claims = pipeline._create_claims(document, normalized)
-
-    renderer = WikiRenderer(project)
-    _, markdown = renderer.render_document_summary(document, normalized, claims)
-
-    assert "## Key Facts" in markdown
-    assert "3个月后进行复查" in markdown
-    assert "## Verified Triples By Head" in markdown
-    assert 'title: "随访记录"' in markdown
-    assert claims[0].verification_status == "verified"
 
 
 def test_local_verifier_sends_unsupported_claim_to_review_queue() -> None:
@@ -464,7 +425,7 @@ def test_head_generator_reprompts_when_verifier_finds_many_errors() -> None:
         head=head,
         contexts=contexts,
         open_kg_examples=[{"subject": "高血压", "predicate": "type", "object_text": "慢性病"}],
-        wiki_context="",
+        corpus_context="",
         previous_claims=[],
     )
 

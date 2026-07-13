@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from sqlalchemy import select, text
@@ -23,6 +23,7 @@ class TurnRecord:
     tool_args: dict | None = None
     tool_result: str | None = None
     step_type: str | None = None
+    citations: list[dict] = field(default_factory=list)
     created_at: datetime | None = None
 
 
@@ -50,6 +51,7 @@ class ConversationMemory:
         tool_args: dict | None = None,
         tool_result: str | None = None,
         step_type: str | None = None,
+        citations: list[dict] | None = None,
     ) -> ConversationTurn:
         """Append a turn and return the persisted row."""
         next_index = self._next_turn_index(session_id)
@@ -62,6 +64,7 @@ class ConversationMemory:
             tool_args=tool_args,
             tool_result=tool_result,
             step_type=step_type,
+            citations=list(citations or []),
         )
         self._db.add(turn)
         self._db.flush()
@@ -90,6 +93,7 @@ class ConversationMemory:
                 tool_args=row.tool_args,
                 tool_result=row.tool_result,
                 step_type=row.step_type,
+                citations=row.citations if isinstance(row.citations, list) else [],
                 created_at=row.created_at,
             )
             for row in rows
@@ -129,6 +133,7 @@ class ConversationMemory:
             tool_args=row.tool_args,
             tool_result=row.tool_result,
             step_type=row.step_type,
+            citations=row.citations if isinstance(row.citations, list) else [],
             created_at=row.created_at,
         )
 
@@ -158,29 +163,67 @@ class ConversationMemory:
         return to_delete
 
     def delete_session(self, session_id: str) -> int:
-        """Remove all turns for *session_id*.  Returns deleted count."""
+        """Remove one session and its stored side data. Returns deleted turn count."""
+        from app.services.session_attachments import delete_attachments_for_session
+
         count = self.turn_count(session_id)
+        delete_attachments_for_session(self._db, session_id)
+        self._db.execute(
+            text(
+                "DELETE FROM agent_trace_steps WHERE run_id IN ("
+                "  SELECT id FROM agent_trace_runs WHERE session_id = :sid"
+                ")"
+            ),
+            {"sid": session_id},
+        )
+        self._db.execute(
+            text("DELETE FROM agent_trace_runs WHERE session_id = :sid"),
+            {"sid": session_id},
+        )
         self._db.execute(
             text("DELETE FROM conversation_turns WHERE session_id = :sid"),
+            {"sid": session_id},
+        )
+        self._db.execute(
+            text("DELETE FROM conversation_sessions WHERE id = :sid"),
             {"sid": session_id},
         )
         self._db.flush()
         return count
 
+    def delete_sessions_for_document(self, document_id: str) -> int:
+        """Remove all sessions scoped to *document_id* and return session count."""
+        rows = self._db.execute(
+            text("SELECT id FROM conversation_sessions WHERE document_id = :did"),
+            {"did": document_id},
+        ).all()
+        count = 0
+        for (session_id,) in rows:
+            self.delete_session(session_id)
+            count += 1
+        self._db.flush()
+        return count
+
     def touch_session(
-        self, session_id: str, *, project_slug: str, ttl_days: int
+        self, session_id: str, *, project_slug: str, ttl_days: int, document_id: str | None = None
     ) -> None:
         """Create or update a conversation session with an expiry time.
 
         Sets ``expires_at = now + ttl_days``.  An existing session is never
-        silently rebound to a different project.
+        silently rebound to a different project or document scope.
         """
         existing = self._db.get(ConversationSession, session_id)
-        if existing is not None and existing.project_slug != project_slug:
-            raise ValueError(
-                f"Session {session_id} belongs to project {existing.project_slug}; "
-                f"cannot rebind to project {project_slug}."
-            )
+        if existing is not None:
+            if existing.project_slug != project_slug:
+                raise ValueError(
+                    f"Session {session_id} belongs to project {existing.project_slug}; "
+                    f"cannot rebind to project {project_slug}."
+                )
+            if existing.document_id != document_id:
+                raise ValueError(
+                    f"Session {session_id} is scoped to document {existing.document_id}; "
+                    f"cannot rebind to document {document_id}."
+                )
         expires_at = datetime.utcnow() + timedelta(days=ttl_days)
         if existing:
             existing.expires_at = expires_at
@@ -189,6 +232,7 @@ class ConversationMemory:
             session = ConversationSession(
                 id=session_id,
                 project_slug=project_slug,
+                document_id=document_id,
                 expires_at=expires_at,
             )
             self._db.add(session)
@@ -199,8 +243,6 @@ class ConversationMemory:
 
         Returns the number of sessions deleted.
         """
-        from app.services.session_attachments import delete_attachments_for_session
-
         now = datetime.utcnow()
         # Find expired session ids
         result = self._db.execute(
@@ -216,15 +258,7 @@ class ConversationMemory:
         # SQLite, so a batch DELETE WHERE id IN :ids is not portable.
         count = 0
         for sid in expired_ids:
-            delete_attachments_for_session(self._db, sid)
-            self._db.execute(
-                text("DELETE FROM conversation_turns WHERE session_id = :sid"),
-                {"sid": sid},
-            )
-            self._db.execute(
-                text("DELETE FROM conversation_sessions WHERE id = :sid"),
-                {"sid": sid},
-            )
+            self.delete_session(sid)
             count += 1
         self._db.flush()
         return count

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,7 +13,21 @@ from sqlalchemy.pool import StaticPool
 from app.api import routes
 from app.api.routes import router
 from app.db.session import Base, get_db
-from app.models.records import Document, DocumentChunk, PageKind, PipelineRun, Project, ReviewItem, WikiPage
+from app.models.records import (
+    AgentTraceRun,
+    AgentTraceStep,
+    Claim,
+    ConversationSession,
+    ConversationTurn,
+    Document,
+    DocumentChunk,
+    PipelineRun,
+    Project,
+    QuestionAnswer,
+    ReviewItem,
+    SessionAttachment,
+    SessionAttachmentChunk,
+)
 from app.services.filesystem import InvalidStoragePathError, UploadTooLargeError
 from app.services.parser import ParsedDocument
 from app.services.pipeline import IngestionPipeline
@@ -66,32 +81,6 @@ def test_list_endpoints_apply_limit_and_offset() -> None:
     assert client.get("/api/documents?limit=201").status_code == 422
     assert client.get("/api/reviews?offset=-1").status_code == 422
 
-
-def test_wiki_lint_route_passes_pagination(monkeypatch) -> None:
-    db = make_session()
-    client = make_client(db, raise_server_exceptions=False)
-
-    def fake_lint_project_wiki(db_session: Session, project_slug: str, *, limit: int, offset: int) -> dict:
-        assert db_session is db
-        return {
-            "project_slug": project_slug,
-            "page_count": 0,
-            "issue_count": 5,
-            "limit": limit,
-            "offset": offset,
-            "returned_issue_count": 1,
-            "issues": [{"kind": "demo"}],
-        }
-
-    monkeypatch.setattr(routes, "lint_project_wiki", fake_lint_project_wiki)
-
-    response = client.get("/api/wiki/lint?project_slug=demo&limit=1&offset=2")
-
-    assert response.status_code == 200
-    assert response.json()["limit"] == 1
-    assert response.json()["offset"] == 2
-    assert response.json()["returned_issue_count"] == 1
-    assert response.json()["issue_count"] == 5
 
 
 def test_project_slug_validation_returns_client_error() -> None:
@@ -359,45 +348,6 @@ def test_pipeline_dashboard_global_returns_one_row_per_document() -> None:
     assert len(document_ids) == 6
 
 
-def test_document_source_route_returns_markdown_body() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(
-        id="d1",
-        project_id=project.id,
-        title="Source Doc",
-        file_name="source.pdf",
-        sha256="sha1",
-        raw_path="raw/source.pdf",
-        raw_text="Raw text fallback.",
-        status="ready",
-    )
-    wiki = WikiPage(
-        id="w1",
-        project_id=project.id,
-        slug="source-doc",
-        title="Source Doc",
-        kind=PageKind.source_summary.value,
-        markdown_path="wiki/source-doc.md",
-        markdown_content="# Source Doc\n\nWiki markdown body.",
-        source_document_ids=[document.id],
-    )
-    db.add_all([project, document, wiki])
-    db.commit()
-    client = make_client(db)
-
-    response = client.get("/api/documents/d1/source")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["markdown"] == wiki.markdown_content
-
-    # When no wiki page covers the document, raw_text is used.
-    wiki.source_document_ids = []
-    db.commit()
-    response = client.get("/api/documents/d1/source")
-    assert response.json()["markdown"] == document.raw_text
-
 
 def test_document_title_prefers_metadata_title_over_hash_filename() -> None:
     db = make_session()
@@ -456,6 +406,44 @@ def test_document_title_prefers_metadata_title_over_hash_filename() -> None:
     )
     fallback = pipeline._resolve_document_title(parsed_no_human, hash_document)
     assert "Untitled" in fallback
+
+
+def test_backfill_document_titles_is_idempotent_and_preserves_slugs() -> None:
+    """The title backfill script updates titles without changing source slugs."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
+        file_name="Readable Paper Name.pdf",
+        sha256="sha",
+        raw_path="raw/Readable Paper Name.pdf",
+        metadata_json={"source_slug": "sources/stable-slug", "source_title": "Old Title"},
+        status="pending",
+    )
+    db.add_all([project, document])
+    db.commit()
+
+    import scripts.backfill_document_titles as backfill_mod
+
+    original_session_local = backfill_mod.SessionLocal
+    backfill_mod.SessionLocal = lambda: db
+    try:
+        counts = backfill_mod.backfill_titles(dry_run=False)
+        assert counts["total"] == 1
+        assert counts["changed"] == 1
+
+        refreshed = db.get(Document, "d1")
+        assert refreshed is not None
+        assert refreshed.title == "Readable Paper Name"
+        assert refreshed.metadata_json.get("source_slug") == "sources/stable-slug"
+
+        # Second run should be a no-op.
+        counts2 = backfill_mod.backfill_titles(dry_run=False)
+        assert counts2["changed"] == 0
+    finally:
+        backfill_mod.SessionLocal = original_session_local
 
 
 def test_list_runs_supports_project_slug_filter_and_enriched_fields() -> None:
@@ -537,3 +525,253 @@ def test_document_source_includes_project_identity() -> None:
     payload = response.json()
     assert payload["project_slug"] == "demo"
     assert payload["project_title"] == "Demo Project"
+
+
+def test_document_file_route_serves_inline_pdf_and_source_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    raw_root = tmp_path / "demo"
+    raw_root.mkdir()
+    pdf_path = raw_root / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 test")
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="Paper",
+        file_name="paper.pdf",
+        sha256="sha1",
+        raw_path=str(pdf_path),
+        status="ready",
+    )
+    db.add_all([project, document])
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/documents/d1/file?project_slug=demo")
+    assert response.status_code == 200
+    assert response.content == b"%PDF-1.4 test"
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.headers["content-disposition"].startswith("inline;")
+
+    source = client.get("/api/documents/d1/source").json()
+    assert source["source_file_available"] is True
+    assert source["source_file_is_pdf"] is True
+    assert source["source_file_mime"] == "application/pdf"
+    assert source["source_file_url"] == "/api/documents/d1/file?project_slug=demo"
+    assert client.get("/api/documents/d1/file").status_code == 422
+
+
+def test_document_file_route_rejects_missing_mismatch_and_out_of_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path / "raw")
+    routes.settings.raw_dir.mkdir()
+    outside_path = tmp_path / "outside.pdf"
+    outside_path.write_bytes(b"outside")
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    other = Project(id="p2", slug="other", name="Other")
+    missing = Document(
+        id="missing",
+        project_id=project.id,
+        title="Missing",
+        file_name="missing.pdf",
+        sha256="sha1",
+        raw_path=str(routes.settings.raw_dir / "missing.pdf"),
+    )
+    escaped = Document(
+        id="escaped",
+        project_id=project.id,
+        title="Escaped",
+        file_name="escaped.pdf",
+        sha256="sha2",
+        raw_path=str(outside_path),
+    )
+    db.add_all([project, other, missing, escaped])
+    db.commit()
+    client = make_client(db)
+
+    assert client.get("/api/documents/missing/file?project_slug=demo").status_code == 404
+    assert client.get("/api/documents/escaped/file?project_slug=demo").status_code == 404
+    assert client.get("/api/documents/missing/file?project_slug=other").status_code == 404
+    source = client.get("/api/documents/escaped/source").json()
+    assert source["source_file_available"] is False
+    assert source["source_file_url"] is None
+
+
+
+def test_delete_document_requires_project_slug() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="Paper",
+        file_name="paper.pdf",
+        sha256="sha1",
+        raw_path="raw/paper.pdf",
+    )
+    db.add_all([project, document])
+    db.commit()
+    client = make_client(db)
+
+    response = client.delete("/api/documents/d1")
+
+    assert response.status_code == 422
+    assert db.get(Document, "d1") is not None
+
+
+def test_delete_project_requires_confirmation_and_cleans_project_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    demo_root = tmp_path / "demo"
+    other_root = tmp_path / "other"
+    demo_root.mkdir()
+    other_root.mkdir()
+    demo_pdf = demo_root / "demo.pdf"
+    other_pdf = other_root / "other.pdf"
+    attachment_file = demo_root / "__sessions__" / "s1" / "attachment.pdf"
+    attachment_file.parent.mkdir(parents=True)
+    demo_pdf.write_bytes(b"demo")
+    other_pdf.write_bytes(b"other")
+    attachment_file.write_bytes(b"attachment")
+
+    db = make_session()
+    demo = Project(id="p1", slug="demo", name="Demo")
+    other = Project(id="p2", slug="other", name="Other")
+    demo_doc = Document(
+        id="d1",
+        project_id=demo.id,
+        title="Demo Doc",
+        file_name="demo.pdf",
+        sha256="sha1",
+        raw_path=str(demo_pdf),
+    )
+    other_doc = Document(
+        id="d2",
+        project_id=other.id,
+        title="Other Doc",
+        file_name="other.pdf",
+        sha256="sha2",
+        raw_path=str(other_pdf),
+    )
+    db.add_all(
+        [
+            demo,
+            other,
+            demo_doc,
+            other_doc,
+            ConversationSession(
+                id="s1",
+                project_slug="demo",
+                expires_at=datetime.utcnow() + timedelta(days=1),
+            ),
+            ConversationSession(
+                id="s2",
+                project_slug="other",
+                expires_at=datetime.utcnow() + timedelta(days=1),
+            ),
+            ConversationTurn(id="t1", session_id="s1", turn_index=0, role="user", content="hello"),
+            SessionAttachment(
+                id="a1",
+                session_id="s1",
+                project_id=demo.id,
+                file_name="attachment.pdf",
+                storage_path=str(attachment_file),
+                sha256="sha3",
+                byte_size=10,
+            ),
+            SessionAttachmentChunk(id="ac1", attachment_id="a1", ordinal=0, text="attachment chunk"),
+            AgentTraceRun(
+                id="trace1",
+                request_id="req1",
+                session_id="s1",
+                project_slug="demo",
+                query="q",
+                constraints={},
+                final_answer="a",
+                citations=[],
+                warnings=[],
+                status="completed",
+            ),
+            AgentTraceStep(id="step1", run_id="trace1", step_id=1, step_type="route", summary="s"),
+        ]
+    )
+    db.commit()
+    client = make_client(db)
+
+    assert client.delete("/api/projects/demo?confirm_slug=wrong").status_code == 400
+    assert db.get(Project, "p1") is not None
+
+    response = client.delete("/api/projects/demo?confirm_slug=demo")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert db.get(Project, "p1") is None
+    assert db.get(Document, "d1") is None
+    assert db.get(ConversationSession, "s1") is None
+    assert db.get(ConversationTurn, "t1") is None
+    assert db.get(SessionAttachment, "a1") is None
+    assert db.get(SessionAttachmentChunk, "ac1") is None
+    assert db.get(AgentTraceRun, "trace1") is None
+    assert db.get(AgentTraceStep, "step1") is None
+    assert not demo_pdf.exists()
+    assert not attachment_file.exists()
+
+    assert db.get(Project, "p2") is not None
+    assert db.get(Document, "d2") is not None
+    assert db.get(ConversationSession, "s2") is not None
+    assert other_pdf.exists()
+
+
+def test_delete_document_removes_document_scoped_sessions(tmp_path, monkeypatch) -> None:
+    """Deleting a document removes its document-scoped sessions and side data."""
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    raw_root = tmp_path / "demo"
+    raw_root.mkdir()
+    pdf_path = raw_root / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF")
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="Paper",
+        file_name="paper.pdf",
+        sha256="sha1",
+        raw_path=str(pdf_path),
+        status="ready",
+    )
+    session = ConversationSession(
+        id="doc-scoped-sess",
+        project_slug="demo",
+        document_id="d1",
+        expires_at=datetime.utcnow() + timedelta(days=1),
+    )
+    turn = ConversationTurn(
+        id="t1",
+        session_id="doc-scoped-sess",
+        turn_index=0,
+        role="user",
+        content="hello",
+    )
+    attachment = SessionAttachment(
+        id="a1",
+        session_id="doc-scoped-sess",
+        project_id=project.id,
+        file_name="note.pdf",
+        storage_path=str(raw_root / "note.pdf"),
+        sha256="sha2",
+        byte_size=4,
+    )
+    db.add_all([project, document, session, turn, attachment])
+    db.commit()
+
+    client = make_client(db)
+    response = client.delete("/api/documents/d1?project_slug=demo")
+    assert response.status_code == 200
+    assert response.json()["sessions_deleted"] == 1
+    assert db.get(ConversationSession, "doc-scoped-sess") is None
+    assert db.get(ConversationTurn, "t1") is None
+    assert db.get(SessionAttachment, "a1") is None
+    assert db.get(Document, "d1") is None

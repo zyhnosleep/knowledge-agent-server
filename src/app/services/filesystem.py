@@ -117,14 +117,10 @@ def _safe_upload_filename(filename: str | None) -> str:
 def project_paths(project_slug: str) -> dict[str, Path]:
     safe_slug = safe_project_slug(project_slug)
     raw_base = settings.raw_dir.expanduser().resolve()
-    wiki_base = settings.wiki_dir.expanduser().resolve()
     raw_base.mkdir(parents=True, exist_ok=True)
-    wiki_base.mkdir(parents=True, exist_ok=True)
     raw_root = _ensure_within(raw_base / safe_slug, raw_base)
-    wiki_root = _ensure_within(wiki_base / safe_slug, wiki_base)
     raw_root.mkdir(parents=True, exist_ok=True)
-    wiki_root.mkdir(parents=True, exist_ok=True)
-    return {"raw_root": raw_root, "wiki_root": wiki_root}
+    return {"raw_root": raw_root}
 
 
 async def save_upload(project_slug: str, upload: UploadFile) -> Path:

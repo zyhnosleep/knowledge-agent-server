@@ -151,6 +151,10 @@ class ToolRegistry:
                                 "type": "integer",
                                 "description": "Max evidence items to return (default 15).",
                             },
+                            "document_id": {
+                                "type": "string",
+                                "description": "Optional document ID to scope retrieval to a single document.",
+                            },
                         },
                         "required": ["project_slug", "question"],
                     },
@@ -188,6 +192,10 @@ class ToolRegistry:
                         "question": {
                             "type": "string",
                             "description": "Natural-language question.",
+                        },
+                        "document_id": {
+                            "type": "string",
+                            "description": "Optional document ID to scope the answer to a single document.",
                         },
                     },
                     "required": ["project_slug", "question"],
@@ -367,7 +375,12 @@ def _rag_answer_handler(
     db = ctx.get("db")
     if db is None:
         raise ToolExecutionError("Tool context is missing 'db' Session")
-    response = rag_adapter.answer(db, args["project_slug"], args["question"])
+    response = rag_adapter.answer(
+        db,
+        args["project_slug"],
+        args["question"],
+        document_id=args.get("document_id"),
+    )
     return {
         "answer_markdown": response.answer_markdown,
         "citations": [
@@ -398,7 +411,11 @@ def _rag_retrieve_evidence_handler(
     if not isinstance(limit, int):
         limit = 15
     pack = rag_adapter.retrieve_evidence(
-        db, args["project_slug"], args["question"], limit=limit
+        db,
+        args["project_slug"],
+        args["question"],
+        limit=limit,
+        document_id=args.get("document_id"),
     )
     return {
         "status": pack.status,

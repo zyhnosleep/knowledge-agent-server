@@ -24,6 +24,25 @@ def test_static_frontend_contains_pipeline_dashboard_shell() -> None:
     assert "/source" in html
 
 
+def test_inline_script_is_valid_javascript() -> None:
+    html = _html()
+    script_match = re.search(r"<script>([\s\S]*?)</script>", html)
+    assert script_match is not None
+    script = script_match.group(1)
+    # Keep this cheap: it catches missing function wrappers/braces that make
+    # the whole dashboard non-interactive in browsers.
+    import subprocess
+
+    result = subprocess.run(
+        ["node", "--check", "-"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_no_hardcoded_internal_research_api_calls() -> None:
     """The frontend must build project-aware URLs from activeProjectSlug rather than hardcoding internal-research."""
     html = _html()
@@ -49,6 +68,10 @@ def test_chat_session_apis_referenced() -> None:
 def test_source_markdown_body_referenced() -> None:
     html = _html()
     assert "data.markdown" in html or ".markdown" in html
+    assert "source_file_url" in html
+    assert "pdf-frame" in html
+    assert "#page=" in html
+    assert "新窗口打开" in html
 
 
 def test_active_project_state_exists() -> None:
@@ -68,7 +91,8 @@ def test_topic_card_chat_action_referenced() -> None:
 
 def test_select_session_includes_project_slug() -> None:
     html = _html()
-    assert '/turns?project_slug=" + encodeURIComponent(activeProjectSlug)' in html
+    assert '"/turns?" + scopeQueryParams()' in html
+    assert '"project_slug=" + encodeURIComponent(activeProjectSlug)' in html
 
 
 def test_session_list_uses_preview() -> None:
@@ -125,9 +149,24 @@ def test_composer_hint_text() -> None:
 def test_attachment_upload_and_delete_endpoints_referenced() -> None:
     html = _html()
     assert "/api/agent/sessions/" in html
-    assert "/attachments?project_slug=" in html
+    assert '"/attachments?" + scopeQueryParams()' in html
     assert "/attachments/" in html
     assert "attachment_id" in html
+
+
+def test_hard_delete_controls_and_endpoints_referenced() -> None:
+    html = _html()
+    assert "deleteProject" in html
+    assert "deleteDocument" in html
+    assert "deleteSession" in html
+    assert 'method: "DELETE"' in html
+    assert "/api/projects/" in html
+    assert "/api/documents/" in html
+    assert "/api/agent/sessions/" in html
+    assert "confirm_slug" in html
+    assert "delete-doc-action" in html
+    assert "topic-delete" in html
+    assert "recent-session" in html
 
 
 def test_plus_button_opens_hidden_file_input() -> None:
@@ -167,14 +206,16 @@ def test_start_new_chat_clears_state() -> None:
     assert "function startNewChat" in html
     assert "activeSessionId = null" in html
     assert "activeAttachments = []" in html
+    assert "var preserveDocumentScope = !!options.preserveDocumentScope" in html
+    assert "activeDocumentId = preserveDocumentScope ? documentId : null" in html
     assert "clearThinking" in html
     assert "renderAttachments" in html
 
 
 def test_select_session_loads_turns_and_attachments() -> None:
     html = _html()
-    assert '/turns?project_slug=" + encodeURIComponent(activeProjectSlug)' in html
-    assert "/attachments?project_slug=" in html
+    assert '"/turns?" + scopeQueryParams()' in html
+    assert '"/attachments?" + scopeQueryParams()' in html
     assert "function loadSessionAttachments" in html
     assert "loadSessionAttachments()" in html
     assert "function selectSession" in html
@@ -253,3 +294,156 @@ def test_no_common_mojibake_fragments_in_touched_labels() -> None:
     ]
     for fragment in mojibake_fragments:
         assert fragment not in html, f"Found mojibake fragment {fragment!r}"
+
+
+# Document-scoped chat coverage.
+
+
+def test_active_document_state_exists() -> None:
+    html = _html()
+    assert "activeDocumentId" in html
+    assert "activeDocumentTitle" in html
+
+
+def test_document_chat_action_in_library() -> None:
+    html = _html()
+    assert "enterDocumentChat" in html
+    assert "class=\"table-action chat-action\"" in html
+    assert "对话" in html
+    assert "doc.id" in html or "run.document_id" in html
+
+
+def test_document_chat_action_in_run_table() -> None:
+    html = _html()
+    assert "class=\"table-action chat-action\"" in html
+    assert "对话" in html
+
+
+def test_enter_document_chat_sets_state() -> None:
+    html = _html()
+    match = re.search(r"function enterDocumentChat\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "activeDocumentId =" in body
+    assert "activeDocumentTitle =" in body
+    assert "updateChatContextLabel" in body
+
+
+def test_scope_query_params_includes_document_id() -> None:
+    html = _html()
+    match = re.search(r"function scopeQueryParams\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "project_slug=" in body
+    assert "document_id=" in body
+    assert "activeDocumentId" in body
+
+
+def test_project_chat_clears_document_state() -> None:
+    html = _html()
+    match = re.search(r"function setActiveProject\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "activeDocumentId = null" in body
+    assert "activeDocumentTitle = null" in body
+
+
+def test_session_restore_validates_scope() -> None:
+    html = _html()
+    assert "function restoreSessionScope" in html
+    assert "scope_type" in html
+    assert "document_id" in html
+    assert "currentSessions.find" in html
+
+
+def test_citation_markers_stripped() -> None:
+    html = _html()
+    assert "function stripCitationMarkers" in html
+    assert "replace(/\\[\\d+" in html
+
+
+def test_source_list_rendering() -> None:
+    html = _html()
+    assert "来源文献" in html
+    assert "function renderSources" in html
+    assert "function deduplicateSources" in html
+    assert "getSourceTitle" in html
+    assert "getSourceUrl" in html
+
+
+def test_document_scope_in_rag_payload() -> None:
+    html = _html()
+    assert "function runRag" in html
+    assert "payload.document_id = activeDocumentId" in html
+    assert "/api/query" in html
+
+
+def test_document_scope_in_agent_payload() -> None:
+    html = _html()
+    assert "function runAgent" in html
+    assert "payload.document_id = activeDocumentId" in html
+    assert "/api/agent/query/stream" in html
+
+
+def test_session_list_uses_document_id_when_document_scope() -> None:
+    html = _html()
+    match = re.search(r"function loadAgentSessions\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "scopeQueryParams()" in body
+    assert "/api/agent/sessions?" in body
+
+
+def test_delete_session_uses_document_scope() -> None:
+    html = _html()
+    match = re.search(r"function deleteSession\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert "scopeQueryParams()" in body
+    assert "preserveDocumentScope: isDocumentScope()" in html
+
+
+def test_document_scoped_new_chat_preserves_document_scope() -> None:
+    html = _html()
+    assert html.count("startNewChat({ preserveDocumentScope: isDocumentScope() });") >= 2
+
+
+def test_preserved_source_and_delete_actions() -> None:
+    html = _html()
+    assert "openSource" in html
+    assert "deleteDocument" in html
+    assert "deleteProject" in html
+    assert "class=\"table-action source-action\"" in html
+    assert "class=\"table-action chat-action\"" in html
+    assert "class=\"icon-button danger-action delete-doc-action\"" in html
+
+
+def test_document_scope_label_shows_real_title() -> None:
+    html = _html()
+    assert "单篇文献" in html
+    assert "activeDocumentTitle || activeDocumentId" in html
+
+
+def test_answer_meta_does_not_expose_technical_route_labels() -> None:
+    html = _html()
+    match = re.search(r"function runAgent\([^)]*\)\s*\{(.*?)\}", html, re.S)
+    assert match is not None
+    body = match.group(1)
+    assert 'showAnswer(["Agent"' not in body
+    assert 'data.route.route' not in body
+
+
+def test_no_raw_html_injection_for_sources() -> None:
+    html = _html()
+    assert "link.textContent = title" in html
+    assert "item.textContent = title" in html
+    assert "link.href = url" in html
+    assert "link.target = \"_blank\"" in html
+    assert "link.rel = \"noopener\"" in html
+
+
+def test_attachment_requests_preserve_project_scope() -> None:
+    html = _html()
+    assert '"/attachments?" + scopeQueryParams()' in html
+    assert "activeProjectSlug" in html
+    assert "activeDocumentId" in html

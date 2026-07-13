@@ -26,7 +26,13 @@ class RAGAdapter:
     never reaches into QueryService internals directly.
     """
 
-    def answer(self, db: Session, project_slug: str, question: str) -> QueryResponse:
+    def answer(
+        self,
+        db: Session,
+        project_slug: str,
+        question: str,
+        document_id: str | None = None,
+    ) -> QueryResponse:
         """Execute a RAG query and return the full response.
 
         ``save_answer`` is forced to ``False`` so the Agent result is
@@ -36,7 +42,7 @@ class RAGAdapter:
         t0 = time.monotonic()
         try:
             result = QueryService(db).answer(
-                project_slug, question, save_answer=False
+                project_slug, question, save_answer=False, document_id=document_id
             )
         except ValueError:
             # Return an empty-but-valid response so the Agent can
@@ -54,7 +60,12 @@ class RAGAdapter:
         return result
 
     def retrieve_evidence(
-        self, db: Session, project_slug: str, question: str, limit: int = 15
+        self,
+        db: Session,
+        project_slug: str,
+        question: str,
+        limit: int = 15,
+        document_id: str | None = None,
     ) -> EvidencePack:
         """Retrieve-only RAG: return an EvidencePack without drafting an answer.
 
@@ -65,7 +76,7 @@ class RAGAdapter:
         t0 = time.monotonic()
         try:
             result = QueryService(db).retrieve_evidence(
-                project_slug, question, limit=limit
+                project_slug, question, limit=limit, document_id=document_id
             )
         except ValueError:
             logger.warning(

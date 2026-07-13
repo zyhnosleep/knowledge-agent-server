@@ -1,13 +1,13 @@
 # LLM Wiki Server
 
-`LLM Wiki Server` 是一个面向服务器部署的内部知识库骨架，延续 `llm_wiki` 的 `raw -> wiki -> schema` 思路，并补上共享服务所需的数据库、任务队列、审核流和外部核查接口。
+`LLM Wiki Server` 是一个面向服务器部署的文献知识库，使用原始文档、结构化分块和可追溯引用支撑 RAG 与 Agent 问答。
 
 当前版本已经具备这些基础能力：
 
 - 文档上传、去重、解析与分块
 - 使用 Ollama 做本地抽取、摘要、嵌入与问答
 - 使用 OpenAI 兼容 API 做可选的结构化复核
-- 将数据库内容投影为 `raw/`、`wiki/`、`index.md`、`log.md` 结构
+- 保存原始文档并生成可检索的结构化分块
 - 提供 FastAPI 接口和轻量 Web 控制台
 - 提供 Redis worker 骨架，支持异步摄入
 
@@ -76,8 +76,6 @@ python scripts/watch_ingest_progress.py
 
 完整步骤见 [docs/deploy-no-docker.md](D:\LLM_wiki\docs\deploy-no-docker.md)。
 上面的命令和 `scripts/*.sh` 都按 POSIX `sh` 兼容方式整理，不依赖 `source`。
-如需配合本地 Obsidian 使用，见 [docs/obsidian-workflow.md](D:\LLM_wiki\docs\obsidian-workflow.md)。
-
 ## 环境变量建议
 
 无 Docker 服务器版建议使用以下核心配置：
@@ -91,7 +89,6 @@ REDIS_URL=redis://127.0.0.1:6379/0
 QUEUE_JOB_TIMEOUT=9000
 DATA_DIR=./data
 RAW_DIR=./data/raw
-WIKI_DIR=./data/wiki
 CACHE_DIR=./data/cache
 OLLAMA_BASE_URL=http://127.0.0.1:11435
 OLLAMA_GENERATION_MODEL=qwen3.6:27b
@@ -129,7 +126,7 @@ EXTERNAL_API_ENABLED=false
 ## 运行说明
 
 - `worker` 依赖 `REDIS_URL`；无 Docker 双进程版要求 Redis 可用。
-- `MINIO_ENABLED=false` 时，原始文件和 Wiki 页面都直接保存在本地 `data/`。
+- `MINIO_ENABLED=false` 时，原始文件直接保存在本地 `data/raw/`。
 - `SQLite` 适合当前轻量协作和验证阶段，不适合高并发写入。
 - `EXTERNAL_API_ENABLED=false` 时，问答和摄入只走本地 Ollama。
 - `DOCUMENT_INTELLIGENCE_ENABLED=true` 时，PDF 会优先走页面渲染 + 多模态理解链路。
@@ -142,10 +139,9 @@ EXTERNAL_API_ENABLED=false
 
 ## Obsidian 协作
 
-- 服务器负责 `ingest / query / verify / writeback`，把原始资料编译为 `wiki/` 下的 Markdown 页面。
-- `wiki/` 目录可以同步到本地，直接作为 Obsidian Vault 打开。
+- 服务器负责 `ingest / query / verify`，把原始资料解析成 `DocumentChunk` 并建立向量索引。
 - 上传 `.md` / `.txt` 很适合这套流程，但服务器内部仍会做 snippet/chunk 处理，用于证据定位、去重和 fallback 检索。
-- 查询主路径是 `wiki-first`，不是传统 `raw chunk first` 的 RAG。
+- 查询主路径是基于 `Document` 与 `DocumentChunk` 的证据优先 RAG。
 
 ## Docker 说明
 
@@ -156,7 +152,6 @@ EXTERNAL_API_ENABLED=false
 ```text
 data/
   raw/          原始文档
-  wiki/         Wiki 页面投影
   cache/        中间缓存
 src/app/
   api/          FastAPI 路由
@@ -164,7 +159,7 @@ src/app/
   db/           数据库初始化
   models/       ORM 模型
   schemas/      请求与响应结构
-  services/     解析、检索、模型、Wiki 渲染
+  services/     解析、检索、模型与 Agent 服务
   workers/      队列 worker
 scripts/
   start_redis.sh

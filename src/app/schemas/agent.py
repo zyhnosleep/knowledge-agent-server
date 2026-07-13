@@ -27,6 +27,7 @@ class AgentQueryRequest(BaseModel):
     project_slug: str
     query: str
     session_id: str | None = None
+    document_id: str | None = None
     constraints: AgentConstraints = Field(default_factory=AgentConstraints)
 
 
@@ -136,7 +137,7 @@ class EvidenceItem(BaseModel):
 
     ``source_stage`` indicates which retrieval path produced the item.
     Suggested values: ``document_table``, ``document_figure``,
-    ``profile_term``, ``claim``, ``source_chunk``, ``wiki_page``, or
+    ``profile_term``, ``claim``, ``source_chunk``, or
     ``unknown``.
 
     ``support_hint`` is a best-effort deterministic label: ``direct``
@@ -148,6 +149,7 @@ class EvidenceItem(BaseModel):
     index: int
     document_id: str | None = None
     chunk_id: str | None = None
+    attachment_id: str | None = None
     page_slug: str | None = None
     page_title: str | None = None
     page_kind: str | None = None
@@ -188,6 +190,9 @@ class AgentSessionRead(BaseModel):
 
     id: str
     project_slug: str
+    scope_type: str  # "project" | "document"
+    document_id: str | None = None
+    document_title: str | None = None
     preview: str
     turn_count: int
     created_at: str
@@ -205,6 +210,7 @@ class AgentTurnRead(BaseModel):
     tool_args: dict[str, Any] | None = None
     tool_result: str | None = None
     step_type: str | None = None
+    citations: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str
 
 

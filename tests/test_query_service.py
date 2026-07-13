@@ -1,11 +1,12 @@
-﻿from sqlalchemy import create_engine
+import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
-from app.models.records import Claim, Document, DocumentChunk, Project, QuestionAnswer, WikiPage
+from app.models.records import Claim, Document, DocumentChunk, Project, QuestionAnswer
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import MAX_CONTEXTS, ExtractedMetric, PageMatch, PaperMatch, QueryService, RetrievedContext, settings
+from app.services.search import MAX_CONTEXTS, ExtractedMetric, PaperMatch, QueryService, RetrievedContext, settings
 from app.schemas.common import Citation
 from app.services.table_normalization import normalize_table_text
 
@@ -101,44 +102,6 @@ def make_table_document(
     )
 
 
-def test_query_service_uses_wiki_page_context_and_returns_page_citation() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="Medical Case", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/medical-case",
-        title="8b4b1a24d0f74a7cab2d54a0a5ebdb4d-Medical Case Summary",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/medical-case.md",
-        markdown_content="# Medical Case Summary\n\nThe doctor recommended a follow-up in two weeks after discharge.",
-        source_document_ids=["d1"],
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="Patient demographics and medication details appear here before any follow-up timing is mentioned later.",
-        page_label="1",
-        embedding=None,
-    )
-    db.add_all([project, document, wiki_page, chunk])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service._answer_wiki_first("demo", "When is the follow-up?", save_answer=False)
-
-    assert isinstance(response, QueryResponse)
-    assert response.answer_markdown == "Follow-up is recommended in two weeks."
-    assert response.citations[0].page_slug == "sources/medical-case"
-    assert response.citations[0].page_title == "Medical Case Summary"
-    assert "follow-up in two weeks" in fake_ollama.last_prompt.lower()
-
 
 def test_source_chunk_search_ignores_failed_documents() -> None:
     db = make_session()
@@ -174,112 +137,7 @@ def test_source_chunk_search_ignores_failed_documents() -> None:
     assert contexts == []
 
 
-def test_search_wiki_pages_prioritizes_exact_source_identifier_over_body_overlap() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    target_page = WikiPage(
-        id="w-target",
-        project_id="p1",
-        slug="sources/opls4",
-        title="OPLS4",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/opls4.md",
-        markdown_content="# OPLS4\n\nCanonical source page.",
-        source_document_ids=[],
-    )
-    distracting_page = WikiPage(
-        id="w-distractor",
-        project_id="p1",
-        slug="sources/opls5-force-field-development-and-validation",
-        title="OPLS5 Force Field Development and Validation",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/opls5.md",
-        markdown_content=(
-            "# OPLS5\n\n"
-            "OPLS3e salt bridge overstabilization acidic residue pKa bias water ions torsion sulfur FEP validation. "
-            "OPLS3e salt bridge overstabilization acidic residue pKa bias water ions torsion sulfur FEP validation."
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, target_page, distracting_page])
-    db.commit()
 
-    service = QueryService(db)
-    matches = service._search_wiki_pages(
-        "OPLS4",
-        "p1",
-        limit=2,
-    )
-
-    assert matches[0].page.slug == "sources/opls4"
-
-
-def test_search_wiki_pages_does_not_skip_useful_page_with_placeholder_phrase() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/opls4-force-field-development-and-validation",
-        title="OPLS4 Force Field Development and Validation",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/opls4.md",
-        markdown_content=(
-            "# OPLS4 Force Field Development and Validation\n\n"
-            "## Summary\n"
-            "OPLS4 addresses OPLS3e salt bridge overstabilization and acidic residue pKa bias.\n\n"
-            "## Figure Notes\n"
-            "No summary available."
-        ),
-        source_document_ids=[],
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    matches = service._search_wiki_pages("How does OPLS4 address OPLS3e salt bridge overstabilization?", "p1", limit=2)
-
-    assert [match.page.slug for match in matches] == ["sources/opls4-force-field-development-and-validation"]
-
-
-def test_search_wiki_pages_skips_source_page_with_only_placeholder_bullets() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/empty-opls4",
-        title="OPLS4 Empty Placeholder",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/empty-opls4.md",
-        markdown_content="# OPLS4 Empty Placeholder\n\nNo summary available.\n\n- No claims yet.",
-        source_document_ids=[],
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    matches = service._search_wiki_pages("OPLS4", "p1", limit=2)
-
-    assert matches == []
 
 
 def test_draft_answer_omits_index_overview_when_contexts_exist() -> None:
@@ -372,215 +230,11 @@ def test_query_service_saves_query_page_when_requested() -> None:
     answers = db.query(QuestionAnswer).all()
     assert len(answers) == 1
     assert "Follow-up is recommended" in answers[0].answer_markdown
-    query_pages = db.query(WikiPage).filter(WikiPage.kind == "query_answer").all()
-    assert query_pages == []
 
 
-def test_query_service_prefers_wiki_only_for_strong_chinese_match() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="Community Follow-up Record", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/community-followup-record",
-        title="Community Follow-up Record",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/case.md",
-        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
-        source_document_ids=["d1"],
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="Patient demographics, diagnosis, and medication details appear here before follow-up timing is mentioned later.",
-        page_label="1",
-        embedding=None,
-    )
-    db.add_all([project, document, wiki_page, chunk])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
-
-    assert response.citations
-    assert response.citations[0].page_slug == "sources/community-followup-record"
-    assert response.citations[0].document_id is None
-    assert "Patient demographics" not in fake_ollama.last_prompt
 
 
-def test_query_service_filters_irrelevant_wiki_pages_and_empty_entities() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    relevant_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/community-followup",
-        title="Community Follow-up Record",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/community-followup.md",
-        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 3, "key_terms": ["follow-up", "hypertension"]},
-    )
-    irrelevant_page = WikiPage(
-        id="w2",
-        project_id="p1",
-        slug="sources/sample",
-        title="Sample",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/sample.md",
-        markdown_content="# Sample\n\nMethod A improves control stability. Method B is slower.",
-        source_document_ids=["d2"],
-        metadata_json={"verified_claim_count": 2, "key_terms": ["method", "control"]},
-    )
-    empty_entity = WikiPage(
-        id="w3",
-        project_id="p1",
-        slug="entities/demographics",
-        title="Demographics",
-        kind="entity",
-        markdown_path="wiki/demo/entities/demographics.md",
-        markdown_content="# Demographics\n\n## Summary\nNo summary available.\n\n## Claims\n- No claims yet.",
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 0, "key_terms": ["demographics"]},
-    )
-    db.add_all([project, relevant_page, irrelevant_page, empty_entity])
-    db.commit()
 
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Follow-up is recommended in three months.", citations=[], risk_level="normal")
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
-
-    assert len(response.citations) == 1
-    assert response.citations[0].page_slug == "sources/community-followup"
-    assert "Method A improves control stability" not in fake_ollama.last_prompt
-    assert "No summary available." not in fake_ollama.last_prompt
-
-
-def test_query_service_infers_citation_indexes_from_answer_markdown() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    first_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/one",
-        title="One",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/one.md",
-        markdown_content="# One\n\nThe first page is unrelated.",
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 1, "key_terms": ["first"]},
-    )
-    second_page = WikiPage(
-        id="w2",
-        project_id="p1",
-        slug="sources/two",
-        title="Two",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/two.md",
-        markdown_content="# Two\n\nThe doctor recommended a follow-up in three months.",
-        source_document_ids=["d2"],
-        metadata_json={"verified_claim_count": 2, "key_terms": ["follow-up", "three months"]},
-    )
-    db.add_all([project, first_page, second_page])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Based on the source, follow-up is recommended in three months [1].", citations=[], risk_level="normal")
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service._answer_wiki_first("demo", "When is follow-up recommended?", save_answer=False)
-
-    assert len(response.citations) == 1
-    assert response.citations[0].page_slug == "sources/two"
-
-
-def test_wiki_first_answer_appends_supported_evidence_anchors() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/method-paper",
-        title="Method Paper",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/method-paper.md",
-        markdown_content=(
-            "# Method Paper\n\n"
-            "The evidence reports an ABCD validation signal, charge transfer, "
-            "and a -1.5 kcal/mol binding shift."
-        ),
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 2, "key_terms": ["validation", "charge transfer"]},
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="The method is supported by validation evidence.", citations=[0], risk_level="normal")
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service._answer_wiki_first("demo", "How does the validation mechanism work?", save_answer=False)
-
-    assert "ABCD" in response.answer_markdown
-    assert "charge transfer" in response.answer_markdown
-    assert "-1.5 kcal/mol" in response.answer_markdown
-    assert "[0]" in response.answer_markdown
-    assert response.citations[0].page_slug == "sources/method-paper"
-
-
-def test_query_service_promotes_raw_chunk_citations_to_wiki_pages_when_source_evidence_not_requested() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="Community Follow-up Record", file_name="case.md", sha256="abc", raw_path="raw/case.md", status="ready")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/community-followup",
-        title="Community Follow-up Record",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/community-followup.md",
-        markdown_content="# Community Follow-up Record\n\nThe doctor recommended a follow-up in three months and continuing the current treatment plan.",
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 3, "key_terms": ["follow-up", "hypertension"]},
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="The patient was diagnosed with hypertension. The doctor recommended follow-up in three months.",
-        page_label="1",
-        embedding=None,
-    )
-    db.add_all([project, document, wiki_page, chunk])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = FakeOllama()
-    fake_ollama.payload = QueryAnswerPayload(answer_markdown="Follow-up is recommended in three months.", citations=[1], risk_level="normal")
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-    service._should_use_wiki_only = lambda question, page_matches: False
-
-    response = service._answer_wiki_first("demo", "When did the doctor recommend follow-up?", save_answer=False)
-
-    assert len(response.citations) == 1
-    assert response.citations[0].page_slug == "sources/community-followup"
-    assert response.citations[0].chunk_id is None
 
 
 def test_rag_router_prefers_exact_opls4_over_opls5() -> None:
@@ -763,70 +417,6 @@ def test_rag_router_allows_multiple_documents_for_comparison_query() -> None:
     assert {"opls4", "opls5"}.issubset({match.document.id for match in matches})
 
 
-def test_rag_table_query_uses_document_table_evidence_not_profile_or_wiki() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(
-        id="d1",
-        project_id="p1",
-        title="FooNet Benchmark Paper",
-        file_name="foonet.pdf",
-        sha256="abc",
-        raw_path="raw/foonet.pdf",
-        raw_text="FooNet reports benchmark metrics.",
-        metadata_json={
-            "source_slug": "sources/foonet",
-            "document_intelligence": {
-                "tables": [
-                    {
-                        "page_label": "7",
-                        "markdown": (
-                            "Table 7: FooNet results.\n"
-                            "| Model | Dataset-A | Dataset-A | Dataset-B | Dataset-B |\n"
-                            "| --- | --- | --- | --- | --- |\n"
-                            "|  | Accuracy | F1 | Accuracy | F1 |\n"
-                            "| FooNet | 91.2 | 88.4 | 84.1 | 80.6 |"
-                        ),
-                    }
-                ]
-            }
-        },
-        status="ready",
-    )
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/wrong-wiki-foonet",
-        title="FooNet wiki",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/foonet.md",
-        markdown_content="# FooNet\n\n## Summary\nThe wiki summary should not be the RAG citation.",
-        source_document_ids=["d1"],
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = FakeOllama()
-    service.verifier = FakeVerifier()
-    service._search_wiki_pages = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("wiki-first should not run in rag mode"))
-    service.ollama.payload = QueryAnswerPayload(
-        answer_markdown="Table 7 reports Dataset-A Accuracy 91.2 / F1 88.4 and Dataset-B Accuracy 84.1 / F1 80.6 [0].",
-        citations=[0],
-        risk_level="normal",
-    )
-
-    response = service.answer("demo", "What are FooNet Accuracy and F1 on Dataset-A and Dataset-B in Table 7?", save_answer=False)
-
-    assert response.citations
-    assert response.citations[0].document_id == "d1"
-    assert response.citations[0].page_slug == "sources/foonet"
-    assert response.citations[0].page_label == "7"
-    assert response.citations[0].excerpt.startswith("Table 7")
-    assert "91.2" in response.citations[0].excerpt
-    assert "paper_profile" not in service.ollama.last_prompt
-    assert "wiki summary should not" not in service.ollama.last_prompt.lower()
-
 
 def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() -> None:
     db = make_session()
@@ -869,7 +459,7 @@ def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() 
     assert "91.2" in contexts[0].citation.excerpt
 
 
-def test_charmm36m_table_query_locks_scope_and_uses_canonical_source_slug() -> None:
+def test_charmm36m_table_query_locks_scope_and_preserves_document_source_slug() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
     charmm36 = make_table_document(
@@ -927,7 +517,7 @@ def test_charmm36m_table_query_locks_scope_and_uses_canonical_source_slug() -> N
 
     assert response.citations
     assert {citation.document_id for citation in response.citations} == {"charmm36m"}
-    assert {citation.page_slug for citation in response.citations} == {"sources/charmm36m-force-field"}
+    assert {citation.page_slug for citation in response.citations} == {"sources/charmm36m"}
     assert all("CHARMM36 | 9.9" not in citation.excerpt for citation in response.citations)
     assert all("OPLS5 | 5.5" not in citation.excerpt for citation in response.citations)
     assert "Table 2" in response.citations[0].excerpt
@@ -3010,84 +2600,9 @@ def test_explicit_table_query_does_not_use_prose_metric_chunk_as_table_evidence(
     assert contexts == []
 
 
-def test_answer_ignores_public_wiki_mode_and_uses_rag() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(
-        id="d1",
-        project_id="p1",
-        title="Medical Case",
-        file_name="case.md",
-        sha256="abc",
-        raw_path="raw/case.md",
-        metadata_json={"source_slug": "sources/medical-case"},
-        status="ready",
-    )
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/medical-case",
-        title="Medical Case Summary",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/medical-case.md",
-        markdown_content="# Medical Case Summary\n\nThe doctor recommended a follow-up in two weeks after discharge.",
-        source_document_ids=["d1"],
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="The source evidence says the doctor recommended a follow-up in two weeks after discharge.",
-        page_label="1",
-        embedding=None,
-    )
-    db.add_all([project, document, wiki_page, chunk])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = FakeOllama()
-    service.verifier = FakeVerifier()
-    service._answer_wiki_first = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("public answer must not use wiki mode"))
-    old_mode = settings.query_mode
-    settings.query_mode = "wiki"
-    try:
-        response = service.answer("demo", "When is the follow-up?", save_answer=False)
-    finally:
-        settings.query_mode = old_mode
-
-    assert response.citations
-    assert response.citations[0].page_slug == "sources/medical-case"
-    assert response.citations[0].document_id == "d1"
 
 
-def test_rag_returns_no_evidence_instead_of_falling_back_to_wiki() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/wiki-only",
-        title="Wiki Only",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/wiki-only.md",
-        markdown_content="# Wiki Only\n\nThis wiki page should not be used by RAG.",
-        source_document_ids=[],
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = FakeOllama()
-    service.verifier = FakeVerifier()
-    service._answer_wiki_first = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RAG must not fall back to wiki"))
-
-    response = service.answer("demo", "What does the wiki-only page say?", save_answer=False)
-
-    assert "No supporting evidence" in response.answer_markdown
-    assert response.citations == []
-
-
-def test_rag_save_answer_does_not_write_wiki_query_page() -> None:
+def test_rag_save_answer_persists_only_question_answer() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
     document = Document(
@@ -3115,54 +2630,11 @@ def test_rag_save_answer_does_not_write_wiki_query_page() -> None:
     service = QueryService(db)
     service.ollama = FakeOllama()
     service.verifier = FakeVerifier()
-    service._save_query_page = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RAG save_answer must not write wiki pages"))
-
     response = service.answer("demo", "What does FooNet report?", save_answer=True)
 
     assert response.citations
-    assert db.query(WikiPage).count() == 0
+    assert db.query(QuestionAnswer).count() == 1
 
-
-def test_rag_citation_source_fields_come_from_document_metadata_not_wiki() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(
-        id="d1",
-        project_id="p1",
-        title="FooNet Benchmark Paper",
-        file_name="foonet.pdf",
-        sha256="abc",
-        raw_path="raw/foonet.pdf",
-        raw_text="FooNet reports benchmark metrics.",
-        metadata_json={"source_slug": "sources/foonet", "source_title": "FooNet Source"},
-        status="ready",
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="FooNet reports benchmark metrics in the source evidence.",
-        page_label="1",
-        embedding=None,
-    )
-    wrong_wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/wrong-wiki-source",
-        title="Wrong Wiki Source",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/wrong.md",
-        markdown_content="# Wrong\n\nThis page must not define RAG source identity.",
-        source_document_ids=["d1"],
-    )
-    db.add_all([project, document, chunk, wrong_wiki_page])
-    db.commit()
-
-    response = QueryService(db)._search_source_chunks("What does FooNet report?", "p1", ["d1"], limit=1)
-
-    assert response
-    assert response[0].citation.page_slug == "sources/foonet"
-    assert response[0].citation.page_title == "FooNet Source"
 
 
 # ---- New tests for PDF query validation fixes ----
@@ -3246,7 +2718,7 @@ def test_is_metric_query_detects_metric_questions() -> None:
     assert not QueryService._is_metric_query("ff19SB 涓轰粈涔堟帹鑽愬拰 OPC water model 涓€璧蜂娇鐢紵")
 
 
-def test_extract_figure_blocks_from_wiki_markdown() -> None:
+def test_extract_figure_blocks_from_document_markdown() -> None:
     markdown = """
 ## Summary
 Some text.
@@ -3265,7 +2737,7 @@ Some text.
     assert any("SAC-KG architecture" in b for b in blocks)
 
 
-def test_extract_table_blocks_from_wiki_markdown() -> None:
+def test_extract_table_blocks_from_document_markdown() -> None:
     markdown = """
 ## Tables
 ### Page 5
@@ -3286,81 +2758,6 @@ def test_extract_table_blocks_from_wiki_markdown() -> None:
     combined = "\n".join(blocks)
     assert "74.7" in combined or "SAC-KG" in combined
 
-
-def test_select_citations_dedups_same_page_slug() -> None:
-    """Same page_slug should appear at most 2 times with distinct excerpts."""
-    from app.schemas.common import Citation
-    from app.services.search import RetrievedContext
-
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/test-paper",
-        title="Test Paper",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/test-paper.md",
-        markdown_content="# Test Paper\n\nContent A\n\nContent B\n\nContent C",
-        source_document_ids=["d1"],
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    contexts = [
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/test-paper", page_title="Test Paper",
-                page_kind="source_summary", score=5.0, page_label="1",
-                excerpt="Content A excerpt",
-            ),
-            prompt_text="Content A excerpt",
-            score=5.0,
-        ),
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/test-paper", page_title="Test Paper",
-                page_kind="source_summary", score=4.0, page_label="1",
-                excerpt="Content A excerpt",  # same excerpt 鈫?should be deduped
-            ),
-            prompt_text="Content A excerpt",
-            score=4.0,
-        ),
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/test-paper", page_title="Test Paper",
-                page_kind="source_summary", score=3.0, page_label="2",
-                excerpt="Content B different excerpt",
-            ),
-            prompt_text="Content B different excerpt",
-            score=3.0,
-        ),
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/test-paper", page_title="Test Paper",
-                page_kind="source_summary", score=2.0, page_label="3",
-                excerpt="Content C yet another excerpt",
-            ),
-            prompt_text="Content C yet another excerpt",
-            score=2.0,
-        ),
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/other-page", page_title="Other Page",
-                page_kind="source_summary", score=1.0, page_label="1",
-                excerpt="Different page content",
-            ),
-            prompt_text="Different page content",
-            score=1.0,
-        ),
-    ]
-    citations = service._select_citations(contexts, [0, 1, 2, 3, 4])
-    # Should dedup same excerpt, keep at most 2 per page_slug.
-    test_paper_citations = [c for c in citations if c.page_slug == "sources/test-paper"]
-    assert len(test_paper_citations) <= 2
-    # Should still include other page.
-    assert any(c.page_slug == "sources/other-page" for c in citations)
 
 
 def test_build_answer_constraints_figure_query_with_context() -> None:
@@ -3433,103 +2830,6 @@ def test_rank_blocks_prioritizes_dataset_metric_table() -> None:
     assert "74.7" in ranked[0][0]
 
 
-def test_metric_query_repairs_false_missing_answer_when_table_context_exists() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Summary\n"
-            "SAC-KG is a KG construction framework.\n\n"
-            "## Tables\n"
-            "### Page 8\n"
-            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
-            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
-            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
-        ),
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
-            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
-            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    fake_ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(
-                answer_markdown="The exact numeric values are not included in the provided text excerpts.",
-                citations=[1],
-                risk_level="normal",
-            ),
-            QueryAnswerPayload(
-                answer_markdown="Table 5 reports SAC-KG ChatGPT at OIE2016 F1 74.7 / AUC 73.2 and NYT F1 88.8 / AUC 87.3 [0].",
-                citations=[0],
-                risk_level="normal",
-            ),
-        ]
-    )
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
-
-    assert "74.7" in response.answer_markdown
-    assert "88.8" in response.answer_markdown
-    assert response.citations
-    assert "88.8" in response.citations[0].excerpt
-    assert len(fake_ollama.prompts) == 0
-
-
-def test_build_contexts_adds_component_facets() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/sac-kg",
-        title="SAC-KG",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/sac-kg.md",
-        markdown_content=(
-            "# SAC-KG\n\n"
-            "SAC-KG is a framework.\n\n"
-            "Generator extracts relations and tail entities.\n\n"
-            "Verifier corrects generation errors.\n\n"
-            "Pruner decides whether tail entities should grow."
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 3, "key_terms": ["SAC-KG", "Generator", "Verifier", "Pruner"]},
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-    service = QueryService(db)
-    matches = service._search_wiki_pages("SAC-KG 鐨?Generator銆乂erifier銆丳runer 鍒嗗埆鍋氫粈涔堬紵", "p1")
-
-    contexts = service._build_contexts("SAC-KG 鐨?Generator銆乂erifier銆丳runer 鍒嗗埆鍋氫粈涔堬紵", "p1", matches)
-    prompt = "\n".join(context.prompt_text for context in contexts)
-
-    assert "Generator extracts" in prompt
-    assert "Verifier corrects" in prompt
-    assert "Pruner decides" in prompt
 
 
 def test_unsupported_answer_numbers_detects_numbers_missing_from_evidence() -> None:
@@ -3644,312 +2944,11 @@ def test_choose_citation_indexes_unions_payload_inferred_and_facets() -> None:
     assert "[4]" in renumbered
 
 
-def test_build_contexts_table_first_skips_summary_and_raw_when_table_exists() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    document = Document(id="d1", project_id="p1", title="Knowledge graph", file_name="kg.pdf", sha256="abc", raw_path="raw/kg.pdf", status="ready")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Summary\nThis summary mentions OIE2016 but has no metrics.\n\n"
-            "## Tables\n### Page 8\n"
-            "Table 5: Benchmark results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
-        ),
-        source_document_ids=["d1"],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["OIE2016", "NYT", "Table 5"]},
-    )
-    chunk = DocumentChunk(
-        id="c1",
-        document_id="d1",
-        ordinal=0,
-        text="Raw source chunk should not be used when table context exists.",
-        page_label="8",
-        embedding=None,
-    )
-    db.add_all([project, document, wiki_page, chunk])
-    db.commit()
-
-    service = QueryService(db)
-    matches = service._search_wiki_pages("What are OIE2016 and NYT F1/AUC metrics?", "p1")
-    contexts = service._build_contexts("What are OIE2016 and NYT F1/AUC metrics?", "p1", matches)
-
-    assert contexts
-    assert all("Table 5" in context.prompt_text for context in contexts)
-    assert all("This summary mentions" not in context.citation.excerpt for context in contexts)
-    assert all(context.citation.document_id is None for context in contexts)
-    assert "88.8" in contexts[0].citation.excerpt
 
 
-def test_build_contexts_scans_wiki_tables_when_page_matches_are_empty() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Summary\n"
-            "The summary discusses benchmarks but does not reproduce the values.\n\n"
-            "## Tables\n"
-            "### Page 8\n"
-            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
-            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
-            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
-            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
-            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    contexts = service._build_contexts(
-        "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵",
-        "p1",
-        [],
-    )
-
-    assert contexts
-    assert contexts[0].citation.page_slug == "sources/knowledge-graph"
-    assert contexts[0].citation.excerpt.startswith("Table 5")
-    assert "74.7" in contexts[0].prompt_text
-    assert "88.8" in contexts[0].prompt_text
 
 
-def test_build_contexts_global_table_scan_requires_query_relevance() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/unrelated",
-        title="Unrelated",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/unrelated.md",
-        markdown_content=(
-            "# Unrelated\n\n"
-            "## Tables\n"
-            "### Page 2\n"
-            "Table 9: Unrelated benchmark.\n"
-            "| Model | F1 |\n"
-            "| --- | --- |\n"
-            "| OtherModel | 55.1 |\n"
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
 
-    service = QueryService(db)
-    contexts = service._build_contexts("What are FooNet Accuracy values on Dataset-A?", "p1", [])
-
-    assert contexts == []
-
-
-def test_global_table_scan_rejects_weak_metric_overlap_without_requested_entity_or_dataset() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/unrelated",
-        title="Unrelated",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/unrelated.md",
-        markdown_content=(
-            "# Unrelated\n\n"
-            "## Tables\n"
-            "### Page 4\n"
-            "Table 4: Generic benchmark with common metric words.\n"
-            "| Model | PubMedQA |  | BioASQ |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | Accuracy | F1 | Accuracy | F1 |\n"
-            "| OtherModel | 80.1 | 74.4 | 70.5 | 66.9 |\n"
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    contexts = service._build_contexts("What are FooNet Accuracy and F1 values on Dataset-A?", "p1", [])
-
-    assert contexts == []
-
-
-def test_build_contexts_global_table_scan_uses_generic_dataset_anchors() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/foo",
-        title="Foo",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/foo.md",
-        markdown_content=(
-            "# Foo\n\n"
-            "## Tables\n"
-            "### Page 2\n"
-            "Table 1: Unrelated benchmark.\n"
-            "| Model | F1 |\n"
-            "| --- | --- |\n"
-            "| OtherModel | 55.1 |\n"
-            "### Page 7\n"
-            "Table 7: FooNet benchmark results.\n"
-            "| Model | Dataset-A |  | Dataset-B |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | Accuracy | F1 | Accuracy | F1 |\n"
-            "| BaselineNet | 70.1 | 61.4 | 68.2 | 59.7 |\n"
-            "| FooNet | 91.2 | 89.5 | 87.6 | 85.4 |\n"
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    contexts = service._build_contexts("What are FooNet Accuracy and F1 on Dataset-A and Dataset-B?", "p1", [])
-
-    assert contexts
-    assert contexts[0].citation.excerpt.startswith("Table 7")
-    assert "91.2" in contexts[0].prompt_text
-    assert "85.4" in contexts[0].prompt_text
-
-
-def test_matched_page_unrelated_table_does_not_block_global_requested_table() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    matched_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/overview",
-        title="SAC-KG Overview",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/overview.md",
-        markdown_content=(
-            "# SAC-KG Overview\n\n"
-            "## Summary\n"
-            "This page discusses SAC-KG and mentions OIE2016 and NYT, but its table is unrelated.\n\n"
-            "## Tables\n"
-            "### Page 2\n"
-            "Table 1: Training configuration.\n"
-            "| Setting | Value |\n"
-            "| --- | --- |\n"
-            "| Batch size | 32 |\n"
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT"]},
-    )
-    requested_table_page = WikiPage(
-        id="w2",
-        project_id="p1",
-        slug="sources/benchmark",
-        title="Benchmark",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/benchmark.md",
-        markdown_content=(
-            "# Benchmark\n\n"
-            "## Tables\n"
-            "### Page 8\n"
-            "Table 5: F1 score and AUC results on OIE2016 and NYT datasets.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, matched_page, requested_table_page])
-    db.commit()
-
-    service = QueryService(db)
-    matches = [PageMatch(page=matched_page, score=20.0)]
-    contexts = service._build_contexts("What are SAC-KG metrics on OIE2016 and NYT?", "p1", matches)
-
-    assert contexts
-    assert contexts[0].citation.page_slug == "sources/benchmark"
-    assert "74.7" in contexts[0].prompt_text
-    assert "Batch size" not in contexts[0].prompt_text
-
-
-def test_global_table_scan_requires_non_table_anchor_when_table_number_is_not_unique() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wrong_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/wrong",
-        title="Wrong",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/wrong.md",
-        markdown_content=(
-            "# Wrong\n\n"
-            "## Tables\n"
-            "### Page 8\n"
-            "Table 5: Another model results on unrelated datasets.\n"
-            "| Model | Dataset-X |  |\n"
-            "| --- | --- | --- |\n"
-            "|  | F1 | AUC |\n"
-            "| OtherModel | 60.1 | 58.2 |\n"
-        ),
-        source_document_ids=[],
-    )
-    right_page = WikiPage(
-        id="w2",
-        project_id="p1",
-        slug="sources/right",
-        title="Right",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/right.md",
-        markdown_content=(
-            "# Right\n\n"
-            "## Tables\n"
-            "### Page 8\n"
-            "Table 5: F1 score and AUC results on OIE2016 and NYT datasets.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
-        ),
-        source_document_ids=[],
-    )
-    db.add_all([project, wrong_page, right_page])
-    db.commit()
-
-    service = QueryService(db)
-    contexts = service._build_contexts("What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", "p1", [])
-
-    assert contexts
-    assert contexts[0].citation.page_slug == "sources/right"
-    assert all("OtherModel" not in context.prompt_text for context in contexts)
 
 
 def test_metric_query_without_structured_table_does_not_fall_back_to_prose_source_chunk() -> None:
@@ -3978,184 +2977,8 @@ def test_metric_query_without_structured_table_does_not_fall_back_to_prose_sourc
     assert "As shown in Table 5" not in service.ollama.last_prompt
 
 
-def test_metric_query_uses_deterministic_table_fallback_when_repair_still_missing() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Summary\nSAC-KG is a KG construction framework.\n\n"
-            "## Tables\n### Page 8\n"
-            "Table 5: F1 score and AUC results on OIE2016, WEB, NYT, and PENN datasets.\n"
-            "| Model | OIE2016 |  | WEB |  | NYT |  | PENN |  |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC | F1 | AUC | F1 | AUC |\n"
-            "| OpenIE 6 (2020) | 55.3 | 61.1 | 61.1 | 64.9 | 30.7 | 55.2 | 54.2 | 63.1 |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 96.6 | 95.7 | 88.8 | 87.3 | 91.1 | 90.1 |\n"
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The values are not present in the provided text.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The exact values are still not included in the provided context.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are SAC-KG metrics on OIE2016 and NYT?", save_answer=False)
-
-    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
-    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
-    assert response.citations
-    assert "Table 5" in response.citations[0].excerpt
-    assert "88.8" in response.citations[0].excerpt
 
 
-def test_metric_query_repairs_answer_that_only_mentions_metric_names() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    table = (
-        "Table 4: Biomedical QA benchmark.\n"
-        "| Method | PubMedQA | PubMedQA | BioASQ | BioASQ |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | Accuracy | F1 | Accuracy | F1 |\n"
-        "| BioGraph-RAG | 84.9 | 79.6 | 75.2 | 71.3 |"
-    )
-    contexts = [
-        RetrievedContext(
-            citation=Citation(page_slug="sources/bio", page_title="Bio", page_kind="source_summary", score=1, excerpt=table),
-            prompt_text=table,
-            score=1,
-        )
-    ]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(
-                answer_markdown="Table 4 reports Accuracy and F1 for PubMedQA and BioASQ, but the answer omits the numbers. [0]",
-                citations=[0],
-                risk_level="normal",
-            ),
-            QueryAnswerPayload(
-                answer_markdown="The repaired answer still only says Accuracy and F1 are reported for PubMedQA and BioASQ. [0]",
-                citations=[0],
-                risk_level="normal",
-            ),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are BioGraph-RAG Accuracy and F1 values on PubMedQA and BioASQ?", save_answer=False)
-
-    assert "PUBMEDQA" in response.answer_markdown
-    assert "84.9" in response.answer_markdown
-    assert "79.6" in response.answer_markdown
-    assert "BIOASQ" in response.answer_markdown
-    assert "75.2" in response.answer_markdown
-    assert "71.3" in response.answer_markdown
-
-
-def test_chinese_table_query_prompt_requires_chinese_answer() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    table = (
-        "Table 5: F1 score and AUC results.\n"
-        "| Model | OIE2016 |  | NYT |  |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | F1 | AUC | F1 | AUC |\n"
-        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-    )
-    contexts = [
-        RetrievedContext(
-            citation=Citation(page_slug="sources/kg", page_title="KG", page_kind="source_summary", score=1, excerpt=table),
-            prompt_text=table,
-            score=1,
-        )
-    ]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    fake_ollama = FakeOllama()
-    service.ollama = fake_ollama
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "SAC-KG 鍦?OIE2016 鎴?NYT 鏁版嵁闆嗕笂鐨勬寚鏍囨槸浠€涔堬紵", save_answer=False)
-
-    assert fake_ollama.last_prompt == ""
-    assert "已在表格证据中找到相关指标" in response.answer_markdown
-
-
-def test_metric_fallback_extracts_values_from_citation_excerpt_when_prompt_text_lacks_table() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    table_excerpt = (
-        "Table 5: F1 score and AUC results.\n"
-        "| Model | OIE2016 |  | NYT |  |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | F1 | AUC | F1 | AUC |\n"
-        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-    )
-    contexts = [
-        RetrievedContext(
-            citation=Citation(
-                page_slug="sources/kg",
-                page_title="KG",
-                page_kind="source_summary",
-                score=10,
-                excerpt=table_excerpt,
-            ),
-            prompt_text="As shown in Table 5, the requested metrics are discussed without a reproduced table.",
-            score=10,
-        )
-    ]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The specific metric values are not present in the provided text.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the provided context.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are SAC-KG metrics on OIE2016 and NYT?", save_answer=False)
-
-    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
-    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
-    assert service.ollama.prompts == []
 
 
 def test_table_citation_indexes_detect_table_data_in_citation_excerpt() -> None:
@@ -4253,117 +3076,6 @@ def test_table_citation_indexes_ignore_table5_prose_without_metric_values_or_row
     assert indexes == []
 
 
-def test_metric_query_selects_real_table5_over_higher_scored_prose_context() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    prose_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=50,
-            excerpt="As shown in Table 5, SAC-KG outperforms other baselines on benchmark datasets.",
-        ),
-        prompt_text="As shown in Table 5, SAC-KG outperforms other baselines on benchmark datasets.",
-        score=50,
-    )
-    table = (
-        "Table 5: F1 score and AUC results.\n"
-        "| Model | OIE2016 |  | NYT |  |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | F1 | AUC | F1 | AUC |\n"
-        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-    )
-    table_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=5,
-            excerpt=table,
-        ),
-        prompt_text=table,
-        score=5,
-    )
-    contexts = [prose_context, table_context]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The exact values are not present in the provided context.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the provided context.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
-
-    assert "OIE2016 F1 74.7 / AUC 73.2" in response.answer_markdown
-    assert "NYT F1 88.8 / AUC 87.3" in response.answer_markdown
-    assert response.citations
-    assert response.citations[0].excerpt.startswith("Table 5")
-    assert all("As shown in Table 5" not in citation.excerpt for citation in response.citations)
-
-
-def test_table_evidence_replacement_preserves_inline_citation_marker() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    prose_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=50,
-            excerpt="As shown in Table 5, SAC-KG outperforms baselines on benchmark datasets.",
-        ),
-        prompt_text="As shown in Table 5, SAC-KG outperforms baselines on benchmark datasets.",
-        score=50,
-    )
-    table = (
-        "Table 5: F1 score and AUC results.\n"
-        "| Model | OIE2016 |  | NYT |  |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | F1 | AUC | F1 | AUC |\n"
-        "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-    )
-    table_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=5,
-            excerpt=table,
-        ),
-        prompt_text=table,
-        score=5,
-    )
-    contexts = [prose_context, table_context]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(
-                answer_markdown="Table 5 reports OIE2016 F1 74.7 / AUC 73.2 and NYT F1 88.8 / AUC 87.3 [0].",
-                citations=[0],
-                risk_level="normal",
-            )
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are SAC-KG Table 5 F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
-
-    assert response.answer_markdown.endswith("[0]")
-    assert len(response.citations) == 1
-    assert response.citations[0].excerpt.startswith("Table 5")
 
 
 def test_context_has_table_data_rejects_html_until_it_is_converted_to_markdown() -> None:
@@ -4408,56 +3120,6 @@ def test_citation_is_table_evidence_requires_structured_rows() -> None:
     assert not QueryService._citation_is_table_evidence(prose)
     assert QueryService._citation_is_table_evidence(table)
 
-
-def test_metric_query_fallback_when_chinese_draft_says_values_cannot_be_extracted() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Tables\n### Page 8\n"
-            "Table 5: F1 score and AUC results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |\n"
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 5, "key_terms": ["SAC-KG", "OIE2016", "NYT", "Table 5"]},
-    )
-    document = make_table_document(
-        table_markdown=(
-            "Table 5: F1 score and AUC results.\n"
-            "| Model | OIE2016 |  | NYT |  |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "|  | F1 | AUC | F1 | AUC |\n"
-            "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |"
-        )
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The current retrieved snippets do not directly contain the complete table, so the specific values cannot be extracted.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The values still cannot be extracted from the current retrieved content.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are SAC-KG F1/AUC metrics on OIE2016 and NYT?", save_answer=False)
-
-    assert "74.7" in response.answer_markdown
-    assert "73.2" in response.answer_markdown
-    assert "88.8" in response.answer_markdown
-    assert "87.3" in response.answer_markdown
 
 
 def test_metric_extraction_uses_requested_non_sac_kg_row_selector() -> None:
@@ -4585,50 +3247,6 @@ def test_metric_extraction_handles_generic_multi_level_dataset_headers() -> None
     assert values["PUBMEDQA"] == {"Accuracy": "84.9", "F1": "79.6"}
     assert values["BIOASQ"] == {"Accuracy": "75.2", "F1": "71.3"}
 
-
-def test_metric_query_extracts_generic_table7_foonet_metrics() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    table = (
-        "Table 7: FooNet benchmark results.\n"
-        "| Model | Dataset-A |  | Dataset-B |  |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "|  | Accuracy | F1 | Accuracy | F1 |\n"
-        "| BaselineNet | 70.1 | 61.4 | 68.2 | 59.7 |\n"
-        "| FooNet | 91.2 | 89.5 | 87.6 | 85.4 |"
-    )
-    contexts = [
-        RetrievedContext(
-            citation=Citation(page_slug="sources/foo", page_title="Foo", page_kind="source_summary", score=1, excerpt=table),
-            prompt_text=table,
-            score=1,
-        )
-    ]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The exact metric values are not present in the provided context.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The requested metric values still cannot be extracted.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What are FooNet Accuracy and F1 on Dataset-A and Dataset-B in Table 7?", save_answer=False)
-
-    assert "Table 7" in response.answer_markdown
-    assert "DATASET-A" in response.answer_markdown
-    assert "91.2" in response.answer_markdown
-    assert "89.5" in response.answer_markdown
-    assert "DATASET-B" in response.answer_markdown
-    assert "87.6" in response.answer_markdown
-    assert "85.4" in response.answer_markdown
-    assert response.citations
-    assert response.citations[0].excerpt.startswith("Table 7")
 
 
 def test_generic_table_terms_include_lowercase_scientific_entities() -> None:
@@ -4889,8 +3507,8 @@ def test_rag_table_query_answers_grouped_peptide_values_without_model_generation
     fake_ollama = CountingFakeOllama()
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
-    service._route_papers = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
+    service._route_papers = lambda question, project_id, document_id=None, limit=3: []
+    service._build_rag_contexts = lambda question, project_id, paper_matches, document_ids=None: contexts
     service._search_source_chunks = lambda question, project_id, document_ids, limit=5: []
 
     response = service.answer(
@@ -5677,108 +4295,6 @@ def test_table_block_excerpt_starts_at_html_table_after_prose() -> None:
     assert "As shown in Table 3" not in excerpt
 
 
-def test_table_query_citation_excerpt_starts_from_table_evidence() -> None:
-    db = make_session()
-    project = Project(id="p1", slug="demo", name="Demo")
-    wiki_page = WikiPage(
-        id="w1",
-        project_id="p1",
-        slug="sources/knowledge-graph",
-        title="Knowledge graph",
-        kind="source_summary",
-        markdown_path="wiki/demo/sources/knowledge-graph.md",
-        markdown_content=(
-            "# Knowledge graph\n\n"
-            "## Summary\nA summary should not become the table citation.\n\n"
-            "## Tables\n### Page 4\n"
-            "Table 2: Ablation study.\n"
-            "| Variant | F1 |\n"
-            "| --- | --- |\n"
-            "| w/o verifier | 68.1 |\n"
-            "| SAC-KG full | 74.7 |\n"
-        ),
-        source_document_ids=[],
-        metadata_json={"verified_claim_count": 4, "key_terms": ["Table 2", "ablation"]},
-    )
-    document = make_table_document(
-        page_label="4",
-        table_markdown=(
-            "Table 2: Ablation study.\n"
-            "| Variant | F1 |\n"
-            "| --- | --- |\n"
-            "| w/o verifier | 68.1 |\n"
-            "| SAC-KG full | 74.7 |"
-        ),
-    )
-    db.add_all([project, document, wiki_page])
-    db.commit()
-
-    service = QueryService(db)
-    service.ollama = FakeOllama()
-    service.ollama.payload = QueryAnswerPayload(answer_markdown="Table 2 reports the ablation result [0].", citations=[0], risk_level="normal")
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "Please cite Table 2 ablation results.", save_answer=False)
-
-    assert response.citations
-    assert response.citations[0].excerpt.startswith("Table 2")
-    assert "A summary should not" not in response.citations[0].excerpt
-
-
-def test_table2_ablation_selects_markdown_table_over_higher_scored_prose_context() -> None:
-    db = make_session()
-    db.add(Project(id="p1", slug="demo", name="Demo"))
-    db.commit()
-    prose_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=40,
-            excerpt="As shown in Table 2, the ablation study validates each component.",
-        ),
-        prompt_text="As shown in Table 2, the ablation study validates each component.",
-        score=40,
-    )
-    table = (
-        "Table 2: Ablation study.\n"
-        "| Iteration rounds | Model | Number of recalls | Precision | Domain Specificity |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "| Iteration 1 | SAC-KG w/o prompt | 10.15 | 80.64 | 74.19 |\n"
-        "| Iteration 1 | SAC-KG | 13.50 | 88.81 | 80.50 |"
-    )
-    table_context = RetrievedContext(
-        citation=Citation(
-            page_slug="sources/kg",
-            page_title="KG",
-            page_kind="source_summary",
-            score=5,
-            excerpt=table,
-        ),
-        prompt_text=table,
-        score=5,
-    )
-    contexts = [prose_context, table_context]
-
-    service = QueryService(db)
-    service._load_index_context = lambda project_slug: None
-    service._search_wiki_pages = lambda question, project_id: []
-    service._build_rag_contexts = lambda question, project_id, paper_matches: contexts
-    service.ollama = SequencedFakeOllama(
-        [
-            QueryAnswerPayload(answer_markdown="The ablation values are not included in the provided context.", citations=[0], risk_level="normal"),
-            QueryAnswerPayload(answer_markdown="The ablation values still cannot be extracted.", citations=[0], risk_level="normal"),
-        ]
-    )
-    service.verifier = FakeVerifier()
-
-    response = service.answer("demo", "What conclusions can be drawn from Table 2 ablation study?", save_answer=False)
-
-    assert "Table 2 shows" in response.answer_markdown
-    assert "precision 88.81" in response.answer_markdown
-    assert response.citations
-    assert response.citations[0].excerpt.startswith("Table 2")
-    assert all("As shown in Table 2" not in citation.excerpt for citation in response.citations)
 
 
 def test_ablation_table_excerpt_keeps_all_rows_needed_for_summary() -> None:
@@ -6913,3 +5429,123 @@ def test_answer_overview_query_prompt_uses_substantive_chunks() -> None:
     assert all(citation.document_id == "d1" for citation in response.citations)
     assert "neural network" in fake_ollama.last_prompt.lower()
     assert "Methods" not in fake_ollama.last_prompt
+
+
+def test_document_scope_isolates_direct_rag_results_and_fallback() -> None:
+    """Scoped direct RAG only returns evidence from the requested document."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc_a = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha",
+        file_name="alpha.pdf",
+        sha256="sha-a",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    doc_b = Document(
+        id="d-b",
+        project_id="p1",
+        title="Beta",
+        file_name="beta.pdf",
+        sha256="sha-b",
+        raw_path="raw/beta.pdf",
+        status="ready",
+    )
+    chunk_a = DocumentChunk(
+        id="c-a",
+        document_id="d-a",
+        ordinal=0,
+        text="Alpha document contains the unique term alpharidium.",
+    )
+    chunk_b = DocumentChunk(
+        id="c-b",
+        document_id="d-b",
+        ordinal=0,
+        text="Beta document contains the unique term betaridium.",
+    )
+    db.add_all([project, doc_a, doc_b, chunk_a, chunk_b])
+    db.commit()
+
+    service = QueryService(db)
+    service.ollama = FakeOllama()
+    service.verifier = FakeVerifier()
+
+    # Scoped to doc_a: should only find doc_a evidence.
+    response_a = service.answer(
+        "demo", "alpharidium", save_answer=False, document_id="d-a"
+    )
+    assert all(c.document_id == "d-a" for c in response_a.citations)
+
+    # Scoped to doc_a for a term only in doc_b: no fallback to doc_b.
+    response_empty = service.answer(
+        "demo", "betaridium", save_answer=False, document_id="d-a"
+    )
+    assert response_empty.citations == []
+
+    # Project-wide query falls back and finds doc_b evidence.
+    response_project = service.answer("demo", "betaridium", save_answer=False)
+    assert any(c.document_id == "d-b" for c in response_project.citations)
+
+
+def test_document_scope_rejects_foreign_document() -> None:
+    """Scoped queries reject document IDs outside the project."""
+    db = make_session()
+    project_a = Project(id="p-a", slug="topic-a", name="Topic A")
+    project_b = Project(id="p-b", slug="topic-b", name="Topic B")
+    doc_b = Document(
+        id="d-b",
+        project_id="p-b",
+        title="Other",
+        file_name="other.pdf",
+        sha256="sha",
+        raw_path="raw/other.pdf",
+        status="ready",
+    )
+    db.add_all([project_a, project_b, doc_b])
+    db.commit()
+
+    service = QueryService(db)
+    with pytest.raises(ValueError):
+        service.answer("topic-a", "anything", save_answer=False, document_id="d-b")
+
+
+def test_retrieve_evidence_honors_document_scope() -> None:
+    """retrieve_evidence only returns items from the scoped document."""
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    doc_a = Document(
+        id="d-a",
+        project_id="p1",
+        title="Alpha",
+        file_name="alpha.pdf",
+        sha256="sha-a",
+        raw_path="raw/alpha.pdf",
+        status="ready",
+    )
+    doc_b = Document(
+        id="d-b",
+        project_id="p1",
+        title="Beta",
+        file_name="beta.pdf",
+        sha256="sha-b",
+        raw_path="raw/beta.pdf",
+        status="ready",
+    )
+    chunk_a = DocumentChunk(
+        id="c-a", document_id="d-a", ordinal=0, text="Alpha content here."
+    )
+    chunk_b = DocumentChunk(
+        id="c-b", document_id="d-b", ordinal=0, text="Beta content here."
+    )
+    db.add_all([project, doc_a, doc_b, chunk_a, chunk_b])
+    db.commit()
+
+    service = QueryService(db)
+    pack = service.retrieve_evidence("demo", "content", document_id="d-a")
+    assert pack.status == "ok"
+    assert all(item.document_id == "d-a" for item in pack.items)
+
+    empty_pack = service.retrieve_evidence("demo", "beta", document_id="d-a")
+    assert empty_pack.status == "empty"

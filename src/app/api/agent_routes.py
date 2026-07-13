@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.records import ConversationSession, SessionAttachment, SessionAttachmentChunk
+from app.models.records import ConversationSession, Document, SessionAttachment, SessionAttachmentChunk
 from app.schemas.agent import (
     AgentConstraints,
     AgentQueryRequest,
@@ -112,6 +112,43 @@ def _assert_session_project(session_id: str | None, project_slug: str, db: Sessi
         )
 
 
+def _assert_session_scope(
+    session_id: str | None,
+    project_slug: str,
+    document_id: str | None,
+    db: Session,
+) -> None:
+    """Raise if an existing session is being reused with an incompatible scope."""
+    _assert_session_project(session_id, project_slug, db)
+    if not session_id:
+        return
+    session = db.get(ConversationSession, session_id)
+    if session is None:
+        return
+    if session.document_id != document_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Session {session_id} is scoped to document {session.document_id}; "
+                f"cannot be used for document {document_id}."
+            ),
+        )
+
+
+def _validate_document_in_project(
+    document_id: str | None, project_slug: str, db: Session
+) -> None:
+    """Raise 404 if the document does not exist or belongs to another project."""
+    if document_id is None:
+        return
+    document = db.get(Document, document_id)
+    if document is None or document.project is None or document.project.slug != project_slug:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{document_id}' not found in project '{project_slug}'.",
+        )
+
+
 @agent_router.post("/query", response_model=AgentQueryResponse)
 def agent_query(
     payload: AgentQueryRequest, db: Session = Depends(get_db)
@@ -126,7 +163,10 @@ def agent_query(
             detail="Agent service is not enabled. Set AGENT_ENABLED=true.",
         )
 
-    _assert_session_project(payload.session_id, payload.project_slug, db)
+    _validate_document_in_project(payload.document_id, payload.project_slug, db)
+    _assert_session_scope(
+        payload.session_id, payload.project_slug, payload.document_id, db
+    )
 
     executor = _build_executor(db)
     response = executor.execute(_apply_server_constraint_defaults(payload))
@@ -183,7 +223,10 @@ async def agent_query_stream(
             detail="Agent service is not enabled. Set AGENT_ENABLED=true.",
         )
 
-    _assert_session_project(payload.session_id, payload.project_slug, db)
+    _validate_document_in_project(payload.document_id, payload.project_slug, db)
+    _assert_session_scope(
+        payload.session_id, payload.project_slug, payload.document_id, db
+    )
 
     # Derive a thread-safe session factory from the injected session's
     # bind so tests that override the DB engine still work.
@@ -297,7 +340,8 @@ def get_agent_trace(
 
 @agent_router.get("/sessions", response_model=list[AgentSessionRead])
 def list_agent_sessions(
-    project_slug: str | None = Query(None, description="Project slug to filter by"),
+    project_slug: str = Query(..., description="Project slug to filter by"),
+    document_id: str | None = Query(None, description="Document ID to filter by"),
     limit: int = Query(50, ge=1, le=200, description="Max sessions to return"),
     offset: int = Query(0, ge=0, description="Number of sessions to skip"),
     db: Session = Depends(get_db),
@@ -307,47 +351,39 @@ def list_agent_sessions(
     Sessions are read-only here; creation and updates happen through the
     Agent query endpoints.
     """
+    _validate_document_in_project(document_id, project_slug, db)
     stmt = select(ConversationSession).order_by(ConversationSession.updated_at.desc())
-    if project_slug is not None:
-        stmt = stmt.where(ConversationSession.project_slug == project_slug)
+    stmt = stmt.where(ConversationSession.project_slug == project_slug)
+    if document_id is not None:
+        stmt = stmt.where(ConversationSession.document_id == document_id)
+    else:
+        stmt = stmt.where(ConversationSession.document_id.is_(None))
     rows = db.scalars(stmt.offset(offset).limit(limit)).all()
     memory = ConversationMemory(db)
     sessions: list[AgentSessionRead] = []
     for row in rows:
-        first_user_turn = memory.first_user_turn(row.id)
-        sessions.append(
-            AgentSessionRead(
-                id=row.id,
-                project_slug=row.project_slug,
-                preview=(first_user_turn.content if first_user_turn else row.id),
-                turn_count=memory.turn_count(row.id),
-                created_at=row.created_at.isoformat(),
-                updated_at=row.updated_at.isoformat(),
-                expires_at=row.expires_at.isoformat(),
-            )
-        )
+        sessions.append(_build_agent_session_read(row, memory))
     return sessions
 
 
 @agent_router.get("/sessions/{session_id}/turns", response_model=list[AgentTurnRead])
 def get_agent_session_turns(
     session_id: str,
-    project_slug: str | None = Query(None, description="Project slug to scope access"),
+    project_slug: str = Query(..., description="Project slug to scope access"),
+    document_id: str | None = Query(None, description="Document ID to scope access"),
     db: Session = Depends(get_db),
 ):
     """Return ordered turns for a single Agent conversation session.
 
-    When *project_slug* is provided, the session must belong to that
-    project; otherwise a 404 is returned to prevent cross-topic turn
+    The session must belong to the requested project and exact document
+    scope; otherwise a 404 is returned to prevent cross-topic turn
     restoration.
     """
+    _validate_document_in_project(document_id, project_slug, db)
     session = db.get(ConversationSession, session_id)
     if session is None:
-        if ConversationMemory(db).turn_count(session_id) == 0:
-            raise HTTPException(status_code=404, detail="Session not found.")
-        if project_slug is not None:
-            raise HTTPException(status_code=404, detail="Session not found.")
-    elif project_slug is not None and session.project_slug != project_slug:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session.project_slug != project_slug or session.document_id != document_id:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     memory = ConversationMemory(db)
@@ -361,10 +397,39 @@ def get_agent_session_turns(
             tool_args=turn.tool_args,
             tool_result=turn.tool_result,
             step_type=turn.step_type,
+            citations=turn.citations if isinstance(turn.citations, list) else [],
             created_at=(turn.created_at.isoformat() if turn.created_at else ""),
         )
         for turn in turns
     ]
+
+
+@agent_router.delete("/sessions/{session_id}")
+def delete_agent_session(
+    session_id: str,
+    project_slug: str = Query(..., description="Project slug to scope access"),
+    document_id: str | None = Query(None, description="Document ID to scope access"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Hard-delete one Agent conversation session and its associated data."""
+    session = db.get(ConversationSession, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session.project_slug != project_slug:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session.document_id != document_id:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    deleted_project_slug = session.project_slug
+    deleted_document_id = session.document_id
+    deleted_turns = ConversationMemory(db).delete_session(session_id)
+    db.commit()
+    return {
+        "deleted": True,
+        "session_id": session_id,
+        "project_slug": deleted_project_slug,
+        "document_id": deleted_document_id,
+        "turns_deleted": deleted_turns,
+    }
 
 
 def _sse_event(event: str, data: dict) -> str:
@@ -377,6 +442,32 @@ def _sse_heartbeat() -> str:
     return _sse_event(
         "heartbeat",
         {"timestamp": datetime.utcnow().isoformat()},
+    )
+
+
+def _build_agent_session_read(
+    row: ConversationSession, memory: ConversationMemory
+) -> AgentSessionRead:
+    """Build an AgentSessionRead with scope and title information."""
+    first_user_turn = memory.first_user_turn(row.id)
+    document_title = None
+    if row.document_id is not None:
+        # Avoid importing Document at module level to keep startup light.
+        from app.models.records import Document
+
+        document = row.document_id and memory._db.get(Document, row.document_id)
+        document_title = document.title if document is not None else None
+    return AgentSessionRead(
+        id=row.id,
+        project_slug=row.project_slug,
+        scope_type="document" if row.document_id is not None else "project",
+        document_id=row.document_id,
+        document_title=document_title,
+        preview=(first_user_turn.content if first_user_turn else row.id),
+        turn_count=memory.turn_count(row.id),
+        created_at=row.created_at.isoformat(),
+        updated_at=row.updated_at.isoformat(),
+        expires_at=row.expires_at.isoformat(),
     )
 
 
@@ -413,19 +504,24 @@ def _build_final_event(response: AgentQueryResponse) -> dict:
 
 
 def _ensure_session_for_attachments(
-    db: Session, session_id: str, project_slug: str
+    db: Session, session_id: str, project_slug: str, document_id: str | None = None
 ) -> ConversationSession:
     """Return existing session or create/touch one for the given project_slug.
 
-    Raises HTTPException when an existing session belongs to a different project.
+    Raises HTTPException when an existing session belongs to a different scope.
     """
+    _validate_document_in_project(document_id, project_slug, db)
     existing = db.get(ConversationSession, session_id)
-    if existing is not None and existing.project_slug != project_slug:
+    if (
+        existing is not None
+        and (existing.project_slug != project_slug or existing.document_id != document_id)
+    ):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Session {session_id} belongs to project {existing.project_slug}; "
-                f"cannot be used for project {project_slug}."
+                f"Session {session_id} is scoped to project {existing.project_slug} "
+                f"and document {existing.document_id}; cannot be used for project "
+                f"{project_slug} and document {document_id}."
             ),
         )
     memory = ConversationMemory(db)
@@ -433,19 +529,22 @@ def _ensure_session_for_attachments(
         session_id,
         project_slug=project_slug,
         ttl_days=settings.agent_conversation_ttl_days,
+        document_id=document_id,
     )
     db.flush()
     return db.get(ConversationSession, session_id)
 
 
 def _assert_session_project_match(
-    db: Session, session_id: str, project_slug: str
+    db: Session, session_id: str, project_slug: str, document_id: str | None = None
 ) -> None:
-    """Raise 404 if the session does not exist or belongs to a different project."""
+    """Raise 404 if the session does not exist or belongs to a different scope."""
     session = db.get(ConversationSession, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session.project_slug != project_slug:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if session.document_id != document_id:
         raise HTTPException(status_code=404, detail="Session not found.")
 
 
@@ -480,6 +579,7 @@ def _chunk_to_read(chunk: SessionAttachmentChunk) -> AttachmentChunkRead:
 async def upload_session_attachment(
     session_id: str,
     project_slug: str = Query(..., description="Project slug that owns the session"),
+    document_id: str | None = Query(None, description="Document ID that scopes the session"),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> AttachmentUploadResponse:
@@ -494,7 +594,7 @@ async def upload_session_attachment(
         raise HTTPException(status_code=400, detail="File name is required.")
 
     project = get_or_create_project(db, project_slug, project_slug)
-    _ensure_session_for_attachments(db, session_id, project_slug)
+    _ensure_session_for_attachments(db, session_id, project_slug, document_id)
 
     try:
         attachment, chunks = await save_session_attachment(
@@ -524,10 +624,11 @@ async def upload_session_attachment(
 def list_session_attachments_route(
     session_id: str,
     project_slug: str = Query(..., description="Project slug that owns the session"),
+    document_id: str | None = Query(None, description="Document ID that scopes the session"),
     db: Session = Depends(get_db),
 ) -> list[AttachmentRead]:
     """List temporary attachment summaries for the session/project."""
-    _assert_session_project_match(db, session_id, project_slug)
+    _assert_session_project_match(db, session_id, project_slug, document_id)
     attachments = list_session_attachments(db, session_id, project_slug=project_slug)
     return [_attachment_to_read(a) for a in attachments]
 
@@ -537,10 +638,11 @@ def delete_session_attachment_route(
     session_id: str,
     attachment_id: str,
     project_slug: str = Query(..., description="Project slug that owns the session"),
+    document_id: str | None = Query(None, description="Document ID that scopes the session"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Delete a session attachment and its chunks, plus best-effort stored file."""
-    _assert_session_project_match(db, session_id, project_slug)
+    _assert_session_project_match(db, session_id, project_slug, document_id)
     attachment = get_session_attachment(db, attachment_id)
     if attachment is None or attachment.session_id != session_id:
         raise HTTPException(status_code=404, detail="Attachment not found.")

@@ -32,7 +32,6 @@ def test_project_paths_rejects_path_traversal(tmp_path, monkeypatch) -> None:
     from app.services import filesystem
 
     monkeypatch.setattr(filesystem.settings, "raw_dir", tmp_path / "raw")
-    monkeypatch.setattr(filesystem.settings, "wiki_dir", tmp_path / "wiki")
 
     with pytest.raises(InvalidStoragePathError):
         project_paths("../outside")
@@ -48,7 +47,6 @@ def test_save_upload_sanitizes_filename_and_rejects_traversal(tmp_path, monkeypa
     from app.services import filesystem
 
     monkeypatch.setattr(filesystem.settings, "raw_dir", tmp_path / "raw")
-    monkeypatch.setattr(filesystem.settings, "wiki_dir", tmp_path / "wiki")
     monkeypatch.setattr(filesystem.settings, "max_upload_bytes", 1024)
     upload = UploadFile(file=BytesIO(b"content"), filename="../evil.pdf")
 
@@ -60,7 +58,6 @@ def test_save_upload_deletes_partial_file_when_upload_exceeds_limit(tmp_path, mo
     from app.services import filesystem
 
     monkeypatch.setattr(filesystem.settings, "raw_dir", tmp_path / "raw")
-    monkeypatch.setattr(filesystem.settings, "wiki_dir", tmp_path / "wiki")
     monkeypatch.setattr(filesystem.settings, "max_upload_bytes", 5)
     upload = UploadFile(file=BytesIO(b"123456"), filename="paper.pdf")
 
@@ -74,7 +71,6 @@ def test_save_upload_writes_safe_file_without_partial_suffix(tmp_path, monkeypat
     from app.services import filesystem
 
     monkeypatch.setattr(filesystem.settings, "raw_dir", tmp_path / "raw")
-    monkeypatch.setattr(filesystem.settings, "wiki_dir", tmp_path / "wiki")
     monkeypatch.setattr(filesystem.settings, "max_upload_bytes", 1024)
     upload = UploadFile(file=BytesIO(b"content"), filename="paper.pdf")
 

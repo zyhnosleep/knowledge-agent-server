@@ -76,7 +76,7 @@ def test_stream_returns_200_with_valid_payload(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="stream answer",
                 citations=[],
@@ -119,7 +119,7 @@ def test_stream_has_expected_event_names(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="stream answer",
                 citations=[],
@@ -193,7 +193,7 @@ def test_stream_final_event_has_trace_id(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="stream answer",
                 citations=[],
@@ -262,7 +262,7 @@ def test_stream_has_heartbeat_event(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="hb answer",
                 citations=[],
@@ -339,7 +339,7 @@ def test_stream_final_event_has_enriched_summary_fields(monkeypatch) -> None:
     from app.schemas.common import QueryResponse
 
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             return QueryResponse(
                 answer_markdown="enriched answer",
                 citations=[],

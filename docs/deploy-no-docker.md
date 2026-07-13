@@ -60,7 +60,6 @@ REDIS_URL=redis://127.0.0.1:6379/0
 QUEUE_JOB_TIMEOUT=9000
 DATA_DIR=./data
 RAW_DIR=./data/raw
-WIKI_DIR=./data/wiki
 CACHE_DIR=./data/cache
 OLLAMA_BASE_URL=http://127.0.0.1:11435
 OLLAMA_GENERATION_MODEL=qwen3.6:27b
@@ -244,26 +243,16 @@ tail -f logs/worker.log
 
 1. 上传 1 个 `txt` 或 `md` 文档
 2. 确认 worker 消费队列
-3. 检查 `data/raw/` 和 `data/wiki/`
-4. 检查项目目录下的 `index.md` 和 `log.md`
+3. 检查 `data/raw/` 和文档分块记录
+4. 检查文档解析状态和向量索引
 5. 发起 1 次问答，确认返回 `citations`
 6. 重复上传同一文档，确认去重生效
 
-## 8. Obsidian 协作方式
+## 8. 文档与检索
 
-这版服务器可以和 Obsidian 配合，但两者职责不同：
-
-- 服务器负责上传、摄入、抽取、问答、`wiki/queries/` 写回
-- `data/wiki/<project>/` 是主知识工件目录
-- Obsidian 适合在本地打开同步下来的 `wiki/` 目录，做人类阅读、策展、双链浏览
-
-需要注意：
-
-- 直接上传 `.md` 文档是推荐输入方式之一
-- 服务器内部仍会做 snippet/chunk 处理，用于证据定位和 fallback 检索
-- 查询主路径已经收敛到 `wiki-first`
-
-更详细的协作说明见 [docs/obsidian-workflow.md](D:\LLM_wiki\docs\obsidian-workflow.md)。
+- 服务器负责上传、摄入、抽取和问答。
+- 原始资料保存在 `data/raw/`，检索证据来自 `DocumentChunk` 和向量索引。
+- 查询主路径采用文档证据优先的 RAG，并返回可追溯 citation。
 
 ## 9. 常见问题
 

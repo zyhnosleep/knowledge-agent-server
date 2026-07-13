@@ -75,7 +75,6 @@ app.include_router(quality_router, prefix="/api")
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
-app.mount("/wiki", StaticFiles(directory=settings.wiki_dir), name="wiki")
 
 
 @app.get("/", include_in_schema=False)

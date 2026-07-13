@@ -31,7 +31,7 @@ def test_profile_command_sets(monkeypatch, tmp_path) -> None:
     expected_last_tests = {
         "quick": ["tests/test_parser_document_intelligence.py", "tests/test_query_eval.py"],
         "query": ["tests/test_query_service.py", "tests/test_paper_profile.py"],
-        "full": ["tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py", "tests/test_wiki_quality.py"],
+            "full": ["tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py"],
     }
 
     for profile, expected_count in expected_pytest_counts.items():
@@ -614,7 +614,7 @@ def test_service_ingest_requires_pdf_argument() -> None:
         raise AssertionError("--run-service-ingest-smoke should require --service-ingest-pdf")
 
 
-def test_run_service_ingest_smoke_collects_quality_and_lint(monkeypatch, tmp_path) -> None:
+def test_run_service_ingest_smoke_collects_document_quality(monkeypatch, tmp_path) -> None:
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n")
     calls: list[str] = []
@@ -665,12 +665,6 @@ def test_run_service_ingest_smoke_collects_quality_and_lint(monkeypatch, tmp_pat
                 },
                 "error": "",
             }
-        if url.endswith("/wiki/lint?project_slug=mineru-rag-smoke&limit=20&offset=0"):
-            return {
-                "status_code": 200,
-                "payload": {"issue_count": 0, "returned_issue_count": 0, "issues": []},
-                "error": "",
-            }
         raise AssertionError(url)
 
     monkeypatch.setattr(run_mineru_rag_loop, "_upload_service_ingest_pdf", fake_upload)
@@ -700,12 +694,10 @@ def test_run_service_ingest_smoke_collects_quality_and_lint(monkeypatch, tmp_pat
         "mineru_parser": True,
         "page_outputs_present": True,
         "content_list_present": True,
-        "lint_reachable": True,
     }
     assert summary["evidence"]["document_id"] == "d1"
     assert summary["evidence"]["page_output_count"] == 2
-    assert summary["evidence"]["lint_issue_count"] == 0
-    assert len(calls) == 3
+    assert len(calls) == 2
 
 
 def test_run_service_ingest_smoke_fails_when_parser_falls_back(monkeypatch, tmp_path) -> None:
@@ -728,8 +720,6 @@ def test_run_service_ingest_smoke_fails_when_parser_falls_back(monkeypatch, tmp_
             return {"status_code": 200, "payload": {"id": "d1", "status": "ready", "metadata_json": {}}, "error": ""}
         if url.endswith("/documents/d1/quality"):
             return {"status_code": 200, "payload": {"parser_mode": "pdf_vision", "page_output_count": 0}, "error": ""}
-        if "/wiki/lint" in url:
-            return {"status_code": 200, "payload": {"issue_count": 0, "returned_issue_count": 0}, "error": ""}
         raise AssertionError(url)
 
     monkeypatch.setattr(run_mineru_rag_loop, "_http_get_json", fake_get)
@@ -815,8 +805,6 @@ def test_run_service_ingest_smoke_can_allow_duplicate_skip(monkeypatch, tmp_path
             }
         if url.endswith("/documents/d1/quality"):
             return {"status_code": 200, "payload": {"parser_mode": "pdf_mineru", "page_output_count": 1}, "error": ""}
-        if "/wiki/lint" in url:
-            return {"status_code": 200, "payload": {"issue_count": 0, "returned_issue_count": 0}, "error": ""}
         raise AssertionError(url)
 
     monkeypatch.setattr(run_mineru_rag_loop, "_http_get_json", fake_get)

@@ -420,7 +420,7 @@
 
       .topic-head {
         display: grid;
-        grid-template-columns: 52px minmax(0, 1fr);
+        grid-template-columns: 52px minmax(0, 1fr) 34px;
         gap: 14px;
         align-items: center;
       }
@@ -467,6 +467,12 @@
         align-items: center;
         justify-content: space-between;
         gap: 12px;
+      }
+
+      .row-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
       }
 
       .status-badge,
@@ -598,6 +604,23 @@
         white-space: nowrap;
       }
 
+      .chat-action {
+        min-height: 32px;
+        padding: 0 12px;
+        border: 1px solid var(--blue-soft);
+        border-radius: 8px;
+        background: var(--surface-tint);
+        color: var(--blue);
+        font-weight: 800;
+        white-space: nowrap;
+      }
+
+      .chat-action:disabled {
+        border-color: var(--line);
+        background: var(--surface-soft);
+        color: var(--faint);
+      }
+
       .table-action:disabled {
         border-color: var(--line);
         background: var(--surface-soft);
@@ -639,6 +662,11 @@
         background: var(--surface-soft);
         color: var(--muted);
         font-weight: 900;
+      }
+
+      .danger-action {
+        border-color: rgba(239, 68, 68, 0.34);
+        color: #f87171;
       }
 
       .drawer-body {
@@ -919,6 +947,73 @@
         font-size: 12px;
       }
 
+      .answer-sources {
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 1px solid var(--line);
+      }
+
+      .answer-sources[hidden] {
+        display: none;
+      }
+
+      .answer-sources h4 {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .answer-sources ul {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.75;
+      }
+
+      .answer-sources li {
+        margin-bottom: 4px;
+      }
+
+      .answer-sources a {
+        color: var(--blue);
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
+      .message-sources {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid var(--line);
+      }
+
+      .message-sources h4 {
+        margin: 0 0 6px;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .message-sources ul {
+        margin: 0;
+        padding-left: 16px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .message-sources li {
+        margin-bottom: 2px;
+      }
+
+      .message-sources a {
+        color: var(--blue);
+        text-decoration: underline;
+      }
+
       .composer {
         display: grid;
         gap: 10px;
@@ -1094,6 +1189,10 @@
       }
 
       .document-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 12px;
         padding: 12px;
         border: 1px solid var(--line);
         border-radius: 8px;
@@ -1135,6 +1234,34 @@
         word-break: break-word;
         line-height: 1.75;
         font-size: 14px;
+      }
+
+      .pdf-panel {
+        display: grid;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .pdf-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .pdf-frame {
+        width: 100%;
+        min-height: min(68dvh, 760px);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-soft);
+      }
+
+      .recent-session {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 34px;
+        align-items: center;
+        gap: 8px;
       }
 
       @media (max-width: 1180px) {
@@ -1262,6 +1389,10 @@
             <article class="answer" id="answerPanel" hidden>
               <div class="answer-meta" id="answerMeta"></div>
               <div class="answer-text" id="answerText"></div>
+              <div class="answer-sources" id="answerSources" hidden>
+                <h4>来源文献</h4>
+                <ul id="answerSourcesList"></ul>
+              </div>
             </article>
           </div>
           <div class="composer">
@@ -1407,8 +1538,11 @@
       var activeProjectSlug = "internal-research";
       var activeProjectName = "Internal Research";
       var activeSessionId = null;
+      var activeDocumentId = null;
+      var activeDocumentTitle = null;
       var projects = [];
       var activeAttachments = [];
+      var currentSessions = [];
 
       function makeSessionId() {
         return "sess-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -1445,6 +1579,82 @@
         }
       }
 
+      function scopeQueryParams() {
+        var params = "project_slug=" + encodeURIComponent(activeProjectSlug);
+        if (activeDocumentId) {
+          params += "&document_id=" + encodeURIComponent(activeDocumentId);
+        }
+        return params;
+      }
+
+      function isDocumentScope() {
+        return !!activeDocumentId;
+      }
+
+      function stripCitationMarkers(text) {
+        return String(text || "").replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "");
+      }
+
+      function getSourceKey(citation) {
+        var id = citation.document_id || citation.attachment_id || "";
+        var title = citation.page_title || citation.title || citation.file_name || "";
+        return id + "|" + title;
+      }
+
+      function getSourceTitle(citation) {
+        if (citation.page_title) return citation.page_title;
+        if (citation.attachment_id) return citation.title || citation.file_name || citation.attachment_id;
+        return citation.document_id || "未知来源";
+      }
+
+      function getSourceUrl(citation) {
+        if (!citation.document_id) return null;
+        return "/api/documents/" + encodeURIComponent(citation.document_id) + "/file?project_slug=" + encodeURIComponent(activeProjectSlug);
+      }
+
+      function deduplicateSources(citations) {
+        var seen = {};
+        var sources = [];
+        (citations || []).forEach(function (c) {
+          var key = getSourceKey(c);
+          if (!key || seen[key]) return;
+          seen[key] = true;
+          sources.push(c);
+        });
+        return sources;
+      }
+
+      function renderSources(citations, container) {
+        container.replaceChildren();
+        var sources = deduplicateSources(citations);
+        if (!sources.length) {
+          container.hidden = true;
+          return;
+        }
+        container.hidden = false;
+        var heading = document.createElement("h4");
+        heading.textContent = "来源文献";
+        var list = document.createElement("ul");
+        sources.forEach(function (c) {
+          var item = document.createElement("li");
+          var title = getSourceTitle(c);
+          var url = getSourceUrl(c);
+          if (url) {
+            var link = document.createElement("a");
+            link.href = url;
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = title;
+            item.appendChild(link);
+          } else {
+            item.textContent = title;
+          }
+          list.appendChild(item);
+        });
+        container.appendChild(heading);
+        container.appendChild(list);
+      }
+
       function fetchJson(url, options) {
         return fetch(url, options).then(function (response) {
           return response.text().then(function (text) {
@@ -1467,29 +1677,38 @@
         $("chatMessages").hidden = false;
       }
 
-      function showAnswer(meta, text) {
+      function showAnswer(meta, text, citations) {
         $("answerPanel").hidden = false;
         $("answerMeta").replaceChildren();
-        meta.forEach(function (item) {
+        (meta || []).forEach(function (item) {
           var chip = document.createElement("span");
           chip.textContent = item;
           $("answerMeta").appendChild(chip);
         });
-        $("answerText").textContent = text;
+        $("answerText").textContent = stripCitationMarkers(text);
+        renderSources(citations, $("answerSources"));
       }
 
-      function appendMessage(role, content, meta) {
+      function appendMessage(role, content, meta, citations) {
         var box = $("chatMessages");
         if (!box) return;
         showMessages();
         var div = document.createElement("div");
         div.className = "message " + role;
         var label = document.createElement("strong");
-        label.textContent = meta ? role + " · " + meta : role;
+        var roleNames = { user: "你", agent: "回答", tool: "工具" };
+        var roleName = roleNames[role] || role;
+        label.textContent = meta ? roleName + " · " + meta : roleName;
         var body = document.createElement("div");
-        body.textContent = content || "";
+        body.textContent = stripCitationMarkers(content || "");
         div.appendChild(label);
         div.appendChild(body);
+        if ((role === "agent" || role === "tool") && citations && citations.length) {
+          var sourcesBox = document.createElement("div");
+          sourcesBox.className = "message-sources";
+          renderSources(citations, sourcesBox);
+          div.appendChild(sourcesBox);
+        }
         box.appendChild(div);
         box.scrollTop = box.scrollHeight;
       }
@@ -1533,6 +1752,9 @@
           session_id: sessionId,
           constraints: { max_steps: 8, max_tool_calls: 5, budget_tokens: 20000, timeout_seconds: 180 }
         };
+        if (activeDocumentId) {
+          payload.document_id = activeDocumentId;
+        }
         return fetch("/api/agent/query/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1544,7 +1766,7 @@
           var buffer = "";
           var finalData = null;
           clearThinking();
-          showAnswer(["Agent", "streaming"], "正在分析...");
+          showAnswer([], "正在分析...");
 
           function read() {
             return reader.read().then(function (result) {
@@ -1556,7 +1778,7 @@
                 var event = parseSSE(part);
                 if (!event) return;
                 if (event.name === "start") {
-                  showAnswer(["Agent", "streaming"], "正在分析...");
+                  showAnswer([], "正在分析...");
                 }
                 if (event.name === "step") {
                   var tool = event.data && event.data.tool_name ? event.data.tool_name : "step";
@@ -1575,7 +1797,6 @@
 
           return read().then(function (data) {
             var answer = data && (data.answer_markdown || data.final_answer) ? (data.answer_markdown || data.final_answer) : "未返回答案。";
-            var route = data && data.route && data.route.route ? data.route.route : "agent";
             var stepSummary = data && Array.isArray(data.step_summary)
               ? data.step_summary
               : (data && Array.isArray(data.steps) ? data.steps : []);
@@ -1585,8 +1806,9 @@
                 appendThinking(s.summary, s.tool_name || s.step_type);
               });
             }
-            showAnswer(["Agent", route], answer);
-            appendMessage("agent", answer);
+            var citations = data && Array.isArray(data.citations) ? data.citations : [];
+            showAnswer([], answer, citations);
+            appendMessage("agent", answer, null, citations);
             if (data && data.session_id) {
               activeSessionId = data.session_id;
               loadAgentSessions();
@@ -1598,14 +1820,19 @@
 
       function runRag(question) {
         appendMessage("user", question);
+        var payload = { project_slug: activeProjectSlug, question: question, save_answer: true };
+        if (activeDocumentId) {
+          payload.document_id = activeDocumentId;
+        }
         return fetchJson("/api/query", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_slug: activeProjectSlug, question: question, save_answer: true })
+          body: JSON.stringify(payload)
         }).then(function (data) {
           var answer = data.answer_markdown || "未返回答案。";
-          showAnswer(["RAG", data.verification_status || "local-only"], answer);
-          appendMessage("agent", answer);
+          var citations = data.citations || [];
+          showAnswer([], answer, citations);
+          appendMessage("agent", answer, null, citations);
         });
       }
 
@@ -1665,6 +1892,7 @@
             '<div class="topic-head">',
             '<div class="topic-icon"></div>',
             '<h3></h3>',
+            '<button class="icon-button danger-action topic-delete" type="button" title="删除主题" aria-label="删除主题">×</button>',
             "</div>",
             '<div class="topic-meta"></div>',
             '<div class="progress-track"><div class="progress-bar"></div></div>',
@@ -1677,6 +1905,10 @@
           chatAction.addEventListener("click", function (event) {
             event.stopPropagation();
             enterTopicChat(project.slug, project.name);
+          });
+          card.querySelector(".topic-delete").addEventListener("click", function (event) {
+            event.stopPropagation();
+            deleteProject(project);
           });
           card.addEventListener("click", function () {
             setActiveProject(project.slug, project.name);
@@ -1699,6 +1931,8 @@
       function setActiveProject(slug, name) {
         activeProjectSlug = slug;
         activeProjectName = name || slug;
+        activeDocumentId = null;
+        activeDocumentTitle = null;
         $("activeProjectLabel").textContent = activeProjectName;
         activeSessionId = null;
         activeAttachments = [];
@@ -1710,15 +1944,48 @@
         loadAgentSessions();
       }
 
+      function resetSourceDrawer() {
+        $("sourceDrawerBody").innerHTML = '<div class="empty">选择一条已完成的文献记录后，这里会显示可校对的原始 PDF 或 RAG Chunk。</div>';
+        $("sourceDrawerFoot").textContent = "无需离开运行页，即可对照原始 PDF、解析进程与向量块源文本。";
+      }
+
+      function deleteProject(project) {
+        if (!project || !project.slug) return;
+        var message = "确定删除主题“" + (project.name || project.slug) + "”及其全部文档、会话和解析数据吗？";
+        if (!window.confirm(message)) return;
+        var url = "/api/projects/" + encodeURIComponent(project.slug) + "?confirm_slug=" + encodeURIComponent(project.slug);
+        fetchJson(url, { method: "DELETE" }).then(function () {
+          if (project.slug === activeProjectSlug) {
+            activeSessionId = null;
+            activeAttachments = [];
+            renderAttachments();
+            resetSourceDrawer();
+          }
+          return loadProjects();
+        }).then(function () {
+          if (activeView === "runs") return loadPipelineDashboard();
+          if (activeView === "files") return loadDocuments();
+          if (activeView === "chat") return loadAgentSessions();
+        }).catch(function (err) {
+          alert(err.message || String(err));
+        });
+      }
+
       function updateChatContextLabel() {
         var label = $("chatContextLabel");
         if (!label) return;
-        label.textContent = activeProjectName || activeProjectSlug;
+        if (activeDocumentId) {
+          label.textContent = "单篇文献：《" + (activeDocumentTitle || activeDocumentId) + "》";
+        } else {
+          label.textContent = activeProjectName || activeProjectSlug;
+        }
       }
 
       function enterTopicChat(slug, name) {
         activeProjectSlug = slug;
         activeProjectName = name || slug;
+        activeDocumentId = null;
+        activeDocumentTitle = null;
         $("activeProjectLabel").textContent = activeProjectName;
         activeSessionId = null;
         activeAttachments = [];
@@ -1735,6 +2002,35 @@
             startNewChat();
           }
         });
+      }
+
+      function enterDocumentChat(documentId, documentTitle) {
+        activeDocumentId = documentId;
+        activeDocumentTitle = documentTitle || documentId;
+        activeSessionId = null;
+        activeAttachments = [];
+        renderAttachments();
+        updateChatContextLabel();
+        setView("chat", { skipSessionLoad: true });
+        loadAgentSessions().then(function (sessions) {
+          renderSessions(sessions);
+          if (sessions && sessions.length) {
+            selectSession(sessions[0].id);
+          } else {
+            resetChatSurface();
+            renderSessions([]);
+          }
+        });
+      }
+
+      function resetChatSurface() {
+        var box = $("chatMessages");
+        if (box) box.replaceChildren();
+        $("answerPanel").hidden = true;
+        $("questionInput").value = "";
+        $("questionInput").focus();
+        clearThinking();
+        showWelcome();
       }
 
       function renderRuns(runs) {
@@ -1755,7 +2051,7 @@
             '<td><div class="mini-progress"><div class="progress-track"><div class="progress-bar"></div></div><span></span></div></td>',
             '<td><span class="status-badge"></span></td>',
             '<td class="muted"></td>',
-            '<td><button class="table-action" type="button"></button></td>'
+            '<td><div class="row-actions"><button class="table-action source-action" type="button"></button><button class="table-action chat-action" type="button">对话</button><button class="icon-button danger-action delete-doc-action" type="button" title="删除文档" aria-label="删除文档">×</button></div></td>'
           ].join("");
           row.querySelector(".doc-title").textContent = run.document_title || "未关联文档";
           row.querySelector(".doc-file").textContent = run.file_name || run.run_type || "";
@@ -1766,14 +2062,37 @@
           badge.textContent = run.status_label || run.status;
           setStatusBadgeVars(badge, run.status);
           row.children[3].textContent = formatDateTime(run.updated_at || run.created_at);
-          var action = row.querySelector(".table-action");
+          var action = row.querySelector(".source-action");
           action.textContent = run.action_available ? "查看原文" : "不可用";
           action.disabled = !run.action_available || !run.document_id;
           if (run.document_id) {
             action.addEventListener("click", function () { openSource(run.document_id); });
             row.addEventListener("dblclick", function () { openSource(run.document_id); });
           }
+          var chatAction = row.querySelector(".chat-action");
+          chatAction.disabled = !run.document_id;
+          if (run.document_id) {
+            chatAction.addEventListener("click", function () {
+              enterDocumentChat(run.document_id, run.document_title || run.file_name);
+            });
+          }
+          row.querySelector(".delete-doc-action").addEventListener("click", function () {
+            deleteDocument(run.document_id, run.document_title || run.file_name);
+          });
           body.appendChild(row);
+        });
+      }
+
+      function deleteDocument(documentId, title) {
+        if (!documentId) return;
+        var label = title || documentId;
+        if (!window.confirm("确定删除文档“" + label + "”及其解析数据吗？")) return;
+        var url = "/api/documents/" + encodeURIComponent(documentId) + "?project_slug=" + encodeURIComponent(activeProjectSlug);
+        fetchJson(url, { method: "DELETE" }).then(function () {
+          resetSourceDrawer();
+          return Promise.all([loadPipelineDashboard(), loadDocuments()]);
+        }).catch(function (err) {
+          alert(err.message || String(err));
         });
       }
 
@@ -1818,7 +2137,7 @@
         });
       }
 
-      function renderSource(data) {
+      function renderSourceLegacy(data) {
         var chunks = data.chunks || [];
         var markdown = data.markdown || "";
         var body = $("sourceDrawerBody");
@@ -1870,6 +2189,87 @@
         selectChunk(chunks[0], list.querySelector(".chunk-option"));
       }
 
+      function sourceFileUrl(data, pageLabel) {
+        if (!data || !data.source_file_url) return null;
+        var page = parseInt(pageLabel, 10);
+        if (!Number.isFinite(page) || page <= 0) return data.source_file_url;
+        return data.source_file_url + "#page=" + page;
+      }
+
+      function renderSource(data) {
+        var chunks = data.chunks || [];
+        var markdown = data.markdown || "";
+        var body = $("sourceDrawerBody");
+        var fileUrl = sourceFileUrl(data, chunks[0] && chunks[0].page_label);
+        body.replaceChildren();
+        if (!fileUrl && !markdown && !chunks.length) {
+          var empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "暂无可预览原文";
+          body.appendChild(empty);
+          return;
+        }
+        var frame = null;
+        var openLink = null;
+        if (fileUrl) {
+          var pdfPanel = document.createElement("div");
+          pdfPanel.className = "pdf-panel";
+          pdfPanel.innerHTML = [
+            '<div class="pdf-toolbar">',
+            '<strong></strong>',
+            '<a class="table-action" target="_blank" rel="noopener">新窗口打开</a>',
+            "</div>",
+            '<iframe class="pdf-frame" title="原始 PDF"></iframe>'
+          ].join("");
+          pdfPanel.querySelector("strong").textContent = data.source_file_is_pdf ? "原始 PDF" : "原始文件";
+          openLink = pdfPanel.querySelector("a");
+          openLink.href = fileUrl;
+          frame = pdfPanel.querySelector("iframe");
+          frame.src = fileUrl;
+          body.appendChild(pdfPanel);
+        } else if (markdown) {
+          var panel = document.createElement("div");
+          panel.className = "markdown-panel";
+          panel.innerHTML = '<h3>解析文本</h3><pre></pre>';
+          panel.querySelector("pre").textContent = markdown;
+          body.appendChild(panel);
+        }
+        if (!chunks.length) {
+          $("sourceDrawerFoot").textContent = data.document_title || "";
+          return;
+        }
+        var current = document.createElement("article");
+        current.className = "chunk-card";
+        current.innerHTML = '<span class="chunk-label"></span><p class="chunk-text"></p>';
+        body.appendChild(current);
+        var list = document.createElement("div");
+        list.className = "chunk-list";
+        body.appendChild(list);
+
+        function selectChunk(chunk, button) {
+          current.querySelector(".chunk-label").textContent = chunk.label || "RAG Chunk";
+          current.querySelector(".chunk-text").textContent = chunk.text || "";
+          list.querySelectorAll(".chunk-option").forEach(function (item) { item.classList.remove("active"); });
+          if (button) button.classList.add("active");
+          var nextUrl = sourceFileUrl(data, chunk.page_label);
+          if (nextUrl && frame) frame.src = nextUrl;
+          if (nextUrl && openLink) openLink.href = nextUrl;
+          $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
+        }
+
+        chunks.slice(0, 8).forEach(function (chunk, index) {
+          var button = document.createElement("button");
+          button.className = "chunk-option" + (index === 0 ? " active" : "");
+          button.type = "button";
+          button.innerHTML = '<strong></strong><span class="muted"></span>';
+          button.querySelector("strong").textContent = chunk.label || ("RAG Chunk #" + String(index + 1).padStart(2, "0"));
+          button.querySelector("span").textContent = (chunk.heading || data.document_title || "").slice(0, 80);
+          button.addEventListener("click", function () { selectChunk(chunk, button); });
+          list.appendChild(button);
+        });
+        selectChunk(chunks[0], list.querySelector(".chunk-option"));
+      }
+
       function loadDocuments() {
         return fetchJson("/api/documents?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=50").then(function (docs) {
           var box = $("documentsBox");
@@ -1884,9 +2284,18 @@
           docs.slice(0, 12).forEach(function (doc) {
             var row = document.createElement("div");
             row.className = "document-row";
-            row.innerHTML = "<strong></strong><span class=\"muted\"></span>";
+            row.innerHTML = '<div><strong></strong><span class="muted"></span></div><div class="row-actions"><button class="table-action source-action" type="button">原文</button><button class="table-action chat-action" type="button">对话</button><button class="icon-button danger-action delete-doc-action" type="button" title="删除文档" aria-label="删除文档">×</button></div>';
             row.querySelector("strong").textContent = doc.title || doc.file_name;
             row.querySelector("span").textContent = doc.status + " · " + doc.file_name;
+            row.querySelector(".source-action").addEventListener("click", function () {
+              openSource(doc.id);
+            });
+            row.querySelector(".chat-action").addEventListener("click", function () {
+              enterDocumentChat(doc.id, doc.title || doc.file_name);
+            });
+            row.querySelector(".delete-doc-action").addEventListener("click", function () {
+              deleteDocument(doc.id, doc.title || doc.file_name);
+            });
             box.appendChild(row);
           });
         }).catch(function (err) {
@@ -1909,6 +2318,8 @@
           if (projects.length && !projects.find(function (p) { return p.slug === activeProjectSlug; })) {
             activeProjectSlug = projects[0].slug;
             activeProjectName = projects[0].name;
+            activeDocumentId = null;
+            activeDocumentTitle = null;
             activeSessionId = null;
             activeAttachments = [];
             renderAttachments();
@@ -1950,7 +2361,8 @@
       }
 
       function loadAgentSessions() {
-        return fetchJson("/api/agent/sessions?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=20").then(function (sessions) {
+        var url = "/api/agent/sessions?" + scopeQueryParams() + "&limit=20";
+        return fetchJson(url).then(function (sessions) {
           renderSessions(sessions);
           return sessions;
         }).catch(function (err) {
@@ -1960,6 +2372,7 @@
       }
 
       function renderSessions(sessions) {
+        currentSessions = sessions || [];
         var list = $("sessionList");
         list.replaceChildren();
         var newBtn = document.createElement("button");
@@ -1967,7 +2380,9 @@
         newBtn.type = "button";
         newBtn.id = "newChatButton";
         newBtn.textContent = "新聊天";
-        newBtn.addEventListener("click", startNewChat);
+        newBtn.addEventListener("click", function () {
+          startNewChat({ preserveDocumentScope: isDocumentScope() });
+        });
         list.appendChild(newBtn);
         if (!(sessions || []).length) {
           var empty = document.createElement("div");
@@ -1977,6 +2392,8 @@
           return;
         }
         (sessions || []).forEach(function (session) {
+          var item = document.createElement("div");
+          item.className = "recent-session";
           var btn = document.createElement("button");
           btn.className = "recent-card" + (session.id === activeSessionId ? " active" : "");
           btn.type = "button";
@@ -1984,7 +2401,31 @@
           btn.textContent = label.length > 28 ? label.slice(0, 28) + "…" : label;
           btn.title = session.id + (session.preview ? " — " + session.preview : "");
           btn.addEventListener("click", function () { selectSession(session.id); });
-          list.appendChild(btn);
+          var del = document.createElement("button");
+          del.className = "icon-button danger-action";
+          del.type = "button";
+          del.title = "删除会话";
+          del.setAttribute("aria-label", "删除会话");
+          del.textContent = "×";
+          del.addEventListener("click", function () { deleteSession(session.id); });
+          item.appendChild(btn);
+          item.appendChild(del);
+          list.appendChild(item);
+        });
+      }
+
+      function deleteSession(sessionId) {
+        if (!sessionId) return;
+        if (!window.confirm("确定删除这条会话及其附件数据吗？")) return;
+        var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "?" + scopeQueryParams();
+        fetchJson(url, { method: "DELETE" }).then(function () {
+          if (activeSessionId === sessionId) {
+            startNewChat({ preserveDocumentScope: isDocumentScope() });
+          } else {
+            loadAgentSessions();
+          }
+        }).catch(function (err) {
+          alert(err.message || String(err));
         });
       }
 
@@ -1994,7 +2435,7 @@
           renderAttachments();
           return Promise.resolve([]);
         }
-        var url = "/api/agent/sessions/" + encodeURIComponent(activeSessionId) + "/attachments?project_slug=" + encodeURIComponent(activeProjectSlug);
+        var url = "/api/agent/sessions/" + encodeURIComponent(activeSessionId) + "/attachments?" + scopeQueryParams();
         return fetchJson(url).then(function (attachments) {
           activeAttachments = attachments || [];
           renderAttachments();
@@ -2007,31 +2448,52 @@
         });
       }
 
-      function startNewChat() {
+      function startNewChat(options) {
+        options = options || {};
+        var preserveDocumentScope = !!options.preserveDocumentScope;
+        var documentId = activeDocumentId;
+        var documentTitle = activeDocumentTitle;
         activeSessionId = null;
         activeAttachments = [];
-        var box = $("chatMessages");
-        if (box) box.replaceChildren();
-        $("answerPanel").hidden = true;
-        $("questionInput").value = "";
-        $("questionInput").focus();
-        clearThinking();
+        activeDocumentId = preserveDocumentScope ? documentId : null;
+        activeDocumentTitle = preserveDocumentScope ? documentTitle : null;
+        resetChatSurface();
         renderAttachments();
-        showWelcome();
         renderSessions([]);
         loadAgentSessions();
+        updateChatContextLabel();
+      }
+
+      function restoreSessionScope(session) {
+        if (session.project_slug && session.project_slug !== activeProjectSlug) {
+          activeProjectSlug = session.project_slug;
+          activeProjectName = session.project_slug;
+          $("activeProjectLabel").textContent = activeProjectName;
+        }
+        if (session.scope_type === "document" && session.document_id) {
+          activeDocumentId = session.document_id;
+          activeDocumentTitle = session.document_title || session.document_id;
+        } else {
+          activeDocumentId = null;
+          activeDocumentTitle = null;
+        }
+        updateChatContextLabel();
       }
 
       function selectSession(sessionId) {
+        var session = currentSessions.find(function (s) { return s.id === sessionId; });
+        if (session) {
+          restoreSessionScope(session);
+        }
         activeSessionId = sessionId;
-        var turnsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/turns?project_slug=" + encodeURIComponent(activeProjectSlug);
-        var attachmentsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?project_slug=" + encodeURIComponent(activeProjectSlug);
+        var turnsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/turns?" + scopeQueryParams();
+        var attachmentsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         fetchJson(turnsUrl).then(function (turns) {
           renderTurns(turns);
           $("answerPanel").hidden = true;
           loadAgentSessions();
         }).catch(function (err) {
-          showAnswer(["error"], err.message || String(err));
+          showAnswer([], err.message || String(err));
         });
         fetchJson(attachmentsUrl).then(function (attachments) {
           activeAttachments = attachments || [];
@@ -2052,7 +2514,7 @@
           return;
         }
         turns.forEach(function (turn) {
-          appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type);
+          appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type, turn.citations);
         });
       }
 
@@ -2081,7 +2543,7 @@
         var sessionId = activeSessionId;
         var attachment_id = attachmentId;
         if (!sessionId || !attachment_id) return;
-        var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments/" + encodeURIComponent(attachment_id) + "?project_slug=" + encodeURIComponent(activeProjectSlug);
+        var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments/" + encodeURIComponent(attachment_id) + "?" + scopeQueryParams();
         fetchJson(url, { method: "DELETE" }).then(function () {
           activeAttachments = activeAttachments.filter(function (a) { return a.id !== attachment_id; });
           renderAttachments();
@@ -2093,7 +2555,7 @@
       function uploadAttachment(file) {
         var sessionId = activeSessionId || makeSessionId();
         activeSessionId = sessionId;
-        var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?project_slug=" + encodeURIComponent(activeProjectSlug);
+        var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         var data = new FormData();
         data.append("file", file);
         fetchJson(url, { method: "POST", body: data }).then(function (res) {
@@ -2110,7 +2572,13 @@
 
       document.querySelectorAll("[data-view-target]").forEach(function (button) {
         button.addEventListener("click", function () {
-          setView(button.dataset.viewTarget);
+          var target = button.dataset.viewTarget;
+          if (target === "chat") {
+            startNewChat();
+            setView("chat", { skipSessionLoad: true });
+          } else {
+            setView(target);
+          }
         });
       });
 
@@ -2120,6 +2588,8 @@
         $("sourceDrawerBody").innerHTML = '<div class="empty">选择一条已完成的文献记录后，这里会显示可校对的 RAG Chunk。</div>';
         $("sourceDrawerFoot").textContent = "无需离开运行页，即可对照解析进程与向量块源文本。";
       });
+
+      $("closeDrawerButton").addEventListener("click", resetSourceDrawer);
 
       $("sidebarNewChatButton").addEventListener("click", function () {
         startNewChat();
@@ -2149,7 +2619,7 @@
         var question = $("questionInput").value.trim();
         if (!question) return;
         $("sendButton").disabled = true;
-        showAnswer([$("queryMode").value === "agent" ? "Agent" : "RAG", "processing"], "正在分析...");
+        showAnswer([], "正在分析...");
         clearThinking();
         var task = $("queryMode").value === "agent" ? runAgent(question) : runRag(question);
         task.then(function () {
@@ -2157,7 +2627,7 @@
           $("questionInput").style.height = "auto";
           $("composerHint").textContent = "问点难的，让我多想一步";
         }).catch(function (err) {
-          showAnswer(["error"], err.message || String(err));
+          showAnswer([], err.message || String(err));
         }).finally(function () {
           $("sendButton").disabled = false;
         });
@@ -2181,6 +2651,8 @@
         }
         activeProjectSlug = slug;
         activeProjectName = name;
+        activeDocumentId = null;
+        activeDocumentTitle = null;
         activeSessionId = null;
         activeAttachments = [];
         renderAttachments();

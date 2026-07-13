@@ -30,7 +30,7 @@ def make_db() -> Session:
 def make_executor(db: Session, *, rag_answer_text: str = "test answer") -> AgentExecutor:
     """Build an AgentExecutor with a RAGAdapter that returns a fixed answer."""
     class StubRAG:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
             citations = []
             if rag_answer_text:
@@ -98,6 +98,29 @@ def test_execute_returns_completed_status() -> None:
     assert response.trace_id is not None
     assert response.answer_provider is not None
     assert response.answer_model is not None
+
+
+def test_execute_persists_final_answer_citations_in_history() -> None:
+    """Restored conversation turns keep final-answer citation metadata."""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor(db)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="hello?", session_id="cite-sess")
+    )
+
+    history = ConversationMemory(db).get_history(response.session_id)
+    final_turns = [
+        turn
+        for turn in history
+        if turn.role == "agent" and turn.step_type == "finalize"
+    ]
+    assert final_turns
+    assert final_turns[-1].citations
+    assert final_turns[-1].citations[0]["document_id"] == "d1"
 
 
 def test_execute_has_route_and_tool_and_finalize_steps() -> None:
@@ -640,7 +663,7 @@ def make_complex_query_executor(
 ) -> AgentExecutor:
     """Build an executor where RAGAdapter answers complex queries."""
     class StubRAGComplex:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
             citations = []
             if rag_answer_text:
@@ -658,7 +681,7 @@ def make_complex_query_executor(
                 verification_status="local-only",
             )
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             from app.schemas.agent import EvidenceItem, EvidencePack
             return EvidencePack(
                 status="ok",
@@ -951,7 +974,7 @@ def make_executor_with_retrieve(
         ]
 
     class StubRAGWithRetrieve:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
 
             citations = []
@@ -970,7 +993,7 @@ def make_executor_with_retrieve(
                 verification_status="local-only",
             )
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             from app.schemas.agent import EvidenceItem, EvidencePack
 
             items = [
@@ -1220,7 +1243,7 @@ def test_executor_passes_evidence_pack_to_synthesize_tool(monkeypatch) -> None:
     captured_tool_args = {}
 
     class StubRAGWithRetrieve:
-        def answer(self, db, project_slug, question):
+        def answer(self, db, project_slug, question, document_id=None):
             from app.schemas.common import QueryResponse, Citation
             return QueryResponse(
                 answer_markdown="test answer",
@@ -1228,7 +1251,7 @@ def test_executor_passes_evidence_pack_to_synthesize_tool(monkeypatch) -> None:
                 verification_status="local-only",
             )
 
-        def retrieve_evidence(self, db, project_slug, question, limit=15):
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
             from app.schemas.agent import EvidenceItem, EvidencePack
             return EvidencePack(
                 status="ok",

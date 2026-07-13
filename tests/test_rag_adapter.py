@@ -28,7 +28,7 @@ def test_rag_adapter_returns_query_response(monkeypatch) -> None:
     db.add(project)
     db.commit()
 
-    def fake_answer(self, project_slug, question, save_answer=False):
+    def fake_answer(self, project_slug, question, save_answer=False, document_id=None):
         return QueryResponse(
             answer_markdown="test answer",
             citations=[],
@@ -51,7 +51,7 @@ def test_rag_adapter_missing_project_returns_empty(monkeypatch) -> None:
     """RAGAdapter.answer() returns empty response for unknown project slug."""
     db = make_db()
 
-    def fake_answer(self, project_slug, question, save_answer=False):
+    def fake_answer(self, project_slug, question, save_answer=False, document_id=None):
         raise ValueError("Project not found")
 
     monkeypatch.setattr(
@@ -172,7 +172,7 @@ def test_rag_adapter_retrieve_evidence_returns_evidence_pack(monkeypatch) -> Non
 
     from app.schemas.agent import EvidencePack
 
-    def fake_retrieve_evidence(self, project_slug, question, limit=15):
+    def fake_retrieve_evidence(self, project_slug, question, limit=15, document_id=None):
         from app.schemas.agent import EvidenceItem
         return EvidencePack(
             status="ok",
@@ -211,7 +211,7 @@ def test_rag_adapter_retrieve_evidence_missing_project_returns_empty(monkeypatch
     """RAGAdapter.retrieve_evidence() returns empty EvidencePack for unknown project slug."""
     db = make_db()
 
-    def fake_retrieve_evidence(self, project_slug, question, limit=15):
+    def fake_retrieve_evidence(self, project_slug, question, limit=15, document_id=None):
         raise ValueError("Project not found")
 
     monkeypatch.setattr(
@@ -238,7 +238,7 @@ def test_rag_adapter_retrieve_evidence_calls_query_service_with_limit(monkeypatc
 
     call_args = {}
 
-    def fake_retrieve_evidence(self, project_slug, question, limit=15):
+    def fake_retrieve_evidence(self, project_slug, question, limit=15, document_id=None):
         call_args["project_slug"] = project_slug
         call_args["question"] = question
         call_args["limit"] = limit

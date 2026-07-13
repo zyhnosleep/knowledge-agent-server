@@ -16,6 +16,7 @@ from app.schemas.agent import EvidenceItem, EvidencePack
 from app.services.filesystem import (
     InvalidStoragePathError,
     UploadTooLargeError,
+    _ensure_within,
     _safe_upload_filename,
     compute_sha256,
     safe_project_slug,
@@ -142,13 +143,18 @@ def get_session_attachment(db: Session, attachment_id: str) -> SessionAttachment
 def delete_session_attachment(db: Session, attachment: SessionAttachment) -> None:
     """Delete an attachment, its chunks, and best-effort its stored file."""
     try:
-        path = Path(attachment.storage_path)
+        raw_base = settings.raw_dir.expanduser().resolve()
+        stored_path = Path(attachment.storage_path)
+        candidate = stored_path if stored_path.is_absolute() else raw_base / stored_path
+        path = _ensure_within(candidate, raw_base)
         if path.exists() and path.is_file():
             path.unlink(missing_ok=True)
         # Best-effort: remove parent session dir if empty.
         parent = path.parent
         if parent.exists() and parent.is_dir() and not any(parent.iterdir()):
             parent.rmdir()
+    except InvalidStoragePathError:
+        logger.warning("Skipping attachment file outside storage root for %s", attachment.id)
     except Exception:
         logger.exception("Failed to remove attachment file for %s", attachment.id)
     db.delete(attachment)

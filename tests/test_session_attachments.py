@@ -345,7 +345,10 @@ def test_executor_answers_from_attachment_when_rag_is_insufficient() -> None:
     assert any("temporary attachments" in w for w in response.warnings)
 
 
-def test_purge_expired_sessions_deletes_attachments(tmp_path) -> None:
+def test_purge_expired_sessions_deletes_attachments(tmp_path, monkeypatch) -> None:
+    import app.services.session_attachments as attachment_mod
+
+    monkeypatch.setattr(attachment_mod.settings, "raw_dir", tmp_path)
     db = make_db()
     project = Project(id="p1", slug="demo", name="Demo")
     db.add(project)
@@ -406,3 +409,61 @@ def test_delete_attachments_for_session_count() -> None:
     db.commit()
     assert count == 3
     assert list_session_attachments(db, "bulk-sess") == []
+
+
+def test_attachment_evidence_is_isolated_by_session() -> None:
+    """Attachment retrieval only returns chunks from the same session."""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    memory = ConversationMemory(db)
+    memory.touch_session("sess-a", project_slug="demo", ttl_days=30)
+    memory.touch_session("sess-b", project_slug="demo", ttl_days=30)
+    db.commit()
+
+    attachment_a = SessionAttachment(
+        id="a1",
+        session_id="sess-a",
+        project_id="p1",
+        file_name="alpha.txt",
+        storage_path="/dev/null",
+        sha256="sha-a",
+        byte_size=10,
+    )
+    chunk_a = SessionAttachmentChunk(
+        id="c1",
+        attachment_id="a1",
+        ordinal=0,
+        text="Alpha session attachment content.",
+    )
+    attachment_b = SessionAttachment(
+        id="a2",
+        session_id="sess-b",
+        project_id="p1",
+        file_name="beta.txt",
+        storage_path="/dev/null",
+        sha256="sha-b",
+        byte_size=10,
+    )
+    chunk_b = SessionAttachmentChunk(
+        id="c2",
+        attachment_id="a2",
+        ordinal=0,
+        text="Beta session attachment content.",
+    )
+    db.add_all([attachment_a, chunk_a, attachment_b, chunk_b])
+    db.commit()
+
+    pack_a = retrieve_session_attachment_evidence(db, "demo", "sess-a", "content")
+    assert pack_a.status == "ok"
+    assert all("Alpha" in item.excerpt for item in pack_a.items)
+    assert not any("Beta" in item.excerpt for item in pack_a.items)
+
+    # Cross-session query terms do not leak evidence from sess-b into sess-a.
+    cross_pack = retrieve_session_attachment_evidence(db, "demo", "sess-a", "beta")
+    assert cross_pack.status == "ok"
+    assert cross_pack.items
+    assert all("Alpha" in item.excerpt for item in cross_pack.items)
+    assert not any("Beta" in item.excerpt for item in cross_pack.items)

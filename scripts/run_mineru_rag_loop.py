@@ -30,7 +30,7 @@ PYTEST_COMMANDS = {
     "full": [
         ["-m", "pytest", "tests/test_parser_document_intelligence.py", "tests/test_query_eval.py", "-q"],
         ["-m", "pytest", "tests/test_query_service.py", "tests/test_paper_profile.py", "-q"],
-        ["-m", "pytest", "tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py", "tests/test_wiki_quality.py", "-q"],
+        ["-m", "pytest", "tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py", "-q"],
     ],
 }
 
@@ -408,7 +408,6 @@ def _run_service_ingest_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "run": None,
         "document": None,
         "quality": None,
-        "lint": None,
         "error": None,
     }
     if pdf_path is None or not pdf_path.is_file():
@@ -453,25 +452,11 @@ def _run_service_ingest_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
     document = _http_get_json(_api_url(args.base_url, f"documents/{urllib.parse.quote(document_id, safe='')}"), timeout=args.service_ingest_http_timeout)
     quality = _http_get_json(_api_url(args.base_url, f"documents/{urllib.parse.quote(document_id, safe='')}/quality"), timeout=args.service_ingest_http_timeout)
-    lint = _http_get_json(
-        _api_url(
-            args.base_url,
-            "wiki/lint",
-            {
-                "project_slug": args.service_ingest_project_slug,
-                "limit": "20",
-                "offset": "0",
-            },
-        ),
-        timeout=args.service_ingest_http_timeout,
-    )
     summary["document"] = document
     summary["quality"] = quality
-    summary["lint"] = lint
 
     document_payload = document.get("payload") if isinstance(document.get("payload"), dict) else {}
     quality_payload = quality.get("payload") if isinstance(quality.get("payload"), dict) else {}
-    lint_payload = lint.get("payload") if isinstance(lint.get("payload"), dict) else {}
     metadata = document_payload.get("metadata_json") if isinstance(document_payload.get("metadata_json"), dict) else {}
     intelligence = metadata.get("document_intelligence") if isinstance(metadata.get("document_intelligence"), dict) else {}
 
@@ -483,7 +468,6 @@ def _run_service_ingest_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "mineru_parser": parser_mode == "pdf_mineru",
         "page_outputs_present": page_output_count > 0,
         "content_list_present": bool(content_list_path),
-        "lint_reachable": lint.get("status_code") == 200,
     }
     summary["checks"] = checks
     summary["evidence"] = {
@@ -497,8 +481,6 @@ def _run_service_ingest_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "formula_count": quality_payload.get("formula_count"),
         "figure_count": quality_payload.get("figure_count"),
         "content_list_path": content_list_path,
-        "lint_issue_count": lint_payload.get("issue_count"),
-        "lint_returned_issue_count": lint_payload.get("returned_issue_count"),
         "warnings": quality_payload.get("warnings"),
         "duplicate_skipped": duplicate_skipped,
     }

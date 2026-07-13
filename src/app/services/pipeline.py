@@ -16,7 +16,6 @@ from app.models.records import (
     DocumentChunk,
     DocumentStatus,
     Entity,
-    PageKind,
     PipelineRun,
     Project,
     ReviewItem,
@@ -24,7 +23,6 @@ from app.models.records import (
     ReviewStatus,
     RunStatus,
     RunType,
-    WikiPage,
 )
 from app.services.ai import (
     DocumentAnalysisPayload,
@@ -46,8 +44,6 @@ from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
 from app.services.vector_store import ChunkVector, SQLiteVecStore
-from app.services.wiki import WikiRenderer
-from app.services.wiki_quality import build_ingest_quality_report
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -201,7 +197,7 @@ class IngestionPipeline:
             ensure_source_identity(document, document.title)
             ensure_paper_profile(document)
             merged_metadata = dict(document.metadata_json or {})
-            quality_report = build_ingest_quality_report(document)
+            quality_report = {"status": "ok", "document_id": document.id}
             merged_metadata["ingest_quality"] = quality_report
             document.metadata_json = merged_metadata
             self._set_progress(run, 30, "chunking", "Replacing document chunks and preparing embeddings.")
@@ -215,7 +211,6 @@ class IngestionPipeline:
                     **dict(run.provider_report or {}),
                     "entities": 0,
                     "claims": 0,
-                    "wiki_pages": 0,
                     "review_items": 0,
                     "ingest_quality": quality_report,
                     "sac_kg_enabled": False,
@@ -234,12 +229,7 @@ class IngestionPipeline:
             entity_decisions = self._decide_entity_growth(document, entities, claims)
             self._apply_claim_growth_decisions(claims, entity_decisions)
             entities = self._ensure_growing_entities(document.project_id, entities, claims, entity_decisions)
-            if settings.wiki_enabled:
-                self._set_progress(run, 82, "rendering_wiki", "Rendering optional Obsidian-friendly wiki pages.")
-                wiki_pages = self._render_wiki(document, extraction, entities, claims, entity_decisions)
-            else:
-                self._set_progress(run, 82, "indexing_rag", "Skipping wiki rendering; RAG and SAC-KG artifacts are ready.")
-                wiki_pages = []
+            self._set_progress(run, 82, "indexing_rag", "RAG and SAC-KG artifacts are ready.")
             self._set_progress(run, 94, "reviewing", "Creating review items and final provider report.")
             review_count = self._create_review_items(document, extraction, claims)
 
@@ -249,7 +239,6 @@ class IngestionPipeline:
                 **dict(run.provider_report or {}),
                 "entities": len(entities),
                 "claims": len(claims),
-                "wiki_pages": len(wiki_pages),
                 "review_items": review_count,
                 "ingest_quality": quality_report,
             }
@@ -365,8 +354,8 @@ class IngestionPipeline:
         chunks = self.db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id).order_by(DocumentChunk.ordinal)).all()
         contexts = self._select_generation_contexts(document, full_text, list(chunks))
         sentence_entries = self._build_sentence_entries(list(chunks))
-        wiki_context = self._current_wiki_context(document.project_id) if settings.wiki_enabled else ""
-        seed_analysis = self._seed_document_analysis(document, full_text, contexts, wiki_context)
+        corpus_context = ""
+        seed_analysis = self._seed_document_analysis(document, full_text, contexts, corpus_context)
         candidate_heads = self._collect_candidate_heads(document, full_text, seed_analysis)
         previous_claims = self._project_verified_claims(document.project_id)
 
@@ -380,7 +369,7 @@ class IngestionPipeline:
                     head=head,
                     contexts=head_contexts,
                     open_kg_examples=examples,
-                    wiki_context=wiki_context,
+                    corpus_context=corpus_context,
                     previous_claims=previous_claims,
                 )
             )
@@ -398,7 +387,7 @@ class IngestionPipeline:
         document: Document,
         full_text: str,
         contexts: list[dict],
-        wiki_context: str,
+        corpus_context: str,
     ) -> DocumentAnalysisPayload:
         fallback = self._fallback_analysis(document, full_text, contexts)
         prompt = "\n\n".join(
@@ -409,7 +398,7 @@ class IngestionPipeline:
                     "Return a concise summary, key facts, entities, concepts, and draft triples. "
                     "Preserve exact dates, doses, diagnoses, and recommendations."
                 ),
-                "Current corpus context:\n" + (wiki_context or "No existing corpus context."),
+                "Current corpus context:\n" + (corpus_context or "No existing corpus context."),
                 "Retrieved document contexts:\n" + json.dumps(contexts, ensure_ascii=False),
             ]
         )
@@ -417,7 +406,7 @@ class IngestionPipeline:
             lambda: self.ollama.generate_structured(
                 DocumentAnalysisPayload,
                 system_prompt=(
-                    "You are preparing a structured overview for an internal LLM Wiki. "
+                    "You are preparing a structured overview for an internal document knowledge base. "
                     "Focus on candidate heads, key facts, and entity-rich summaries."
                 ),
                 user_prompt=prompt,
@@ -452,9 +441,6 @@ class IngestionPipeline:
             add_candidate(entity.name, entity_type=entity.entity_type, aliases=entity.aliases, summary=entity.summary)
         for concept in seed_analysis.concepts:
             add_candidate(concept, entity_type="concept")
-        for term in self._current_wiki_terms(document.project_id):
-            if term and term in full_text:
-                add_candidate(term, entity_type="concept")
         for subject in self._project_verified_subjects(document.project_id):
             if subject and subject in full_text:
                 add_candidate(subject, entity_type="concept")
@@ -575,7 +561,7 @@ class IngestionPipeline:
         head: dict,
         contexts: list[dict],
         open_kg_examples: list[dict],
-        wiki_context: str,
+        corpus_context: str,
         previous_claims: list[Claim],
     ) -> HeadAnalysisPayload:
         fallback = self._fallback_head_analysis(head, contexts)
@@ -589,7 +575,7 @@ class IngestionPipeline:
                     "Preserve exact evidence, dates, doses, and follow-up guidance. "
                     "Return related entities and concepts only when they are grounded in the snippets."
                 ),
-                "Current corpus context:\n" + (wiki_context or "No existing corpus context."),
+                "Current corpus context:\n" + (corpus_context or "No existing corpus context."),
                 "Open KG example triples:\n" + json.dumps(open_kg_examples, ensure_ascii=False),
                 "Retrieved domain snippets:\n" + json.dumps(contexts, ensure_ascii=False),
             ]
@@ -598,7 +584,7 @@ class IngestionPipeline:
             lambda: self.ollama.generate_structured(
                 HeadAnalysisPayload,
                 system_prompt=(
-                    "You are the Generator in a SAC-KG-inspired LLM Wiki pipeline. "
+                    "You are the Generator in a SAC-KG-inspired document pipeline. "
                     "Return triples-first JSON for a single head entity."
                 ),
                 user_prompt=base_prompt,
@@ -688,7 +674,7 @@ class IngestionPipeline:
             lambda: self.ollama.generate_structured(
                 HeadAnalysisPayload,
                 system_prompt=(
-                    "You are the Verifier correction pass in a SAC-KG-inspired LLM Wiki pipeline. "
+                    "You are the Verifier correction pass in a SAC-KG-inspired document pipeline. "
                     "Fix triple count, head-entity mismatches, format issues, contradictions, and missing evidence."
                 ),
                 user_prompt="\n\n".join(
@@ -879,17 +865,6 @@ class IngestionPipeline:
             coverage_notes=coverage_notes,
         )
 
-    def _current_wiki_terms(self, project_id: str) -> list[str]:
-        if not settings.wiki_enabled:
-            return []
-        pages = self.db.scalars(select(WikiPage).where(WikiPage.project_id == project_id)).all()
-        terms: list[str] = []
-        for page in pages:
-            key_terms = (page.metadata_json or {}).get("key_terms", [])
-            if isinstance(key_terms, list):
-                terms.extend(str(term) for term in key_terms)
-        return list(dict.fromkeys(terms))
-
     def _project_verified_claims(self, project_id: str) -> list[Claim]:
         return self.db.scalars(
             select(Claim)
@@ -958,22 +933,6 @@ class IngestionPipeline:
             if marker.lower() in full_text.lower():
                 terms.add(marker.lower())
         return terms
-
-    def _current_wiki_context(self, project_id: str) -> str:
-        if not settings.wiki_enabled:
-            return ""
-        pages = self.db.scalars(
-            select(WikiPage)
-            .where(WikiPage.project_id == project_id, WikiPage.kind != PageKind.query_answer.value)
-            .order_by(WikiPage.updated_at.desc())
-        ).all()
-        lines: list[str] = []
-        for page in pages[:8]:
-            metadata = page.metadata_json or {}
-            summary = metadata.get("summary") or page.markdown_content[:240].replace("\n", " ")
-            key_terms = ", ".join(metadata.get("key_terms", [])[:8]) if isinstance(metadata.get("key_terms"), list) else ""
-            lines.append(f"- {page.title} [{page.kind}]: {summary} Key terms: {key_terms}")
-        return "\n".join(lines)[:3000]
 
     def _local_triple_examples(self, project_id: str) -> list[dict]:
         examples: list[dict] = []
@@ -1463,71 +1422,6 @@ class IngestionPipeline:
             return list(self.db.scalars(select(Entity).where(Entity.project_id == project_id, Entity.name.in_(grow_names))).all())
         return entities
 
-    def _render_wiki(
-        self,
-        document: Document,
-        extraction: DocumentExtraction,
-        entities: list[Entity],
-        claims: list[Claim],
-        entity_decisions: dict[str, GrowthDecision],
-    ) -> list[WikiPage]:
-        project = self.db.get(Project, document.project_id)
-        assert project is not None
-        renderer = WikiRenderer(project)
-
-        pages: list[WikiPage] = []
-        grow_entities = [entity for entity in entities if entity_decisions.get(entity.name, GrowthDecision(name=entity.name)).decision == "grow"]
-        entity_links = renderer.build_entity_links(grow_entities)
-        source_metadata = self._source_page_metadata(extraction, entities, claims)
-        summary_slug, summary_md = renderer.render_document_summary(
-            document,
-            extraction,
-            claims,
-            entity_links=entity_links,
-            metadata=source_metadata,
-        )
-        pages.append(
-            self._upsert_page(
-                project.id,
-                document.title,
-                summary_slug,
-                PageKind.source_summary.value,
-                summary_md,
-                [document.id],
-                metadata_json=source_metadata,
-            )
-        )
-
-        entity_metadata_by_name = {
-            entity.name: self._entity_page_metadata(entity.name, entity_decisions.get(entity.name, GrowthDecision(name=entity.name, decision="grow")), claims)
-            for entity in grow_entities
-        }
-        for entity_name, slug, content in renderer.render_entity_pages(
-            grow_entities,
-            claims,
-            source_page_slug=summary_slug,
-            source_page_title=document.title,
-            entity_links=entity_links,
-            metadata_by_name=entity_metadata_by_name,
-        ):
-            decision = entity_decisions.get(entity_name, GrowthDecision(name=entity_name, decision="grow"))
-            pages.append(
-                self._upsert_page(
-                    project.id,
-                    entity_name,
-                    slug,
-                    PageKind.entity.value,
-                    content,
-                    [document.id],
-                    metadata_json=entity_metadata_by_name.get(entity_name) or self._entity_page_metadata(entity_name, decision, claims),
-                )
-            )
-
-        renderer.render_index(pages + self.db.scalars(select(WikiPage).where(WikiPage.project_id == project.id)).all())
-        renderer.render_log(document, extraction)
-        self.db.commit()
-        return pages
-
     def _source_page_metadata(self, extraction: DocumentExtraction, entities: list[Entity], claims: list[Claim]) -> dict:
         key_terms = sorted(
             {
@@ -1574,46 +1468,6 @@ class IngestionPipeline:
             "growth_decision": decision.decision,
             "growth_reason": decision.reason,
         }
-
-    def _upsert_page(
-        self,
-        project_id: str,
-        title: str,
-        slug: str,
-        kind: str,
-        markdown: str,
-        source_document_ids: list[str],
-        metadata_json: dict | None = None,
-    ) -> WikiPage:
-        project = self.db.get(Project, project_id)
-        assert project is not None
-        renderer = WikiRenderer(project)
-        path = renderer.write_page(slug, markdown)
-        page = self.db.scalar(select(WikiPage).where(WikiPage.project_id == project_id, WikiPage.slug == slug))
-        merged_source_ids = source_document_ids
-        if page is None:
-            page = WikiPage(
-                project_id=project_id,
-                slug=slug,
-                title=title,
-                kind=kind,
-                markdown_path=str(path),
-                markdown_content=markdown,
-                source_document_ids=source_document_ids,
-                metadata_json=metadata_json or {},
-            )
-            self.db.add(page)
-        else:
-            merged_source_ids = sorted(set((page.source_document_ids or []) + source_document_ids))
-            page.title = title
-            page.kind = kind
-            page.markdown_path = str(path)
-            page.markdown_content = markdown
-            page.source_document_ids = merged_source_ids
-            page.metadata_json = metadata_json or {}
-        if page.metadata_json is not None:
-            page.metadata_json["source_count"] = len(merged_source_ids)
-        return page
 
     def _create_review_items(self, document: Document, extraction: DocumentExtraction, claims: list[Claim]) -> int:
         existing_items = self.db.scalars(select(ReviewItem).where(ReviewItem.document_id == document.id)).all()

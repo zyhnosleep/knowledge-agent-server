@@ -28,14 +28,12 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     raw_dir: Path = Field(default=Path("./data/raw"), alias="RAW_DIR")
-    wiki_dir: Path = Field(default=Path("./data/wiki"), alias="WIKI_DIR")
     cache_dir: Path = Field(default=Path("./data/cache"), alias="CACHE_DIR")
     max_upload_bytes: int = Field(default=50 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
 
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")
     query_mode: str = Field(default="rag", alias="QUERY_MODE")
-    wiki_enabled: bool = Field(default=False, alias="WIKI_ENABLED")
     sac_kg_enabled: bool = Field(default=True, alias="SAC_KG_ENABLED")
     vector_store_enabled: bool = Field(default=True, alias="VECTOR_STORE_ENABLED")
     vector_store_backend: str = Field(default="sqlite-vec", alias="VECTOR_STORE_BACKEND")
@@ -90,6 +88,6 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     settings = Settings()
-    for path in (settings.data_dir, settings.raw_dir, settings.wiki_dir, settings.cache_dir):
+    for path in (settings.data_dir, settings.raw_dir, settings.cache_dir):
         path.mkdir(parents=True, exist_ok=True)
     return settings
