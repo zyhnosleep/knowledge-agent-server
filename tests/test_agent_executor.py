@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from sqlalchemy import create_engine
@@ -8,7 +10,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.session import Base
 from app.models.records import Project
-from app.schemas.agent import AgentQueryRequest, ToolSpec
+from app.schemas.agent import AgentQueryRequest, EvidencePack, ToolSpec
+from app.schemas.common import QueryResponse
 from app.services.agent_executor import AgentExecutor
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
@@ -78,6 +81,138 @@ def make_executor(db: Session, *, rag_answer_text: str = "test answer") -> Agent
     memory = ConversationMemory(db)
     trace_store = AgentTraceStore(db)
     return AgentExecutor(rag=rag, tools=tools, memory=memory, db=db, trace_store=trace_store)
+
+
+def build_executor_with_rag(db: Session, rag) -> AgentExecutor:
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+    return AgentExecutor(
+        rag=rag,
+        tools=tools,
+        memory=ConversationMemory(db),
+        db=db,
+        trace_store=AgentTraceStore(db),
+        synthesizer=None,
+    )
+
+
+def test_execute_commits_session_turn_before_rag(monkeypatch) -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    commit_count = 0
+    commit_counts_seen: list[int] = []
+    real_commit = db.commit
+
+    def tracked_commit() -> None:
+        nonlocal commit_count
+        commit_count += 1
+        real_commit()
+
+    monkeypatch.setattr(db, "commit", tracked_commit)
+
+    class InspectingRAG:
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit=15, document_id=None
+        ):
+            return EvidencePack(status="empty", items=[])
+
+        def answer(self, db, project_slug, question, document_id=None):
+            commit_counts_seen.append(commit_count)
+            return QueryResponse(
+                answer_markdown="ok",
+                citations=[],
+                verification_status="local-only",
+            )
+
+    executor = build_executor_with_rag(db, InspectingRAG())
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="hello", session_id="commit-sess")
+    )
+
+    assert response.status == "completed"
+    assert commit_counts_seen and commit_counts_seen[0] >= 1
+
+
+def test_concurrent_sessions_release_initial_write_transaction(tmp_path) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'agent-concurrency.db'}",
+        future=True,
+        connect_args={"check_same_thread": False, "timeout": 0.2},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False, future=True
+    )
+    with session_factory() as setup_db:
+        setup_db.add(Project(id="p1", slug="demo", name="Demo"))
+        setup_db.commit()
+
+    first_in_rag = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    errors: list[BaseException] = []
+    responses = {}
+
+    class BlockingRAG:
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit=15, document_id=None
+        ):
+            return EvidencePack(status="empty", items=[])
+
+        def answer(self, db, project_slug, question, document_id=None):
+            if question == "first":
+                first_in_rag.set()
+                if not release_first.wait(timeout=5.0):
+                    raise TimeoutError("test did not release first request")
+            return QueryResponse(
+                answer_markdown=f"answer for {question}",
+                citations=[],
+                verification_status="local-only",
+            )
+
+    rag = BlockingRAG()
+
+    def run_query(name: str, session_id: str, finished=None) -> None:
+        db = session_factory()
+        try:
+            executor = build_executor_with_rag(db, rag)
+            responses[name] = executor.execute(
+                AgentQueryRequest(
+                    project_slug="demo", query=name, session_id=session_id
+                )
+            )
+            db.commit()
+        except BaseException as exc:
+            errors.append(exc)
+            db.rollback()
+        finally:
+            db.close()
+            if finished is not None:
+                finished.set()
+
+    first_thread = threading.Thread(
+        target=run_query, args=("first", "concurrent-first"), daemon=True
+    )
+    second_thread = threading.Thread(
+        target=run_query,
+        args=("second", "concurrent-second", second_finished),
+        daemon=True,
+    )
+
+    first_thread.start()
+    assert first_in_rag.wait(timeout=2.0)
+    second_thread.start()
+    assert second_finished.wait(timeout=2.0)
+    release_first.set()
+    first_thread.join(timeout=2.0)
+    second_thread.join(timeout=2.0)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == []
+    assert responses["first"].status == "completed"
+    assert responses["second"].status == "completed"
 
 
 def test_execute_returns_completed_status() -> None:

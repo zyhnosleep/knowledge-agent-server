@@ -100,6 +100,9 @@ class AgentExecutor:
             session_id, role="user", content=request.query, step_type="user_query"
         )
         self._compact_if_needed(session_id, constraints)
+        # Release SQLite's write lock before retrieval and model calls, which
+        # may take much longer than the initial conversation bookkeeping.
+        self._commit_progress()
 
         try:
             # ==============================================================
@@ -277,6 +280,7 @@ class AgentExecutor:
                 evidence_pack, session_attachment_pack, max_items=15
             )
 
+            self._commit_progress()
             answer_text, citations, tool_calls_used = self._run_rag_answer(
                 request.project_slug,
                 request.query,
@@ -313,6 +317,7 @@ class AgentExecutor:
             synth_provider = "local"
             synth_model = "local-fallback"
             if not max_steps_hit:
+                self._commit_progress()
                 synth_result = self._run_synthesize(
                     request.query,
                     route.route,
@@ -533,6 +538,14 @@ class AgentExecutor:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _commit_progress(self) -> None:
+        """Persist short bookkeeping writes before a potentially long step."""
+        try:
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
 
     def _finalize_truncated(
         self,
