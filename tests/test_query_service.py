@@ -2078,7 +2078,15 @@ def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
         evidence_chunk_id="c1",
         confidence=0.7,
         verification_status="needs-review",
-        metadata_json={},
+        metadata_json={
+            "paper_profile": {
+                "profile_version": "paper-profile-v1",
+                "title": "ff99sb disp",
+                "routing_summary": "TIP4P-D is the primary water model introduced by this paper.",
+                "aliases": ["ff99sb-disp", "ff99sb disp"],
+                "key_terms": ["TIP4P-D", "TIP3P", "TIP4P-EW", "TIP4P/2005", "IDP"],
+            }
+        },
     )
     db.add_all([project, document, chunk, claim])
     db.commit()
@@ -2430,8 +2438,16 @@ def test_route_papers_locks_tip4p_d_to_ff99sb_disp() -> None:
         file_name="ff99sb-disp.pdf",
         sha256="disp",
         raw_path="raw/ff99sb-disp.pdf",
-        raw_text="TIP4P-D improves disordered protein ensembles.",
-        metadata_json={},
+        raw_text="This paper introduces a new water model called TIP4P-D to improve disordered protein ensembles.",
+        metadata_json={
+            "paper_profile": {
+                "profile_version": "paper-profile-v1",
+                "title": "ff99sb disp",
+                "routing_summary": "TIP4P-D is the primary water model introduced by this paper.",
+                "aliases": ["ff99sb-disp", "ff99sb disp"],
+                "key_terms": ["TIP4P-D", "TIP3P", "TIP4P-EW", "TIP4P/2005", "IDP"],
+            }
+        },
         status="ready",
     )
     ff19 = Document(
@@ -2441,8 +2457,16 @@ def test_route_papers_locks_tip4p_d_to_ff99sb_disp() -> None:
         file_name="ff19sb.pdf",
         sha256="ff19",
         raw_path="raw/ff19sb.pdf",
-        raw_text="ff19SB discusses TIP3P, TIP4P-EW, and TIP4P/2005 comparisons.",
-        metadata_json={},
+        raw_text="ff19SB discusses TIP3P, TIP4P-EW, TIP4P/2005, and briefly tests TIP4P-D.",
+        metadata_json={
+            "paper_profile": {
+                "profile_version": "paper-profile-v1",
+                "title": "CHARMM36IDPSFF",
+                "routing_summary": "TIP4P-D is also tested in selected simulations.",
+                    "aliases": ["ff19SB", "CHARMM36IDPSFF"],
+                    "key_terms": ["TIP4P-D", "TIP3P", "TIP4P-EW", "TIP4P/2005", "IDP"],
+            }
+        },
         status="ready",
     )
     db.add_all([disp, ff19])
@@ -2454,6 +2478,12 @@ def test_route_papers_locks_tip4p_d_to_ff99sb_disp() -> None:
     )
 
     assert [(match.document.id, match.locked) for match in matches] == [("disp", True)]
+
+    explicit_matches = QueryService(db)._route_papers(
+        "ff19SB 的参数表如何比较 TIP4P-D 和 TIP3P？",
+        "p1",
+    )
+    assert [(match.document.id, match.locked) for match in explicit_matches] == [("ff19", True)]
 
 
 def test_route_papers_locks_chinese_primary_subject_with_bi_comparison() -> None:
@@ -4820,6 +4850,42 @@ def test_evidence_overlap_accepts_source_title_for_profile_term_context() -> Non
 
     assert QueryService._evidence_overlaps_question_scientific_terms(
         "What is the difference between CHARMM36m and CHARMM36?", contexts
+    )
+
+
+def test_evidence_overlap_accepts_explicit_document_title_when_acronym_is_absent() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff99sb-disp",
+                page_title="ff99sb disp",
+                page_kind="source_summary",
+                score=75,
+                excerpt="Water models underestimate London dispersion interactions.",
+            ),
+            prompt_text="Water models underestimate London dispersion interactions.",
+            score=75,
+        )
+    ]
+
+    assert QueryService._evidence_overlaps_question_scientific_terms(
+        "ff99sb-disp/TIP4P-D 这篇文献认为标准水模型导致 IDP 模拟失败的根本原因是什么？",
+        contexts,
+    )
+
+
+def test_evidence_overlap_normalizes_hyphenated_scientific_terms() -> None:
+    contexts = [
+        RetrievedContext(
+            citation=Citation(page_slug="sources/water-model", page_title="Water model", score=10, excerpt="TIP4P-EW benchmark"),
+            prompt_text="The comparison includes TIP4P-EW and TIP4P/2005.",
+            score=10,
+        )
+    ]
+
+    assert QueryService._evidence_overlaps_question_scientific_terms(
+        "为什么 TIP4P-D 比 TIP4P-EW 更能改善 IDP 构象采样？",
+        contexts,
     )
 
 

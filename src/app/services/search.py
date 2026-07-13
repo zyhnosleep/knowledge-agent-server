@@ -54,6 +54,7 @@ class PaperMatch:
     score: float
     exact_alias: bool = False
     locked: bool = False
+    introduced_subject: bool = False
 
 
 @dataclass
@@ -500,6 +501,7 @@ class QueryService:
             profile = paper_profile_data(document)
             profile_text = paper_profile_text(document)
             profile_terms = self._tokenize(profile_text)
+            raw_terms = self._tokenize(document.raw_text or "")
             title_terms = self._tokenize(document.title)
             alias_values = [str(item) for item in profile.get("aliases") or []]
             key_values = [str(item) for item in profile.get("key_terms") or []]
@@ -512,6 +514,10 @@ class QueryService:
                 for selector in scientific_selectors
                 if self._selector_matches_text(selector, selector_text)
             ]
+            introduced_selector_count = self._introduced_selector_count(
+                primary_selectors or scientific_selectors,
+                document.raw_text or "",
+            )
             identity_text = self._paper_identity_route_text(document, profile)
             primary_selector_hits = [
                 selector
@@ -520,16 +526,25 @@ class QueryService:
             ]
             score = (
                 len(query_terms & profile_terms)
+                + len(query_terms & raw_terms)
                 + len(query_terms & title_terms) * 3
                 + len(query_terms & alias_terms) * 5
                 + len(query_terms & key_terms) * 2
                 + len(selector_hits) * 4
+                + introduced_selector_count * 12
                 + len(primary_selector_hits) * 18
             )
             if exact_alias:
                 score += 18
             if score >= PAPER_ROUTE_MIN_SCORE:
-                matches.append(PaperMatch(document=document, score=float(score), exact_alias=exact_alias))
+                matches.append(
+                    PaperMatch(
+                        document=document,
+                        score=float(score),
+                        exact_alias=exact_alias,
+                        introduced_subject=introduced_selector_count > 0,
+                    )
+                )
         ranked = sorted(matches, key=lambda item: item.score, reverse=True)
         subject_locked = [
             match
@@ -545,8 +560,6 @@ class QueryService:
         primary = self._primary_subject_match(question, ranked)
         if primary is not None:
             return [self._locked_paper_match(primary)]
-        if self._is_cross_paper_query(question):
-            return ranked[: max(limit, 5)]
         exact_matches = [match for match in ranked if match.exact_alias]
         if exact_matches:
             if len(exact_matches) > 1:
@@ -555,13 +568,41 @@ class QueryService:
                     return [self._locked_paper_match(primary)]
                 return exact_matches[: max(limit, 5)]
             return [self._locked_paper_match(exact_matches[0])]
+        if self._is_cross_paper_query(question):
+            return ranked[: max(limit, 5)]
+        introduced_matches = [match for match in ranked if match.introduced_subject]
+        if len(introduced_matches) == 1:
+            return [self._locked_paper_match(introduced_matches[0])]
         if self._top_paper_match_is_obvious(ranked):
             return [self._locked_paper_match(ranked[0])]
         return ranked[:limit]
 
     @staticmethod
     def _locked_paper_match(match: PaperMatch) -> PaperMatch:
-        return PaperMatch(document=match.document, score=match.score, exact_alias=match.exact_alias, locked=True)
+        return PaperMatch(
+            document=match.document,
+            score=match.score,
+            exact_alias=match.exact_alias,
+            locked=True,
+            introduced_subject=match.introduced_subject,
+        )
+
+    @staticmethod
+    def _introduced_selector_count(selectors: list[str], text: str) -> int:
+        if not selectors or not text:
+            return 0
+        count = 0
+        for selector in selectors:
+            escaped = re.escape(selector)
+            if re.search(
+                rf"(?:\bwe\s+(?:introduc\w*|creat\w*|propos\w*|develop\w*|present\w*)|"
+                rf"\bthis\s+(?:paper|work|study)\s+(?:introduc\w*|propos\w*|develop\w*|present\w*)|"
+                rf"本文(?:引入|提出|开发|构建))[^.\n]{{0,240}}{escaped}",
+                text,
+                re.IGNORECASE,
+            ):
+                count += 1
+        return count
 
     @staticmethod
     def _top_paper_match_is_obvious(ranked: list[PaperMatch]) -> bool:
@@ -584,7 +625,6 @@ class QueryService:
                 document.title or "",
                 document.file_name or "",
                 document.raw_path or "",
-                document.raw_text or "",
             )
             if part
         )
@@ -601,7 +641,6 @@ class QueryService:
                 document.title or "",
                 document.file_name or "",
                 document.raw_path or "",
-                document.raw_text or "",
             )
             if part
         )
@@ -2058,8 +2097,16 @@ class QueryService:
         specific_terms = cls._extract_specific_question_scientific_terms(question)
         if not specific_terms:
             return True  # nothing specific to gate on
+        normalized_question = cls._normalize_selector(question)
         for ctx in contexts:
-            evidence = cls._context_relevance_text(ctx).lower()
+            citation = getattr(ctx, "citation", None)
+            if citation is None:
+                continue
+            title_key = cls._normalize_selector(getattr(citation, "page_title", None) or "")
+            if len(title_key) >= 5 and title_key in normalized_question:
+                return True
+        for ctx in contexts:
+            evidence = cls._normalize_selector(cls._context_relevance_text(ctx))
             for term in specific_terms:
                 if term and len(term) >= 3 and term in evidence:
                     return True
