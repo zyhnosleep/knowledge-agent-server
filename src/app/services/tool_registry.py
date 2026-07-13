@@ -383,19 +383,7 @@ def _rag_answer_handler(
     )
     return {
         "answer_markdown": response.answer_markdown,
-        "citations": [
-            {
-                "document_id": c.document_id,
-                "chunk_id": c.chunk_id,
-                "page_slug": c.page_slug,
-                "page_title": c.page_title,
-                "score": c.score,
-                "excerpt": c.excerpt,
-                "page_kind": c.page_kind,
-                "page_label": c.page_label,
-            }
-            for c in response.citations
-        ],
+        "citations": [c.model_dump() for c in response.citations],
         "verification_status": response.verification_status,
     }
 

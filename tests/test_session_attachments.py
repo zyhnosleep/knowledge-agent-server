@@ -14,7 +14,7 @@ from app.api.agent_routes import agent_router
 from app.core.config import get_settings
 from app.db.session import Base, get_db
 from app.models.records import ConversationSession, Project, SessionAttachment, SessionAttachmentChunk
-from app.schemas.agent import AgentQueryRequest
+from app.schemas.agent import AgentQueryRequest, EvidencePack
 from app.schemas.common import Citation, QueryResponse
 from app.services.agent_executor import AgentExecutor
 from app.services.agent_trace_store import AgentTraceStore
@@ -216,6 +216,187 @@ def test_retrieve_attachment_evidence_ranks_by_overlap() -> None:
     assert pack.status == "ok"
     assert len(pack.items) == 1
     assert pack.items[0].excerpt == "delta echo foxtrot"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("只根据当前附件回答 token 和 color", True),
+        ("请读取这个临时文件，不要引用项目文档", True),
+        ("Answer using only the attachment", True),
+        ("比较附件与项目文档", False),
+        ("介绍项目中的 CHARMM36 文献", False),
+    ],
+)
+def test_attachment_only_query_detection(query: str, expected: bool) -> None:
+    assert AgentExecutor._is_attachment_only_query(query) is expected
+
+
+def test_executor_attachment_only_query_skips_project_rag() -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    memory = ConversationMemory(db)
+    memory.touch_session("attachment-only-sess", project_slug="demo", ttl_days=30)
+    db.add(
+        SessionAttachment(
+            id="alpha-attachment",
+            session_id="attachment-only-sess",
+            project_id="p1",
+            file_name="alpha.txt",
+            storage_path="/dev/null",
+            sha256="alpha",
+            byte_size=40,
+        )
+    )
+    db.add(
+        SessionAttachmentChunk(
+            id="alpha-chunk",
+            attachment_id="alpha-attachment",
+            ordinal=0,
+            text="token: helios-314159\ncolor: crimson",
+        )
+    )
+    db.commit()
+
+    class ForbiddenProjectRAG:
+        retrieve_calls = 0
+        answer_calls = 0
+
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit=15, document_id=None
+        ):
+            self.retrieve_calls += 1
+            return EvidencePack(status="empty", items=[])
+
+        def answer(self, db, project_slug, question, document_id=None):
+            self.answer_calls += 1
+            return QueryResponse(
+                answer_markdown="unrelated project answer",
+                citations=[
+                    Citation(
+                        document_id="project-doc",
+                        chunk_id="project-chunk",
+                        score=0.9,
+                        excerpt="unrelated project evidence",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+    rag = ForbiddenProjectRAG()
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+    executor = AgentExecutor(
+        rag=rag,
+        tools=tools,
+        memory=ConversationMemory(db),
+        db=db,
+        trace_store=AgentTraceStore(db),
+        synthesizer=None,
+    )
+
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="只根据当前附件回答 token 和 color，不要引用项目文档",
+            session_id="attachment-only-sess",
+        )
+    )
+
+    assert response.status == "completed"
+    assert "helios-314159" in response.final_answer
+    assert "crimson" in response.final_answer
+    assert rag.retrieve_calls == 0
+    assert rag.answer_calls == 0
+    assert response.citations
+    assert all(c.page_kind == "session_attachment" for c in response.citations)
+    assert all(c.attachment_id == "alpha-attachment" for c in response.citations)
+    assert not any(step.tool_name == "rag.answer" for step in response.steps)
+    assert not any(step.tool_name == "rag.retrieve_evidence" for step in response.steps)
+    assert not any(step.tool_name == "answer.synthesize" for step in response.steps)
+    finalize_step = next(step for step in response.steps if step.step_type == "finalize")
+    assert finalize_step.metadata["source_scope"] == "session_attachments_only"
+    assert finalize_step.metadata["project_rag_skipped"] is True
+    trace = AgentTraceStore(db).get_trace(response.trace_id)
+    assert trace is not None
+    assert trace["citations"][0]["attachment_id"] == "alpha-attachment"
+
+
+def test_executor_mixed_attachment_query_keeps_project_rag() -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    memory = ConversationMemory(db)
+    memory.touch_session("mixed-sess", project_slug="demo", ttl_days=30)
+    db.add(
+        SessionAttachment(
+            id="mixed-attachment",
+            session_id="mixed-sess",
+            project_id="p1",
+            file_name="mixed.txt",
+            storage_path="/dev/null",
+            sha256="mixed",
+            byte_size=30,
+        )
+    )
+    db.add(
+        SessionAttachmentChunk(
+            id="mixed-chunk",
+            attachment_id="mixed-attachment",
+            ordinal=0,
+            text="attachment comparison evidence",
+        )
+    )
+    db.commit()
+
+    class CountingRAG:
+        retrieve_calls = 0
+        answer_calls = 0
+
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit=15, document_id=None
+        ):
+            self.retrieve_calls += 1
+            return EvidencePack(status="empty", items=[])
+
+        def answer(self, db, project_slug, question, document_id=None):
+            self.answer_calls += 1
+            return QueryResponse(
+                answer_markdown="project comparison evidence",
+                citations=[
+                    Citation(
+                        document_id="project-doc",
+                        chunk_id="project-chunk",
+                        score=0.9,
+                        excerpt="project comparison evidence",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+    rag = CountingRAG()
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+    executor = AgentExecutor(
+        rag=rag,
+        tools=tools,
+        memory=ConversationMemory(db),
+        db=db,
+        trace_store=AgentTraceStore(db),
+        synthesizer=None,
+    )
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="比较附件与项目文档",
+            session_id="mixed-sess",
+        )
+    )
+
+    assert response.status == "completed"
+    assert rag.retrieve_calls == 1
+    assert rag.answer_calls == 1
+    assert any(c.document_id == "project-doc" for c in response.citations)
+    assert any(c.attachment_id == "mixed-attachment" for c in response.citations)
 
 
 def test_executor_includes_session_attachment_evidence(monkeypatch, tmp_path) -> None:

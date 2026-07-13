@@ -256,67 +256,100 @@ class AgentExecutor:
                 )
                 return status
 
-            # ---- rag.retrieve_evidence (v4) ----
-            evidence_pack = self._run_retrieve_evidence(
-                request.project_slug,
-                request.query,
-                request.document_id,
-                constraints,
-                steps,
-                usage,
-                session_id,
-            )
+            attachment_only_requested = self._is_attachment_only_query(request.query)
+            attachment_only = False
+            session_attachment_pack = None
 
-            # ---- session-scoped temporary attachments ----
-            session_attachment_pack = self._run_retrieve_session_attachments(
-                request.project_slug,
-                request.query,
-                constraints,
-                steps,
-                usage,
-                session_id,
-            )
-            evidence_pack = self._merge_evidence_pack(
-                evidence_pack, session_attachment_pack, max_items=15
-            )
+            if attachment_only_requested:
+                session_attachment_pack = self._run_retrieve_session_attachments(
+                    request.project_slug,
+                    request.query,
+                    constraints,
+                    steps,
+                    usage,
+                    session_id,
+                )
+                attachment_only = bool(
+                    session_attachment_pack and session_attachment_pack.get("items")
+                )
 
-            self._commit_progress()
-            answer_text, citations, tool_calls_used = self._run_rag_answer(
-                request.project_slug,
-                request.query,
-                request.document_id,
-                constraints,
-                steps,
-                usage,
-                session_id,
-            )
-            tool_calls = tool_calls_used
-            attachment_citations = self._session_attachment_citations(evidence_pack)
-            if attachment_citations:
-                citations = self._merge_citations(citations, attachment_citations)
-
-            # ---- detect insufficient evidence ----
-            _evidence_insufficient = bool(
-                answer_text and _INSUFFICIENT_EVIDENCE_RE.search(answer_text)
-            )
-            if attachment_citations and (_evidence_insufficient or not answer_text.strip()):
+            if attachment_only:
+                evidence_pack = self._merge_evidence_pack(
+                    None, session_attachment_pack, max_items=15
+                )
+                citations = self._session_attachment_citations(evidence_pack)
                 answer_text = self._draft_session_attachment_answer(
-                    request.query, attachment_citations
+                    request.query, citations
                 )
+                tool_calls = usage.tool_calls
                 warnings.append(
-                    "Answered from temporary attachments scoped to this session."
+                    "Answered only from temporary attachments scoped to this session."
                 )
-            elif _evidence_insufficient:
-                warnings.append(
-                    "Insufficient evidence — retrieved documents do not contain "
-                    "information relevant to the query terms. Consider uploading "
-                    "the target documents."
+            else:
+                # ---- rag.retrieve_evidence (v4) ----
+                evidence_pack = self._run_retrieve_evidence(
+                    request.project_slug,
+                    request.query,
+                    request.document_id,
+                    constraints,
+                    steps,
+                    usage,
+                    session_id,
                 )
+
+                # ---- session-scoped temporary attachments ----
+                if session_attachment_pack is None:
+                    session_attachment_pack = self._run_retrieve_session_attachments(
+                        request.project_slug,
+                        request.query,
+                        constraints,
+                        steps,
+                        usage,
+                        session_id,
+                    )
+                evidence_pack = self._merge_evidence_pack(
+                    evidence_pack, session_attachment_pack, max_items=15
+                )
+
+                self._commit_progress()
+                answer_text, citations, tool_calls_used = self._run_rag_answer(
+                    request.project_slug,
+                    request.query,
+                    request.document_id,
+                    constraints,
+                    steps,
+                    usage,
+                    session_id,
+                )
+                tool_calls = tool_calls_used
+                attachment_citations = self._session_attachment_citations(evidence_pack)
+                if attachment_citations:
+                    citations = self._merge_citations(citations, attachment_citations)
+
+                # ---- detect insufficient evidence ----
+                _evidence_insufficient = bool(
+                    answer_text and _INSUFFICIENT_EVIDENCE_RE.search(answer_text)
+                )
+                if attachment_citations and (
+                    _evidence_insufficient or not answer_text.strip()
+                ):
+                    answer_text = self._draft_session_attachment_answer(
+                        request.query, attachment_citations
+                    )
+                    warnings.append(
+                        "Answered from temporary attachments scoped to this session."
+                    )
+                elif _evidence_insufficient:
+                    warnings.append(
+                        "Insufficient evidence — retrieved documents do not contain "
+                        "information relevant to the query terms. Consider uploading "
+                        "the target documents."
+                    )
 
             # ---- answer.synthesize (v3) ----
             synth_provider = "local"
             synth_model = "local-fallback"
-            if not max_steps_hit:
+            if not max_steps_hit and not attachment_only:
                 self._commit_progress()
                 synth_result = self._run_synthesize(
                     request.query,
@@ -367,6 +400,8 @@ class AgentExecutor:
                 and verify_result.get("result", {}).get("retry_recommended", False)
             )
             if (
+                not attachment_only
+                and
                 retry_recommended
                 and route.max_retries > 0
                 and tool_calls < constraints.max_tool_calls
@@ -408,7 +443,15 @@ class AgentExecutor:
                         f"Agent produced final answer with "
                         f"{len(citations)} citations"
                     ),
-                    metadata={"route": route.route},
+                    metadata={
+                        "route": route.route,
+                        "source_scope": (
+                            "session_attachments_only"
+                            if attachment_only
+                            else "project_and_session"
+                        ),
+                        "project_rag_skipped": attachment_only,
+                    },
                 )
                 steps.append(finalize_step)
 
@@ -438,17 +481,7 @@ class AgentExecutor:
             trace_id = None
             if self._trace_store is not None:
                 try:
-                    raw_citations_for_trace = [
-                        {
-                            "document_id": c.document_id,
-                            "chunk_id": c.chunk_id,
-                            "page_slug": c.page_slug,
-                            "page_title": c.page_title,
-                            "excerpt": c.excerpt,
-                            "score": c.score,
-                        }
-                        for c in citations
-                    ]
+                    raw_citations_for_trace = [c.model_dump() for c in citations]
                     trace_id = self._trace_store.persist_run(
                         request_id=request_id,
                         session_id=session_id,
@@ -546,6 +579,32 @@ class AgentExecutor:
         except Exception:
             self._db.rollback()
             raise
+
+    @staticmethod
+    def _is_attachment_only_query(query: str) -> bool:
+        """Return whether a query explicitly limits evidence to attachments."""
+        normalized = " ".join(query.lower().split())
+        has_attachment = any(
+            term in normalized
+            for term in ("附件", "临时文件", "attachment", "attached file")
+        )
+        has_exclusive_scope = any(
+            term in normalized
+            for term in (
+                "只根据",
+                "仅根据",
+                "只使用",
+                "仅使用",
+                "不要引用项目",
+                "only the attachment",
+                "only attachment",
+                "using only",
+            )
+        )
+        is_comparison = any(
+            term in normalized for term in ("比较", "对比", "compare")
+        )
+        return has_attachment and has_exclusive_scope and not is_comparison
 
     def _finalize_truncated(
         self,
@@ -785,6 +844,7 @@ class AgentExecutor:
                 Citation(
                     document_id=c.get("document_id"),
                     chunk_id=c.get("chunk_id"),
+                    attachment_id=c.get("attachment_id"),
                     page_slug=c.get("page_slug"),
                     page_title=c.get("page_title"),
                     page_kind=c.get("page_kind"),
@@ -879,19 +939,7 @@ class AgentExecutor:
 
         step_id = len(steps)
         t0 = time.monotonic()
-        raw_citations = [
-            {
-                "document_id": c.document_id,
-                "chunk_id": c.chunk_id,
-                "page_slug": c.page_slug,
-                "page_title": c.page_title,
-                "page_kind": c.page_kind,
-                "score": c.score,
-                "page_label": c.page_label,
-                "excerpt": c.excerpt,
-            }
-            for c in citations
-        ]
+        raw_citations = [c.model_dump() for c in citations]
         verify_result = self._tools.call_tool(
             "answer.verify",
             {
@@ -986,19 +1034,7 @@ class AgentExecutor:
 
         step_id = len(steps)
         t0 = time.monotonic()
-        raw_citations = [
-            {
-                "document_id": c.document_id,
-                "chunk_id": c.chunk_id,
-                "page_slug": c.page_slug,
-                "page_title": c.page_title,
-                "page_kind": c.page_kind,
-                "score": c.score,
-                "page_label": c.page_label,
-                "excerpt": c.excerpt,
-            }
-            for c in citations
-        ]
+        raw_citations = [c.model_dump() for c in citations]
 
         # Build conversation summary from memory
         conv_summary = self._build_conversation_summary(session_id)
