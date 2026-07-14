@@ -112,7 +112,7 @@ def test_upload_refreshes_project_list_after_new_topic() -> None:
 
 def test_dark_theme_colors_present() -> None:
     html = _html()
-    assert "#0b0f17" in html or "#111827" in html
+    assert "#070a0e" in html
 
 
 def test_session_list_is_in_sidebar_not_chat_page() -> None:
@@ -447,3 +447,187 @@ def test_attachment_requests_preserve_project_scope() -> None:
     assert '"/attachments?" + scopeQueryParams()' in html
     assert "activeProjectSlug" in html
     assert "activeDocumentId" in html
+
+
+# ---------------------------------------------------------------------------
+# Nocturne full-UI contract tests (night-research-full-ui workflow)
+# ---------------------------------------------------------------------------
+
+
+def test_nocturne_semantic_tokens_present() -> None:
+    html = _html()
+    assert "--night-950" in html
+    assert "--paper-100" in html
+    assert "--signal" in html
+    assert "--evidence" in html
+
+
+def test_shell_dimensions_match_reference() -> None:
+    html = _html()
+    sidebar_match = re.search(r"--sidebar-w:\s*(\d+)px", html)
+    assert sidebar_match is not None
+    sidebar_width = int(sidebar_match.group(1))
+    assert 270 <= sidebar_width <= 278, f"sidebar width {sidebar_width}px not in 270-278px"
+    topbar_match = re.search(r"\.topbar\s*\{[^}]*?height:\s*(\d+)px", html, re.S)
+    assert topbar_match is not None
+    topbar_height = int(topbar_match.group(1))
+    assert 68 <= topbar_height <= 72, f"topbar height {topbar_height}px not near 70px"
+
+
+def test_brand_includes_lighthouse_and_institute() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    assert "夜航研究所" in html
+    assert "NIGHT RESEARCH INSTITUTE" in html
+    assert "RAG Research" in html
+    lighthouse = soup.select_one(".brand-mark svg, .brand svg")
+    assert lighthouse is not None, "lighthouse brand mark missing"
+
+
+def test_navigation_items_and_active_indicator() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    nav = soup.select_one("nav[aria-label='主导航']")
+    assert nav is not None
+    targets = [b.get("data-view-target") for b in nav.select("[data-view-target]")]
+    assert "chat" in targets
+    assert "files" in targets
+    assert "runs" in targets
+    assert "border-left" in html or "box-shadow: inset" in html
+
+
+def test_chat_is_default_route_without_hash() -> None:
+    html = _html()
+    match = re.search(r"setView\(\(location\.hash[^)]+\)\.slice\(1\)\)", html)
+    assert match is not None
+    default_match = re.search(r"var\s+activeView\s*=\s*[\"']chat[\"']", html)
+    assert default_match is not None, "activeView must default to chat"
+
+
+def test_research_index_present() -> None:
+    html = _html()
+    assert "RESEARCH INDEX" in html
+    assert "01" in html and "ASK" in html
+    assert "02" in html and "TRACE" in html
+    assert "03" in html and "READ" in html
+
+
+def test_evidence_constellation_is_native_svg_not_canvas() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    constellation = soup.select_one("#evidenceConstellation, .evidence-constellation")
+    assert constellation is not None
+    assert constellation.find("svg") is not None, "constellation must use inline SVG"
+    assert "<canvas" not in str(constellation).lower()
+    assert "particle" not in html.lower()
+
+
+def test_chat_welcome_has_three_column_stage() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    welcome = soup.select_one("#chatWelcome")
+    assert welcome is not None
+    stage = welcome.select_one(".welcome-stage")
+    assert stage is not None
+    assert "grid-template-columns" in html or "flex" in stage.get("style", "")
+
+
+def test_project_overview_in_chat_welcome() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    overview = soup.select_one("#chatWelcome .project-overview, .project-overview")
+    assert overview is not None
+    labels = overview.get_text()
+    assert "文档总数" in labels
+    assert "运行记录" in labels
+    assert "失败任务" in labels or "成功率" in labels
+
+
+def test_composer_has_sample_prompts() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    prompts = soup.select(".sample-prompt, [class*='sample-prompt']")
+    assert len(prompts) >= 2, "expected at least two sample prompts"
+
+
+def test_chat_answer_has_collapsible_trace() -> None:
+    html = _html()
+    assert "trace-summary" in html or "traceSummary" in html
+    assert "检索与推理已完成" in html or "completed-trace" in html
+
+
+def test_answer_uses_safe_text_citations() -> None:
+    html = _html()
+    assert "document.createTextNode" in html
+    assert "data-citation-index" in html
+    assert "innerHTML" not in html.split("<script>")[1] or "step.innerHTML" in html
+
+
+def test_document_library_archive_layout() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    files_view = soup.select_one('[data-view="files"]')
+    assert files_view is not None
+    rail = files_view.select_one(".files-rail, .archive-rail")
+    assert rail is not None
+    table = files_view.select_one(".document-index, .document-table, .doc-index")
+    assert table is not None
+
+
+def test_document_rows_have_sequence_and_actions() -> None:
+    html = _html()
+    assert "doc-index-row" in html or "document-row" in html
+    assert "进入对话" in html
+    assert "delete-doc-action" in html
+
+
+def test_run_dashboard_open_metrics_and_table() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    runs_view = soup.select_one('[data-view="runs"]')
+    assert runs_view is not None
+    assert runs_view.select_one("#pipelineMetrics") is not None
+    assert runs_view.select_one("#pipelineRunsBody") is not None
+    assert runs_view.select_one(".runs-overview-rail") is not None
+
+
+def test_run_dashboard_preserves_topic_chat() -> None:
+    html = _html()
+    assert "enterTopicChat" in html
+    assert "进入对话" in html
+
+
+def test_source_drawer_is_split_workspace() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    drawer = soup.select_one("#sourceDrawer")
+    assert drawer is not None
+    assert drawer.select_one(".pdf-frame") is not None
+    assert drawer.select_one(".chunk-list") is not None
+
+
+def test_source_drawer_restores_dashboard_on_close() -> None:
+    html = _html()
+    assert "sourceDrawerOpen" in html or "runs-layout" in html
+    assert "closeDrawerButton" in html
+    assert "resetSourceDrawer" in html
+
+
+def test_responsive_breakpoints_defined() -> None:
+    html = _html()
+    media_queries = re.findall(r"@media\s*\(\s*max-width:\s*(\d+)px\s*\)", html)
+    widths = sorted(set(int(w) for w in media_queries))
+    assert any(1180 <= w <= 1220 for w in widths), "missing 1200px breakpoint"
+    assert any(880 <= w <= 920 for w in widths), "missing 900px breakpoint"
+    assert any(760 <= w <= 780 for w in widths), "missing 768px breakpoint"
+    assert any(470 <= w <= 490 for w in widths), "missing 480px breakpoint"
+
+
+def test_reduced_motion_fallback() -> None:
+    html = _html()
+    assert "prefers-reduced-motion" in html
+
+
+def test_focus_visible_states() -> None:
+    html = _html()
+    assert ":focus-visible" in html

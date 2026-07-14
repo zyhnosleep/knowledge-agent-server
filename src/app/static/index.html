@@ -7,39 +7,53 @@
     <link rel="icon" href="data:," />
     <style>
       :root {
-        --bg: #0b0f17;
-        --surface: #111827;
-        --surface-soft: #151c28;
-        --surface-tint: #1a2332;
-        --ink: #f3f5f8;
-        --muted: #9aa3b2;
-        --faint: #6b7280;
-        --line: #243042;
-        --line-strong: #314155;
-        --green: #22c55e;
-        --green-soft: #0f3d22;
-        --blue: #3b82f6;
-        --blue-soft: #172554;
+        --night-950: #070a0e;
+        --night-900: #0a0f14;
+        --night-850: #10161d;
+        --night-800: #151c24;
+        --night-700: #25303b;
+        --line-soft: #1b242d;
+        --line: #25303b;
+        --paper-100: #edf1f3;
+        --paper-300: #b7c0c8;
+        --paper-500: #7d8996;
+        --signal: #a9ef58;
+        --evidence: #4d8dff;
         --purple: #8b5cf6;
-        --purple-soft: #2e1065;
-        --red: #ef4444;
-        --red-soft: #450a0a;
-        --amber: #f59e0b;
-        --amber-soft: #451a03;
+        --amber: #f5a623;
+        --danger: #f06f73;
+
+        /* Behavior aliases for legacy selectors and tests */
+        --bg: var(--night-950);
+        --surface: var(--night-850);
+        --surface-soft: var(--night-800);
+        --surface-tint: var(--night-800);
+        --ink: var(--paper-100);
+        --muted: var(--paper-300);
+        --faint: var(--paper-500);
+        --green: var(--signal);
+        --green-soft: rgba(169, 239, 88, 0.12);
+        --blue: var(--evidence);
+        --blue-soft: rgba(77, 141, 255, 0.12);
+        --red: var(--danger);
+        --red-soft: rgba(240, 111, 115, 0.12);
         --shadow: 0 18px 38px rgb(0 0 0 / 28%);
-        --solid-shadow: 0 7px 0 #0d1320, 0 22px 40px rgb(0 0 0 / 22%);
-        --sidebar-w: 254px;
+        --sidebar-w: 276px;
+        --topbar-h: 70px;
       }
 
       * {
         box-sizing: border-box;
       }
 
+      [hidden] { display: none !important; }
+
+      html,
       body {
         margin: 0;
         min-height: 100dvh;
-        background: var(--bg);
-        color: var(--ink);
+        background: var(--night-950);
+        color: var(--paper-100);
         font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         -webkit-font-smoothing: antialiased;
         letter-spacing: 0;
@@ -55,6 +69,8 @@
 
       button {
         cursor: pointer;
+        background: transparent;
+        border: 0;
       }
 
       button:disabled {
@@ -82,51 +98,85 @@
         gap: 18px;
         padding: 22px 16px 18px;
         border-right: 1px solid var(--line);
-        background: linear-gradient(180deg, #0f1621 0%, #0b1018 100%);
+        background: var(--night-900);
       }
 
       .brand {
         display: grid;
-        gap: 6px;
+        gap: 8px;
       }
 
-      .brand strong {
-        font-size: 22px;
-        line-height: 1.05;
+      .brand-mark {
+        display: flex;
+        align-items: center;
+        gap: 12px;
       }
 
-      .brand span,
-      .muted,
-      .nav-button small {
-        color: var(--muted);
+      .brand-mark svg {
+        width: 28px;
+        height: 28px;
+        flex-shrink: 0;
+        color: var(--paper-100);
+      }
+
+      .brand-titles {
+        display: grid;
+        gap: 1px;
+      }
+
+      .brand-titles strong {
+        font-size: 15px;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        line-height: 1.2;
+      }
+
+      .brand-titles span {
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        color: var(--paper-500);
+        text-transform: uppercase;
+      }
+
+      .brand-rag {
+        font-size: 18px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        color: var(--paper-100);
       }
 
       .nav {
         display: grid;
-        gap: 8px;
+        gap: 4px;
       }
 
       .nav-button {
         width: 100%;
-        min-height: 58px;
+        min-height: 48px;
         display: grid;
         grid-template-columns: 32px minmax(0, 1fr);
         align-items: center;
         gap: 11px;
         padding: 10px 12px;
         border: 1px solid transparent;
-        border-radius: 10px;
+        border-radius: 8px;
         background: transparent;
-        color: var(--ink);
+        color: var(--paper-300);
         text-align: left;
+        transition: background 160ms ease, color 160ms ease;
       }
 
-      .nav-button:hover,
+      .nav-button:hover {
+        background: var(--night-800);
+        color: var(--paper-100);
+      }
+
       .nav-button.active {
-        border-color: var(--line-strong);
-        background: var(--surface-tint);
-        color: var(--blue);
-        box-shadow: inset 4px 0 0 var(--blue);
+        border-color: var(--line);
+        background: var(--night-800);
+        color: var(--paper-100);
+        box-shadow: inset 3px 0 0 var(--paper-100);
       }
 
       .nav-icon,
@@ -141,24 +191,21 @@
       .nav-icon {
         width: 32px;
         height: 32px;
-        background: var(--surface-tint);
-        color: #9fb1cc;
-      }
-
-      .nav-button.active .nav-icon {
-        background: var(--blue);
-        color: #fff;
+        background: transparent;
+        color: inherit;
       }
 
       .nav-button strong {
         display: block;
-        font-size: 15px;
+        font-size: 14px;
+        font-weight: 500;
       }
 
       .nav-button small {
         display: block;
-        margin-top: 2px;
-        font-size: 12px;
+        margin-top: 1px;
+        font-size: 11px;
+        color: var(--paper-500);
       }
 
       .session-list {
@@ -176,21 +223,21 @@
         justify-content: space-between;
         gap: 8px;
         padding: 0 6px;
-        color: var(--muted);
-        font-size: 12px;
-        font-weight: 800;
+        color: var(--paper-500);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
         text-transform: uppercase;
-        letter-spacing: 0.04em;
       }
 
       .session-list-head button {
         padding: 4px 8px;
         border: 0;
         border-radius: 6px;
-        background: var(--surface-tint);
-        color: var(--muted);
-        font-size: 12px;
-        font-weight: 800;
+        background: var(--night-800);
+        color: var(--paper-500);
+        font-size: 11px;
+        font-weight: 700;
       }
 
       .session-list-body {
@@ -199,25 +246,25 @@
         overflow-y: auto;
         display: grid;
         align-content: start;
-        gap: 7px;
+        gap: 6px;
         padding-right: 4px;
       }
 
       .session-list-empty {
         padding: 12px;
-        color: var(--faint);
+        color: var(--paper-500);
         font-size: 13px;
         text-align: center;
       }
 
       .recent-card {
-        min-height: 44px;
-        padding: 10px 12px;
+        min-height: 40px;
+        padding: 9px 12px;
         border: 1px solid transparent;
         border-left: 3px solid transparent;
         border-radius: 8px;
         background: transparent;
-        color: var(--muted);
+        color: var(--paper-300);
         text-align: left;
         font-size: 13px;
         line-height: 1.35;
@@ -225,13 +272,13 @@
       }
 
       .recent-card:hover {
-        background: var(--surface-tint);
+        background: var(--night-800);
       }
 
       .recent-card.active {
-        border-left-color: var(--green);
-        background: var(--surface-tint);
-        color: var(--ink);
+        border-left-color: var(--signal);
+        background: var(--night-800);
+        color: var(--paper-100);
       }
 
       .profile {
@@ -239,19 +286,19 @@
         gap: 3px;
         padding-top: 12px;
         border-top: 1px solid var(--line);
-        color: var(--muted);
-        font-size: 13px;
+        color: var(--paper-500);
+        font-size: 12px;
       }
 
       .profile strong {
-        color: var(--ink);
+        color: var(--paper-100);
       }
 
       .main {
         min-width: 0;
         display: grid;
-        grid-template-rows: 64px minmax(0, 1fr);
-        background: var(--bg);
+        grid-template-rows: var(--topbar-h) minmax(0, 1fr);
+        background: var(--night-950);
       }
 
       .topbar {
@@ -259,45 +306,57 @@
         align-items: center;
         justify-content: space-between;
         gap: 18px;
-        padding: 0 28px;
+        padding: 0 36px;
         border-bottom: 1px solid var(--line);
-        background: rgba(11, 15, 23, 0.75);
-        backdrop-filter: blur(16px);
+        background: var(--night-950);
       }
 
-      .topbar-title {
-        margin: 0;
-        font-size: 22px;
-        line-height: 1;
-        color: var(--ink);
+      .topbar-label {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+        font-size: 11px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--paper-500);
+      }
+
+      .topbar-label span {
+        color: var(--paper-100);
+      }
+
+      .topbar-line {
+        width: 120px;
+        height: 1px;
+        background: linear-gradient(90deg, var(--line), transparent);
       }
 
       .status-pill {
         display: inline-flex;
         align-items: center;
-        gap: 9px;
-        min-height: 34px;
-        padding: 0 14px;
-        border: 1px solid var(--green-soft);
+        gap: 8px;
+        min-height: 32px;
+        padding: 0 12px;
+        border: 1px solid var(--line);
         border-radius: 999px;
-        background: rgba(34, 197, 94, 0.08);
-        color: var(--green);
-        font-size: 13px;
-        font-weight: 800;
+        background: var(--night-900);
+        color: var(--signal);
+        font-size: 12px;
+        font-weight: 600;
         white-space: nowrap;
       }
 
       .status-dot {
-        width: 10px;
-        height: 10px;
+        width: 8px;
+        height: 8px;
         border-radius: 50%;
         background: currentColor;
-        box-shadow: 0 0 0 4px rgb(34 197 94 / 14%);
       }
 
       .view {
         min-width: 0;
-        padding: 28px 28px 40px;
+        padding: 36px 36px 40px;
       }
 
       .view[hidden] {
@@ -1331,27 +1390,190 @@
           border-radius: 14px;
         }
       }
+      /* Nocturne Research — production UI derived from the approved five-screen study. */
+      :root { --solid-shadow: 0 24px 70px rgb(0 0 0 / 28%); }
+      body { background: var(--night-950); color: var(--paper-100); }
+      .topbar { height: 70px; }
+      button, select, input, textarea { font: inherit; }
+      button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+        outline: 2px solid var(--signal); outline-offset: 3px;
+      }
+      .brand { height: 76px; display: flex; gap: 13px; padding: 8px 11px 4px; align-items: center; }
+      .brand-lighthouse { width: 28px; height: 44px; fill: none; stroke: var(--paper-100); stroke-width: 1.4; }
+      .brand-wordmark { display: grid; gap: 3px; }
+      .brand-wordmark strong { font-family: Georgia, "Noto Serif SC", serif; font-size: 16px; letter-spacing: .28em; white-space: nowrap; }
+      .brand-wordmark small { font: 7px/1.2 ui-monospace, monospace; letter-spacing: .13em; color: var(--paper-500); }
+      .product-name { padding: 0 13px 18px; font-size: 22px; font-weight: 650; letter-spacing: .02em; }
+      .nav { padding: 0 18px 24px; border-bottom: 1px solid var(--line-soft); }
+      .nav-button { min-height: 48px; border-radius: 7px; padding: 0 14px; gap: 12px; }
+      .nav-button::before { width: 3px; left: 0; background: var(--paper-100); }
+      .nav-button.active { background: #1a212a; }
+      .nav-icon { width: 22px; height: 22px; font-size: 17px; border: 0; background: none; }
+      .nav-button small { display: none; }
+      .session-list { padding: 15px 18px; flex: 1; min-height: 0; overflow: hidden; }
+      .session-list-body { max-height: 100%; overflow-y: auto; scrollbar-width: thin; }
+      .session-list-head { color: var(--paper-500); font-size: 12px; }
+      .session-list-head button { color: var(--paper-300); }
+      .profile { margin: auto 16px 16px; padding: 14px 16px; border: 1px solid var(--line); background: transparent; box-shadow: none; }
+      .profile small { color: var(--paper-500); }
+      .profile strong { color: var(--paper-300); }
+      .project-online { font: 9px ui-monospace, monospace; color: var(--paper-500); letter-spacing: .08em; }
+      .project-online i { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 10px var(--signal); }
+      .topbar { padding: 0 40px; border-bottom: 1px solid var(--line-soft); background: rgb(7 10 14 / 88%); }
+      .topbar-label { display: flex; align-items: center; gap: 20px; color: var(--paper-500); font: 11px ui-monospace, monospace; letter-spacing: .12em; }
+      .topbar-label i { width: 190px; height: 1px; background: linear-gradient(90deg, var(--paper-300), transparent); position: relative; }
+      .topbar-label i::after { content: ""; position: absolute; right: 0; top: -3px; width: 5px; height: 5px; border: 1px solid var(--paper-500); border-radius: 50%; }
+      .status-pill { background: none; border: 0; box-shadow: none; padding: 0; color: var(--paper-300); }
+
+      .view { max-width: none; padding: 27px 40px 40px; }
+      .page-intro { margin: 0; padding: 0 0 24px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; }
+      .page-intro h1, .chat-welcome h1 { font-family: Georgia, "Noto Serif SC", serif; font-weight: 500; color: var(--paper-100); }
+      .page-intro h1 { font-size: clamp(36px, 4vw, 52px); margin: 4px 0 6px; }
+      .page-intro p { color: var(--paper-500); }
+      .section-kicker { margin: 0 0 12px; font: 10px ui-monospace, monospace; letter-spacing: .16em; color: var(--paper-500); text-transform: uppercase; }
+
+      .chat-view { height: calc(100vh - 70px); padding: 0; overflow: hidden; position: relative; }
+      .chat-surface { max-width: none; height: 100%; padding: 0; overflow: auto; }
+      .welcome-stage { min-height: 100%; display: grid; grid-template-columns: minmax(520px, 1.12fr) minmax(360px, .88fr) 145px; align-items: center; gap: 24px; padding: 44px 38px 170px 70px; background: radial-gradient(circle at 62% 40%, rgb(39 80 130 / 12%), transparent 32%); text-align: left; }
+      .welcome-copy { max-width: 610px; }
+      .chat-welcome h1 { font-size: clamp(46px, 3.5vw, 58px); line-height: 1.16; margin: 0 0 24px; letter-spacing: -.035em; white-space: nowrap; }
+      .welcome-lede { max-width: 480px; color: var(--paper-300); font-size: 15px; line-height: 1.9; }
+      .research-index { max-width: 405px; margin-top: 34px; padding-top: 25px; border-top: 1px solid var(--paper-500); display: grid; gap: 15px; }
+      .index-title { margin-bottom: 5px; color: var(--paper-500); font: 10px ui-monospace, monospace; letter-spacing: .17em; }
+      .research-index div { display: grid; grid-template-columns: 34px 70px 1fr; align-items: center; gap: 10px; }
+      .research-index b { color: var(--signal); font: 12px ui-monospace, monospace; }
+      .research-index strong { font: 12px ui-monospace, monospace; letter-spacing: .12em; }
+      .research-index div span { font-size: 12px; color: var(--paper-500); }
+      .evidence-constellation { position: relative; min-height: 500px; opacity: .92; }
+      .evidence-constellation svg { width: 100%; height: 100%; position: absolute; inset: 0; overflow: visible; }
+      .constellation-lines { fill: none; stroke: #3b4d65; stroke-width: 1; }
+      .constellation-nodes circle { fill: #fff; stroke: var(--evidence); stroke-width: 5; filter: drop-shadow(0 0 9px var(--evidence)); }
+      .node-label { position: absolute; color: var(--paper-300); font: 12px ui-monospace, monospace; }
+      .node-label small { display: block; margin-top: 5px; color: var(--paper-500); font: 10px sans-serif; }
+      .node-label.n1 { left: 35%; top: 15%; }.node-label.n2 { left: 72%; top: 38%; }.node-label.n3 { left: 14%; top: 59%; }.node-label.n4 { right: 0; bottom: 16%; }
+      .project-overview { border-left: 1px solid var(--paper-500); padding-left: 15px; }
+      .project-overview h2, .runs-overview-rail h2 { font-size: 12px; font-weight: 500; color: var(--paper-500); }
+      .project-overview dl, .runs-overview-rail dl { display: grid; gap: 20px; margin-top: 22px; }
+      .project-overview dl div, .runs-overview-rail dl div { display: grid; gap: 6px; }
+      .project-overview dt, .runs-overview-rail dt { color: var(--paper-500); font-size: 11px; }
+      .project-overview dd, .runs-overview-rail dd { margin: 0; font-size: 22px; color: var(--paper-300); }
+      .composer { position: absolute; left: 50%; bottom: 22px; width: min(820px, calc(100% - 80px)); transform: translateX(-50%); padding: 0; z-index: 5; }
+      .composer-box { min-height: 112px; grid-template-columns: 44px 1fr auto; align-items: end; padding: 16px; background: rgb(18 25 33 / 93%); border: 1px solid #4c5863; border-radius: 10px; box-shadow: 0 22px 70px rgb(0 0 0 / 42%); backdrop-filter: blur(16px); }
+      .composer-box textarea { align-self: start; padding: 6px 0; min-height: 50px; }
+      .composer-actions { align-self: end; }
+      .send-button { border-color: #4c7d32; background: transparent; color: var(--paper-100); min-width: 46px; }
+      .composer-meta { padding: 10px 4px; font-style: italic; }
+      .sample-prompt { border: 0; background: none; padding: 0; color: var(--paper-500); font-size: 11px; font-style: italic; cursor: pointer; }
+      .sample-prompt:hover { color: var(--paper-300); }
+      .chat-messages, .answer, .thinking-feed { max-width: 850px; margin-left: 40px; }
+      .chat-messages { padding: 28px 0 150px; }
+      .message { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 18px 0; }
+      .message.agent > div:not(.message-sources), .answer-text { font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
+      .citation-ref { color: #70a8ff; font: 11px ui-monospace, monospace; vertical-align: super; cursor: default; }
+      .thinking-feed { margin-top: 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); }
+      .thinking-step { border: 0; border-bottom: 1px solid var(--line-soft); background: none; }
+      .trace-summary { max-width: 850px; margin: 28px 0 0 40px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); color: var(--paper-300); }
+      .chat-view.researching .topbar-label i, .chat-view.researching .thinking-feed { box-shadow: 0 0 18px rgb(77 141 255 / 28%); }
+      .chat-view.researching .send-button { color: var(--signal); }
+
+      .files-layout { grid-template-columns: 242px minmax(0, 1fr); gap: 26px; margin-top: 28px; }
+      .files-layout > *, .upload-form, .upload-form > label { min-width: 0; }
+      .upload-form select, .upload-form input { width: 100%; min-width: 0; }
+      .files-rail { padding-right: 26px; border-right: 1px solid var(--line); }
+      .upload-panel, .document-index, .library-stats, .runs-panel { border: 0; background: transparent; box-shadow: none; }
+      .upload-panel .panel-head, .document-index .panel-head { padding: 0 0 18px; border: 0; }
+      .upload-form { display: grid; grid-template-columns: 1fr; gap: 13px; padding: 0; }
+      .upload-form > label { display: grid; gap: 6px; font-size: 11px; color: var(--paper-500); }
+      .upload-form > label input, .upload-form > label select { margin-top: 6px; }
+      .file-picker-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+      .upload-drop { min-height: 158px; display: grid; place-content: center; gap: 8px; margin-top: 6px; border: 1px dashed #59636d; background: transparent; color: var(--paper-300); cursor: pointer; }
+      .upload-drop b { font-size: 34px; font-weight: 300; }.upload-drop small { color: var(--paper-500); }
+      .library-stats { margin-top: 32px; }.library-stats h3 { font-size: 13px; }
+      .library-stats dl { display: grid; gap: 0; }.library-stats dl div { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+      .library-stats dt { color: var(--paper-500); font-size: 12px; }.library-stats dd { margin: 0; font: 13px ui-monospace, monospace; }
+      .document-columns { color: var(--paper-500); font: 9px ui-monospace, monospace; letter-spacing: .08em; }
+      .document-list { padding: 0; border-top: 1px solid var(--line); }
+      .document-row { min-height: 64px; display: grid; grid-template-columns: 36px minmax(240px, 1fr) 150px auto; align-items: center; gap: 10px; padding: 10px 4px; border-bottom: 1px solid var(--line); background: transparent; border-radius: 0; }
+      .document-row::before { content: attr(data-index); color: var(--signal); font: 12px ui-monospace, monospace; }
+      .document-row > div:first-of-type { display: grid; gap: 5px; }.document-row strong { font-size: 12px; }.document-row .muted { font-size: 10px; }
+
+      .metrics { border-top: 0; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+      .metric { border: 0; border-right: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 14px 18px; }
+      .runs-layout { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 0; align-items: stretch; }
+      .runs-main { padding-right: 30px; min-width: 0; }
+      .runs-panel { margin-top: 8px; }
+      .topic-grid[hidden] { display: none; }
+      .runs-panel .panel-head { padding: 12px 0; border-bottom: 1px solid var(--line); }
+      .run-table th { color: var(--paper-500); font: 10px ui-monospace, monospace; letter-spacing: .04em; }
+      .run-table td { border-bottom-color: var(--line); }
+      .runs-overview-rail { border-left: 1px solid var(--line); padding: 15px 0 20px 24px; min-height: calc(100vh - 270px); }
+      .runs-overview-rail > strong { display: inline-block; margin-top: 15px; }.rail-running { float: right; color: var(--signal); font-size: 10px; }
+      .runs-overview-rail dl { gap: 12px; }.runs-overview-rail dl div { display: flex; justify-content: space-between; }.runs-overview-rail dd { font-size: 13px; }
+      .success-track { height: 2px; background: var(--line); }.success-track i { display: block; width: 0; height: 100%; background: var(--signal); transition: width .4s ease; }
+      .runs-overview-rail h3 { margin-top: 40px; color: var(--paper-500); font-size: 12px; }.runs-overview-rail ol { list-style: none; padding: 0; color: var(--paper-500); font-size: 10px; line-height: 1.7; }.runs-overview-rail li { border-left: 1px solid var(--line); padding: 0 0 18px 15px; }
+      .runs-layout.drawer-open { grid-template-columns: minmax(430px, .82fr) minmax(620px, 1.18fr); }
+      .runs-layout.drawer-open .runs-overview-rail { display: none; }
+      .source-drawer { position: relative; inset: auto; width: auto; max-height: none; min-height: calc(100vh - 250px); display: grid; grid-template-rows: auto 1fr auto; border: 1px solid var(--line); border-bottom: 0; background: var(--night-900); box-shadow: -24px 0 70px rgb(0 0 0 / 18%); }
+      .source-drawer[hidden] { display: none; }
+      .drawer-body { display: grid; grid-template-columns: minmax(350px, 1.2fr) minmax(240px, .8fr); gap: 14px; overflow: auto; padding: 14px; }
+      .pdf-panel, .markdown-panel { grid-row: 1 / span 2; }.pdf-frame { min-height: 580px; }.chunk-card { margin: 0; }.chunk-list { min-width: 0; }
+      .flow-card { display: none; }
+
+      @media (max-width: 1200px) {
+        .welcome-stage { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); padding-left: 45px; }
+        .chat-welcome h1 { white-space: normal; }
+        .project-overview { display: none; }
+        .runs-layout { grid-template-columns: 1fr; }.runs-overview-rail { display: none; }
+        .runs-layout.drawer-open { grid-template-columns: minmax(380px, .75fr) minmax(520px, 1.25fr); }
+      }
+      @media (max-width: 900px) {
+        .welcome-stage { grid-template-columns: 1fr; align-items: start; padding: 54px 34px 180px; }
+        .evidence-constellation { display: none; }
+        .files-layout { grid-template-columns: 210px minmax(0, 1fr); }
+        .runs-layout.drawer-open { display: block; }.runs-layout.drawer-open .runs-main { display: none; }
+        .drawer-body { grid-template-columns: 1fr 280px; }
+      }
+      @media (max-width: 768px) {
+        .shell { grid-template-columns: 1fr; }.sidebar { position: relative; width: auto; height: auto; min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+        .brand, .product-name, .session-list, .profile { display: none; }.nav { display: grid; grid-template-columns: repeat(3, 1fr); padding: 8px; border: 0; }.nav-button { justify-content: center; }
+        .topbar { padding: 0 18px; }.topbar-label i { width: 70px; }.view { padding: 24px 18px; }
+        .chat-view { height: calc(100vh - 134px); }.welcome-stage { padding: 40px 22px 170px; }.chat-welcome h1 { font-size: 42px; }
+        .composer { width: calc(100% - 28px); bottom: 10px; }.composer-meta { display: none; }
+        .files-layout { grid-template-columns: 1fr; }.files-rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 25px; }
+        .document-columns { display: none; }.document-index, .document-list { min-width: 0; overflow: hidden; }.document-row { width: 100%; grid-template-columns: 28px minmax(0, 1fr); }.document-row > .muted { display: none; }.document-row .row-actions { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
+        .drawer-body { grid-template-columns: 1fr; }.pdf-panel, .markdown-panel { grid-row: auto; }.pdf-frame { min-height: 460px; }
+      }
+      @media (max-width: 480px) {
+        .topbar-label i { display: none; }.status-pill { font-size: 10px; }.chat-welcome h1 { font-size: 34px; }.welcome-lede { font-size: 13px; }
+        .research-index div { grid-template-columns: 26px 58px 1fr; }.composer-box { grid-template-columns: 36px 1fr; }.composer-actions { grid-column: 1 / -1; justify-content: flex-end; }
+        .page-intro h1 { font-size: 36px; }.metrics { grid-template-columns: repeat(3, 1fr); }.metric { padding: 10px 5px; }.metric strong { font-size: 24px; }
+        .run-table th:nth-child(2), .run-table td:nth-child(2), .run-table th:nth-child(4), .run-table td:nth-child(4) { display: none; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+      }
     </style>
   </head>
   <body>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
-          <strong>RAG Agent Platform</strong>
-          <span>科研知识加工工作台</span>
+          <svg class="brand-lighthouse" viewBox="0 0 28 44" aria-hidden="true"><path d="M10 40h9M12 35h5M9 35h11L17 15h-5L9 35ZM12 10h5l-1-5h-3l-1 5Zm-5 6 5-3m10 3-5-3M7 40h15"/></svg>
+          <span class="brand-wordmark"><strong>夜航研究所</strong><small>NIGHT RESEARCH INSTITUTE</small></span>
         </div>
+        <div class="product-name">RAG Research</div>
 
         <nav class="nav" aria-label="主导航">
           <button class="nav-button" type="button" data-view-target="chat">
-            <span class="nav-icon" aria-hidden="true">A</span>
-            <span><strong>新聊天</strong><small>Agent</small></span>
+            <span class="nav-icon" aria-hidden="true">□</span>
+            <span><strong>新聊天</strong><small>Research</small></span>
           </button>
           <button class="nav-button" type="button" data-view-target="files">
-            <span class="nav-icon" aria-hidden="true">D</span>
-            <span><strong>文档库</strong><small>Docs</small></span>
+            <span class="nav-icon" aria-hidden="true">◉</span>
+            <span><strong>文档库</strong><small>Library</small></span>
           </button>
           <button class="nav-button active" type="button" data-view-target="runs">
-            <span class="nav-icon" aria-hidden="true">P</span>
+            <span class="nav-icon" aria-hidden="true">▷</span>
             <span><strong>运行</strong><small>Pipeline</small></span>
           </button>
         </nav>
@@ -1367,25 +1589,52 @@
         </div>
 
         <div class="profile">
-          <strong>张宇恒 Plus</strong>
-          <span id="activeProjectLabel">internal-research</span>
+          <small>当前项目</small>
+          <strong id="activeProjectLabel">internal-research</strong>
+          <span class="project-online"><i></i> INDEX ONLINE</span>
         </div>
       </aside>
 
       <main class="main">
         <header class="topbar">
-          <h1 class="topbar-title">RAG Agent Platform</h1>
+          <div class="topbar-label"><span id="viewEyebrow">RESEARCH CONVERSATION / 01</span><i></i></div>
           <div class="status-pill" id="healthStatus"><span class="status-dot"></span><span>检查服务中</span></div>
         </header>
 
         <section class="view chat-view" data-view="chat" hidden>
           <div class="chat-surface" id="chatSurface">
             <div class="chat-welcome" id="chatWelcome">
-              <h1>构建科研级对话交互</h1>
-              <p class="muted" id="chatContextLabel">Internal Research</p>
+             <div class="welcome-stage">
+              <div class="welcome-copy">
+                <p class="section-kicker">NIGHT RESEARCH / <span id="chatContextLabel">Internal Research</span></p>
+                <h1>从一个问题开始研究。</h1>
+                <p class="welcome-lede">我将基于你的文档库与研究项目，通过检索、溯源与阅读，给出可验证、可追溯的研究结论。</p>
+                <div class="research-index" aria-label="Research Index">
+                  <span class="index-title">RESEARCH INDEX</span>
+                  <div><b>01</b><strong>ASK</strong><span>提出问题，定义研究边界</span></div>
+                  <div><b>02</b><strong>TRACE</strong><span>追溯证据，建立可靠关联</span></div>
+                  <div><b>03</b><strong>READ</strong><span>阅读原文，验证与深入</span></div>
+                </div>
+              </div>
+              <div class="evidence-constellation" aria-label="证据关系图">
+                <svg viewBox="0 0 520 440" role="img" aria-label="文献证据关联网络">
+                  <g class="constellation-lines"><path d="M138 287L203 96L376 190L451 354L138 287L376 190"/><path d="M203 96L451 354"/></g>
+                  <g class="constellation-nodes"><circle cx="203" cy="96" r="5"/><circle cx="376" cy="190" r="5"/><circle cx="138" cy="287" r="5"/><circle cx="451" cy="354" r="5"/></g>
+                </svg>
+                <span class="node-label n1">OPLS-AA<small>力场开发与验证</small></span>
+                <span class="node-label n2">有机液体性质<small>预测与关联</small></span>
+                <span class="node-label n3">分子描述符<small>特征工程</small></span>
+                <span class="node-label n4">研究方法<small>综述与比较</small></span>
+              </div>
+              <aside class="project-overview">
+                <h2>项目概览</h2>
+                <dl><div><dt>文档总数</dt><dd id="chatDocumentCount">—</dd></div><div><dt>运行记录</dt><dd id="chatRunCount">—</dd></div><div><dt>失败任务</dt><dd id="chatFailedCount">—</dd></div><div><dt>知识覆盖</dt><dd id="chatCoverage">—</dd></div></dl>
+              </aside>
+             </div>
             </div>
             <div class="chat-messages" id="chatMessages" hidden></div>
             <div class="thinking-feed" id="thinkingFeed" hidden></div>
+            <details class="trace-summary" id="traceSummary" hidden><summary>检索与推理已完成</summary><p>已完成检索、原文阅读与证据整理。</p></details>
             <article class="answer" id="answerPanel" hidden>
               <div class="answer-meta" id="answerMeta"></div>
               <div class="answer-text" id="answerText"></div>
@@ -1398,62 +1647,67 @@
           <div class="composer">
             <div class="attachment-bar" id="attachmentBar" hidden></div>
             <form class="composer-box" id="queryForm">
-              <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件" aria-label="添加临时文件">+</button>
-              <textarea id="questionInput" rows="1" aria-label="输入问题" placeholder="询问论文、文档或 Agent 能力..."></textarea>
+              <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件" aria-label="添加临时文件">⌕</button>
+              <textarea id="questionInput" rows="1" aria-label="输入问题" placeholder="询问论文、附件或研究项目…"></textarea>
               <input id="attachmentInput" type="file" multiple hidden />
               <div class="composer-actions">
                 <select id="queryMode" aria-label="查询模式">
                   <option value="agent">Agent</option>
                   <option value="rag">普通 RAG</option>
                 </select>
-                <button class="send-button" id="sendButton" type="submit">发送</button>
+                <button class="send-button" id="sendButton" type="submit" aria-label="发送问题">→</button>
               </div>
             </form>
             <div class="composer-meta">
               <span id="composerHint">问点难的，让我多想一步</span>
-              <span>Enter 发送 · Shift+Enter 换行</span>
+              <span><button class="sample-prompt" type="button">“比较不同力场的适用范围”</button>　<button class="sample-prompt" type="button">“基于我的文档预测方法综述”</button></span>
             </div>
           </div>
         </section>
 
-        <section class="view" data-view="files" hidden>
+        <section class="view files-view" data-view="files" hidden>
           <div class="page-intro">
             <div>
+              <p class="section-kicker">DOCUMENT LIBRARY / 04</p>
               <h1>文档库</h1>
-              <p>以主题聚合文献资料，上传后进入解析、切片、索引与可回溯问答流程。</p>
+              <p>集中管理研究资料与知识资产，支持文档解析、索引与溯源，构建可验证的研究基础。</p>
             </div>
           </div>
 
-          <div class="files-grid">
-            <section class="panel">
+          <div class="files-grid files-layout">
+            <aside class="files-rail">
+            <section class="upload-panel">
               <div class="panel-head">
                 <h2>上传文档</h2>
               </div>
-              <form class="upload-form" id="uploadForm" style="padding: 22px;">
+              <form class="upload-form" id="uploadForm">
                 <label>Topic
                   <select id="uploadTopicSelect"></select>
                 </label>
                 <label id="newTopicSlugLabel" hidden>New slug<input id="newTopicSlug" type="text" placeholder="my-topic" /></label>
                 <label id="newTopicNameLabel" hidden>New name<input id="newTopicName" type="text" placeholder="My Topic" /></label>
-                <label>File<input id="fileInput" type="file" /></label>
-                <button class="send-button" id="uploadButton" type="submit">提交</button>
+                <label class="file-picker-label">File<input id="fileInput" type="file" accept=".pdf,.txt,.md,.doc,.docx" /></label>
+                <button class="upload-drop" id="uploadButton" type="button" aria-label="提交"><b>＋</b><span>点击或拖拽文件到此处</span><small>支持 PDF 格式，单个文件 ≤ 200MB</small></button>
               </form>
             </section>
+            <section class="library-stats"><h3>项目统计</h3><dl><div><dt>文档总数</dt><dd id="libraryDocumentCount">—</dd></div><div><dt>已索引</dt><dd id="libraryIndexedCount">—</dd></div><div><dt>索引中</dt><dd id="libraryIndexingCount">—</dd></div><div><dt>失败</dt><dd id="libraryFailedCount">—</dd></div></dl></section>
+            </aside>
 
-            <section class="panel">
+            <section class="document-index">
               <div class="panel-head">
-                <h2>最近文档</h2>
+                <h2>最近文档</h2><span class="document-columns">文件名　　上传时间　　状态　　操作</span>
               </div>
-              <div class="document-list" id="documentsBox" style="padding: 18px;"></div>
+              <div class="document-list" id="documentsBox"></div>
             </section>
           </div>
         </section>
 
-        <section class="view" data-view="runs">
+        <section class="view runs-view" data-view="runs">
           <div class="page-intro">
             <div>
-              <h1>运行配置与状态看板</h1>
-              <p>对齐极简浅色美学体系，用厚实感主题卡、业务化命名列表和原文回溯抽屉串起知识加工闭环。</p>
+              <p class="section-kicker">PIPELINE DASHBOARD / 05</p>
+              <h1>运行看板</h1>
+              <p>对齐文献流与全本体系，用事实主题卡、业务化命名列表和原文回溯抽屉串起知识加工闭环。</p>
             </div>
             <div class="status-pill"><span class="status-dot"></span><span>所有服务正常</span></div>
           </div>
@@ -1464,21 +1718,21 @@
             <div class="metric"><span>失败任务</span><strong>0</strong></div>
           </div>
 
-          <div class="runs-layout">
-            <div>
+          <div class="runs-layout" id="runsLayout">
+            <div class="runs-main">
               <div class="section-title">
                 <div>
-                  <h2>第一阶段：卡片化大厅</h2>
-                  <p>每个主题卡片聚合文献数量、解析率和当前处理状态。</p>
+                  <h2>运行追踪</h2>
+                  <p>第二阶段：全局业务化命名列表</p>
                 </div>
               </div>
-              <div class="topic-grid" id="pipelineTopicGrid"></div>
+              <div class="topic-grid" id="pipelineTopicGrid" hidden></div>
 
               <section class="panel runs-panel">
                 <div class="panel-head">
                   <div>
-                    <h2>运行追踪</h2>
-                    <span class="muted">第二阶段：全局业务化命名列表</span>
+                    <h2>文献处理队列</h2>
+                    <span class="muted">实时更新解析、切片与索引状态</span>
                   </div>
                   <button class="table-action" type="button" id="refreshRunsButton">刷新</button>
                 </div>
@@ -1499,28 +1753,18 @@
               </section>
             </div>
 
-            <aside class="source-drawer" id="sourceDrawer" aria-live="polite">
+            <aside class="runs-overview-rail" id="runsOverviewRail"><h2>项目概览</h2><strong id="runsProjectName">internal-research</strong><span class="rail-running">● 运行中</span><dl><div><dt>文档总数</dt><dd id="railDocumentCount">—</dd></div><div><dt>运行记录</dt><dd id="railRunCount">—</dd></div><div><dt>失败任务</dt><dd id="railFailedCount">—</dd></div><div><dt>成功率</dt><dd id="railSuccessRate">—</dd></div></dl><div class="success-track"><i id="railSuccessBar"></i></div><h3>最近事件</h3><ol id="recentEvents"><li>等待运行数据…</li></ol></aside>
+
+            <aside class="source-drawer" id="sourceDrawer" aria-live="polite" hidden>
               <div class="drawer-head">
                 <h2>原文回溯</h2>
                 <button class="icon-button" type="button" id="closeDrawerButton" aria-label="关闭原文回溯">X</button>
               </div>
               <div class="drawer-body" id="sourceDrawerBody">
                 <div class="empty">选择一条已完成的文献记录后，这里会显示可校对的 RAG Chunk。</div>
+                <template id="sourceWorkspaceTemplate"><iframe class="pdf-frame" title="原始 PDF"></iframe><div class="chunk-list"></div></template>
               </div>
               <div class="drawer-foot" id="sourceDrawerFoot">无需离开运行页，即可对照解析进程与向量块源文本。</div>
-              <section class="panel flow-card" aria-label="业务闭环">
-                <div class="flow-grid">
-                  <div class="flow-node green">主题大厅</div>
-                  <div class="flow-arrow">-></div>
-                  <div class="flow-node blue">运行追踪</div>
-                  <div class="flow-arrow">^</div>
-                  <div></div>
-                  <div class="flow-arrow">v</div>
-                  <div class="flow-node amber">对话闭环</div>
-                  <div class="flow-arrow"><-</div>
-                  <div class="flow-node purple">原文回溯</div>
-                </div>
-              </section>
             </aside>
           </div>
         </section>
@@ -1528,7 +1772,7 @@
     </div>
 
     <script>
-      var activeView = "runs";
+      var activeView = "chat";
       var topicAccents = [
         { color: "#22c55e", soft: "#0f3d22", icon: "C" },
         { color: "#3b82f6", soft: "#172554", icon: "O" },
@@ -1554,7 +1798,7 @@
 
       function setView(name, options) {
         options = options || {};
-        if (!document.querySelector('[data-view="' + name + '"]')) name = "runs";
+        if (!document.querySelector('[data-view="' + name + '"]')) name = "chat";
         activeView = name;
         document.querySelectorAll("[data-view]").forEach(function (view) {
           view.hidden = view.dataset.view !== name;
@@ -1562,6 +1806,8 @@
         document.querySelectorAll("[data-view-target]").forEach(function (button) {
           button.classList.toggle("active", button.dataset.viewTarget === name);
         });
+        var viewLabels = { chat: "RESEARCH CONVERSATION / 01", files: "DOCUMENT LIBRARY / 04", runs: "PIPELINE DASHBOARD / 05" };
+        if ($("viewEyebrow")) $("viewEyebrow").textContent = viewLabels[name] || viewLabels.chat;
         history.replaceState(null, "", "#" + name);
         if (name === "files") loadDocuments();
         if (name === "runs") loadPipelineDashboard();
@@ -1593,6 +1839,25 @@
 
       function stripCitationMarkers(text) {
         return String(text || "").replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "");
+      }
+
+      function renderCitedText(text, container) {
+        container.replaceChildren();
+        var source = String(text || "");
+        var pattern = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
+        var cursor = 0;
+        var match;
+        while ((match = pattern.exec(source)) !== null) {
+          if (match.index > cursor) container.appendChild(document.createTextNode(source.slice(cursor, match.index)));
+          var reference = document.createElement("sup");
+          reference.className = "citation-ref";
+          reference.textContent = "[" + match[1] + "]";
+          reference.setAttribute("data-citation-index", match[1]);
+          reference.setAttribute("aria-label", "引用 " + match[1]);
+          container.appendChild(reference);
+          cursor = pattern.lastIndex;
+        }
+        if (cursor < source.length) container.appendChild(document.createTextNode(source.slice(cursor)));
       }
 
       function getSourceKey(citation) {
@@ -1677,15 +1942,23 @@
         $("chatMessages").hidden = false;
       }
 
+      function setResearchingState(active) {
+        var view = document.querySelector('[data-view="chat"]');
+        if (view) view.classList.toggle("researching", !!active);
+        if ($("sendButton")) $("sendButton").textContent = active ? "···" : "→";
+        if ($("composerHint")) $("composerHint").textContent = active ? "正在检索、阅读并组织证据…" : "可尝试：“比较不同力场的适用范围”";
+      }
+
       function showAnswer(meta, text, citations) {
         $("answerPanel").hidden = false;
+        if ($("traceSummary")) $("traceSummary").hidden = false;
         $("answerMeta").replaceChildren();
         (meta || []).forEach(function (item) {
           var chip = document.createElement("span");
           chip.textContent = item;
           $("answerMeta").appendChild(chip);
         });
-        $("answerText").textContent = stripCitationMarkers(text);
+        renderCitedText(text, $("answerText"));
         renderSources(citations, $("answerSources"));
       }
 
@@ -1700,7 +1973,7 @@
         var roleName = roleNames[role] || role;
         label.textContent = meta ? roleName + " · " + meta : roleName;
         var body = document.createElement("div");
-        body.textContent = stripCitationMarkers(content || "");
+        renderCitedText(content || "", body);
         div.appendChild(label);
         div.appendChild(body);
         if ((role === "agent" || role === "tool") && citations && citations.length) {
@@ -1867,6 +2140,15 @@
           card.querySelector("strong").textContent = item[1];
           metrics.appendChild(card);
         });
+        var documentCount = totals.document_count || 0;
+        var runCount = totals.run_count || 0;
+        var failedCount = totals.failed_count || 0;
+        var successRate = runCount ? Math.round(((runCount - failedCount) / runCount) * 100) : 100;
+        [["chatDocumentCount", documentCount], ["chatRunCount", runCount], ["chatFailedCount", failedCount], ["chatCoverage", successRate + "%"],
+         ["libraryDocumentCount", documentCount], ["railDocumentCount", documentCount], ["railRunCount", runCount], ["railFailedCount", failedCount], ["railSuccessRate", successRate + "%"]]
+          .forEach(function (pair) { if ($(pair[0])) $(pair[0]).textContent = pair[1]; });
+        if ($("railSuccessBar")) $("railSuccessBar").style.width = successRate + "%";
+        if ($("runsProjectName")) $("runsProjectName").textContent = activeProjectSlug;
       }
 
       function renderTopicCards(activeTopic) {
@@ -1947,6 +2229,8 @@
       function resetSourceDrawer() {
         $("sourceDrawerBody").innerHTML = '<div class="empty">选择一条已完成的文献记录后，这里会显示可校对的原始 PDF 或 RAG Chunk。</div>';
         $("sourceDrawerFoot").textContent = "无需离开运行页，即可对照原始 PDF、解析进程与向量块源文本。";
+        $("sourceDrawer").hidden = true;
+        if ($("runsLayout")) $("runsLayout").classList.remove("drawer-open");
       }
 
       function deleteProject(project) {
@@ -2027,6 +2311,7 @@
         var box = $("chatMessages");
         if (box) box.replaceChildren();
         $("answerPanel").hidden = true;
+        if ($("traceSummary")) $("traceSummary").hidden = true;
         $("questionInput").value = "";
         $("questionInput").focus();
         clearThinking();
@@ -2036,6 +2321,16 @@
       function renderRuns(runs) {
         var body = $("pipelineRunsBody");
         body.replaceChildren();
+        var events = $("recentEvents");
+        if (events) {
+          events.replaceChildren();
+          runs.slice(0, 5).forEach(function (run) {
+            var item = document.createElement("li");
+            item.textContent = "运行 " + (run.status || "updated") + ": " + (run.document_title || run.file_name || "文档");
+            events.appendChild(item);
+          });
+          if (!runs.length) { var idle = document.createElement("li"); idle.textContent = "暂无运行事件"; events.appendChild(idle); }
+        }
         if (!runs.length) {
           var row = document.createElement("tr");
           row.innerHTML = '<td colspan="5"><div class="empty">暂无运行记录</div></td>';
@@ -2127,6 +2422,10 @@
       }
 
       function openSource(documentId, silent) {
+        if (!silent) {
+          $("sourceDrawer").hidden = false;
+          if ($("runsLayout")) $("runsLayout").classList.add("drawer-open");
+        }
         if (!silent) {
           $("sourceDrawerBody").innerHTML = '<div class="empty">正在读取原文...</div>';
         }
@@ -2281,12 +2580,20 @@
             box.appendChild(empty);
             return;
           }
-          docs.slice(0, 12).forEach(function (doc) {
+          var indexedCount = docs.filter(function (doc) { return doc.status === "ready" || doc.status === "completed" || doc.status === "indexed"; }).length;
+          var failedCount = docs.filter(function (doc) { return doc.status === "failed"; }).length;
+          if ($("libraryDocumentCount")) $("libraryDocumentCount").textContent = docs.length;
+          if ($("libraryIndexedCount")) $("libraryIndexedCount").textContent = indexedCount;
+          if ($("libraryIndexingCount")) $("libraryIndexingCount").textContent = Math.max(0, docs.length - indexedCount - failedCount);
+          if ($("libraryFailedCount")) $("libraryFailedCount").textContent = failedCount;
+          docs.slice(0, 50).forEach(function (doc, index) {
             var row = document.createElement("div");
             row.className = "document-row";
-            row.innerHTML = '<div><strong></strong><span class="muted"></span></div><div class="row-actions"><button class="table-action source-action" type="button">原文</button><button class="table-action chat-action" type="button">对话</button><button class="icon-button danger-action delete-doc-action" type="button" title="删除文档" aria-label="删除文档">×</button></div>';
+            row.dataset.index = String(index + 1).padStart(2, "0");
+            row.innerHTML = '<div><strong></strong><span class="muted"></span></div><time class="muted"></time><div class="row-actions"><button class="table-action source-action" type="button">进入原文</button><button class="table-action chat-action" type="button">对话</button><button class="icon-button danger-action delete-doc-action" type="button" title="删除文档" aria-label="删除文档">×</button></div>';
             row.querySelector("strong").textContent = doc.title || doc.file_name;
-            row.querySelector("span").textContent = doc.status + " · " + doc.file_name;
+            row.querySelector("span").textContent = doc.file_name + " · " + doc.status;
+            row.querySelector("time").textContent = formatDateTime(doc.updated_at || doc.created_at);
             row.querySelector(".source-action").addEventListener("click", function () {
               openSource(doc.id);
             });
@@ -2582,6 +2889,13 @@
         });
       });
 
+      document.querySelectorAll(".sample-prompt").forEach(function (button) {
+        button.addEventListener("click", function () {
+          $("questionInput").value = button.textContent.replace(/[“”]/g, "");
+          $("questionInput").focus();
+        });
+      });
+
       $("refreshRunsButton").addEventListener("click", loadPipelineDashboard);
 
       $("closeDrawerButton").addEventListener("click", function () {
@@ -2619,21 +2933,30 @@
         var question = $("questionInput").value.trim();
         if (!question) return;
         $("sendButton").disabled = true;
+        setResearchingState(true);
         showAnswer([], "正在分析...");
         clearThinking();
         var task = $("queryMode").value === "agent" ? runAgent(question) : runRag(question);
         task.then(function () {
           $("questionInput").value = "";
           $("questionInput").style.height = "auto";
-          $("composerHint").textContent = "问点难的，让我多想一步";
+          $("composerHint").textContent = "可尝试：“比较不同力场的适用范围”";
         }).catch(function (err) {
           showAnswer([], err.message || String(err));
         }).finally(function () {
           $("sendButton").disabled = false;
+          setResearchingState(false);
         });
       });
 
       $("uploadTopicSelect").addEventListener("change", toggleNewTopicInputs);
+
+      $("uploadButton").addEventListener("click", function () { $("fileInput").click(); });
+      $("fileInput").addEventListener("change", function () {
+        if ($("fileInput").files && $("fileInput").files.length) {
+          $("uploadForm").dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+        }
+      });
 
       $("uploadForm").addEventListener("submit", function (event) {
         event.preventDefault();
@@ -2700,7 +3023,7 @@
       });
 
       loadProjects();
-      setView((location.hash || "#runs").slice(1));
+      setView((location.hash || "#chat").slice(1));
     </script>
   </body>
 </html>

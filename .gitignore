@@ -43,5 +43,6 @@ server_pull/
 .vscode/
 .idea/
 .claude/
+.codex/codex_with_cc/
 .DS_Store
 Thumbs.db
