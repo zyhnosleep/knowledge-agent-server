@@ -242,11 +242,7 @@ def test_enter_topic_chat_clears_session_and_attachments() -> None:
 
 def test_load_projects_clears_session_when_switching_topic() -> None:
     html = _html()
-    match = re.search(
-        r"if \(projects\.length && !projects\.find\(.*?\}\)\) \{(.*?)\}",
-        html,
-        re.S,
-    )
+    match = re.search(r"if \(nextProject\) \{(.*?)\n\s*\}", html, re.S)
     assert match is not None
     body = match.group(1)
     assert "activeSessionId = null" in body
@@ -631,3 +627,37 @@ def test_reduced_motion_fallback() -> None:
 def test_focus_visible_states() -> None:
     html = _html()
     assert ":focus-visible" in html
+
+
+def test_global_project_switcher_controls_exist() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    sidebar = soup.select_one("#sidebarProjectSwitcher")
+    assert sidebar is not None
+    assert sidebar.select_one("#sidebarProjectSelect") is not None
+    runs_view = soup.select_one('[data-view="runs"]')
+    assert runs_view is not None
+    assert runs_view.select_one("#projectSwitchBar") is not None
+    assert runs_view.select_one("#projectSwitchTabs") is not None
+    assert runs_view.select_one("#projectSyncStatus") is not None
+
+
+def test_project_switcher_persists_and_restores_active_project() -> None:
+    html = _html()
+    assert "night-research-active-project" in html
+    assert "getStoredProjectSlug" in html
+    assert "storeActiveProjectSlug" in html
+    assert "localStorage.getItem" in html
+    assert "localStorage.setItem" in html
+    assert "renderProjectSwitchers" in html
+
+
+def test_project_tabs_are_accessible_and_use_global_switch_path() -> None:
+    html = _html()
+    assert 'role="tablist"' in html
+    assert 'role="tab"' in html
+    assert "aria-selected" in html
+    assert "setProjectSyncState" in html
+    assert 'setActiveProject(project.slug, project.name)' in html
+    assert "PROJECT SYNCING" in html
+    assert "PROJECT SYNCED" in html

@@ -1399,6 +1399,7 @@
         outline: 2px solid var(--signal); outline-offset: 3px;
       }
       .brand { height: 76px; display: flex; gap: 13px; padding: 8px 11px 4px; align-items: center; }
+      .sidebar { height: 100dvh; min-height: 0; overflow: hidden; }
       .brand-lighthouse { width: 28px; height: 44px; fill: none; stroke: var(--paper-100); stroke-width: 1.4; }
       .brand-wordmark { display: grid; gap: 3px; }
       .brand-wordmark strong { font-family: Georgia, "Noto Serif SC", serif; font-size: 16px; letter-spacing: .28em; white-space: nowrap; }
@@ -1415,8 +1416,14 @@
       .session-list-head { color: var(--paper-500); font-size: 12px; }
       .session-list-head button { color: var(--paper-300); }
       .profile { margin: auto 16px 16px; padding: 14px 16px; border: 1px solid var(--line); background: transparent; box-shadow: none; }
-      .profile small { color: var(--paper-500); }
+      .profile label { color: var(--paper-500); font-size: 10px; }
       .profile strong { color: var(--paper-300); }
+      .project-select-wrap { position: relative; margin-top: 9px; }
+      .project-select-wrap::before { content: ""; position: absolute; left: 11px; top: 50%; width: 6px; height: 6px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 9px rgb(169 239 88 / 48%); transform: translateY(-50%); pointer-events: none; z-index: 1; }
+      .project-select-wrap::after { content: "⌄"; position: absolute; right: 11px; top: 50%; color: var(--paper-300); transform: translateY(-56%); pointer-events: none; }
+      #sidebarProjectSelect { width: 100%; min-height: 40px; appearance: none; border: 1px solid var(--line); border-radius: 5px; padding: 0 34px 0 28px; background: var(--night-900); color: var(--paper-100); font-size: 12px; }
+      #sidebarProjectSwitcher[data-sync-state="syncing"] #sidebarProjectSelect { color: var(--paper-500); }
+      .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
       .project-online { font: 9px ui-monospace, monospace; color: var(--paper-500); letter-spacing: .08em; }
       .project-online i { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 10px var(--signal); }
       .topbar { padding: 0 40px; border-bottom: 1px solid var(--line-soft); background: rgb(7 10 14 / 88%); }
@@ -1498,6 +1505,19 @@
       .document-row > div:first-of-type { display: grid; gap: 5px; }.document-row strong { font-size: 12px; }.document-row .muted { font-size: 10px; }
 
       .metrics { border-top: 0; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+      .project-switch-bar { min-height: 49px; display: flex; align-items: stretch; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); }
+      .project-switch-leading { display: flex; align-items: stretch; min-width: 0; }
+      .project-switch-label { display: flex; align-items: center; padding-right: 25px; color: var(--paper-100); font-size: 13px; font-weight: 650; white-space: nowrap; }
+      .project-switch-tabs { display: flex; align-items: stretch; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+      .project-switch-tabs::-webkit-scrollbar { display: none; }
+      .project-tab { position: relative; min-width: max-content; padding: 0 24px; border-radius: 6px 6px 0 0; color: var(--paper-500); font-size: 12px; }
+      .project-tab[aria-selected="true"] { background: linear-gradient(180deg, rgb(24 32 41 / 88%), transparent); color: var(--paper-100); }
+      .project-tab[aria-selected="true"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--signal); }
+      .project-tab-dot { display: inline-block; width: 6px; height: 6px; margin-left: 9px; border-radius: 50%; background: var(--signal); vertical-align: 1px; }
+      .project-sync-status { display: flex; align-items: center; padding-right: 4px; color: var(--signal); font: 9px ui-monospace, monospace; letter-spacing: .14em; white-space: nowrap; }
+      .project-sync-status[data-state="syncing"] { animation: sync-pulse 1s ease-in-out infinite; }
+      .project-sync-status[data-state="failed"] { color: var(--danger); }
+      @keyframes sync-pulse { 50% { opacity: .38; } }
       .metric { border: 0; border-right: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 14px 18px; }
       .runs-layout { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 0; align-items: stretch; }
       .runs-main { padding-right: 30px; min-width: 0; }
@@ -1534,12 +1554,13 @@
         .drawer-body { grid-template-columns: 1fr 280px; }
       }
       @media (max-width: 768px) {
-        .shell { grid-template-columns: 1fr; }.sidebar { position: relative; width: auto; height: auto; min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+        .shell { grid-template-columns: 1fr; }.sidebar { position: relative; width: auto; height: auto; min-height: 0; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
         .brand, .product-name, .session-list, .profile { display: none; }.nav { display: grid; grid-template-columns: repeat(3, 1fr); padding: 8px; border: 0; }.nav-button { justify-content: center; }
         .topbar { padding: 0 18px; }.topbar-label i { width: 70px; }.view { padding: 24px 18px; }
         .chat-view { height: calc(100vh - 134px); }.welcome-stage { padding: 40px 22px 170px; }.chat-welcome h1 { font-size: 42px; }
         .composer { width: calc(100% - 28px); bottom: 10px; }.composer-meta { display: none; }
         .files-layout { grid-template-columns: 1fr; }.files-rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 25px; }
+        .project-switch-bar { gap: 10px; }.project-switch-label { padding-right: 14px; }.project-tab { padding: 0 16px; }.project-sync-status { display: none; }
         .document-columns { display: none; }.document-index, .document-list { min-width: 0; overflow: hidden; }.document-row { width: 100%; grid-template-columns: 28px minmax(0, 1fr); }.document-row > .muted { display: none; }.document-row .row-actions { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
         .drawer-body { grid-template-columns: 1fr; }.pdf-panel, .markdown-panel { grid-row: auto; }.pdf-frame { min-height: 460px; }
       }
@@ -1588,9 +1609,10 @@
           </div>
         </div>
 
-        <div class="profile">
-          <small>当前项目</small>
-          <strong id="activeProjectLabel">internal-research</strong>
+        <div class="profile project-switcher" id="sidebarProjectSwitcher" data-sync-state="idle">
+          <label for="sidebarProjectSelect">当前项目</label>
+          <div class="project-select-wrap"><select id="sidebarProjectSelect" aria-label="切换当前项目"></select></div>
+          <strong class="visually-hidden" id="activeProjectLabel">internal-research</strong>
           <span class="project-online"><i></i> INDEX ONLINE</span>
         </div>
       </aside>
@@ -1712,6 +1734,16 @@
             <div class="status-pill"><span class="status-dot"></span><span>所有服务正常</span></div>
           </div>
 
+          <div class="project-switch-bar" id="projectSwitchBar">
+            <div class="project-switch-leading">
+              <span class="project-switch-label">研究项目</span>
+              <div class="project-switch-tabs" id="projectSwitchTabs" role="tablist" aria-label="研究项目">
+                <button class="project-tab" type="button" role="tab" aria-selected="false" disabled>正在载入项目</button>
+              </div>
+            </div>
+            <span class="project-sync-status" id="projectSyncStatus" data-state="idle" aria-live="polite">PROJECT SYNCED</span>
+          </div>
+
           <div class="metrics" id="pipelineMetrics">
             <div class="metric"><span>文档总数</span><strong>0</strong></div>
             <div class="metric"><span>运行记录</span><strong>0</strong></div>
@@ -1787,6 +1819,7 @@
       var projects = [];
       var activeAttachments = [];
       var currentSessions = [];
+      var PROJECT_STORAGE_KEY = "night-research-active-project";
 
       function makeSessionId() {
         return "sess-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -2210,20 +2243,101 @@
         setStatusBadgeVars(badge, topic.status);
       }
 
+      function getStoredProjectSlug() {
+        try {
+          return window.localStorage.getItem(PROJECT_STORAGE_KEY) || "";
+        } catch (_) {
+          return "";
+        }
+      }
+
+      function storeActiveProjectSlug(slug) {
+        try {
+          window.localStorage.setItem(PROJECT_STORAGE_KEY, slug);
+        } catch (_) {
+          // Storage can be unavailable in private or locked-down browser contexts.
+        }
+      }
+
+      function setProjectSyncState(state) {
+        var labels = { syncing: "PROJECT SYNCING", synced: "PROJECT SYNCED", failed: "PROJECT SYNC FAILED" };
+        var status = $("projectSyncStatus");
+        if (status) {
+          status.dataset.state = state;
+          status.textContent = labels[state] || labels.synced;
+        }
+        if ($("sidebarProjectSwitcher")) $("sidebarProjectSwitcher").dataset.syncState = state;
+        if ($("sidebarProjectSelect")) $("sidebarProjectSelect").disabled = state === "syncing";
+        document.querySelectorAll("#projectSwitchTabs .project-tab").forEach(function (tab) {
+          tab.disabled = state === "syncing";
+        });
+      }
+
+      function renderProjectSwitchers() {
+        var select = $("sidebarProjectSelect");
+        if (select) {
+          select.replaceChildren();
+          projects.forEach(function (project) {
+            var option = document.createElement("option");
+            option.value = project.slug;
+            option.textContent = project.slug;
+            option.selected = project.slug === activeProjectSlug;
+            select.appendChild(option);
+          });
+          select.onchange = function () {
+            var project = projects.find(function (item) { return item.slug === select.value; });
+            if (project) setActiveProject(project.slug, project.name);
+          };
+        }
+
+        if ($("activeProjectLabel")) $("activeProjectLabel").textContent = activeProjectName || activeProjectSlug;
+        var tabs = $("projectSwitchTabs");
+        if (!tabs) return;
+        tabs.replaceChildren();
+        projects.forEach(function (project) {
+          var selected = project.slug === activeProjectSlug;
+          var tab = document.createElement("button");
+          tab.className = "project-tab";
+          tab.type = "button";
+          tab.setAttribute("role", "tab");
+          tab.setAttribute("aria-selected", selected ? "true" : "false");
+          tab.dataset.projectSlug = project.slug;
+          tab.appendChild(document.createTextNode(project.slug));
+          if (selected) {
+            var dot = document.createElement("span");
+            dot.className = "project-tab-dot";
+            dot.setAttribute("aria-hidden", "true");
+            tab.appendChild(dot);
+          }
+          tab.addEventListener("click", function () { setActiveProject(project.slug, project.name); });
+          tabs.appendChild(tab);
+        });
+      }
+
       function setActiveProject(slug, name) {
+        if (!slug) return Promise.resolve();
+        setProjectSyncState("syncing");
         activeProjectSlug = slug;
         activeProjectName = name || slug;
         activeDocumentId = null;
         activeDocumentTitle = null;
-        $("activeProjectLabel").textContent = activeProjectName;
         activeSessionId = null;
         activeAttachments = [];
+        storeActiveProjectSlug(activeProjectSlug);
         renderAttachments();
+        resetSourceDrawer();
         renderUploadTopicSelect();
         renderTopicCards();
-        loadPipelineDashboard();
-        loadDocuments();
-        loadAgentSessions();
+        renderProjectSwitchers();
+        updateChatContextLabel();
+        if (activeView === "chat") resetChatSurface();
+        return Promise.all([loadPipelineDashboard(), loadDocuments(), loadAgentSessions()]).then(function () {
+          renderProjectSwitchers();
+          setProjectSyncState("synced");
+        }).catch(function (err) {
+          setProjectSyncState("failed");
+          throw err;
+        });
       }
 
       function resetSourceDrawer() {
@@ -2270,12 +2384,13 @@
         activeProjectName = name || slug;
         activeDocumentId = null;
         activeDocumentTitle = null;
-        $("activeProjectLabel").textContent = activeProjectName;
+        storeActiveProjectSlug(activeProjectSlug);
         activeSessionId = null;
         activeAttachments = [];
         renderAttachments();
         renderUploadTopicSelect();
         renderTopicCards();
+        renderProjectSwitchers();
         updateChatContextLabel();
         setView("chat", { skipSessionLoad: true });
         loadAgentSessions().then(function (sessions) {
@@ -2622,18 +2737,24 @@
       function loadProjects() {
         return fetchJson("/api/projects?limit=200").then(function (data) {
           projects = Array.isArray(data) ? data : [];
-          if (projects.length && !projects.find(function (p) { return p.slug === activeProjectSlug; })) {
-            activeProjectSlug = projects[0].slug;
-            activeProjectName = projects[0].name;
+          var storedSlug = getStoredProjectSlug();
+          var storedProject = projects.find(function (project) { return project.slug === storedSlug; });
+          var currentProject = projects.find(function (project) { return project.slug === activeProjectSlug; });
+          var nextProject = storedProject || currentProject || projects[0];
+          if (nextProject) {
+            activeProjectSlug = nextProject.slug;
+            activeProjectName = nextProject.name || nextProject.slug;
             activeDocumentId = null;
             activeDocumentTitle = null;
             activeSessionId = null;
             activeAttachments = [];
             renderAttachments();
-            $("activeProjectLabel").textContent = activeProjectName;
+            storeActiveProjectSlug(activeProjectSlug);
           }
           renderUploadTopicSelect();
           renderTopicCards();
+          renderProjectSwitchers();
+          setProjectSyncState("synced");
           if (activeView === "runs") loadPipelineDashboard();
           if (activeView === "files") loadDocuments();
           if (activeView === "chat") loadAgentSessions();
@@ -2775,7 +2896,8 @@
         if (session.project_slug && session.project_slug !== activeProjectSlug) {
           activeProjectSlug = session.project_slug;
           activeProjectName = session.project_slug;
-          $("activeProjectLabel").textContent = activeProjectName;
+          storeActiveProjectSlug(activeProjectSlug);
+          renderProjectSwitchers();
         }
         if (session.scope_type === "document" && session.document_id) {
           activeDocumentId = session.document_id;
@@ -2989,12 +3111,13 @@
         ).then(function (res) {
           activeProjectSlug = res.project_slug || slug;
           activeProjectName = name;
-          $("activeProjectLabel").textContent = activeProjectName;
+          storeActiveProjectSlug(activeProjectSlug);
           if (!projects.some(function (project) { return project.slug === activeProjectSlug; })) {
             projects.unshift({ slug: activeProjectSlug, name: activeProjectName });
           }
           renderUploadTopicSelect();
           renderTopicCards();
+          renderProjectSwitchers();
           return loadProjects().catch(function (err) {
             console.error("Failed to refresh projects after upload", err);
           }).then(function () {
