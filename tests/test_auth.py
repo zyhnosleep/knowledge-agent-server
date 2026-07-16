@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.core.config import Settings, get_settings
 from app.db.session import Base, get_db
 from app.main import app
-from app.models.records import AuthSession, User
+from app.models.records import AgentTraceRun, AuthSession, ConversationSession, User
 
 
 def _db_session() -> Session:
@@ -110,6 +110,79 @@ def test_business_api_remains_available_when_auth_disabled(client, monkeypatch):
     response = client.get("/api/projects")
 
     assert response.status_code == 200
+
+
+def test_agent_sessions_and_traces_are_scoped_to_authenticated_user(
+    enabled_settings, client, db
+):
+    now = datetime.utcnow()
+    first_user = User(id="u1", feishu_open_id="ou_u1", display_name="User One")
+    second_user = User(id="u2", feishu_open_id="ou_u2", display_name="User Two")
+    db.add_all([first_user, second_user])
+    db.add_all(
+        [
+            AuthSession(
+                user_id="u1",
+                token_hash=hashlib.sha256(b"token-u1").hexdigest(),
+                csrf_hash=hashlib.sha256(b"csrf-u1").hexdigest(),
+                expires_at=now + timedelta(hours=1),
+            ),
+            AuthSession(
+                user_id="u2",
+                token_hash=hashlib.sha256(b"token-u2").hexdigest(),
+                csrf_hash=hashlib.sha256(b"csrf-u2").hexdigest(),
+                expires_at=now + timedelta(hours=1),
+            ),
+        ]
+    )
+    db.add_all(
+        [
+            ConversationSession(
+                id="session-u1",
+                owner_user_id="u1",
+                project_slug="demo",
+                expires_at=now + timedelta(days=1),
+            ),
+            ConversationSession(
+                id="session-u2",
+                owner_user_id="u2",
+                project_slug="demo",
+                expires_at=now + timedelta(days=1),
+            ),
+            AgentTraceRun(
+                id="trace-u1",
+                owner_user_id="u1",
+                request_id="request-u1",
+                session_id="session-u1",
+                project_slug="demo",
+                query="one",
+                final_answer="one",
+                status="completed",
+            ),
+            AgentTraceRun(
+                id="trace-u2",
+                owner_user_id="u2",
+                request_id="request-u2",
+                session_id="session-u2",
+                project_slug="demo",
+                query="two",
+                final_answer="two",
+                status="completed",
+            ),
+        ]
+    )
+    db.commit()
+    client.cookies.set("nri_session", "token-u1")
+
+    sessions = client.get("/api/agent/sessions?project_slug=demo")
+    traces = client.get("/api/agent/traces?project_slug=demo")
+    foreign_trace = client.get("/api/agent/traces/trace-u2")
+
+    assert sessions.status_code == 200
+    assert [item["id"] for item in sessions.json()] == ["session-u1"]
+    assert traces.status_code == 200
+    assert [item["trace_id"] for item in traces.json()["traces"]] == ["trace-u1"]
+    assert foreign_trace.status_code == 404
 
 
 def test_login_returns_503_when_credentials_missing(client, monkeypatch):

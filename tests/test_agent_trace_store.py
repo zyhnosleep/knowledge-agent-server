@@ -66,6 +66,32 @@ def test_persist_run_and_steps() -> None:
     assert len(run["steps"]) == 3
 
 
+def test_trace_store_records_owner_and_hides_other_users_traces() -> None:
+    db = make_db()
+    first = AgentTraceStore(db, owner_user_id="u1")
+    trace_id = first.persist_run(
+        request_id="req-owner",
+        session_id="sess-owner",
+        project_slug="demo",
+        query="private",
+        constraints={},
+        route="simple_rag",
+        steps=[],
+        usage=AgentUsage(),
+        final_answer="private answer",
+        citations=[],
+        warnings=[],
+        status="completed",
+        latency_ms=1,
+    )
+    db.commit()
+
+    second = AgentTraceStore(db, owner_user_id="u2")
+    assert first.get_trace(trace_id) is not None
+    assert second.get_trace(trace_id) is None
+    assert second.list_traces(project_slug="demo") == []
+
+
 def test_get_trace_by_unknown_id_returns_none() -> None:
     """get_trace returns None for an unknown trace id."""
     db = make_db()

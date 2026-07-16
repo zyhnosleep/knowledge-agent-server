@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from app.db.session import Base
-from app.models.records import Document, DocumentChunk, Project
+from app.models.records import AgentTraceRun, ConversationSession, Document, DocumentChunk, Project
 from scripts.migrate_sqlite_to_postgres import MigrationError, migrate_database
 
 
@@ -107,6 +108,45 @@ def test_migration_treats_tables_missing_from_legacy_source_as_empty(
     assert counts["users"] == 0
     assert counts["auth_sessions"] == 0
     assert counts["projects"] == 1
+
+
+def test_migration_fills_new_nullable_columns_missing_from_legacy_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-columns.db"
+    target = tmp_path / "target.db"
+    _prepare_source(source)
+    with Session(create_engine(_url(source), future=True)) as db:
+        db.add(
+            ConversationSession(
+                id="legacy-session",
+                project_slug="research",
+                expires_at=datetime.utcnow(),
+            )
+        )
+        db.add(
+            AgentTraceRun(
+                id="legacy-trace",
+                request_id="legacy-request",
+                session_id="legacy-session",
+                project_slug="research",
+                query="legacy",
+                final_answer="legacy",
+                status="completed",
+            )
+        )
+        db.commit()
+    with create_engine(_url(source), future=True).begin() as connection:
+        connection.execute(text("DROP INDEX ix_conversation_sessions_owner_user_id"))
+        connection.execute(text("DROP INDEX ix_agent_trace_runs_owner_user_id"))
+        connection.execute(text("ALTER TABLE conversation_sessions DROP COLUMN owner_user_id"))
+        connection.execute(text("ALTER TABLE agent_trace_runs DROP COLUMN owner_user_id"))
+    _prepare_target(target)
+
+    first = migrate_database(_url(source), _url(target), reindex_vectors=False)
+    second = migrate_database(_url(source), _url(target), reindex_vectors=False)
+
+    assert first == second
 
 
 def test_migration_rejects_extra_target_rows(tmp_path: Path) -> None:

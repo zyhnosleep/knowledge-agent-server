@@ -191,6 +191,7 @@ class ConversationSession(Base):
     __tablename__ = "conversation_sessions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     project_slug: Mapped[str] = mapped_column(String(120), index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
@@ -235,6 +236,7 @@ class AgentTraceRun(Base):
     __tablename__ = "agent_trace_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     request_id: Mapped[str] = mapped_column(String(36), index=True)
     session_id: Mapped[str] = mapped_column(String(64), index=True)
     project_slug: Mapped[str] = mapped_column(String(120))

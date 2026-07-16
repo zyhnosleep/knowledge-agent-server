@@ -38,6 +38,18 @@ def test_add_and_get_history() -> None:
     assert history[1].tool_name == "rag.answer"
 
 
+def test_touch_session_records_and_enforces_owner() -> None:
+    db, _ = make_memory()
+    first = ConversationMemory(db, owner_user_id="u1")
+    first.touch_session("owned", project_slug="demo", ttl_days=1)
+
+    assert db.get(ConversationSession, "owned").owner_user_id == "u1"
+    with pytest.raises(ValueError, match="another user"):
+        ConversationMemory(db, owner_user_id="u2").touch_session(
+            "owned", project_slug="demo", ttl_days=1
+        )
+
+
 def test_get_history_last_n() -> None:
     db, memory = make_memory()
     for i in range(5):

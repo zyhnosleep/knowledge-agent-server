@@ -22,8 +22,9 @@ class AgentTraceStore:
     persisted.
     """
 
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, owner_user_id: str | None = None) -> None:
         self._db = db
+        self._owner_user_id = owner_user_id
 
     # ------------------------------------------------------------------
     # public API
@@ -57,6 +58,7 @@ class AgentTraceStore:
 
         run = AgentTraceRun(
             id=trace_id,
+            owner_user_id=self._owner_user_id,
             request_id=request_id,
             session_id=session_id,
             project_slug=project_slug,
@@ -96,7 +98,10 @@ class AgentTraceStore:
 
     def get_trace(self, trace_id: str) -> dict[str, Any] | None:
         """Return a full trace dict with ordered steps, or None."""
-        run = self._db.get(AgentTraceRun, trace_id)
+        stmt = select(AgentTraceRun).where(AgentTraceRun.id == trace_id)
+        if self._owner_user_id is not None:
+            stmt = stmt.where(AgentTraceRun.owner_user_id == self._owner_user_id)
+        run = self._db.scalar(stmt)
         if run is None:
             return None
         return _serialize_run(run)
@@ -124,6 +129,8 @@ class AgentTraceStore:
         offset = max(0, offset)
 
         stmt = select(AgentTraceRun)
+        if self._owner_user_id is not None:
+            stmt = stmt.where(AgentTraceRun.owner_user_id == self._owner_user_id)
         if session_id is not None:
             stmt = stmt.where(AgentTraceRun.session_id == session_id)
         if project_slug is not None:

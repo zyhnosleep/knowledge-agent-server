@@ -11,8 +11,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
+from app.api.dependencies import require_business_api_user
 from app.db.session import get_db
-from app.models.records import ConversationSession, Document, SessionAttachment, SessionAttachmentChunk
+from app.models.records import ConversationSession, Document, SessionAttachment, SessionAttachmentChunk, User
 from app.schemas.agent import (
     AgentConstraints,
     AgentQueryRequest,
@@ -43,13 +44,13 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-def _build_executor(db: Session) -> AgentExecutor:
+def _build_executor(db: Session, owner_user_id: str | None = None) -> AgentExecutor:
     """Create an AgentExecutor with all standard dependencies."""
     rag = RAGAdapter()
     tools = ToolRegistry()
     tools._register_builtins(rag)
-    memory = ConversationMemory(db)
-    trace_store = AgentTraceStore(db)
+    memory = ConversationMemory(db, owner_user_id=owner_user_id)
+    trace_store = AgentTraceStore(db, owner_user_id=owner_user_id)
     synthesizer = AgentSynthesizer()
     return AgentExecutor(
         rag=rag, tools=tools, memory=memory, db=db,
@@ -117,12 +118,15 @@ def _assert_session_scope(
     project_slug: str,
     document_id: str | None,
     db: Session,
+    owner_user_id: str | None = None,
 ) -> None:
     """Raise if an existing session is being reused with an incompatible scope."""
-    _assert_session_project(session_id, project_slug, db)
     if not session_id:
         return
     session = db.get(ConversationSession, session_id)
+    if owner_user_id is not None and session is not None and session.owner_user_id != owner_user_id:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    _assert_session_project(session_id, project_slug, db)
     if session is None:
         return
     if session.document_id != document_id:
@@ -151,7 +155,9 @@ def _validate_document_in_project(
 
 @agent_router.post("/query", response_model=AgentQueryResponse)
 def agent_query(
-    payload: AgentQueryRequest, db: Session = Depends(get_db)
+    payload: AgentQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ) -> AgentQueryResponse:
     """Execute a RAG-backed Agent query.
 
@@ -165,10 +171,14 @@ def agent_query(
 
     _validate_document_in_project(payload.document_id, payload.project_slug, db)
     _assert_session_scope(
-        payload.session_id, payload.project_slug, payload.document_id, db
+        payload.session_id,
+        payload.project_slug,
+        payload.document_id,
+        db,
+        current_user.id if current_user else None,
     )
 
-    executor = _build_executor(db)
+    executor = _build_executor(db, current_user.id) if current_user else _build_executor(db)
     response = executor.execute(_apply_server_constraint_defaults(payload))
     try:
         db.commit()
@@ -179,7 +189,9 @@ def agent_query(
 
 
 def _run_executor_in_thread(
-    session_factory: sessionmaker, payload: AgentQueryRequest
+    session_factory: sessionmaker,
+    payload: AgentQueryRequest,
+    owner_user_id: str | None,
 ) -> tuple[AgentQueryResponse, str | None]:
     """Run the blocking AgentExecutor in a worker thread with its own session.
 
@@ -189,7 +201,11 @@ def _run_executor_in_thread(
     """
     db = session_factory()
     try:
-        executor = _build_executor(db)
+        executor = (
+            _build_executor(db, owner_user_id)
+            if owner_user_id is not None
+            else _build_executor(db)
+        )
         response = executor.execute(payload)
         try:
             db.commit()
@@ -206,7 +222,10 @@ def _run_executor_in_thread(
 
 @agent_router.post("/query/stream")
 async def agent_query_stream(
-    payload: AgentQueryRequest, request: Request, db: Session = Depends(get_db)
+    payload: AgentQueryRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ):
     """Execute a RAG-backed Agent query with SSE streaming.
 
@@ -225,7 +244,11 @@ async def agent_query_stream(
 
     _validate_document_in_project(payload.document_id, payload.project_slug, db)
     _assert_session_scope(
-        payload.session_id, payload.project_slug, payload.document_id, db
+        payload.session_id,
+        payload.project_slug,
+        payload.document_id,
+        db,
+        current_user.id if current_user else None,
     )
 
     # Derive a thread-safe session factory from the injected session's
@@ -248,6 +271,7 @@ async def agent_query_stream(
                 _run_executor_in_thread,
                 SessionFactory,
                 _apply_server_constraint_defaults(payload),
+                current_user.id if current_user else None,
             )
 
             # Emit each step as it's available
@@ -305,6 +329,7 @@ def list_agent_traces(
     limit: int = Query(10, ge=1, le=100, description="Max traces to return"),
     offset: int = Query(0, ge=0, description="Number of traces to skip"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ):
     """List Agent traces with optional filters, newest first.
 
@@ -312,7 +337,7 @@ def list_agent_traces(
     with older callers.  At least one filter should be specified to avoid
     scanning the full table.
     """
-    store = AgentTraceStore(db)
+    store = AgentTraceStore(db, owner_user_id=current_user.id if current_user else None)
     traces = store.list_traces(
         session_id=session_id,
         project_slug=project_slug,
@@ -329,9 +354,10 @@ def list_agent_traces(
 def get_agent_trace(
     trace_id: str,
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ):
     """Get a single Agent trace by ID, including ordered steps."""
-    store = AgentTraceStore(db)
+    store = AgentTraceStore(db, owner_user_id=current_user.id if current_user else None)
     trace = store.get_trace(trace_id)
     if trace is None:
         raise HTTPException(status_code=404, detail="Trace not found.")
@@ -345,6 +371,7 @@ def list_agent_sessions(
     limit: int = Query(50, ge=1, le=200, description="Max sessions to return"),
     offset: int = Query(0, ge=0, description="Number of sessions to skip"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ):
     """List Agent conversation sessions, newest first.
 
@@ -354,6 +381,8 @@ def list_agent_sessions(
     _validate_document_in_project(document_id, project_slug, db)
     stmt = select(ConversationSession).order_by(ConversationSession.updated_at.desc())
     stmt = stmt.where(ConversationSession.project_slug == project_slug)
+    if current_user is not None:
+        stmt = stmt.where(ConversationSession.owner_user_id == current_user.id)
     if document_id is not None:
         stmt = stmt.where(ConversationSession.document_id == document_id)
     else:
@@ -372,6 +401,7 @@ def get_agent_session_turns(
     project_slug: str = Query(..., description="Project slug to scope access"),
     document_id: str | None = Query(None, description="Document ID to scope access"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ):
     """Return ordered turns for a single Agent conversation session.
 
@@ -382,6 +412,8 @@ def get_agent_session_turns(
     _validate_document_in_project(document_id, project_slug, db)
     session = db.get(ConversationSession, session_id)
     if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if current_user is not None and session.owner_user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session.project_slug != project_slug or session.document_id != document_id:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -410,10 +442,13 @@ def delete_agent_session(
     project_slug: str = Query(..., description="Project slug to scope access"),
     document_id: str | None = Query(None, description="Document ID to scope access"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ) -> dict:
     """Hard-delete one Agent conversation session and its associated data."""
     session = db.get(ConversationSession, session_id)
     if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if current_user is not None and session.owner_user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session.project_slug != project_slug:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -504,7 +539,11 @@ def _build_final_event(response: AgentQueryResponse) -> dict:
 
 
 def _ensure_session_for_attachments(
-    db: Session, session_id: str, project_slug: str, document_id: str | None = None
+    db: Session,
+    session_id: str,
+    project_slug: str,
+    document_id: str | None = None,
+    owner_user_id: str | None = None,
 ) -> ConversationSession:
     """Return existing session or create/touch one for the given project_slug.
 
@@ -512,6 +551,8 @@ def _ensure_session_for_attachments(
     """
     _validate_document_in_project(document_id, project_slug, db)
     existing = db.get(ConversationSession, session_id)
+    if existing is not None and owner_user_id is not None and existing.owner_user_id != owner_user_id:
+        raise HTTPException(status_code=404, detail="Session not found.")
     if (
         existing is not None
         and (existing.project_slug != project_slug or existing.document_id != document_id)
@@ -524,7 +565,7 @@ def _ensure_session_for_attachments(
                 f"{project_slug} and document {document_id}."
             ),
         )
-    memory = ConversationMemory(db)
+    memory = ConversationMemory(db, owner_user_id=owner_user_id)
     memory.touch_session(
         session_id,
         project_slug=project_slug,
@@ -536,11 +577,17 @@ def _ensure_session_for_attachments(
 
 
 def _assert_session_project_match(
-    db: Session, session_id: str, project_slug: str, document_id: str | None = None
+    db: Session,
+    session_id: str,
+    project_slug: str,
+    document_id: str | None = None,
+    owner_user_id: str | None = None,
 ) -> None:
     """Raise 404 if the session does not exist or belongs to a different scope."""
     session = db.get(ConversationSession, session_id)
     if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if owner_user_id is not None and session.owner_user_id != owner_user_id:
         raise HTTPException(status_code=404, detail="Session not found.")
     if session.project_slug != project_slug:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -582,6 +629,7 @@ async def upload_session_attachment(
     document_id: str | None = Query(None, description="Document ID that scopes the session"),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ) -> AttachmentUploadResponse:
     """Upload a temporary attachment scoped to an Agent conversation session.
 
@@ -594,7 +642,13 @@ async def upload_session_attachment(
         raise HTTPException(status_code=400, detail="File name is required.")
 
     project = get_or_create_project(db, project_slug, project_slug)
-    _ensure_session_for_attachments(db, session_id, project_slug, document_id)
+    _ensure_session_for_attachments(
+        db,
+        session_id,
+        project_slug,
+        document_id,
+        current_user.id if current_user else None,
+    )
 
     try:
         attachment, chunks = await save_session_attachment(
@@ -626,9 +680,16 @@ def list_session_attachments_route(
     project_slug: str = Query(..., description="Project slug that owns the session"),
     document_id: str | None = Query(None, description="Document ID that scopes the session"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ) -> list[AttachmentRead]:
     """List temporary attachment summaries for the session/project."""
-    _assert_session_project_match(db, session_id, project_slug, document_id)
+    _assert_session_project_match(
+        db,
+        session_id,
+        project_slug,
+        document_id,
+        current_user.id if current_user else None,
+    )
     attachments = list_session_attachments(db, session_id, project_slug=project_slug)
     return [_attachment_to_read(a) for a in attachments]
 
@@ -640,9 +701,16 @@ def delete_session_attachment_route(
     project_slug: str = Query(..., description="Project slug that owns the session"),
     document_id: str | None = Query(None, description="Document ID that scopes the session"),
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(require_business_api_user),
 ) -> dict:
     """Delete a session attachment and its chunks, plus best-effort stored file."""
-    _assert_session_project_match(db, session_id, project_slug, document_id)
+    _assert_session_project_match(
+        db,
+        session_id,
+        project_slug,
+        document_id,
+        current_user.id if current_user else None,
+    )
     attachment = get_session_attachment(db, attachment_id)
     if attachment is None or attachment.session_id != session_id:
         raise HTTPException(status_code=404, detail="Attachment not found.")

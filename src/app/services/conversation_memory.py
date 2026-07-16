@@ -34,8 +34,9 @@ class ConversationMemory:
     and enforce turn budgets.
     """
 
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, owner_user_id: str | None = None) -> None:
         self._db = db
+        self._owner_user_id = owner_user_id
 
     # ------------------------------------------------------------------
     # public API
@@ -214,6 +215,8 @@ class ConversationMemory:
         """
         existing = self._db.get(ConversationSession, session_id)
         if existing is not None:
+            if self._owner_user_id is not None and existing.owner_user_id != self._owner_user_id:
+                raise ValueError(f"Session {session_id} belongs to another user.")
             if existing.project_slug != project_slug:
                 raise ValueError(
                     f"Session {session_id} belongs to project {existing.project_slug}; "
@@ -231,6 +234,7 @@ class ConversationMemory:
         else:
             session = ConversationSession(
                 id=session_id,
+                owner_user_id=self._owner_user_id,
                 project_slug=project_slug,
                 document_id=document_id,
                 expires_at=expires_at,

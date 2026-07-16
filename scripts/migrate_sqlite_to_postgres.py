@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Connection, Table, create_engine, func, inspect, select, text
+from sqlalchemy import Connection, MetaData, Table, create_engine, func, inspect, select, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -22,6 +22,15 @@ class MigrationError(RuntimeError):
 
 def _rows(connection: Connection, table: Table) -> list[dict[str, Any]]:
     return [dict(row) for row in connection.execute(select(table)).mappings()]
+
+
+def _source_rows(connection: Connection, table: Table) -> list[dict[str, Any]]:
+    source_table = Table(table.name, MetaData(), autoload_with=connection)
+    reflected_rows = _rows(connection, source_table)
+    return [
+        {column.name: row.get(column.name) for column in table.columns}
+        for row in reflected_rows
+    ]
 
 
 def _primary_key(table: Table, row: dict[str, Any]) -> tuple[Any, ...]:
@@ -170,7 +179,7 @@ def migrate_database(
         with target_engine.begin() as target_connection:
             for table in Base.metadata.sorted_tables:
                 source_rows = (
-                    _rows(source_connection, table)
+                    _source_rows(source_connection, table)
                     if table.name in source_tables
                     else []
                 )
