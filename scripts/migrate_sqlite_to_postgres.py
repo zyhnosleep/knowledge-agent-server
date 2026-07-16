@@ -25,7 +25,12 @@ def _rows(connection: Connection, table: Table) -> list[dict[str, Any]]:
 
 
 def _source_rows(connection: Connection, table: Table) -> list[dict[str, Any]]:
-    source_table = Table(table.name, MetaData(), autoload_with=connection)
+    source_table = Table(
+        table.name,
+        MetaData(),
+        autoload_with=connection,
+        resolve_fks=False,
+    )
     reflected_rows = _rows(connection, source_table)
     return [
         {column.name: row.get(column.name) for column in table.columns}
