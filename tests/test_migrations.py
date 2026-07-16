@@ -37,10 +37,11 @@ def test_alembic_history_has_one_head() -> None:
     assert len(script.get_heads()) == 1
 
 
-def test_postgresql_migration_declares_pgvector_index() -> None:
+def test_postgresql_migration_declares_4096_dimension_pgvector_table() -> None:
     version_files = list((ROOT / "src/app/db/alembic/versions").glob("*.py"))
     migration_text = "\n".join(path.read_text(encoding="utf-8") for path in version_files)
 
     assert "CREATE EXTENSION IF NOT EXISTS vector" in migration_text
     assert "document_chunk_pgvector_index" in migration_text
     assert "vector(4096)" in migration_text
+    assert "USING hnsw (embedding vector_cosine_ops)" not in migration_text

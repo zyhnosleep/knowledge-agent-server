@@ -325,11 +325,6 @@ def upgrade() -> None:
             "CREATE INDEX ix_document_chunk_pgvector_document_id "
             "ON document_chunk_pgvector_index (document_id)"
         )
-        op.execute(
-            "CREATE INDEX ix_document_chunk_pgvector_embedding_hnsw "
-            "ON document_chunk_pgvector_index USING hnsw (embedding vector_cosine_ops)"
-        )
-
     # ### end Alembic commands ###
 
 
