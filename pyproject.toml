@@ -5,6 +5,7 @@ description = "Server-oriented internal knowledge base inspired by llm_wiki."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "alembic>=1.14.0,<2.0",
   "beautifulsoup4>=4.12.3",
   "fastapi>=0.115.0",
   "httpx>=0.28.0",

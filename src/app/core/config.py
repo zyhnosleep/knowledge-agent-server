@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     ollama_generation_model: str = Field(default="qwen3:14b", alias="OLLAMA_GENERATION_MODEL")
     ollama_batch_model: str = Field(default="qwen3:30b", alias="OLLAMA_BATCH_MODEL")
     ollama_embedding_model: str = Field(default="qwen3-embedding:8b", alias="OLLAMA_EMBEDDING_MODEL")
+    ollama_embedding_dimensions: int = Field(default=4096, alias="OLLAMA_EMBEDDING_DIMENSIONS")
     ollama_vision_model: str | None = Field(default=None, alias="OLLAMA_VISION_MODEL")
     ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
     ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")

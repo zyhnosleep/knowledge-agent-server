@@ -39,7 +39,7 @@ from app.services.pipeline import IngestionPipeline
 from app.services.queue import JobDispatcher
 from app.services.repositories import get_or_create_project
 from app.services.search import QueryService
-from app.services.vector_store import SQLiteVecStore
+from app.services.vector_store import get_vector_store
 
 router = APIRouter()
 settings = get_settings()
@@ -122,7 +122,7 @@ def _delete_document_file(db: Session, document: Document) -> bool:
 def _delete_document_resources(db: Session, document: Document) -> dict:
     document_id = document.id
     project_id = document.project_id
-    SQLiteVecStore(db).delete_document(document_id)
+    get_vector_store(db).delete_document(document_id)
     file_deleted = _delete_document_file(db, document)
     trace_runs_deleted = _delete_trace_runs_citing_document(db, document_id)
 

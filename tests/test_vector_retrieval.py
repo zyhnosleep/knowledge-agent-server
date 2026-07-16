@@ -10,7 +10,13 @@ from app.db.session import Base
 from app.models.records import Document, DocumentChunk, Project
 from app.schemas.common import Citation
 from app.services.search import PaperMatch, QueryService, RetrievedContext
-from app.services.vector_store import ChunkVector, SQLiteVecStore, VectorHit
+from app.services.vector_store import (
+    ChunkVector,
+    PGVectorStore,
+    SQLiteVecStore,
+    VectorHit,
+    get_vector_store,
+)
 
 
 class EmbedOnlyOllama:
@@ -25,6 +31,74 @@ def make_session() -> Session:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
+
+
+class _FakeDialect:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeBind:
+    def __init__(self, dialect_name: str) -> None:
+        self.dialect = _FakeDialect(dialect_name)
+
+
+class _FakeDatabase:
+    def __init__(self, dialect_name: str) -> None:
+        self.bind = _FakeBind(dialect_name)
+
+    def get_bind(self) -> _FakeBind:
+        return self.bind
+
+
+def test_vector_store_factory_selects_pgvector_for_postgresql(monkeypatch) -> None:
+    import app.services.vector_store as vector_store_module
+
+    monkeypatch.setattr(vector_store_module.settings, "vector_store_enabled", True)
+    monkeypatch.setattr(vector_store_module.settings, "vector_store_backend", "pgvector")
+
+    store = get_vector_store(_FakeDatabase("postgresql"))  # type: ignore[arg-type]
+
+    assert isinstance(store, PGVectorStore)
+
+
+def test_vector_store_factory_keeps_sqlite_backend_for_tests(monkeypatch) -> None:
+    import app.services.vector_store as vector_store_module
+
+    monkeypatch.setattr(vector_store_module.settings, "vector_store_enabled", True)
+    monkeypatch.setattr(vector_store_module.settings, "vector_store_backend", "sqlite-vec")
+
+    store = get_vector_store(make_session())
+
+    assert isinstance(store, SQLiteVecStore)
+
+
+def test_pgvector_store_normalizes_query_and_preserves_document_scope(monkeypatch) -> None:
+    import app.services.vector_store as vector_store_module
+
+    monkeypatch.setattr(vector_store_module.settings, "ollama_embedding_dimensions", 2)
+    store = PGVectorStore(_FakeDatabase("postgresql"))  # type: ignore[arg-type]
+    monkeypatch.setattr(store, "available", lambda: True)
+    observed: dict[str, object] = {}
+
+    def fake_search_rows(
+        embedding: list[float], limit: int, document_ids: list[str]
+    ) -> list[SimpleNamespace]:
+        observed["embedding"] = embedding
+        observed["limit"] = limit
+        observed["document_ids"] = document_ids
+        return [SimpleNamespace(chunk_id="pg-hit", distance=0.125)]
+
+    monkeypatch.setattr(store, "_search_rows", fake_search_rows)
+
+    hits = store.search([3.0, 4.0], limit=2, document_ids=["d1"])
+
+    assert hits == [VectorHit(chunk_id="pg-hit", distance=0.125)]
+    assert observed == {
+        "embedding": pytest.approx([0.6, 0.8]),
+        "limit": 2,
+        "document_ids": ["d1"],
+    }
 
 
 def test_search_source_chunks_prefers_sqlite_vec_hits(monkeypatch) -> None:
@@ -54,15 +128,12 @@ def test_search_source_chunks_prefers_sqlite_vec_hits(monkeypatch) -> None:
     db.commit()
 
     class FakeVectorStore:
-        def __init__(self, db: Session) -> None:
-            self.db = db
-
         def search(self, embedding: list[float], *, limit: int, document_ids: list[str] | None = None) -> list[VectorHit]:
             return [VectorHit(chunk_id="semantic", distance=0.0)]
 
     import app.services.search as search_module
 
-    monkeypatch.setattr(search_module, "SQLiteVecStore", FakeVectorStore)
+    monkeypatch.setattr(search_module, "get_vector_store", lambda db: FakeVectorStore())
     service = QueryService(db)
     service.ollama = EmbedOnlyOllama([1.0, 0.0])
 
@@ -285,7 +356,7 @@ def test_search_source_chunks_falls_back_to_json_embeddings_when_sqlite_vec_unav
 
     import app.services.search as search_module
 
-    monkeypatch.setattr(search_module, "SQLiteVecStore", UnavailableVectorStore)
+    monkeypatch.setattr(search_module, "get_vector_store", lambda db: UnavailableVectorStore(db))
     service = QueryService(db)
     service.ollama = EmbedOnlyOllama([1.0, 0.0])
 
@@ -331,7 +402,7 @@ def test_search_source_chunks_ignores_vector_hits_outside_scope(monkeypatch) -> 
 
     import app.services.search as search_module
 
-    monkeypatch.setattr(search_module, "SQLiteVecStore", LeakyVectorStore)
+    monkeypatch.setattr(search_module, "get_vector_store", lambda db: LeakyVectorStore(db))
     service = QueryService(db)
     service.ollama = EmbedOnlyOllama([1.0, 0.0])
 
@@ -377,7 +448,7 @@ def test_search_source_chunks_passes_document_scope_to_vector_store(monkeypatch)
 
     import app.services.search as search_module
 
-    monkeypatch.setattr(search_module, "SQLiteVecStore", ScopedVectorStore)
+    monkeypatch.setattr(search_module, "get_vector_store", lambda db: ScopedVectorStore(db))
     service = QueryService(db)
     service.ollama = EmbedOnlyOllama([1.0, 0.0])
 
@@ -421,7 +492,7 @@ def test_search_source_chunks_keeps_json_fallback_when_vector_hits_are_partial(m
 
     import app.services.search as search_module
 
-    monkeypatch.setattr(search_module, "SQLiteVecStore", PartialVectorStore)
+    monkeypatch.setattr(search_module, "get_vector_store", lambda db: PartialVectorStore(db))
     service = QueryService(db)
     service.ollama = EmbedOnlyOllama([1.0, 0.0])
 

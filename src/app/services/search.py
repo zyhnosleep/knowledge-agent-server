@@ -26,7 +26,7 @@ from app.services.paper_profile import (
 )
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_normalization import normalize_table_text
-from app.services.vector_store import SQLiteVecStore
+from app.services.vector_store import get_vector_store
 
 settings = get_settings()
 MIN_CONTEXT_SCORE = 2.5
@@ -1881,7 +1881,7 @@ class QueryService:
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
         vector_hits = (
-            SQLiteVecStore(self.db).search(
+            get_vector_store(self.db).search(
                 question_vector,
                 limit=max(limit * 20, 50),
                 document_ids=document_ids or None,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -305,3 +306,158 @@ class SQLiteVecStore:
         if not math.isfinite(norm) or norm <= 0:
             return []
         return [float(value) / norm for value in embedding]
+
+
+class PGVectorStore:
+    """PostgreSQL pgvector index for document chunk embeddings."""
+
+    _TABLE_NAME = "document_chunk_pgvector_index"
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+        self._available: bool | None = None
+
+    def available(self) -> bool:
+        if not settings.vector_store_enabled:
+            return False
+        if settings.vector_store_backend != "pgvector":
+            return False
+        if self.db.get_bind().dialect.name != "postgresql":
+            return False
+        if self._available is not None:
+            return self._available
+        try:
+            installed = self.db.execute(
+                text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+            ).scalar_one_or_none()
+            self._available = bool(installed)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("pgvector is not available on this connection: %s", exc)
+            self._available = False
+        return self._available
+
+    def replace_document_chunks(
+        self, document_id: str, vectors: Iterable[ChunkVector]
+    ) -> None:
+        normalized = [
+            ChunkVector(
+                chunk_id=vector.chunk_id,
+                document_id=vector.document_id,
+                embedding=embedding,
+            )
+            for vector in vectors
+            if self._valid_embedding(vector.embedding)
+            for embedding in [self._normalize_embedding(vector.embedding)]
+            if len(embedding) == settings.ollama_embedding_dimensions
+        ]
+        if not self.available():
+            return
+        try:
+            with self.db.begin_nested():
+                self.delete_document(document_id)
+                if normalized:
+                    self.db.execute(
+                        text(
+                            f"INSERT INTO {self._TABLE_NAME} "
+                            "(chunk_id, document_id, embedding) "
+                            "VALUES (:chunk_id, :document_id, CAST(:embedding AS vector)) "
+                            "ON CONFLICT (chunk_id) DO UPDATE SET "
+                            "document_id = EXCLUDED.document_id, "
+                            "embedding = EXCLUDED.embedding"
+                        ),
+                        [
+                            {
+                                "chunk_id": vector.chunk_id,
+                                "document_id": vector.document_id,
+                                "embedding": self._serialize(vector.embedding),
+                            }
+                            for vector in normalized
+                        ],
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "pgvector indexing failed for document %s; JSON embeddings remain available: %s",
+                document_id,
+                exc,
+            )
+
+    def delete_document(self, document_id: str) -> None:
+        if not self.available():
+            return
+        self.db.execute(
+            text(f"DELETE FROM {self._TABLE_NAME} WHERE document_id = :document_id"),
+            {"document_id": document_id},
+        )
+
+    def search(
+        self,
+        embedding: list[float],
+        *,
+        limit: int,
+        document_ids: list[str] | None = None,
+    ) -> list[VectorHit]:
+        if not self._valid_embedding(embedding) or limit <= 0 or not self.available():
+            return []
+        normalized = self._normalize_embedding(embedding)
+        if len(normalized) != settings.ollama_embedding_dimensions:
+            return []
+        scoped_document_ids = [
+            str(document_id)
+            for document_id in (document_ids or [])
+            if str(document_id or "").strip()
+        ]
+        try:
+            rows = self._search_rows(normalized, limit, scoped_document_ids)
+            return [
+                VectorHit(chunk_id=str(row.chunk_id), distance=float(row.distance))
+                for row in rows
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pgvector search failed; falling back to JSON embeddings: %s", exc)
+            return []
+
+    def _search_rows(
+        self, embedding: list[float], limit: int, document_ids: list[str]
+    ) -> list[Any]:
+        parameters: dict[str, Any] = {
+            "embedding": self._serialize(embedding),
+            "limit": limit,
+        }
+        scope_sql = ""
+        if document_ids:
+            placeholders = []
+            for index, document_id in enumerate(document_ids):
+                key = f"document_id_{index}"
+                parameters[key] = document_id
+                placeholders.append(f":{key}")
+            scope_sql = f"WHERE document_id IN ({','.join(placeholders)}) "
+        return self.db.execute(
+            text(
+                f"SELECT chunk_id, embedding <=> CAST(:embedding AS vector) AS distance "
+                f"FROM {self._TABLE_NAME} {scope_sql}"
+                "ORDER BY distance LIMIT :limit"
+            ),
+            parameters,
+        ).all()
+
+    @staticmethod
+    def _serialize(embedding: list[float]) -> str:
+        return json.dumps(embedding, separators=(",", ":"))
+
+    @staticmethod
+    def _valid_embedding(embedding: list[float] | None) -> bool:
+        return SQLiteVecStore._valid_embedding(embedding)
+
+    @staticmethod
+    def _normalize_embedding(embedding: list[float]) -> list[float]:
+        return SQLiteVecStore._normalize_embedding(embedding)
+
+
+def get_vector_store(db: Session) -> SQLiteVecStore | PGVectorStore:
+    if (
+        settings.vector_store_enabled
+        and settings.vector_store_backend == "pgvector"
+        and db.get_bind().dialect.name == "postgresql"
+    ):
+        return PGVectorStore(db)
+    return SQLiteVecStore(db)

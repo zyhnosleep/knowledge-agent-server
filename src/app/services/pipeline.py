@@ -43,7 +43,7 @@ from app.services.paper_profile import ensure_paper_profile, ensure_source_ident
 from app.services.parser import parse_document
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
-from app.services.vector_store import ChunkVector, SQLiteVecStore
+from app.services.vector_store import ChunkVector, get_vector_store
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -337,7 +337,7 @@ class IngestionPipeline:
             self.db.add(record)
             records.append(record)
         self.db.flush()
-        SQLiteVecStore(self.db).replace_document_chunks(
+        get_vector_store(self.db).replace_document_chunks(
             document.id,
             [
                 ChunkVector(chunk_id=record.id, document_id=document.id, embedding=record.embedding or [])
@@ -347,7 +347,7 @@ class IngestionPipeline:
         )
 
     def _clear_document_chunks(self, document_id: str) -> None:
-        SQLiteVecStore(self.db).delete_document(document_id)
+        get_vector_store(self.db).delete_document(document_id)
         self.db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
 
     def _extract_document(self, document: Document, full_text: str) -> DocumentExtraction:
