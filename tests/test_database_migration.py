@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
 
 from app.db.session import Base
@@ -89,6 +89,24 @@ def test_migration_dry_run_does_not_write_target(tmp_path: Path) -> None:
     assert counts["projects"] == 1
     with Session(create_engine(_url(target), future=True)) as db:
         assert db.scalar(select(func.count()).select_from(Project)) == 0
+
+
+def test_migration_treats_tables_missing_from_legacy_source_as_empty(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy-source.db"
+    target = tmp_path / "target.db"
+    _prepare_source(source)
+    with create_engine(_url(source), future=True).begin() as connection:
+        connection.execute(text("DROP TABLE auth_sessions"))
+        connection.execute(text("DROP TABLE users"))
+    _prepare_target(target)
+
+    counts = migrate_database(_url(source), _url(target), reindex_vectors=False)
+
+    assert counts["users"] == 0
+    assert counts["auth_sessions"] == 0
+    assert counts["projects"] == 1
 
 
 def test_migration_rejects_extra_target_rows(tmp_path: Path) -> None:

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Connection, Table, create_engine, func, select, text
+from sqlalchemy import Connection, Table, create_engine, func, inspect, select, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -153,18 +153,27 @@ def migrate_database(
 
     counts: dict[str, int] = {}
     with source_engine.connect() as source_connection:
+        source_tables = set(inspect(source_connection).get_table_names())
         if dry_run:
             for table in Base.metadata.sorted_tables:
-                counts[table.name] = int(
-                    source_connection.execute(
-                        select(func.count()).select_from(table)
-                    ).scalar_one()
+                counts[table.name] = (
+                    int(
+                        source_connection.execute(
+                            select(func.count()).select_from(table)
+                        ).scalar_one()
+                    )
+                    if table.name in source_tables
+                    else 0
                 )
             return counts
 
         with target_engine.begin() as target_connection:
             for table in Base.metadata.sorted_tables:
-                source_rows = _rows(source_connection, table)
+                source_rows = (
+                    _rows(source_connection, table)
+                    if table.name in source_tables
+                    else []
+                )
                 target_rows = _rows(target_connection, table)
                 _assert_existing_rows_match(table, source_rows, target_rows)
                 _insert_rows(target_connection, table, source_rows, batch_size)
