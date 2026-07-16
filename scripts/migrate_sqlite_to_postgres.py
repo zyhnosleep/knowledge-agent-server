@@ -38,6 +38,25 @@ def _source_rows(connection: Connection, table: Table) -> list[dict[str, Any]]:
     ]
 
 
+def _rebase_document_paths(
+    rows: list[dict[str, Any]], source_raw_dir: Path | None
+) -> list[dict[str, Any]]:
+    if source_raw_dir is None:
+        return rows
+    raw_root = source_raw_dir.expanduser().resolve()
+    for row in rows:
+        stored = Path(str(row.get("raw_path") or ""))
+        if not stored.is_absolute():
+            continue
+        try:
+            row["raw_path"] = stored.resolve().relative_to(raw_root).as_posix()
+        except ValueError as exc:
+            raise MigrationError(
+                f"Document path is outside source raw directory: {stored}"
+            ) from exc
+    return rows
+
+
 def _primary_key(table: Table, row: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(row[column.name] for column in table.primary_key.columns)
 
@@ -156,6 +175,7 @@ def migrate_database(
     dry_run: bool = False,
     batch_size: int = 250,
     reindex_vectors: bool = True,
+    source_raw_dir: Path | None = None,
 ) -> dict[str, int]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -188,6 +208,8 @@ def migrate_database(
                     if table.name in source_tables
                     else []
                 )
+                if table.name == "documents":
+                    source_rows = _rebase_document_paths(source_rows, source_raw_dir)
                 target_rows = _rows(target_connection, table)
                 _assert_existing_rows_match(table, source_rows, target_rows)
                 _insert_rows(target_connection, table, source_rows, batch_size)
@@ -212,13 +234,18 @@ def migrate_database(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Migrate an LLM Wiki SQLite database into an Alembic-managed PostgreSQL database."
+        description="Migrate an internal knowledge-base SQLite database into PostgreSQL."
     )
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--target-url", required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--skip-vector-reindex", action="store_true")
+    parser.add_argument(
+        "--source-raw-dir",
+        type=Path,
+        help="Rebase absolute document paths under this directory to portable relative paths.",
+    )
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
@@ -228,6 +255,7 @@ def main() -> int:
         dry_run=args.dry_run,
         batch_size=args.batch_size,
         reindex_vectors=not args.skip_vector_reindex,
+        source_raw_dir=args.source_raw_dir,
     )
     payload = {
         "status": "dry-run" if args.dry_run else "completed",

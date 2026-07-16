@@ -77,6 +77,33 @@ def test_migration_preserves_ids_json_and_is_repeatable(tmp_path: Path) -> None:
         assert chunk.embedding == [1.0, 0.0]
 
 
+def test_migration_rebases_absolute_document_paths_to_the_target_raw_root(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    source_raw_dir = tmp_path / "legacy" / "data" / "raw"
+    _prepare_source(source)
+    with Session(create_engine(_url(source), future=True)) as db:
+        document = db.get(Document, "d1")
+        assert document is not None
+        document.raw_path = str(source_raw_dir / "research" / "paper.pdf")
+        db.commit()
+    _prepare_target(target)
+
+    migrate_database(
+        _url(source),
+        _url(target),
+        source_raw_dir=source_raw_dir,
+        reindex_vectors=False,
+    )
+
+    with Session(create_engine(_url(target), future=True)) as db:
+        document = db.get(Document, "d1")
+        assert document is not None
+        assert document.raw_path == "research/paper.pdf"
+
+
 def test_migration_dry_run_does_not_write_target(tmp_path: Path) -> None:
     source = tmp_path / "source.db"
     target = tmp_path / "target.db"
