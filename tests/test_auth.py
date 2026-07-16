@@ -97,6 +97,21 @@ def test_login_returns_503_when_auth_disabled(client, monkeypatch):
     assert response.status_code == 503
 
 
+def test_business_api_requires_session_when_auth_enabled(enabled_settings, client):
+    response = client.get("/api/projects")
+
+    assert response.status_code == 401
+
+
+def test_business_api_remains_available_when_auth_disabled(client, monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    get_settings.cache_clear()
+
+    response = client.get("/api/projects")
+
+    assert response.status_code == 200
+
+
 def test_login_returns_503_when_credentials_missing(client, monkeypatch):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     monkeypatch.setenv("FEISHU_APP_ID", "")
@@ -573,7 +588,8 @@ def test_urlsafe_b64decode_padding_is_aligned_only(enabled_settings):
         assert decoded == data
 
 
-def test_other_routes_remain_unauthenticated(enabled_settings, client, db):
+def test_health_route_is_protected_with_other_business_apis(
+    enabled_settings, client, db
+):
     response = client.get("/api/health")
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.status_code == 401

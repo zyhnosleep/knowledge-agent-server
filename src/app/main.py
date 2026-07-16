@@ -4,12 +4,13 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.agent_routes import agent_router
 from app.api.auth_routes import auth_router
+from app.api.dependencies import require_business_api_user
 from app.api.quality_routes import quality_router
 from app.api.routes import router
 from app.core.config import get_settings
@@ -70,9 +71,18 @@ def _startup_purge() -> None:
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
-app.include_router(router, prefix="/api")
-app.include_router(agent_router, prefix="/api/agent")
-app.include_router(quality_router, prefix="/api")
+business_api_dependencies = [Depends(require_business_api_user)]
+app.include_router(router, prefix="/api", dependencies=business_api_dependencies)
+app.include_router(
+    agent_router,
+    prefix="/api/agent",
+    dependencies=business_api_dependencies,
+)
+app.include_router(
+    quality_router,
+    prefix="/api",
+    dependencies=business_api_dependencies,
+)
 app.include_router(auth_router, prefix="/api/auth")
 
 static_dir = Path(__file__).parent / "static"
