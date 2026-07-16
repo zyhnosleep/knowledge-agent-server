@@ -31,6 +31,15 @@ def _settings() -> Settings:
     return get_settings()
 
 
+@auth_router.get("/status")
+def auth_status() -> dict[str, bool]:
+    settings = _settings()
+    return {
+        "enabled": settings.auth_enabled,
+        "configured": auth_is_configured(settings),
+    }
+
+
 def _set_cookie(
     response: RedirectResponse,
     name: str,

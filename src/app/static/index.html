@@ -354,6 +354,21 @@
         background: currentColor;
       }
 
+      .topbar-actions { display: flex; align-items: center; gap: 16px; }
+      .account-menu { display: inline-flex; align-items: center; gap: 10px; }
+      .account-avatar { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; border: 1px solid var(--line); background: var(--night-800); }
+      .account-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--paper-100); font-size: 12px; }
+      .logout-button { border: 0; background: transparent; color: var(--paper-500); cursor: pointer; font-size: 12px; }
+      .logout-button:hover { color: var(--paper-100); }
+      .auth-gate { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 24px; background: #070a0e; }
+      .auth-gate[hidden] { display: none; }
+      .auth-gate-inner { width: min(440px, 100%); border: 1px solid var(--line); padding: 42px; background: var(--night-900); }
+      .auth-gate-mark { color: var(--signal); font: 11px ui-monospace, monospace; letter-spacing: .14em; }
+      .auth-gate h1 { margin: 18px 0 12px; color: var(--paper-50); font: 36px/1.15 Georgia, serif; letter-spacing: 0; }
+      .auth-gate p { margin: 0 0 28px; color: var(--paper-500); line-height: 1.7; }
+      .auth-login-button { width: 100%; min-height: 46px; border: 1px solid var(--signal); background: var(--signal); color: #081006; font-weight: 700; cursor: pointer; }
+      .auth-login-button:disabled { border-color: var(--line); background: var(--night-800); color: var(--paper-500); cursor: not-allowed; }
+
       .view {
         min-width: 0;
         padding: 36px 36px 40px;
@@ -1576,6 +1591,14 @@
     </style>
   </head>
   <body>
+    <section class="auth-gate" id="authGate" hidden aria-labelledby="authGateTitle">
+      <div class="auth-gate-inner">
+        <span class="auth-gate-mark">NIGHT RESEARCH / ACCESS</span>
+        <h1 id="authGateTitle">进入研究工作台</h1>
+        <p id="authGateMessage">使用公司飞书账号登录后继续。</p>
+        <button class="auth-login-button" id="authLoginButton" type="button">使用飞书登录</button>
+      </div>
+    </section>
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -1620,7 +1643,14 @@
       <main class="main">
         <header class="topbar">
           <div class="topbar-label"><span id="viewEyebrow">RESEARCH CONVERSATION / 01</span><i></i></div>
-          <div class="status-pill" id="healthStatus"><span class="status-dot"></span><span>检查服务中</span></div>
+          <div class="topbar-actions">
+            <div class="status-pill" id="healthStatus"><span class="status-dot"></span><span>检查服务中</span></div>
+            <div class="account-menu" id="accountMenu" hidden>
+              <img class="account-avatar" id="accountAvatar" alt="" />
+              <span class="account-name" id="accountName"></span>
+              <button class="logout-button" id="logoutButton" type="button">退出</button>
+            </div>
+          </div>
         </header>
 
         <section class="view chat-view" data-view="chat" hidden>
@@ -1958,10 +1988,82 @@
           return response.text().then(function (text) {
             var data = parseMaybeJson(text);
             if (!response.ok) {
-              throw new Error(data && data.detail ? data.detail : response.statusText);
+              if (response.status === 401 && url.indexOf("/api/auth/") !== 0) {
+                showAuthGate("登录状态已失效，请重新使用飞书登录。", true);
+              }
+              var error = new Error(data && data.detail ? data.detail : response.statusText);
+              error.status = response.status;
+              throw error;
             }
             return data;
           });
+        });
+      }
+
+      function readCookie(name) {
+        var prefix = encodeURIComponent(name) + "=";
+        var match = document.cookie.split("; ").find(function (item) { return item.indexOf(prefix) === 0; });
+        return match ? decodeURIComponent(match.slice(prefix.length)) : null;
+      }
+
+      function showAuthGate(message, configured) {
+        $("authGateMessage").textContent = message;
+        $("authLoginButton").disabled = !configured;
+        $("authGate").hidden = false;
+      }
+
+      function hideAuthGate() {
+        $("authGate").hidden = true;
+      }
+
+      function renderAccount(user) {
+        $("accountName").textContent = user.display_name || "飞书用户";
+        if (user.avatar_url) {
+          $("accountAvatar").src = user.avatar_url;
+          $("accountAvatar").hidden = false;
+        } else {
+          $("accountAvatar").removeAttribute("src");
+          $("accountAvatar").hidden = true;
+        }
+        $("accountMenu").hidden = false;
+      }
+
+      function initializeWorkspace() {
+        fetchJson("/api/health").then(function () {
+          $("healthStatus").innerHTML = '<span class="status-dot"></span><span>所有服务正常</span>';
+        }).catch(function () {
+          $("healthStatus").innerHTML = '<span class="status-dot"></span><span>服务未连接</span>';
+          $("healthStatus").style.color = "var(--red)";
+        });
+        loadProjects();
+        setView((location.hash || "#chat").slice(1));
+      }
+
+      function bootstrapAuth() {
+        return fetchJson("/api/auth/status").then(function (status) {
+          if (!status.enabled) {
+            hideAuthGate();
+            initializeWorkspace();
+            return;
+          }
+          if (!status.configured) {
+            showAuthGate("飞书登录尚未完成服务器配置，请联系管理员。", false);
+            return;
+          }
+          return fetchJson("/api/auth/me").then(function (user) {
+            renderAccount(user);
+            hideAuthGate();
+            initializeWorkspace();
+          }).catch(function (error) {
+            if (error.status === 401) {
+              showAuthGate("使用公司飞书账号登录后继续。", true);
+              return;
+            }
+            throw error;
+          });
+        }).catch(function (error) {
+          showAuthGate("无法确认登录服务状态，请稍后刷新。", false);
+          console.error("Authentication bootstrap failed", error);
         });
       }
 
@@ -3138,15 +3240,24 @@
         this.style.height = this.scrollHeight + "px";
       });
 
-      fetchJson("/api/health").then(function () {
-        $("healthStatus").innerHTML = '<span class="status-dot"></span><span>所有服务正常</span>';
-      }).catch(function () {
-        $("healthStatus").innerHTML = '<span class="status-dot"></span><span>服务未连接</span>';
-        $("healthStatus").style.color = "var(--red)";
+      $("authLoginButton").addEventListener("click", function () {
+        window.location.assign("/api/auth/login");
       });
 
-      loadProjects();
-      setView((location.hash || "#chat").slice(1));
+      $("logoutButton").addEventListener("click", function () {
+        var csrfToken = readCookie("nri_csrf");
+        fetchJson("/api/auth/logout", {
+          method: "POST",
+          headers: { "X-CSRF-Token": csrfToken || "" }
+        }).then(function () {
+          $("accountMenu").hidden = true;
+          showAuthGate("你已退出，请使用公司飞书账号重新登录。", true);
+        }).catch(function (error) {
+          alert(error.message || String(error));
+        });
+      });
+
+      bootstrapAuth();
     </script>
   </body>
 </html>

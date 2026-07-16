@@ -24,6 +24,23 @@ def test_static_frontend_contains_pipeline_dashboard_shell() -> None:
     assert "/source" in html
 
 
+def test_frontend_contains_feishu_login_and_account_controls() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+
+    assert soup.select_one("#authGate") is not None
+    assert soup.select_one("#authLoginButton") is not None
+    assert soup.select_one("#accountMenu") is not None
+    assert soup.select_one("#accountAvatar") is not None
+    assert soup.select_one("#accountName") is not None
+    assert soup.select_one("#logoutButton") is not None
+    assert "/api/auth/status" in html
+    assert "/api/auth/me" in html
+    assert "/api/auth/login" in html
+    assert "/api/auth/logout" in html
+    assert "X-CSRF-Token" in html
+
+
 def test_inline_script_is_valid_javascript() -> None:
     html = _html()
     script_match = re.search(r"<script>([\s\S]*?)</script>", html)

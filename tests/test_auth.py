@@ -97,6 +97,26 @@ def test_login_returns_503_when_auth_disabled(client, monkeypatch):
     assert response.status_code == 503
 
 
+def test_auth_status_reports_disabled_and_configured_states(client, monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    get_settings.cache_clear()
+    disabled = client.get("/api/auth/status")
+
+    assert disabled.status_code == 200
+    assert disabled.json() == {"enabled": False, "configured": False}
+
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("AUTH_SESSION_SECRET", "test-secret-32-bytes-long-for-hmac")
+    monkeypatch.setenv("FEISHU_APP_ID", "test_app_id")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "test_app_secret")
+    monkeypatch.setenv("FEISHU_REDIRECT_URI", "https://example.test/api/auth/callback")
+    get_settings.cache_clear()
+    configured = client.get("/api/auth/status")
+
+    assert configured.status_code == 200
+    assert configured.json() == {"enabled": True, "configured": True}
+
+
 def test_business_api_requires_session_when_auth_enabled(enabled_settings, client):
     response = client.get("/api/projects")
 
