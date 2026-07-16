@@ -44,5 +44,6 @@ server_pull/
 .idea/
 .claude/
 .codex/codex_with_cc/
+.worktrees/
 .DS_Store
 Thumbs.db
