@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.agent_routes import agent_router
+from app.api.auth_routes import auth_router
 from app.api.quality_routes import quality_router
 from app.api.routes import router
 from app.core.config import get_settings
@@ -72,6 +73,7 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(router, prefix="/api")
 app.include_router(agent_router, prefix="/api/agent")
 app.include_router(quality_router, prefix="/api")
+app.include_router(auth_router, prefix="/api/auth")
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/assets", StaticFiles(directory=static_dir), name="assets")

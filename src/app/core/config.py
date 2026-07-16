@@ -84,6 +84,34 @@ class Settings(BaseSettings):
 
     quality_reports_dir: Path = Field(default=Path("./tmp"), alias="QUALITY_REPORTS_DIR")
 
+    # Authentication -------------------------------------------------------
+    auth_enabled: bool = Field(default=False, alias="AUTH_ENABLED")
+    auth_session_secret: str | None = Field(default=None, alias="AUTH_SESSION_SECRET")
+    auth_session_cookie_name: str = Field(default="nri_session", alias="AUTH_SESSION_COOKIE_NAME")
+    auth_csrf_cookie_name: str = Field(default="nri_csrf", alias="AUTH_CSRF_COOKIE_NAME")
+    auth_state_cookie_name: str = Field(default="nri_oauth_state", alias="AUTH_STATE_COOKIE_NAME")
+    auth_session_max_age_seconds: int = Field(default=604_800, alias="AUTH_SESSION_MAX_AGE_SECONDS")
+    auth_state_max_age_seconds: int = Field(default=600, alias="AUTH_STATE_MAX_AGE_SECONDS")
+    auth_cookie_secure: bool = Field(default=True, alias="AUTH_COOKIE_SECURE")
+    auth_cookie_samesite: str = Field(default="lax", alias="AUTH_COOKIE_SAMESITE")
+
+    feishu_app_id: str | None = Field(default=None, alias="FEISHU_APP_ID")
+    feishu_app_secret: str | None = Field(default=None, alias="FEISHU_APP_SECRET")
+    feishu_redirect_uri: str | None = Field(default=None, alias="FEISHU_REDIRECT_URI")
+    feishu_auth_url: str = Field(
+        default="https://accounts.feishu.cn/open-apis/authen/v1/authorize",
+        alias="FEISHU_AUTH_URL",
+    )
+    feishu_token_url: str = Field(
+        default="https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+        alias="FEISHU_TOKEN_URL",
+    )
+    feishu_user_info_url: str = Field(
+        default="https://open.feishu.cn/open-apis/authen/v1/user_info",
+        alias="FEISHU_USER_INFO_URL",
+    )
+    feishu_allowed_tenant: str | None = Field(default=None, alias="FEISHU_ALLOWED_TENANT")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
