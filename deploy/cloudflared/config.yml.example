@@ -1,0 +1,9 @@
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: /home/zhangyh/llm_wiki_internal_pilot/runtime/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: research.example.com
+    service: http://127.0.0.1:8001
+    originRequest:
+      connectTimeout: 10s
+  - service: http_status:404

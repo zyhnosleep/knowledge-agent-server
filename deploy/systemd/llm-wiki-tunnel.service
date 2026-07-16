@@ -1,0 +1,14 @@
+[Unit]
+Description=Named Cloudflare Tunnel for the knowledge-base pilot
+After=network-online.target llm-wiki-pilot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/local/bin/cloudflared tunnel --config %h/llm_wiki_internal_pilot/runtime/cloudflared/config.yml run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
