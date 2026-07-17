@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -168,6 +169,36 @@ def test_manual_deep_mode_is_recorded_and_passed_to_synthesis() -> None:
     assert route_step.metadata["inference_model"] == "qwen3.6:27b"
     assert captured["context_length"] == 32768
     assert response.answer_model == "qwen3.6:27b"
+
+
+def test_generation_is_wrapped_in_selected_model_lease() -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    executor = make_executor(db, rag_answer_text="test answer")
+    events: list[str] = []
+
+    class RecordingRuntime:
+        @contextmanager
+        def acquire(self, profile, **kwargs):
+            events.append(f"acquire:{profile}")
+            try:
+                yield
+            finally:
+                events.append(f"release:{profile}")
+
+    executor._model_runtime = RecordingRuntime()
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="hello",
+            session_id="leased-session",
+            answer_mode="fast",
+        )
+    )
+
+    assert response.status == "completed"
+    assert events == ["acquire:fast", "release:fast"]
 
 
 def test_concurrent_sessions_release_initial_write_transaction(tmp_path) -> None:

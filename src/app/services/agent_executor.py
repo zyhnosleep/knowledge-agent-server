@@ -25,6 +25,7 @@ from app.services.agent_model_router import AgentModelRouter, InferenceTarget
 from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
+from app.services.model_runtime import ModelRuntime, get_model_runtime
 from app.services.rag_adapter import RAGAdapter, _INSUFFICIENT_EVIDENCE_RE
 from app.services.session_attachments import retrieve_session_attachment_evidence
 from app.services.tool_registry import ToolRegistry
@@ -61,6 +62,7 @@ class AgentExecutor:
         db: Session,
         trace_store: AgentTraceStore | None = None,
         synthesizer: AgentSynthesizer | None = None,
+        model_runtime: ModelRuntime | None = None,
     ) -> None:
         self._rag = rag
         self._tools = tools
@@ -68,6 +70,7 @@ class AgentExecutor:
         self._db = db
         self._trace_store = trace_store
         self._synthesizer = synthesizer
+        self._model_runtime = model_runtime or get_model_runtime()
 
     # ------------------------------------------------------------------
     # public API
@@ -1066,10 +1069,17 @@ class AgentExecutor:
         if target is not None:
             tool_args["target"] = asdict(target)
 
-        synth_result = self._tools.call_tool(
-            "answer.synthesize",
-            tool_args,
-        )
+        if target is not None and target.profile in {"fast", "deep"}:
+            with self._model_runtime.acquire(target.profile):
+                synth_result = self._tools.call_tool(
+                    "answer.synthesize",
+                    tool_args,
+                )
+        else:
+            synth_result = self._tools.call_tool(
+                "answer.synthesize",
+                tool_args,
+            )
         latency = int((time.monotonic() - t0) * 1000)
         usage.tool_calls += 1
 
