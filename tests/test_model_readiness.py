@@ -15,7 +15,7 @@ class FakeResponse:
         return {"models": [{"model": model} for model in self._models]}
 
 
-def test_readiness_treats_available_unloaded_models_as_healthy_idle(monkeypatch) -> None:
+def test_readiness_treats_available_unloaded_embedding_as_healthy_idle(monkeypatch) -> None:
     calls: list[str] = []
 
     class FakeClient:
@@ -30,16 +30,14 @@ def test_readiness_treats_available_unloaded_models_as_healthy_idle(monkeypatch)
 
         def get(self, url):
             calls.append(url)
-            if "11435" in url and url.endswith("/api/tags"):
-                return FakeResponse(["qwen3:14b", "qwen3-embedding:8b"])
-            if "11435" in url:
-                return FakeResponse(["qwen3:14b"])
-            return FakeResponse(["qwen3.6:27b"])
+            if url.endswith("/api/tags"):
+                return FakeResponse(["qwen3.5:9b", "qwen3-embedding:4b"])
+            return FakeResponse(["qwen3.5:9b"])
 
     monkeypatch.setattr("app.services.model_readiness.httpx.Client", FakeClient)
     settings = Settings(
-        OLLAMA_FAST_BASE_URL="http://127.0.0.1:11435",
-        OLLAMA_DEEP_BASE_URL="http://127.0.0.1:11436",
+        OLLAMA_GENERATION_BASE_URL="http://127.0.0.1:11435",
+        OLLAMA_EMBEDDING_BASE_URL="http://127.0.0.1:11435",
     )
     readiness = ModelReadiness(settings, cache_seconds=30)
 
@@ -47,11 +45,11 @@ def test_readiness_treats_available_unloaded_models_as_healthy_idle(monkeypatch)
     second = readiness.check()
 
     assert first["status"] == "ok"
-    assert first["models"]["fast"]["status"] == "ready"
-    assert first["models"]["deep"]["status"] == "ready"
+    assert set(first["models"]) == {"generation", "embedding"}
+    assert first["models"]["generation"]["status"] == "ready"
     assert first["models"]["embedding"]["status"] == "idle"
     assert second == first
-    assert len(calls) == 4
+    assert len(calls) == 2
 
 
 def test_readiness_still_degrades_when_a_configured_model_is_missing(monkeypatch) -> None:
@@ -66,10 +64,8 @@ def test_readiness_still_degrades_when_a_configured_model_is_missing(monkeypatch
             return None
 
         def get(self, url):
-            if url.endswith("/api/tags") and "11435" in url:
-                return FakeResponse(["qwen3:14b"])
             if url.endswith("/api/tags"):
-                return FakeResponse(["qwen3.6:27b"])
+                return FakeResponse(["qwen3.5:9b"])
             return FakeResponse([])
 
     monkeypatch.setattr("app.services.model_readiness.httpx.Client", FakeClient)

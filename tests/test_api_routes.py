@@ -61,17 +61,15 @@ def test_health_distinguishes_api_and_model_readiness(monkeypatch) -> None:
             return {
                 "status": "ok",
                 "models": {
-                    "fast": {"status": "ready", "model": "qwen3:14b", "context_length": 16384},
-                    "deep": {"status": "idle", "model": "qwen3.6:27b", "context_length": 32768},
-                    "embedding": {"status": "ready", "model": "qwen3-embedding:8b", "dimensions": 4096},
+                    "generation": {"status": "idle", "model": "qwen3.5:9b", "context_length": 32768},
+                    "embedding": {"status": "ready", "model": "qwen3-embedding:4b", "dimensions": 2560},
                 },
             }
 
     class FakeRuntime:
         def snapshot(self):
             return {
-                "fast": {"capacity": 1, "active": 0, "queued": 0},
-                "deep": {"capacity": 1, "active": 1, "queued": 2},
+                "generation": {"capacity": 1, "active": 1, "queued": 2},
             }
 
     monkeypatch.setattr(routes, "get_model_readiness", lambda: FakeReadiness())
@@ -81,8 +79,9 @@ def test_health_distinguishes_api_and_model_readiness(monkeypatch) -> None:
 
     assert payload["api_status"] == "ok"
     assert payload["status"] == "ok"
-    assert payload["models"]["deep"]["status"] == "idle"
-    assert payload["queues"]["deep"]["queued"] == 2
+    assert set(payload["models"]) == {"generation", "embedding"}
+    assert payload["models"]["generation"]["status"] == "idle"
+    assert payload["queues"]["generation"]["queued"] == 2
 
 
 def test_list_endpoints_apply_limit_and_offset() -> None:

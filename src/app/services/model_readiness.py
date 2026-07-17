@@ -38,21 +38,15 @@ class ModelReadiness:
             return result
 
     def _probe(self) -> dict[str, Any]:
-        fast = self._probe_endpoint(self._settings.ollama_fast_base_url)
-        deep = self._probe_endpoint(self._settings.ollama_deep_base_url)
+        runtime = self._probe_endpoint(self._settings.ollama_generation_base_url)
         profiles = {
-            "fast": self._model_status(
-                fast,
-                self._settings.ollama_fast_model,
-                context_length=self._settings.ollama_fast_context_length,
-            ),
-            "deep": self._model_status(
-                deep,
-                self._settings.ollama_deep_model,
-                context_length=self._settings.ollama_deep_context_length,
+            "generation": self._model_status(
+                runtime,
+                self._settings.ollama_generation_model,
+                context_length=self._settings.ollama_generation_context_length,
             ),
             "embedding": self._model_status(
-                fast,
+                runtime,
                 self._settings.ollama_embedding_model,
                 dimensions=self._settings.ollama_embedding_dimensions,
             ),
