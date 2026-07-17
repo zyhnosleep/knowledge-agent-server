@@ -255,9 +255,8 @@ git commit -m "Migrate document embeddings to 2560 dimensions"
 
 **Files:**
 - Create: `scripts/build_retrieval_acceptance.py`
-- Create: `benchmarks/query/knowledge_agent_retrieval_v1.json`
 - Create: `tests/test_retrieval_acceptance.py`
-- Modify: `docs/query_acceptance/internal_research_v1.md`
+- Server runtime create: `runtime/acceptance/knowledge_agent_retrieval_v1.json` (contains internal document metadata; do not commit)
 
 - [ ] **Step 1: 写失败测试定义可重复报告格式**
 
@@ -282,7 +281,7 @@ Expected: PASS。
 - [ ] **Step 5: 提交验收工具**
 
 ```bash
-git add scripts/build_retrieval_acceptance.py benchmarks/query/knowledge_agent_retrieval_v1.json tests/test_retrieval_acceptance.py docs/query_acceptance/internal_research_v1.md
+git add scripts/build_retrieval_acceptance.py tests/test_retrieval_acceptance.py docs/superpowers/plans/2026-07-17-knowledge-agent-environment-isolation.md
 git commit -m "Add fixed Knowledge Agent retrieval acceptance"
 ```
 
