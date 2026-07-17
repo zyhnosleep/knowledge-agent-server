@@ -1094,6 +1094,49 @@
         padding: 0 8px;
       }
 
+      .answer-mode-row,
+      .queue-choice {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 6px;
+      }
+
+      .answer-mode-control {
+        display: inline-flex;
+        gap: 3px;
+        padding: 3px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgb(10 17 25 / 72%);
+      }
+
+      .answer-mode-control button,
+      .queue-choice button,
+      .stop-generation {
+        min-height: 30px;
+        padding: 0 11px;
+        border: 1px solid transparent;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .answer-mode-control button[aria-pressed="true"] {
+        border-color: #607080;
+        background: #263544;
+        color: var(--paper-100);
+        box-shadow: 0 0 18px rgb(77 141 255 / 18%);
+      }
+
+      .mode-description { color: var(--faint); font-size: 11px; }
+      .stop-generation { margin-left: auto; border-color: #6c3c42; color: #ff9da8; }
+      .queue-choice { padding: 9px 12px; border: 1px solid #6f5b2d; border-radius: 9px; background: #292416; color: #e8c97a; font-size: 12px; }
+      .queue-choice[hidden], .stop-generation[hidden] { display: none; }
+      .queue-choice button { border-color: #806d38; color: #f1d98d; }
+
       .composer-box {
         min-height: 150px;
         display: grid;
@@ -1698,6 +1741,20 @@
           </div>
           <div class="composer">
             <div class="attachment-bar" id="attachmentBar" hidden></div>
+            <div class="answer-mode-row">
+              <div class="answer-mode-control" id="answerModeControl" role="group" aria-label="回答模式">
+                <button type="button" data-answer-mode="auto" aria-pressed="true">自动</button>
+                <button type="button" data-answer-mode="fast" aria-pressed="false">快速</button>
+                <button type="button" data-answer-mode="deep" aria-pressed="false">深度</button>
+              </div>
+              <span class="mode-description" id="answerModeDescription">自动选择 14B 或 27B</span>
+              <button class="stop-generation" id="stopGenerationButton" type="button" hidden>停止生成</button>
+            </div>
+            <div class="queue-choice" id="queueChoice" hidden aria-live="polite">
+              <span id="queueMessage">深度模型正在排队</span>
+              <button type="button" id="continueQueueButton">继续等待</button>
+              <button type="button" id="switchFastButton">切换快速</button>
+            </div>
             <form class="composer-box" id="queryForm">
               <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件" aria-label="添加临时文件">⌕</button>
               <textarea id="questionInput" rows="1" aria-label="输入问题" placeholder="询问论文、附件或研究项目…"></textarea>
@@ -1849,6 +1906,10 @@
       var projects = [];
       var activeAttachments = [];
       var currentSessions = [];
+      var activeAnswerMode = "auto";
+      var activeAgentAbortController = null;
+      var pendingFastSwitch = false;
+      var activeQueuedQuestion = null;
       var PROJECT_STORAGE_KEY = "night-research-active-project";
 
       function makeSessionId() {
@@ -1857,6 +1918,31 @@
 
       function $(id) {
         return document.getElementById(id);
+      }
+
+      function setAnswerMode(mode) {
+        if (["auto", "fast", "deep"].indexOf(mode) < 0) mode = "auto";
+        activeAnswerMode = mode;
+        var descriptions = {
+          auto: "自动选择 14B 或 27B",
+          fast: "14B · 更快响应 · 16K 上下文",
+          deep: "27B · 复杂证据 · 32K 上下文"
+        };
+        document.querySelectorAll("[data-answer-mode]").forEach(function (button) {
+          button.setAttribute("aria-pressed", button.dataset.answerMode === mode ? "true" : "false");
+        });
+        if ($("answerModeDescription")) $("answerModeDescription").textContent = descriptions[mode];
+      }
+
+      function setQueueChoice(data) {
+        var panel = $("queueChoice");
+        if (!panel) return;
+        panel.hidden = !data;
+        if (data) {
+          var model = data.model || "27B";
+          var position = data.position ? "，前方 " + data.position + " 个请求" : "";
+          $("queueMessage").textContent = model + " 正在排队" + position;
+        }
       }
 
       function setView(name, options) {
@@ -2082,6 +2168,8 @@
         if (view) view.classList.toggle("researching", !!active);
         if ($("sendButton")) $("sendButton").textContent = active ? "···" : "→";
         if ($("composerHint")) $("composerHint").textContent = active ? "正在检索、阅读并组织证据…" : "可尝试：“比较不同力场的适用范围”";
+        if ($("stopGenerationButton")) $("stopGenerationButton").hidden = !active;
+        if (!active) setQueueChoice(null);
       }
 
       function showAnswer(meta, text, citations) {
@@ -2150,14 +2238,18 @@
         return event.name ? event : null;
       }
 
-      function runAgent(question) {
+      function runAgent(question, options) {
+        options = options || {};
         var sessionId = activeSessionId || makeSessionId();
         activeSessionId = sessionId;
-        appendMessage("user", question);
+        if (!options.reuseUserMessage) appendMessage("user", question);
+        activeQueuedQuestion = question;
+        activeAgentAbortController = new AbortController();
         var payload = {
           project_slug: activeProjectSlug,
           query: question,
           session_id: sessionId,
+          answer_mode: activeAnswerMode,
           constraints: { max_steps: 8, max_tool_calls: 5, budget_tokens: 20000, timeout_seconds: 180 }
         };
         if (activeDocumentId) {
@@ -2166,13 +2258,17 @@
         return fetch("/api/agent/query/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(payload),
+          signal: activeAgentAbortController.signal
         }).then(function (response) {
           if (!response.ok || !response.body) throw new Error("Agent stream failed");
           var reader = response.body.getReader();
           var decoder = new TextDecoder();
           var buffer = "";
           var finalData = null;
+          var streamedAnswer = "";
+          var streamedCitations = [];
+          var streamMeta = [];
           clearThinking();
           showAnswer([], "正在分析...");
 
@@ -2188,10 +2284,28 @@
                 if (event.name === "start") {
                   showAnswer([], "正在分析...");
                 }
+                if (event.name === "route") {
+                  var routeMeta = event.data && event.data.metadata ? event.data.metadata : {};
+                  streamMeta = [routeMeta.inference_profile || activeAnswerMode, routeMeta.inference_model || "路由完成"];
+                  appendThinking(event.data && event.data.summary ? event.data.summary : "已选择回答模型", "route");
+                }
                 if (event.name === "step") {
                   var tool = event.data && event.data.tool_name ? event.data.tool_name : "step";
                   var summary = event.data && event.data.summary ? event.data.summary : "正在执行工具与检索...";
                   appendThinking(summary, tool);
+                }
+                if (event.name === "queue") {
+                  setQueueChoice(event.data || {});
+                }
+                if (event.name === "token") {
+                  setQueueChoice(null);
+                  streamedAnswer += event.data && event.data.delta ? event.data.delta : "";
+                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
+                }
+                if (event.name === "citation") {
+                  var citationIndex = event.data && Number.isInteger(event.data.index) ? event.data.index : streamedCitations.length;
+                  streamedCitations[citationIndex] = event.data;
+                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
                 }
                 if (event.name === "final") finalData = event.data;
                 if (event.name === "error") {
@@ -2215,14 +2329,33 @@
               });
             }
             var citations = data && Array.isArray(data.citations) ? data.citations : [];
-            showAnswer([], answer, citations);
-            appendMessage("agent", answer, null, citations);
+            var modelMeta = data && data.model ? [data.model] : streamMeta;
+            showAnswer(modelMeta, answer, citations);
+            appendMessage("agent", answer, data && data.model ? data.model : null, citations);
             if (data && data.session_id) {
               activeSessionId = data.session_id;
               loadAgentSessions();
               loadSessionAttachments();
             }
           });
+        }).catch(function (error) {
+          if (error && error.name === "AbortError") {
+            if (pendingFastSwitch) {
+              pendingFastSwitch = false;
+              setAnswerMode("fast");
+              setQueueChoice(null);
+              return runAgent(question, { reuseUserMessage: true });
+            }
+            if (streamedAnswer) {
+              showAnswer(streamMeta.concat(["已停止 · 内容不完整"]), streamedAnswer, streamedCitations.filter(Boolean));
+            }
+            return;
+          }
+          throw error;
+        }).finally(function () {
+          activeAgentAbortController = null;
+          activeQueuedQuestion = null;
+          setQueueChoice(null);
         });
       }
 
@@ -2984,6 +3117,7 @@
         var documentId = activeDocumentId;
         var documentTitle = activeDocumentTitle;
         activeSessionId = null;
+        setAnswerMode("auto");
         activeAttachments = [];
         activeDocumentId = preserveDocumentScope ? documentId : null;
         activeDocumentTitle = preserveDocumentScope ? documentTitle : null;
@@ -2995,6 +3129,7 @@
       }
 
       function restoreSessionScope(session) {
+        setAnswerMode(session.answer_mode || "auto");
         if (session.project_slug && session.project_slug !== activeProjectSlug) {
           activeProjectSlug = session.project_slug;
           activeProjectName = session.project_slug;
@@ -3133,6 +3268,29 @@
         startNewChat();
         setView("chat", { skipSessionLoad: true });
       });
+
+      document.querySelectorAll("[data-answer-mode]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          setAnswerMode(button.dataset.answerMode);
+        });
+      });
+
+      $("continueQueueButton").addEventListener("click", function () {
+        setQueueChoice(null);
+      });
+
+      $("switchFastButton").addEventListener("click", function () {
+        if (!activeAgentAbortController || !activeQueuedQuestion) return;
+        pendingFastSwitch = true;
+        activeAgentAbortController.abort();
+      });
+
+      $("stopGenerationButton").addEventListener("click", function () {
+        pendingFastSwitch = false;
+        if (activeAgentAbortController) activeAgentAbortController.abort();
+      });
+
+      setAnswerMode("auto");
 
       $("attachmentButton").addEventListener("click", function () {
         $("attachmentInput").click();
