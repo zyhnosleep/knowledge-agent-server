@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -84,6 +86,94 @@ class AgentSynthesizer:
             evidence_pack=evidence_pack,
         )
 
+    def synthesize_stream(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str = "",
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
+        target: InferenceTarget | None = None,
+        event_sink: Callable[[str, dict[str, Any]], None],
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Stream local Ollama deltas while assembling the normal result shape."""
+        resolved_target = target or self._default_target()
+        if self._resolve_provider() != "local":
+            result = self.synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                target=resolved_target,
+            )
+            self._emit_citations(result, citations, event_sink)
+            return result
+
+        if not citations and not (evidence_pack or {}).get("items"):
+            return self._local_fallback(rag_answer, citations)
+
+        messages = self._build_local_messages(
+            query=query,
+            route=route,
+            conversation_summary=conversation_summary,
+            rag_answer=rag_answer,
+            citations=citations,
+            evidence_pack=evidence_pack,
+        )
+        ollama = self._ollama or OllamaClient(
+            base_url=resolved_target.base_url,
+            embedding_base_url=self._settings.ollama_embedding_base_url,
+        )
+        chunks: list[str] = []
+        model = resolved_target.model
+        try:
+            for generated in ollama.stream_chat(
+                messages=messages,
+                model=resolved_target.model,
+                context_length=resolved_target.context_length,
+                max_output_tokens=768,
+                cancel_event=cancel_event,
+            ):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Local Ollama synthesis cancelled")
+                delta = str(generated.get("content") or "")
+                model = str(generated.get("model") or model)
+                if delta:
+                    chunks.append(delta)
+                    event_sink("token", {"delta": delta, "model": model})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Streaming local Ollama synthesis failed: %s", exc)
+            result = self._local_fallback(rag_answer, citations)
+            result["warnings"].append(
+                f"Local Ollama synthesis failed; using evidence fallback: {exc}"
+            )
+            return result
+
+        answer_markdown = "".join(chunks).strip()
+        if not answer_markdown:
+            result = self._local_fallback(rag_answer, citations)
+            result["warnings"].append(
+                "Local Ollama synthesis returned an empty answer; using evidence fallback."
+            )
+            return result
+
+        cited_indexes = self._extract_cited_indexes(answer_markdown, len(citations))
+        result = {
+            "answer_markdown": answer_markdown,
+            "cited_indexes": cited_indexes,
+            "warnings": [],
+            "confidence": 1.0,
+            "provider": "local",
+            "model": model,
+        }
+        self._emit_citations(result, citations, event_sink)
+        return result
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
@@ -137,36 +227,14 @@ class AgentSynthesizer:
         if not citations and not (evidence_pack or {}).get("items"):
             return self._local_fallback(rag_answer, citations)
 
-        evidence_parts: list[str] = []
-        for index, citation in enumerate(citations):
-            excerpt = str(citation.get("excerpt") or "").strip()
-            title = citation.get("page_title") or citation.get("document_id") or "untitled"
-            if excerpt:
-                evidence_parts.append(f"[{index}] {title}: {excerpt}")
-        evidence_text = "\n\n".join(evidence_parts) or "(no citation excerpts)"
-        evidence_pack_text = self._format_evidence_pack_section(evidence_pack)
-
-        system_prompt = (
-            "You are an evidence-grounded knowledge-base assistant. Answer the user's "
-            "question in the user's language by synthesizing the supplied evidence. "
-            "Do not merely repeat the RAG draft. Do not add facts that are absent from "
-            "the evidence. Cite supported statements with the supplied zero-based "
-            "citation indexes, such as [0]. If evidence is insufficient, say exactly "
-            "what cannot be established."
+        messages = self._build_local_messages(
+            query=query,
+            route=route,
+            conversation_summary=conversation_summary,
+            rag_answer=rag_answer,
+            citations=citations,
+            evidence_pack=evidence_pack,
         )
-        user_prompt = (
-            f"User question: {query}\n"
-            f"Route type: {route}\n"
-            f"Conversation context: {conversation_summary or '(none)'}\n\n"
-            f"RAG draft:\n{rag_answer}\n\n"
-            f"Citation excerpts:\n{evidence_text}\n\n"
-            + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
-            + "Return a concise final answer grounded only in this evidence."
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
         ollama = self._ollama or OllamaClient(
             base_url=target.base_url,
             embedding_base_url=self._settings.ollama_embedding_base_url,
@@ -195,22 +263,77 @@ class AgentSynthesizer:
             )
             return result
 
-        max_index = len(citations)
-        cited_indexes = list(
+        return {
+            "answer_markdown": answer_markdown,
+            "cited_indexes": self._extract_cited_indexes(
+                answer_markdown, len(citations)
+            ),
+            "warnings": [],
+            "confidence": 1.0,
+            "provider": "local",
+            "model": str(generated.get("model") or target.model),
+        }
+
+    def _build_local_messages(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        evidence_parts: list[str] = []
+        for index, citation in enumerate(citations):
+            excerpt = str(citation.get("excerpt") or "").strip()
+            title = citation.get("page_title") or citation.get("document_id") or "untitled"
+            if excerpt:
+                evidence_parts.append(f"[{index}] {title}: {excerpt}")
+        evidence_text = "\n\n".join(evidence_parts) or "(no citation excerpts)"
+        evidence_pack_text = self._format_evidence_pack_section(evidence_pack)
+
+        system_prompt = (
+            "You are an evidence-grounded knowledge-base assistant. Answer the user's "
+            "question in the user's language by synthesizing the supplied evidence. "
+            "Do not merely repeat the RAG draft. Do not add facts that are absent from "
+            "the evidence. Cite supported statements with the supplied zero-based "
+            "citation indexes, such as [0]. If evidence is insufficient, say exactly "
+            "what cannot be established."
+        )
+        user_prompt = (
+            f"User question: {query}\n"
+            f"Route type: {route}\n"
+            f"Conversation context: {conversation_summary or '(none)'}\n\n"
+            f"RAG draft:\n{rag_answer}\n\n"
+            f"Citation excerpts:\n{evidence_text}\n\n"
+            + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + "Return a concise final answer grounded only in this evidence."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    @staticmethod
+    def _extract_cited_indexes(answer_markdown: str, max_index: int) -> list[int]:
+        return list(
             dict.fromkeys(
                 int(index)
                 for index in re.findall(r"\[(\d+)\]", answer_markdown)
                 if 0 <= int(index) < max_index
             )
         )
-        return {
-            "answer_markdown": answer_markdown,
-            "cited_indexes": cited_indexes,
-            "warnings": [],
-            "confidence": 1.0,
-            "provider": "local",
-            "model": str(generated.get("model") or target.model),
-        }
+
+    @staticmethod
+    def _emit_citations(
+        result: dict[str, Any],
+        citations: list[dict[str, Any]],
+        event_sink: Callable[[str, dict[str, Any]], None],
+    ) -> None:
+        for index in result.get("cited_indexes", []):
+            if isinstance(index, int) and 0 <= index < len(citations):
+                event_sink("citation", {"index": index, **citations[index]})
 
     def _default_target(self) -> InferenceTarget:
         """Provide a backward-compatible fast target for direct callers."""

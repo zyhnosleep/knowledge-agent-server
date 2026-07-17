@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
@@ -34,6 +36,20 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+class _EventStepList(list[AgentStep]):
+    """List that forwards completed trace steps to a live event sink."""
+
+    def __init__(self, event_sink: Callable[[str, dict[str, Any]], None] | None):
+        super().__init__()
+        self._event_sink = event_sink
+
+    def append(self, step: AgentStep) -> None:
+        super().append(step)
+        if self._event_sink is not None:
+            event_name = "route" if step.step_type == "route" else "step"
+            self._event_sink(event_name, step.model_dump())
+
+
 class AgentExecutor:
     """Orchestrates a single-turn Agent query using read-only RAG.
 
@@ -63,6 +79,8 @@ class AgentExecutor:
         trace_store: AgentTraceStore | None = None,
         synthesizer: AgentSynthesizer | None = None,
         model_runtime: ModelRuntime | None = None,
+        event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self._rag = rag
         self._tools = tools
@@ -71,6 +89,8 @@ class AgentExecutor:
         self._trace_store = trace_store
         self._synthesizer = synthesizer
         self._model_runtime = model_runtime or get_model_runtime()
+        self._event_sink = event_sink
+        self._cancel_event = cancel_event
 
     # ------------------------------------------------------------------
     # public API
@@ -85,7 +105,7 @@ class AgentExecutor:
         request_id = str(uuid4())
         session_id = request.session_id or f"sess_{uuid4().hex[:12]}"
         constraints = request.constraints
-        steps: list[AgentStep] = []
+        steps: list[AgentStep] = _EventStepList(self._event_sink)
         usage = AgentUsage()
         warnings: list[str] = []
         t_start = time.monotonic()
@@ -1070,15 +1090,27 @@ class AgentExecutor:
             tool_args["target"] = asdict(target)
 
         if target is not None and target.profile in {"fast", "deep"}:
-            with self._model_runtime.acquire(target.profile):
+            with self._model_runtime.acquire(
+                target.profile,
+                on_queue=lambda position: self._emit_queue_event(position, target),
+                cancel_event=self._cancel_event,
+            ):
                 synth_result = self._tools.call_tool(
                     "answer.synthesize",
                     tool_args,
+                    ctx={
+                        "event_sink": self._event_sink,
+                        "cancel_event": self._cancel_event,
+                    },
                 )
         else:
             synth_result = self._tools.call_tool(
                 "answer.synthesize",
                 tool_args,
+                ctx={
+                    "event_sink": self._event_sink,
+                    "cancel_event": self._cancel_event,
+                },
             )
         latency = int((time.monotonic() - t0) * 1000)
         usage.tool_calls += 1
@@ -1137,6 +1169,17 @@ class AgentExecutor:
 
         steps.append(step)
         return synth_result
+
+    def _emit_queue_event(self, position: int, target: InferenceTarget) -> None:
+        if self._event_sink is not None:
+            self._event_sink(
+                "queue",
+                {
+                    "position": position,
+                    "profile": target.profile,
+                    "model": target.model,
+                },
+            )
 
     def _build_conversation_summary(self, session_id: str) -> str:
         """Build a brief text summary of recent conversation turns."""

@@ -155,6 +155,66 @@ def test_stream_has_expected_event_names(monkeypatch) -> None:
     assert "done" in event_names, f"Missing 'done' event in {event_names}"
 
 
+def test_stream_emits_live_route_tokens_and_citations_in_order(monkeypatch) -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+
+    from app.schemas.common import Citation, QueryResponse
+
+    monkeypatch.setattr(
+        "app.services.rag_adapter.RAGAdapter.answer",
+        lambda self, db, project_slug, question, document_id=None: QueryResponse(
+            answer_markdown="draft",
+            citations=[
+                Citation(
+                    document_id="d1",
+                    chunk_id="c1",
+                    score=0.9,
+                    excerpt="evidence",
+                )
+            ],
+            verification_status="local-only",
+        ),
+    )
+
+    def fake_stream(self, *, event_sink, cancel_event=None, **kwargs):
+        event_sink("token", {"delta": "流", "model": kwargs["target"].model})
+        event_sink("token", {"delta": "式", "model": kwargs["target"].model})
+        event_sink("citation", {"index": 0, **kwargs["citations"][0]})
+        return {
+            "answer_markdown": "流式 [0]",
+            "cited_indexes": [0],
+            "warnings": [],
+            "confidence": 1.0,
+            "provider": "local",
+            "model": kwargs["target"].model,
+        }
+
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.AgentSynthesizer.synthesize_stream",
+        fake_stream,
+        raising=False,
+    )
+
+    events = _parse_sse_events(
+        make_client(db).post(
+            "/api/agent/query/stream",
+            json={
+                "project_slug": "demo",
+                "query": "hello?",
+                "answer_mode": "fast",
+            },
+        ).text
+    )
+    names = [event["event"] for event in events]
+
+    assert names.count("token") == 2
+    assert names.index("route") < names.index("token")
+    assert names.index("token") < names.index("citation")
+    assert names.index("citation") < names.index("final") < names.index("done")
+
+
 def test_stream_error_path_emits_error_then_done(monkeypatch) -> None:
     """When AgentExecutor raises, the stream emits error then done."""
     db = make_session()

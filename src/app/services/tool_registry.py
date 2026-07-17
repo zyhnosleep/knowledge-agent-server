@@ -277,7 +277,7 @@ class ToolRegistry:
                 side_effect_level="none",
                 timeout_ms=120000,
             ),
-            lambda args, ctx: _answer_synthesize_handler(args, synthesizer),
+            lambda args, ctx: _answer_synthesize_handler(args, synthesizer, ctx),
         )
 
         # ---- answer.verify ----
@@ -430,7 +430,9 @@ def _answer_verify_handler(
 
 
 def _answer_synthesize_handler(
-    args: dict[str, Any], synthesizer: Any | None = None
+    args: dict[str, Any],
+    synthesizer: Any | None = None,
+    ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Call AgentSynthesizer.synthesize and return the result dict."""
     from app.services.agent_synthesizer import AgentSynthesizer
@@ -439,7 +441,7 @@ def _answer_synthesize_handler(
     synthesizer = synthesizer or AgentSynthesizer()
     raw_target = args.get("target")
     target = InferenceTarget(**raw_target) if isinstance(raw_target, dict) else None
-    return synthesizer.synthesize(
+    kwargs = dict(
         query=args.get("query", ""),
         route=args.get("route", "simple_rag"),
         conversation_summary=args.get("conversation_summary", ""),
@@ -448,3 +450,12 @@ def _answer_synthesize_handler(
         evidence_pack=args.get("evidence_pack"),
         target=target,
     )
+    ctx = ctx or {}
+    event_sink = ctx.get("event_sink")
+    if event_sink is not None and hasattr(synthesizer, "synthesize_stream"):
+        return synthesizer.synthesize_stream(
+            **kwargs,
+            event_sink=event_sink,
+            cancel_event=ctx.get("cancel_event"),
+        )
+    return synthesizer.synthesize(**kwargs)

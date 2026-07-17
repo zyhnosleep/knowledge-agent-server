@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+from collections.abc import Callable
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -44,7 +46,13 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-def _build_executor(db: Session, owner_user_id: str | None = None) -> AgentExecutor:
+def _build_executor(
+    db: Session,
+    owner_user_id: str | None = None,
+    *,
+    event_sink: Callable[[str, dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> AgentExecutor:
     """Create an AgentExecutor with all standard dependencies."""
     rag = RAGAdapter()
     synthesizer = AgentSynthesizer()
@@ -55,6 +63,7 @@ def _build_executor(db: Session, owner_user_id: str | None = None) -> AgentExecu
     return AgentExecutor(
         rag=rag, tools=tools, memory=memory, db=db,
         trace_store=trace_store, synthesizer=synthesizer,
+        event_sink=event_sink, cancel_event=cancel_event,
     )
 
 
@@ -192,6 +201,8 @@ def _run_executor_in_thread(
     session_factory: sessionmaker,
     payload: AgentQueryRequest,
     owner_user_id: str | None,
+    event_sink: Callable[[str, dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[AgentQueryResponse, str | None]:
     """Run the blocking AgentExecutor in a worker thread with its own session.
 
@@ -202,9 +213,18 @@ def _run_executor_in_thread(
     db = session_factory()
     try:
         executor = (
-            _build_executor(db, owner_user_id)
+            _build_executor(
+                db,
+                owner_user_id,
+                event_sink=event_sink,
+                cancel_event=cancel_event,
+            )
             if owner_user_id is not None
-            else _build_executor(db)
+            else _build_executor(
+                db,
+                event_sink=event_sink,
+                cancel_event=cancel_event,
+            )
         )
         response = executor.execute(payload)
         try:
@@ -232,9 +252,9 @@ async def agent_query_stream(
     Returns ``text/event-stream``.  Events: start, heartbeat, step,
     warning, final, error, done.
 
-    The synchronous ``AgentExecutor`` runs via ``asyncio.to_thread`` so
-    concurrent stream requests overlap instead of serializing on the
-    event loop.
+    A worker thread publishes live executor/model events through an
+    asyncio queue while the async generator handles heartbeats and
+    disconnect cancellation.
     """
     if not settings.agent_enabled:
         raise HTTPException(
@@ -257,26 +277,60 @@ async def agent_query_stream(
     SessionFactory = sessionmaker(bind=bind, autoflush=False, autocommit=False, future=True)
 
     async def event_generator():
-        try:
-            yield _sse_event("start", {"status": "processing"})
+        cancellation = threading.Event()
+        event_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
 
-            # Emit a heartbeat before the synchronous executor call so
-            # frontends can confirm the stream is alive even when the
-            # executor blocks for a while.
-            yield _sse_heartbeat()
-
-            # Run the blocking executor off the event loop so concurrent
-            # requests overlap instead of serializing.
-            response, persist_error = await asyncio.to_thread(
-                _run_executor_in_thread,
-                SessionFactory,
-                _apply_server_constraint_defaults(payload),
-                current_user.id if current_user else None,
+        def publish(event_name: str, data: dict) -> None:
+            loop.call_soon_threadsafe(
+                event_queue.put_nowait, (event_name, data)
             )
 
-            # Emit each step as it's available
-            for step in response.steps:
-                yield _sse_event("step", step.model_dump())
+        async def run_worker():
+            try:
+                return await asyncio.to_thread(
+                    _run_executor_in_thread,
+                    SessionFactory,
+                    _apply_server_constraint_defaults(payload),
+                    current_user.id if current_user else None,
+                    publish,
+                    cancellation,
+                )
+            finally:
+                await event_queue.put(("__worker_done__", {}))
+
+        try:
+            yield _sse_event("start", {"status": "processing"})
+            yield _sse_heartbeat()
+
+            worker = asyncio.create_task(run_worker())
+            disconnected = False
+            while True:
+                if await request.is_disconnected():
+                    disconnected = True
+                    cancellation.set()
+                    break
+                try:
+                    event_name, data = await asyncio.wait_for(
+                        event_queue.get(),
+                        timeout=settings.agent_stream_heartbeat_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    yield _sse_heartbeat()
+                    continue
+                if event_name == "__worker_done__":
+                    break
+                yield _sse_event(event_name, data)
+
+            if disconnected:
+                cancellation.set()
+                try:
+                    await asyncio.wait_for(worker, timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                return
+
+            response, persist_error = await worker
 
             # Emit warnings
             for warning in response.warnings:

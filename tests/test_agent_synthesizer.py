@@ -26,6 +26,15 @@ class FakeOllamaClient:
     def generate_structured(self, *args, **kwargs):
         raise AssertionError("Local synthesis must not request structured JSON")
 
+    def stream_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        text = self.result["answer_markdown"]
+        midpoint = max(1, len(text) // 2)
+        yield {"content": text[:midpoint], "model": kwargs["model"], "done": False}
+        yield {"content": text[midpoint:], "model": kwargs["model"], "done": True}
+
 
 def _fast_target() -> InferenceTarget:
     return InferenceTarget(
@@ -112,6 +121,27 @@ def test_synthesize_deep_target_calls_27b_once_as_plain_markdown(monkeypatch) ->
     assert ollama.calls[0]["model"] == "qwen3.6:27b"
     assert ollama.calls[0]["context_length"] == 32768
     assert result["model"] == "qwen3.6:27b"
+
+
+def test_synthesize_stream_forwards_tokens_then_citation(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient(result=_local_result()))
+    events: list[tuple[str, dict]] = []
+
+    result = syn.synthesize_stream(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Draft",
+        citations=[{"document_id": "d1", "excerpt": "entropy evidence"}],
+        target=_fast_target(),
+        event_sink=lambda name, data: events.append((name, data)),
+    )
+
+    assert [name for name, _ in events] == ["token", "token", "citation"]
+    assert "".join(data["delta"] for name, data in events if name == "token") == result[
+        "answer_markdown"
+    ]
+    assert events[-1][1]["index"] == 0
 
 
 def test_synthesize_local_failure_returns_evidence_fallback_with_warning(monkeypatch) -> None:
