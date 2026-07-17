@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import math
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, get_args, get_origin
@@ -138,9 +139,76 @@ class SearchHit:
 
 
 class OllamaClient:
-    def __init__(self) -> None:
-        self.base_url = settings.ollama_base_url.rstrip("/")
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        embedding_base_url: str | None = None,
+    ) -> None:
+        self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
+        self.embedding_base_url = (
+            embedding_base_url or settings.ollama_embedding_base_url
+        ).rstrip("/")
         self.timeout = settings.ollama_request_timeout
+
+    def generate_chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        model: str,
+        context_length: int,
+        max_output_tokens: int = 768,
+    ) -> dict[str, Any]:
+        """Generate one non-streaming Markdown response with bounded context."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_ctx": context_length,
+                "num_predict": max_output_tokens,
+            },
+        }
+        data = self._post_chat(payload)
+        return self._chat_result(data)
+
+    def stream_chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        model: str,
+        context_length: int,
+        max_output_tokens: int = 768,
+        cancel_event: threading.Event | None = None,
+    ):
+        """Yield Ollama NDJSON chat chunks until completion or cancellation."""
+        payload = self._with_keep_alive(
+            {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "think": False,
+                "options": {
+                    "num_ctx": context_length,
+                    "num_predict": max_output_tokens,
+                },
+            }
+        )
+        with httpx.Client(timeout=self.timeout) as client:
+            with client.stream(
+                "POST", f"{self.base_url}/api/chat", json=payload
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    result = self._chat_result(data)
+                    result["done"] = bool(data.get("done"))
+                    yield result
 
     def generate_structured(
         self,
@@ -228,11 +296,24 @@ class OllamaClient:
             return []
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(
-                f"{self.base_url}/api/embed",
+                f"{self.embedding_base_url}/api/embed",
                 json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": texts}),
             )
             response.raise_for_status()
             return response.json()["embeddings"]
+
+    @classmethod
+    def _chat_result(cls, data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "content": str(cls._message_content(data) or ""),
+            "model": str(data.get("model") or ""),
+            "prompt_eval_count": int(data.get("prompt_eval_count") or 0),
+            "eval_count": int(data.get("eval_count") or 0),
+            "prompt_eval_duration": int(data.get("prompt_eval_duration") or 0),
+            "eval_duration": int(data.get("eval_duration") or 0),
+            "total_duration": int(data.get("total_duration") or 0),
+            "load_duration": int(data.get("load_duration") or 0),
+        }
 
     @staticmethod
     def _encode_image(image: bytes | str | Path) -> str:
