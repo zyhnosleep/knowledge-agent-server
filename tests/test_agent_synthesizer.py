@@ -5,10 +5,35 @@ import pytest
 from app.services.agent_synthesizer import AgentSynthesizer
 
 
-def test_synthesize_auto_without_external_api_falls_back_locally(monkeypatch) -> None:
-    """When provider is 'auto' and external API is disabled, use local fallback."""
+class FakeOllamaClient:
+    def __init__(self, *, result=None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[dict] = []
+
+    def generate_structured(self, schema, **kwargs):
+        self.calls.append({"schema": schema, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return schema.model_validate(self.result)
+
+
+def _local_result(**overrides):
+    result = {
+        "answer_markdown": "Entropy measures the number of accessible states [0].",
+        "cited_indexes": [0],
+        "warnings": [],
+        "confidence": 0.9,
+    }
+    result.update(overrides)
+    return result
+
+
+def test_synthesize_auto_without_external_api_uses_local_ollama(monkeypatch) -> None:
+    """Auto mode uses Ollama when the external API is disabled."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_auto_disabled)
-    syn = AgentSynthesizer()
+    ollama = FakeOllamaClient(result=_local_result())
+    syn = AgentSynthesizer(ollama_client=ollama)
     result = syn.synthesize(
         query="What is entropy?",
         route="simple_rag",
@@ -17,14 +42,17 @@ def test_synthesize_auto_without_external_api_falls_back_locally(monkeypatch) ->
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
     )
     assert result["provider"] == "local"
-    assert result["answer_markdown"] == "Entropy is a measure of disorder."
+    assert result["model"] == "qwen3:14b"
+    assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
     assert len(result["warnings"]) == 0
+    assert ollama.calls[0]["model"] == "qwen3:14b"
+    assert "entropy defined" in ollama.calls[0]["user_prompt"]
 
 
-def test_synthesize_local_returns_rag_answer_unchanged(monkeypatch) -> None:
-    """When provider is 'local', return RAG answer as-is."""
+def test_synthesize_local_returns_structured_ollama_answer(monkeypatch) -> None:
+    """The local provider synthesizes evidence through Ollama."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient(result=_local_result()))
     result = syn.synthesize(
         query="What is entropy?",
         route="simple_rag",
@@ -32,9 +60,65 @@ def test_synthesize_local_returns_rag_answer_unchanged(monkeypatch) -> None:
         rag_answer="Entropy is a measure of disorder.",
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
     )
+    assert result["provider"] == "local"
+    assert result["model"] == "qwen3:14b"
+    assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
+
+
+def test_synthesize_local_failure_returns_evidence_fallback_with_warning(monkeypatch) -> None:
+    """Ollama failures preserve the evidence answer and report degraded mode."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    syn = AgentSynthesizer(
+        ollama_client=FakeOllamaClient(error=RuntimeError("Ollama unavailable"))
+    )
+
+    result = syn.synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
     assert result["provider"] == "local"
     assert result["model"] == "local-fallback"
     assert result["answer_markdown"] == "Entropy is a measure of disorder."
+    assert any("ollama" in warning.lower() for warning in result["warnings"])
+
+
+def test_synthesize_local_sanitizes_cited_indexes(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    syn = AgentSynthesizer(
+        ollama_client=FakeOllamaClient(
+            result=_local_result(cited_indexes=[0, 2, -1, "0"])
+        )
+    )
+
+    result = syn.synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert result["cited_indexes"] == [0]
+
+
+def test_synthesize_local_without_evidence_skips_ollama(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(result=_local_result())
+    syn = AgentSynthesizer(ollama_client=ollama)
+
+    result = syn.synthesize(
+        query="Say hello",
+        route="simple_rag",
+        rag_answer="No matching evidence was found.",
+        citations=[],
+        evidence_pack={"status": "empty", "items": []},
+    )
+
+    assert result["answer_markdown"] == "No matching evidence was found."
+    assert result["model"] == "local-fallback"
+    assert ollama.calls == []
 
 
 def test_synthesize_external_api_when_enabled_returns_structured_result(monkeypatch) -> None:
@@ -132,7 +216,7 @@ def test_synthesize_external_api_empty_answer_returns_fallback(monkeypatch) -> N
 def test_synthesize_result_has_required_fields(monkeypatch) -> None:
     """Result dict contains all required keys: answer_markdown, cited_indexes, warnings, confidence, provider, model."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient(result=_local_result()))
     result = syn.synthesize(
         query="What is entropy?",
         route="simple_rag",
@@ -147,7 +231,7 @@ def test_synthesize_result_has_required_fields(monkeypatch) -> None:
 def test_synthesize_sanitizes_cited_indexes(monkeypatch) -> None:
     """Nonexistent citation indexes are removed from cited_indexes."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient(result=_local_result()))
     result = syn.synthesize(
         query="What is entropy?",
         route="simple_rag",

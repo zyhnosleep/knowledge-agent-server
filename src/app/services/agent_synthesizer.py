@@ -6,14 +6,23 @@ import re
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.services.ai import OllamaClient
 
 logger = logging.getLogger(__name__)
 
 
+class LocalSynthesisPayload(BaseModel):
+    answer_markdown: str
+    cited_indexes: list[int] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+
+
 class AgentSynthesizer:
-    """Evidence synthesis using external API or local deterministic fallback.
+    """Evidence synthesis using Ollama, an external API, or safe fallback.
 
     Allowed synthesis providers are ``auto``, ``external_api``, and ``local``.
     When the provider is ``auto``, the external API is only used when
@@ -29,8 +38,9 @@ class AgentSynthesizer:
     MAX_EVIDENCE_PACK_ITEMS = 10
     MAX_EXCERPT_CHARS = 300
 
-    def __init__(self) -> None:
+    def __init__(self, ollama_client: OllamaClient | None = None) -> None:
         self._settings = get_settings()
+        self._ollama = ollama_client or OllamaClient()
 
     # ------------------------------------------------------------------
     # public API
@@ -60,7 +70,14 @@ class AgentSynthesizer:
         provider = self._resolve_provider()
 
         if provider == "local":
-            return self._local_fallback(rag_answer, citations)
+            return self._local_synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+            )
 
         # external_api path
         return self._external_synthesize(
@@ -108,6 +125,89 @@ class AgentSynthesizer:
             "confidence": 1.0,
             "provider": "local",
             "model": "local-fallback",
+        }
+
+    def _local_synthesize(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize a cited answer with the configured local Ollama model."""
+        if not citations and not (evidence_pack or {}).get("items"):
+            return self._local_fallback(rag_answer, citations)
+
+        evidence_parts: list[str] = []
+        for index, citation in enumerate(citations):
+            excerpt = str(citation.get("excerpt") or "").strip()
+            title = citation.get("page_title") or citation.get("document_id") or "untitled"
+            if excerpt:
+                evidence_parts.append(f"[{index}] {title}: {excerpt}")
+        evidence_text = "\n\n".join(evidence_parts) or "(no citation excerpts)"
+        evidence_pack_text = self._format_evidence_pack_section(evidence_pack)
+
+        system_prompt = (
+            "You are an evidence-grounded knowledge-base assistant. Answer the user's "
+            "question in the user's language by synthesizing the supplied evidence. "
+            "Do not merely repeat the RAG draft. Do not add facts that are absent from "
+            "the evidence. Cite supported statements with the supplied zero-based "
+            "citation indexes, such as [0]. If evidence is insufficient, say exactly "
+            "what cannot be established."
+        )
+        user_prompt = (
+            f"User question: {query}\n"
+            f"Route type: {route}\n"
+            f"Conversation context: {conversation_summary or '(none)'}\n\n"
+            f"RAG draft:\n{rag_answer}\n\n"
+            f"Citation excerpts:\n{evidence_text}\n\n"
+            + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + "Return a concise final answer grounded only in this evidence."
+        )
+        model = self._settings.ollama_generation_model
+
+        try:
+            parsed = self._ollama.generate_structured(
+                LocalSynthesisPayload,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Local Ollama synthesis failed: %s", exc)
+            result = self._local_fallback(rag_answer, citations)
+            result["warnings"].append(
+                f"Local Ollama synthesis failed; using evidence fallback: {exc}"
+            )
+            return result
+
+        answer_markdown = parsed.answer_markdown.strip()
+        if not answer_markdown:
+            result = self._local_fallback(rag_answer, citations)
+            result["warnings"].extend(parsed.warnings)
+            result["warnings"].append(
+                "Local Ollama synthesis returned an empty answer; using evidence fallback."
+            )
+            return result
+
+        max_index = len(citations)
+        cited_indexes = list(
+            dict.fromkeys(
+                index
+                for index in parsed.cited_indexes
+                if isinstance(index, int) and 0 <= index < max_index
+            )
+        )
+        return {
+            "answer_markdown": answer_markdown,
+            "cited_indexes": cited_indexes,
+            "warnings": [str(warning) for warning in parsed.warnings],
+            "confidence": max(0.0, min(1.0, float(parsed.confidence))),
+            "provider": "local",
+            "model": model,
         }
 
     @staticmethod
