@@ -38,22 +38,22 @@ class Settings(BaseSettings):
     vector_store_enabled: bool = Field(default=True, alias="VECTOR_STORE_ENABLED")
     vector_store_backend: str = Field(default="sqlite-vec", alias="VECTOR_STORE_BACKEND")
 
-    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
-    ollama_generation_model: str = Field(default="qwen3:14b", alias="OLLAMA_GENERATION_MODEL")
-    ollama_fast_base_url: str = Field(default="http://localhost:11435", alias="OLLAMA_FAST_BASE_URL")
-    ollama_deep_base_url: str = Field(default="http://localhost:11436", alias="OLLAMA_DEEP_BASE_URL")
+    ollama_generation_base_url: str = Field(
+        default="http://localhost:11435", alias="OLLAMA_GENERATION_BASE_URL"
+    )
+    ollama_generation_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_GENERATION_MODEL")
     ollama_embedding_base_url: str = Field(
         default="http://localhost:11435", alias="OLLAMA_EMBEDDING_BASE_URL"
     )
-    ollama_fast_model: str = Field(default="qwen3:14b", alias="OLLAMA_FAST_MODEL")
-    ollama_deep_model: str = Field(default="qwen3.6:27b", alias="OLLAMA_DEEP_MODEL")
-    ollama_fast_context_length: int = Field(default=16384, gt=0, alias="OLLAMA_FAST_CONTEXT_LENGTH")
-    ollama_deep_context_length: int = Field(default=32768, gt=0, alias="OLLAMA_DEEP_CONTEXT_LENGTH")
-    ollama_fast_parallelism: int = Field(default=1, gt=0, alias="OLLAMA_FAST_PARALLELISM")
-    ollama_deep_parallelism: int = Field(default=1, gt=0, alias="OLLAMA_DEEP_PARALLELISM")
-    ollama_batch_model: str = Field(default="qwen3:30b", alias="OLLAMA_BATCH_MODEL")
-    ollama_embedding_model: str = Field(default="qwen3-embedding:8b", alias="OLLAMA_EMBEDDING_MODEL")
-    ollama_embedding_dimensions: int = Field(default=4096, alias="OLLAMA_EMBEDDING_DIMENSIONS")
+    ollama_generation_context_length: int = Field(
+        default=32768, gt=0, alias="OLLAMA_GENERATION_CONTEXT_LENGTH"
+    )
+    ollama_generation_parallelism: int = Field(
+        default=1, gt=0, alias="OLLAMA_GENERATION_PARALLELISM"
+    )
+    ollama_batch_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_BATCH_MODEL")
+    ollama_embedding_model: str = Field(default="qwen3-embedding:4b", alias="OLLAMA_EMBEDDING_MODEL")
+    ollama_embedding_dimensions: int = Field(default=2560, alias="OLLAMA_EMBEDDING_DIMENSIONS")
     ollama_vision_model: str | None = Field(default=None, alias="OLLAMA_VISION_MODEL")
     ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
     ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")

@@ -145,7 +145,7 @@ class OllamaClient:
         base_url: str | None = None,
         embedding_base_url: str | None = None,
     ) -> None:
-        self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
+        self.base_url = (base_url or settings.ollama_generation_base_url).rstrip("/")
         self.embedding_base_url = (
             embedding_base_url or settings.ollama_embedding_base_url
         ).rstrip("/")

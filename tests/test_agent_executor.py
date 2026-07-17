@@ -135,7 +135,7 @@ def test_execute_commits_session_turn_before_rag(monkeypatch) -> None:
     assert commit_counts_seen and commit_counts_seen[0] >= 1
 
 
-def test_manual_deep_mode_is_recorded_and_passed_to_synthesis() -> None:
+def test_generation_target_is_recorded_and_passed_to_synthesis() -> None:
     db = make_db()
     db.add(Project(id="p1", slug="demo", name="Demo"))
     db.commit()
@@ -145,7 +145,7 @@ def test_manual_deep_mode_is_recorded_and_passed_to_synthesis() -> None:
     def routed_synthesis(args, ctx):
         captured.update(args["target"])
         return {
-            "answer_markdown": "deep answer [0]",
+            "answer_markdown": "generation answer [0]",
             "cited_indexes": [0],
             "warnings": [],
             "confidence": 1.0,
@@ -158,17 +158,16 @@ def test_manual_deep_mode_is_recorded_and_passed_to_synthesis() -> None:
         AgentQueryRequest(
             project_slug="demo",
             query="hello",
-            session_id="deep-session",
-            answer_mode="deep",
+            session_id="generation-session",
         )
     )
 
     route_step = next(step for step in response.steps if step.step_type == "route")
-    assert route_step.metadata["requested_answer_mode"] == "deep"
-    assert route_step.metadata["inference_profile"] == "deep"
-    assert route_step.metadata["inference_model"] == "qwen3.6:27b"
+    assert "requested_answer_mode" not in route_step.metadata
+    assert route_step.metadata["inference_profile"] == "generation"
+    assert route_step.metadata["inference_model"] == "qwen3.5:9b"
     assert captured["context_length"] == 32768
-    assert response.answer_model == "qwen3.6:27b"
+    assert response.answer_model == "qwen3.5:9b"
 
 
 def test_generation_is_wrapped_in_selected_model_lease() -> None:
@@ -193,12 +192,11 @@ def test_generation_is_wrapped_in_selected_model_lease() -> None:
             project_slug="demo",
             query="hello",
             session_id="leased-session",
-            answer_mode="fast",
         )
     )
 
     assert response.status == "completed"
-    assert events == ["acquire:fast", "release:fast"]
+    assert events == ["acquire:generation", "release:generation"]
 
 
 def test_concurrent_sessions_release_initial_write_transaction(tmp_path) -> None:

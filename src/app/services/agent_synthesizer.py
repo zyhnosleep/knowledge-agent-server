@@ -399,12 +399,12 @@ class AgentSynthesizer:
         }
 
     def _default_target(self) -> InferenceTarget:
-        """Provide a backward-compatible fast target for direct callers."""
+        """Provide the configured generation target for direct callers."""
         return InferenceTarget(
-            profile="fast",
-            base_url=self._settings.ollama_fast_base_url.rstrip("/"),
-            model=self._settings.ollama_fast_model,
-            context_length=self._settings.ollama_fast_context_length,
+            profile="generation",
+            base_url=self._settings.ollama_generation_base_url.rstrip("/"),
+            model=self._settings.ollama_generation_model,
+            context_length=self._settings.ollama_generation_context_length,
             reason="Default local synthesis target",
         )
 

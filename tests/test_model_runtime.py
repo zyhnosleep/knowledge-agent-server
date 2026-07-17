@@ -11,18 +11,17 @@ from app.services.model_runtime import (
 )
 
 
-def test_fast_and_deep_capacities_are_independent() -> None:
-    runtime = ModelRuntime({"fast": 1, "deep": 1})
+def test_generation_capacity_is_reported() -> None:
+    runtime = ModelRuntime({"generation": 1})
 
-    with runtime.acquire("fast"):
-        with runtime.acquire("deep"):
-            snapshot = runtime.snapshot()
-            assert snapshot["fast"]["active"] == 1
-            assert snapshot["deep"]["active"] == 1
+    with runtime.acquire("generation"):
+        snapshot = runtime.snapshot()
+        assert set(snapshot) == {"generation"}
+        assert snapshot["generation"]["active"] == 1
 
 
 def test_waiters_acquire_in_fifo_order_and_report_positions() -> None:
-    runtime = ModelRuntime({"deep": 1})
+    runtime = ModelRuntime({"generation": 1})
     order: list[str] = []
     queued: dict[str, list[int]] = {"second": [], "third": []}
     started = threading.Event()
@@ -30,12 +29,12 @@ def test_waiters_acquire_in_fifo_order_and_report_positions() -> None:
     def worker(name: str) -> None:
         started.set()
         with runtime.acquire(
-            "deep", on_queue=lambda position: queued[name].append(position)
+            "generation", on_queue=lambda position: queued[name].append(position)
         ):
             order.append(name)
             time.sleep(0.02)
 
-    with runtime.acquire("deep"):
+    with runtime.acquire("generation"):
         second = threading.Thread(target=worker, args=("second",))
         third = threading.Thread(target=worker, args=("third",))
         second.start()
@@ -52,19 +51,19 @@ def test_waiters_acquire_in_fifo_order_and_report_positions() -> None:
 
 
 def test_cancelled_waiter_never_acquires() -> None:
-    runtime = ModelRuntime({"deep": 1})
+    runtime = ModelRuntime({"generation": 1})
     cancel = threading.Event()
     acquired = threading.Event()
     cancelled: list[bool] = []
 
     def waiter() -> None:
         try:
-            with runtime.acquire("deep", cancel_event=cancel):
+            with runtime.acquire("generation", cancel_event=cancel):
                 acquired.set()
         except ModelRequestCancelled:
             cancelled.append(True)
 
-    with runtime.acquire("deep"):
+    with runtime.acquire("generation"):
         thread = threading.Thread(target=waiter)
         thread.start()
         time.sleep(0.03)
@@ -77,18 +76,18 @@ def test_cancelled_waiter_never_acquires() -> None:
 
 
 def test_lease_releases_after_body_exception() -> None:
-    runtime = ModelRuntime({"fast": 1})
+    runtime = ModelRuntime({"generation": 1})
 
     with pytest.raises(RuntimeError):
-        with runtime.acquire("fast"):
+        with runtime.acquire("generation"):
             raise RuntimeError("generation failed")
 
-    with runtime.acquire("fast"):
-        assert runtime.snapshot()["fast"]["active"] == 1
+    with runtime.acquire("generation"):
+        assert runtime.snapshot()["generation"]["active"] == 1
 
 
 def test_unknown_profile_is_rejected() -> None:
-    runtime = ModelRuntime({"fast": 1})
+    runtime = ModelRuntime({"generation": 1})
 
     with pytest.raises(ValueError, match="Unknown model profile"):
         with runtime.acquire("deep"):

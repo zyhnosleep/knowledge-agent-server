@@ -36,13 +36,13 @@ class FakeOllamaClient:
         yield {"content": text[midpoint:], "model": kwargs["model"], "done": True}
 
 
-def _fast_target() -> InferenceTarget:
+def _generation_target() -> InferenceTarget:
     return InferenceTarget(
-        profile="fast",
-        base_url="http://fast:11434",
-        model="qwen3:14b",
-        context_length=16384,
-        reason="test fast",
+        profile="generation",
+        base_url="http://generation:11434",
+        model="qwen3.5:9b",
+        context_length=32768,
+        reason="test generation",
     )
 
 
@@ -68,14 +68,14 @@ def test_synthesize_auto_without_external_api_uses_local_ollama(monkeypatch) -> 
         conversation_summary="",
         rag_answer="Entropy is a measure of disorder.",
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
-        target=_fast_target(),
+        target=_generation_target(),
     )
     assert result["provider"] == "local"
-    assert result["model"] == "qwen3:14b"
+    assert result["model"] == "qwen3.5:9b"
     assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
     assert len(result["warnings"]) == 0
-    assert ollama.calls[0]["model"] == "qwen3:14b"
-    assert ollama.calls[0]["context_length"] == 16384
+    assert ollama.calls[0]["model"] == "qwen3.5:9b"
+    assert ollama.calls[0]["context_length"] == 32768
     assert ollama.calls[0]["max_output_tokens"] == 768
     assert "entropy defined" in ollama.calls[0]["messages"][1]["content"]
     assert "MUST use the same language" in ollama.calls[0]["messages"][0]["content"]
@@ -91,23 +91,23 @@ def test_synthesize_local_returns_structured_ollama_answer(monkeypatch) -> None:
         conversation_summary="",
         rag_answer="Entropy is a measure of disorder.",
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
-        target=_fast_target(),
+        target=_generation_target(),
     )
     assert result["provider"] == "local"
-    assert result["model"] == "qwen3:14b"
+    assert result["model"] == "qwen3.5:9b"
     assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
 
 
-def test_synthesize_deep_target_calls_27b_once_as_plain_markdown(monkeypatch) -> None:
+def test_synthesize_generation_target_calls_9b_once_as_plain_markdown(monkeypatch) -> None:
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
     ollama = FakeOllamaClient(result=_local_result())
     syn = AgentSynthesizer(ollama_client=ollama)
     target = InferenceTarget(
-        profile="deep",
-        base_url="http://deep:11434",
-        model="qwen3.6:27b",
+        profile="generation",
+        base_url="http://generation:11434",
+        model="qwen3.5:9b",
         context_length=32768,
-        reason="test deep",
+        reason="test generation",
     )
 
     result = syn.synthesize(
@@ -119,9 +119,9 @@ def test_synthesize_deep_target_calls_27b_once_as_plain_markdown(monkeypatch) ->
     )
 
     assert len(ollama.calls) == 1
-    assert ollama.calls[0]["model"] == "qwen3.6:27b"
+    assert ollama.calls[0]["model"] == "qwen3.5:9b"
     assert ollama.calls[0]["context_length"] == 32768
-    assert result["model"] == "qwen3.6:27b"
+    assert result["model"] == "qwen3.5:9b"
 
 
 def test_synthesize_stream_forwards_tokens_then_citation(monkeypatch) -> None:
@@ -134,7 +134,7 @@ def test_synthesize_stream_forwards_tokens_then_citation(monkeypatch) -> None:
         route="simple_rag",
         rag_answer="Draft",
         citations=[{"document_id": "d1", "excerpt": "entropy evidence"}],
-        target=_fast_target(),
+        target=_generation_target(),
         event_sink=lambda name, data: events.append((name, data)),
     )
 
@@ -157,7 +157,7 @@ def test_synthesize_local_failure_returns_evidence_fallback_with_warning(monkeyp
         route="simple_rag",
         rag_answer="Entropy is a measure of disorder.",
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
-        target=_fast_target(),
+        target=_generation_target(),
     )
 
     assert result["provider"] == "local"
@@ -181,7 +181,7 @@ def test_synthesize_local_sanitizes_cited_indexes(monkeypatch) -> None:
         route="simple_rag",
         rag_answer="Entropy is a measure of disorder.",
         citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
-        target=_fast_target(),
+        target=_generation_target(),
     )
 
     assert result["cited_indexes"] == [0]
@@ -199,7 +199,7 @@ def test_synthesize_local_without_evidence_skips_ollama(monkeypatch) -> None:
         rag_answer="No matching evidence was found.",
         citations=[],
         evidence_pack={"status": "empty", "items": []},
-        target=_fast_target(),
+        target=_generation_target(),
     )
 
     assert result["answer_markdown"] == "No matching evidence was found."

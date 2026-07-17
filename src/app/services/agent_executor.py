@@ -136,10 +136,7 @@ class AgentExecutor:
             # ==============================================================
             route_t0 = time.monotonic()
             route = PolicyRouter().route(request.query)
-            requested_answer_mode = self._memory.get_answer_mode(session_id)
-            inference_target = AgentModelRouter().select(
-                requested_answer_mode, route.route
-            )
+            inference_target = AgentModelRouter().select(route.route)
             route_latency = int((time.monotonic() - route_t0) * 1000)
 
             route_step = AgentStep(
@@ -151,7 +148,6 @@ class AgentExecutor:
                     "route": route.route,
                     "reason": route.reason,
                     "max_retries": route.max_retries,
-                    "requested_answer_mode": requested_answer_mode,
                     "inference_profile": inference_target.profile,
                     "inference_model": inference_target.model,
                     "inference_context_length": inference_target.context_length,
@@ -1090,7 +1086,7 @@ class AgentExecutor:
             tool_args["target"] = asdict(target)
 
         queue_wait_ms = 0
-        if target is not None and target.profile in {"fast", "deep"}:
+        if target is not None and target.profile == "generation":
             queue_started = time.monotonic()
             with self._model_runtime.acquire(
                 target.profile,

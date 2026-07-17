@@ -103,8 +103,5 @@ class ModelRuntime:
 def get_model_runtime() -> ModelRuntime:
     settings = get_settings()
     return ModelRuntime(
-        {
-            "fast": settings.ollama_fast_parallelism,
-            "deep": settings.ollama_deep_parallelism,
-        }
+        {"generation": settings.ollama_generation_parallelism}
     )
