@@ -2,6 +2,14 @@ from app.services import ai
 from app.services.ai import HeadAnalysisPayload, OllamaClient
 
 
+def test_keep_alive_numeric_strings_are_normalized_for_ollama_compatibility(monkeypatch) -> None:
+    monkeypatch.setattr(ai.settings, "ollama_keep_alive", "-1", raising=False)
+
+    payload = OllamaClient._with_keep_alive({"model": "test"})
+
+    assert payload["keep_alive"] == -1
+
+
 def test_parse_structured_content_extracts_json_from_text() -> None:
     content = """
     Here is the structured result:
@@ -226,8 +234,8 @@ def test_generate_structured_sends_keep_alive_to_all_chat_requests(monkeypatch) 
         model="fake-model",
     )
 
-    assert calls[0]["keep_alive"] == "0"
-    assert calls[1]["keep_alive"] == "0"
+    assert calls[0]["keep_alive"] == 0
+    assert calls[1]["keep_alive"] == 0
 
 
 def test_embed_sends_keep_alive_to_single_batch_embedding_request(monkeypatch) -> None:
@@ -260,7 +268,7 @@ def test_embed_sends_keep_alive_to_single_batch_embedding_request(monkeypatch) -
     monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
 
     assert client.embed(["alpha", "beta"]) == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-    assert calls == [{"model": "fake-embedding", "input": ["alpha", "beta"], "keep_alive": "0"}]
+    assert calls == [{"model": "fake-embedding", "input": ["alpha", "beta"], "keep_alive": 0}]
 
 
 def test_json_mode_payload_uses_compact_schema_shape() -> None:

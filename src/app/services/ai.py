@@ -337,7 +337,12 @@ class OllamaClient:
     def _with_keep_alive(payload: dict[str, Any]) -> dict[str, Any]:
         if settings.ollama_keep_alive is None:
             return payload
-        return {**payload, "keep_alive": settings.ollama_keep_alive}
+        keep_alive: str | int = settings.ollama_keep_alive
+        if isinstance(keep_alive, str):
+            normalized = keep_alive.strip()
+            if normalized.lstrip("+-").isdigit():
+                keep_alive = int(normalized)
+        return {**payload, "keep_alive": keep_alive}
 
     @staticmethod
     def _message_content(data: dict[str, Any]) -> Any:
