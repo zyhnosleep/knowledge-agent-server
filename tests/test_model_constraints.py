@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
 from app.models.records import Entity, Project
+from app.core.config import Settings
 
 
 def make_session() -> Session:
@@ -47,3 +49,29 @@ def test_sqlite_schema_upgrade_adds_unique_indexes(tmp_path, monkeypatch) -> Non
     with engine.connect() as connection:
         entity_indexes = {row[1] for row in connection.execute(text("PRAGMA index_list('entities')"))}
     assert "uq_entities_project_name" in entity_indexes
+
+
+def test_dual_ollama_profile_defaults_are_safe() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.ollama_fast_base_url == "http://localhost:11435"
+    assert settings.ollama_deep_base_url == "http://localhost:11436"
+    assert settings.ollama_embedding_base_url == "http://localhost:11435"
+    assert settings.ollama_fast_model == "qwen3:14b"
+    assert settings.ollama_deep_model == "qwen3.6:27b"
+    assert settings.ollama_fast_context_length == 16384
+    assert settings.ollama_deep_context_length == 32768
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("OLLAMA_FAST_CONTEXT_LENGTH", 0),
+        ("OLLAMA_DEEP_CONTEXT_LENGTH", -1),
+        ("OLLAMA_FAST_PARALLELISM", 0),
+        ("OLLAMA_DEEP_PARALLELISM", -1),
+    ],
+)
+def test_dual_ollama_numeric_settings_must_be_positive(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})

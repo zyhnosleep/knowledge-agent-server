@@ -40,6 +40,17 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_generation_model: str = Field(default="qwen3:14b", alias="OLLAMA_GENERATION_MODEL")
+    ollama_fast_base_url: str = Field(default="http://localhost:11435", alias="OLLAMA_FAST_BASE_URL")
+    ollama_deep_base_url: str = Field(default="http://localhost:11436", alias="OLLAMA_DEEP_BASE_URL")
+    ollama_embedding_base_url: str = Field(
+        default="http://localhost:11435", alias="OLLAMA_EMBEDDING_BASE_URL"
+    )
+    ollama_fast_model: str = Field(default="qwen3:14b", alias="OLLAMA_FAST_MODEL")
+    ollama_deep_model: str = Field(default="qwen3.6:27b", alias="OLLAMA_DEEP_MODEL")
+    ollama_fast_context_length: int = Field(default=16384, gt=0, alias="OLLAMA_FAST_CONTEXT_LENGTH")
+    ollama_deep_context_length: int = Field(default=32768, gt=0, alias="OLLAMA_DEEP_CONTEXT_LENGTH")
+    ollama_fast_parallelism: int = Field(default=1, gt=0, alias="OLLAMA_FAST_PARALLELISM")
+    ollama_deep_parallelism: int = Field(default=1, gt=0, alias="OLLAMA_DEEP_PARALLELISM")
     ollama_batch_model: str = Field(default="qwen3:30b", alias="OLLAMA_BATCH_MODEL")
     ollama_embedding_model: str = Field(default="qwen3-embedding:8b", alias="OLLAMA_EMBEDDING_MODEL")
     ollama_embedding_dimensions: int = Field(default=4096, alias="OLLAMA_EMBEDDING_DIMENSIONS")
