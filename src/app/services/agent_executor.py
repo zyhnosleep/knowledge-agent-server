@@ -117,7 +117,6 @@ class AgentExecutor:
             project_slug=request.project_slug,
             ttl_days=settings.agent_conversation_ttl_days,
             document_id=request.document_id,
-            answer_mode=request.answer_mode,
         )
         self._memory.purge_expired_sessions()
 

@@ -194,9 +194,6 @@ class ConversationSession(Base):
     owner_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     project_slug: Mapped[str] = mapped_column(String(120), index=True)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
-    answer_mode: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="auto", server_default="auto"
-    )
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -1742,18 +1742,11 @@
           <div class="composer">
             <div class="attachment-bar" id="attachmentBar" hidden></div>
             <div class="answer-mode-row">
-              <div class="answer-mode-control" id="answerModeControl" role="group" aria-label="回答模式">
-                <button type="button" data-answer-mode="auto" aria-pressed="true">自动</button>
-                <button type="button" data-answer-mode="fast" aria-pressed="false">快速</button>
-                <button type="button" data-answer-mode="deep" aria-pressed="false">深度</button>
-              </div>
-              <span class="mode-description" id="answerModeDescription">自动选择 14B 或 27B</span>
               <button class="stop-generation" id="stopGenerationButton" type="button" hidden>停止生成</button>
             </div>
             <div class="queue-choice" id="queueChoice" hidden aria-live="polite">
-              <span id="queueMessage">深度模型正在排队</span>
+              <span id="queueMessage">回答模型正在排队</span>
               <button type="button" id="continueQueueButton">继续等待</button>
-              <button type="button" id="switchFastButton">切换快速</button>
             </div>
             <form class="composer-box" id="queryForm">
               <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件" aria-label="添加临时文件">⌕</button>
@@ -1906,9 +1899,7 @@
       var projects = [];
       var activeAttachments = [];
       var currentSessions = [];
-      var activeAnswerMode = "auto";
       var activeAgentAbortController = null;
-      var pendingFastSwitch = false;
       var activeQueuedQuestion = null;
       var PROJECT_STORAGE_KEY = "night-research-active-project";
 
@@ -1920,26 +1911,12 @@
         return document.getElementById(id);
       }
 
-      function setAnswerMode(mode) {
-        if (["auto", "fast", "deep"].indexOf(mode) < 0) mode = "auto";
-        activeAnswerMode = mode;
-        var descriptions = {
-          auto: "自动选择 14B 或 27B",
-          fast: "14B · 更快响应 · 16K 上下文",
-          deep: "27B · 复杂证据 · 32K 上下文"
-        };
-        document.querySelectorAll("[data-answer-mode]").forEach(function (button) {
-          button.setAttribute("aria-pressed", button.dataset.answerMode === mode ? "true" : "false");
-        });
-        if ($("answerModeDescription")) $("answerModeDescription").textContent = descriptions[mode];
-      }
-
       function setQueueChoice(data) {
         var panel = $("queueChoice");
         if (!panel) return;
         panel.hidden = !data;
         if (data) {
-          var model = data.model || "27B";
+          var model = data.model || "回答模型";
           var position = data.position ? "，前方 " + data.position + " 个请求" : "";
           $("queueMessage").textContent = model + " 正在排队" + position;
         }
@@ -2249,7 +2226,6 @@
           project_slug: activeProjectSlug,
           query: question,
           session_id: sessionId,
-          answer_mode: activeAnswerMode,
           constraints: { max_steps: 8, max_tool_calls: 5, budget_tokens: 20000, timeout_seconds: 180 }
         };
         if (activeDocumentId) {
@@ -2286,7 +2262,7 @@
                 }
                 if (event.name === "route") {
                   var routeMeta = event.data && event.data.metadata ? event.data.metadata : {};
-                  streamMeta = [routeMeta.inference_profile || activeAnswerMode, routeMeta.inference_model || "路由完成"];
+                  streamMeta = [routeMeta.inference_profile || "generation", routeMeta.inference_model || "路由完成"];
                   appendThinking(event.data && event.data.summary ? event.data.summary : "已选择回答模型", "route");
                 }
                 if (event.name === "step") {
@@ -2340,12 +2316,6 @@
           });
         }).catch(function (error) {
           if (error && error.name === "AbortError") {
-            if (pendingFastSwitch) {
-              pendingFastSwitch = false;
-              setAnswerMode("fast");
-              setQueueChoice(null);
-              return runAgent(question, { reuseUserMessage: true });
-            }
             if (streamedAnswer) {
               showAnswer(streamMeta.concat(["已停止 · 内容不完整"]), streamedAnswer, streamedCitations.filter(Boolean));
             }
@@ -3117,7 +3087,6 @@
         var documentId = activeDocumentId;
         var documentTitle = activeDocumentTitle;
         activeSessionId = null;
-        setAnswerMode("auto");
         activeAttachments = [];
         activeDocumentId = preserveDocumentScope ? documentId : null;
         activeDocumentTitle = preserveDocumentScope ? documentTitle : null;
@@ -3129,7 +3098,6 @@
       }
 
       function restoreSessionScope(session) {
-        setAnswerMode(session.answer_mode || "auto");
         if (session.project_slug && session.project_slug !== activeProjectSlug) {
           activeProjectSlug = session.project_slug;
           activeProjectName = session.project_slug;
@@ -3269,28 +3237,13 @@
         setView("chat", { skipSessionLoad: true });
       });
 
-      document.querySelectorAll("[data-answer-mode]").forEach(function (button) {
-        button.addEventListener("click", function () {
-          setAnswerMode(button.dataset.answerMode);
-        });
-      });
-
       $("continueQueueButton").addEventListener("click", function () {
         setQueueChoice(null);
       });
 
-      $("switchFastButton").addEventListener("click", function () {
-        if (!activeAgentAbortController || !activeQueuedQuestion) return;
-        pendingFastSwitch = true;
-        activeAgentAbortController.abort();
-      });
-
       $("stopGenerationButton").addEventListener("click", function () {
-        pendingFastSwitch = false;
         if (activeAgentAbortController) activeAgentAbortController.abort();
       });
-
-      setAnswerMode("auto");
 
       $("attachmentButton").addEventListener("click", function () {
         $("attachmentInput").click();

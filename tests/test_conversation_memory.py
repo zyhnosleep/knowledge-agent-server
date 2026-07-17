@@ -143,26 +143,8 @@ def test_touch_session_creates_new_session() -> None:
     session = db.get(ConversationSession, "sess-abc")
     assert session is not None
     assert session.project_slug == "demo"
-    assert session.answer_mode == "auto"
-    assert memory.get_answer_mode("sess-abc") == "auto"
+    assert not hasattr(session, "answer_mode")
     assert session.expires_at > datetime.utcnow() + timedelta(days=29)  # ~30 days
-
-
-def test_touch_session_updates_answer_mode_and_preserves_it_when_omitted() -> None:
-    """Explicit mode changes persist; ordinary TTL touches do not reset them."""
-    db, memory = make_memory()
-    memory.touch_session(
-        "sess-mode", project_slug="demo", ttl_days=30, answer_mode="deep"
-    )
-    assert memory.get_answer_mode("sess-mode") == "deep"
-
-    memory.touch_session("sess-mode", project_slug="demo", ttl_days=60)
-    assert db.get(ConversationSession, "sess-mode").answer_mode == "deep"
-
-    memory.touch_session(
-        "sess-mode", project_slug="demo", ttl_days=60, answer_mode="fast"
-    )
-    assert memory.get_answer_mode("sess-mode") == "fast"
 
 
 def test_touch_session_updates_existing_session() -> None:
@@ -337,10 +319,11 @@ def test_sqlite_migration_adds_session_mode_document_id_and_citations_columns() 
         {"now": datetime.utcnow()},
     )
     db.commit()
-    row = db.execute(
-        text("SELECT answer_mode FROM conversation_sessions WHERE id = 's1'")
-    ).one()
-    assert row.answer_mode == "auto"
+    columns = {
+        row[1]
+        for row in db.execute(text("PRAGMA table_info('conversation_sessions')"))
+    }
+    assert "answer_mode" not in columns
 
 
 def test_turn_citations_round_trip() -> None:

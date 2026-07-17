@@ -33,7 +33,7 @@ def test_alembic_upgrade_builds_current_schema_on_sqlite(tmp_path: Path) -> None
     session_columns = {
         column["name"]: column for column in inspector.get_columns("conversation_sessions")
     }
-    assert session_columns["answer_mode"]["nullable"] is False
+    assert "answer_mode" not in session_columns
 
 
 def test_alembic_history_has_one_head() -> None:

@@ -203,7 +203,6 @@ def test_stream_emits_live_route_tokens_and_citations_in_order(monkeypatch) -> N
             json={
                 "project_slug": "demo",
                 "query": "hello?",
-                "answer_mode": "fast",
             },
         ).text
     )

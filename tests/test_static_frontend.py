@@ -576,23 +576,16 @@ def test_answer_uses_safe_text_citations() -> None:
     assert "innerHTML" not in html.split("<script>")[1] or "step.innerHTML" in html
 
 
-def test_agent_answer_mode_controls_are_accessible() -> None:
+def test_agent_answer_mode_controls_are_removed() -> None:
     html = _html()
-    soup = BeautifulSoup(html, "html.parser")
-    control = soup.select_one("#answerModeControl[role='group']")
-    assert control is not None
-    buttons = control.select("button[data-answer-mode]")
-    assert [button.get("data-answer-mode") for button in buttons] == [
-        "auto",
-        "fast",
-        "deep",
-    ]
-    assert all(button.has_attr("aria-pressed") for button in buttons)
+    assert 'id="answerModeControl"' not in html
+    assert "data-answer-mode" not in html
+    assert "answer_mode: activeAnswerMode" not in html
 
 
-def test_agent_stream_contract_supports_modes_tokens_queue_and_stop() -> None:
+def test_agent_stream_contract_supports_tokens_queue_and_stop() -> None:
     html = _html()
-    assert "answer_mode: activeAnswerMode" in html
+    assert "answer_mode: activeAnswerMode" not in html
     assert 'event.name === "route"' in html
     assert 'event.name === "queue"' in html
     assert 'event.name === "token"' in html
@@ -600,14 +593,15 @@ def test_agent_stream_contract_supports_modes_tokens_queue_and_stop() -> None:
     assert "new AbortController()" in html
     assert "activeAgentAbortController.abort()" in html
     assert "继续等待" in html
-    assert "切换快速" in html
+    assert "切换快速" not in html
+    assert 'id="switchFastButton"' not in html
     assert "停止生成" in html
 
 
-def test_session_restore_uses_persisted_answer_mode() -> None:
+def test_session_restore_does_not_use_answer_mode() -> None:
     html = _html()
-    assert "session.answer_mode || \"auto\"" in html
-    assert "setAnswerMode" in html
+    assert "session.answer_mode" not in html
+    assert "setAnswerMode" not in html
 
 
 def test_document_library_archive_layout() -> None:

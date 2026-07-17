@@ -30,16 +30,11 @@ from app.schemas.agent import AgentQueryRequest
 from app.services.conversation_memory import ConversationMemory
 
 
-@pytest.mark.parametrize("answer_mode", ["auto", "fast", "deep"])
-def test_agent_query_request_accepts_supported_answer_modes(answer_mode: str) -> None:
-    request = AgentQueryRequest(project_slug="demo", query="question", answer_mode=answer_mode)
+def test_agent_query_request_has_no_answer_mode() -> None:
+    request = AgentQueryRequest(project_slug="demo", query="question")
 
-    assert request.answer_mode == answer_mode
-
-
-def test_agent_query_request_rejects_unknown_answer_mode() -> None:
-    with pytest.raises(ValidationError):
-        AgentQueryRequest(project_slug="demo", query="question", answer_mode="slow")
+    assert "answer_mode" not in AgentQueryRequest.model_fields
+    assert "answer_mode" not in request.model_dump()
 
 
 def make_session() -> Session:
@@ -129,7 +124,6 @@ def test_agent_enabled_with_valid_payload_returns_200(monkeypatch) -> None:
             "project_slug": "demo",
             "query": "hello?",
             "session_id": "mode-session",
-            "answer_mode": "deep",
         },
     )
     assert response.status_code == 200
@@ -140,7 +134,7 @@ def test_agent_enabled_with_valid_payload_returns_200(monkeypatch) -> None:
     # v2a: route + rag.answer + answer.verify + finalize
     assert len(data["steps"]) >= 3
     assert data["usage"]["tool_calls"] >= 2
-    assert db.get(ConversationSession, "mode-session").answer_mode == "deep"
+    assert db.get(ConversationSession, "mode-session") is not None
 
 
 def test_agent_route_applies_server_constraint_defaults(monkeypatch) -> None:
@@ -598,7 +592,6 @@ def test_list_agent_sessions_by_project() -> None:
             ConversationSession(
                 id="sess-b",
                 project_slug="demo",
-                answer_mode="deep",
                 expires_at=datetime.utcnow() + timedelta(days=30),
             ),
             ConversationSession(
@@ -622,10 +615,7 @@ def test_list_agent_sessions_by_project() -> None:
         assert "created_at" in session
         assert "updated_at" in session
         assert "expires_at" in session
-    assert {s["id"]: s["answer_mode"] for s in data} == {
-        "sess-a": "auto",
-        "sess-b": "deep",
-    }
+    assert all("answer_mode" not in session for session in data)
 
 
 def test_list_agent_sessions_requires_project_slug() -> None:
