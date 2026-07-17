@@ -171,6 +171,9 @@ class AgentSynthesizer:
             )
             return result
 
+        answer_markdown = self._sanitize_inline_citations(
+            answer_markdown, len(citations)
+        )
         cited_indexes = self._extract_cited_indexes(answer_markdown, len(citations))
         result = {
             "answer_markdown": answer_markdown,
@@ -275,6 +278,9 @@ class AgentSynthesizer:
             )
             return result
 
+        answer_markdown = self._sanitize_inline_citations(
+            answer_markdown, len(citations)
+        )
         return {
             "answer_markdown": answer_markdown,
             "cited_indexes": self._extract_cited_indexes(
@@ -305,6 +311,9 @@ class AgentSynthesizer:
                 evidence_parts.append(f"[{index}] {title}: {excerpt}")
         evidence_text = "\n\n".join(evidence_parts) or "(no citation excerpts)"
         evidence_pack_text = self._format_evidence_pack_section(evidence_pack)
+        evidence_pack_text = re.sub(
+            r"(?m)^  \[(\d+)\]", r"  evidence-item-\1", evidence_pack_text
+        )
 
         system_prompt = (
             "You are an evidence-grounded knowledge-base assistant. Answer the user's "
@@ -314,7 +323,8 @@ class AgentSynthesizer:
             "Do not merely repeat the RAG draft. Do not add facts that are absent from "
             "the evidence. Cite supported statements with the supplied zero-based "
             "citation indexes, such as [0]. If evidence is insufficient, say exactly "
-            "what cannot be established."
+            "what cannot be established. Evidence-pack item labels are retrieval metadata, "
+            "not citation indexes; cite only indexes listed under Citation excerpts."
         )
         user_prompt = (
             f"User question: {query}\n"
@@ -339,6 +349,15 @@ class AgentSynthesizer:
                 if 0 <= int(index) < max_index
             )
         )
+
+    @staticmethod
+    def _sanitize_inline_citations(answer_markdown: str, max_index: int) -> str:
+        """Remove inline numeric markers that cannot resolve to a citation."""
+        def replace(match: re.Match[str]) -> str:
+            index = int(match.group(1))
+            return match.group(0) if 0 <= index < max_index else ""
+
+        return re.sub(r"\[(-?\d+)\]", replace, answer_markdown)
 
     @staticmethod
     def _emit_citations(

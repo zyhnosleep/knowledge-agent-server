@@ -185,6 +185,7 @@ def test_synthesize_local_sanitizes_cited_indexes(monkeypatch) -> None:
     )
 
     assert result["cited_indexes"] == [0]
+    assert "[2]" not in result["answer_markdown"]
 
 
 def test_synthesize_local_without_evidence_skips_ollama(monkeypatch) -> None:
