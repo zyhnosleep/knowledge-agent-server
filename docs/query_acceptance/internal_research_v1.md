@@ -4,7 +4,7 @@ This benchmark checks whether the `internal-research` project can answer real qu
 
 ## Sources
 
-The benchmark covers these source wiki pages:
+The benchmark covers these source documents:
 
 - `sources/charmm36-force-field-refinement-for-proteins`
 - `sources/charmm36idpsff`

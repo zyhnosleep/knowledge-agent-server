@@ -1,0 +1,14 @@
+[Unit]
+Description=Knowledge Agent test Cloudflare Tunnel
+After=network-online.target knowledge-agent-test-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/local/bin/cloudflared tunnel --config %h/knowledge-agent-test/runtime/cloudflared/config.yml run
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

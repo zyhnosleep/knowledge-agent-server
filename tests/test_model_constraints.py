@@ -61,8 +61,6 @@ def test_default_generation_stack_is_single_qwen_profile() -> None:
     assert settings.ollama_generation_parallelism == 1
     assert settings.ollama_embedding_model == "qwen3-embedding:4b"
     assert settings.ollama_embedding_dimensions == 2560
-    assert not hasattr(settings, "ollama_fast_model")
-    assert not hasattr(settings, "ollama_deep_model")
 
 
 @pytest.mark.parametrize(

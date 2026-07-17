@@ -17,7 +17,7 @@ def _default_mineru_bin() -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    app_name: str = Field(default="LLM Wiki Server", alias="APP_NAME")
+    app_name: str = Field(default="Knowledge Agent", alias="APP_NAME")
     app_env: str = Field(default="development", alias="APP_ENV")
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")
@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     minio_endpoint: str = Field(default="localhost:9000", alias="MINIO_ENDPOINT")
     minio_access_key: str = Field(default="minioadmin", alias="MINIO_ACCESS_KEY")
     minio_secret_key: str = Field(default="minioadmin", alias="MINIO_SECRET_KEY")
-    minio_bucket: str = Field(default="llm-wiki", alias="MINIO_BUCKET")
+    minio_bucket: str = Field(default="knowledge-agent", alias="MINIO_BUCKET")
     minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
 
     agent_enabled: bool = Field(default=True, alias="AGENT_ENABLED")

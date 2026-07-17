@@ -1,5 +1,5 @@
 [Unit]
-Description=LLM Wiki Ollama fast and embedding runtime (GPU 0)
+Description=Knowledge Agent development model runtime on GPU 0
 After=network-online.target
 Wants=network-online.target
 
@@ -8,12 +8,12 @@ Type=simple
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 Environment=CUDA_VISIBLE_DEVICES=0
 Environment=OLLAMA_HOST=127.0.0.1:11435
-Environment=OLLAMA_MODELS=%h/llm_runtime/models
+Environment=OLLAMA_MODELS=%h/knowledge-agent-models
 Environment=OLLAMA_FLASH_ATTENTION=1
 Environment=OLLAMA_KV_CACHE_TYPE=q8_0
 Environment=OLLAMA_KEEP_ALIVE=5m
 Environment=OLLAMA_NUM_PARALLEL=1
-Environment=OLLAMA_CONTEXT_LENGTH=16384
+Environment=OLLAMA_CONTEXT_LENGTH=32768
 ExecStart=/usr/bin/env ollama serve
 Restart=on-failure
 RestartSec=3

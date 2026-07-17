@@ -541,7 +541,7 @@ def test_trace_preserves_safe_model_performance_metadata() -> None:
         status="completed",
         latency_ms=1000,
         provider="local",
-        model="qwen3:14b",
+        model="qwen3.5:9b",
     )
     db.commit()
 

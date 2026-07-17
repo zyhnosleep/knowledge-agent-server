@@ -4,11 +4,12 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/llm_wiki
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/knowledge_agent
       REDIS_URL: redis://redis:6379/0
       MINIO_ENABLED: "true"
       MINIO_ENDPOINT: minio:9000
-      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_GENERATION_BASE_URL: http://ollama:11434
+      OLLAMA_EMBEDDING_BASE_URL: http://ollama:11434
     ports:
       - "8000:8000"
     volumes:
@@ -26,11 +27,12 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/llm_wiki
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/knowledge_agent
       REDIS_URL: redis://redis:6379/0
       MINIO_ENABLED: "true"
       MINIO_ENDPOINT: minio:9000
-      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_GENERATION_BASE_URL: http://ollama:11434
+      OLLAMA_EMBEDDING_BASE_URL: http://ollama:11434
     volumes:
       - ./data:/app/data
     extra_hosts:
@@ -43,7 +45,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: llm_wiki
+      POSTGRES_DB: knowledge_agent
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:

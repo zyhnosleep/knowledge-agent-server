@@ -1,7 +1,7 @@
 [project]
-name = "llm-wiki-server"
+name = "knowledge-agent-server"
 version = "0.1.0"
-description = "Server-oriented internal knowledge base inspired by llm_wiki."
+description = "Server-oriented research knowledge and evidence Agent."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

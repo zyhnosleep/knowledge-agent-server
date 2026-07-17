@@ -15,7 +15,7 @@ if [ -f "$ROOT_DIR/.env" ]; then
 fi
 
 APP_PORT="${APP_PORT:-8000}"
-OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://$OLLAMA_HOST_VALUE}"
+OLLAMA_API_URL="${OLLAMA_API_URL:-http://$OLLAMA_HOST_VALUE}"
 
 check_pid() {
   name="$1"
@@ -39,8 +39,8 @@ check_redis() {
 }
 
 check_ollama() {
-  if command -v curl >/dev/null 2>&1 && curl -fsS "$OLLAMA_BASE_URL/api/tags" >/dev/null 2>&1; then
-    echo "ollama: running ($OLLAMA_BASE_URL)"
+  if command -v curl >/dev/null 2>&1 && curl -fsS "$OLLAMA_API_URL/api/tags" >/dev/null 2>&1; then
+    echo "ollama: running ($OLLAMA_API_URL)"
   else
     check_pid "ollama" "$RUN_DIR/ollama.pid"
   fi

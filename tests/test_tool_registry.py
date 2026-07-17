@@ -553,7 +553,7 @@ def test_answer_synthesize_uses_injected_synthesizer_and_target() -> None:
             "target": {
                 "profile": "deep",
                 "base_url": "http://deep:11434",
-                "model": "qwen3.6:27b",
+                "model": "qwen3.5:9b",
                 "context_length": 32768,
                 "reason": "manual deep",
             },
@@ -562,7 +562,7 @@ def test_answer_synthesize_uses_injected_synthesizer_and_target() -> None:
 
     assert result["ok"] is True
     assert synthesizer.target.profile == "deep"
-    assert result["result"]["model"] == "qwen3.6:27b"
+    assert result["result"]["model"] == "qwen3.5:9b"
 
 
 def test_answer_synthesize_accepts_evidence_pack_in_call() -> None:

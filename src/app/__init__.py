@@ -1,1 +1,1 @@
-"""LLM Wiki server package."""
+"""Knowledge Agent server package."""

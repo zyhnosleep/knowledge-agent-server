@@ -1,0 +1,16 @@
+[Unit]
+Description=Knowledge Agent test API
+After=network-online.target knowledge-agent-test-ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/knowledge-agent-test
+EnvironmentFile=%h/knowledge-agent-test/runtime/app.env
+ExecStart=%h/knowledge-agent-test/.venv/bin/python -m uvicorn app.main:app --app-dir src --host 127.0.0.1 --port 8001
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

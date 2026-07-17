@@ -38,7 +38,7 @@ class QueryHTTPResult:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate /api/query answers against a JSON benchmark.")
     parser.add_argument("benchmark", type=Path, help="Path to a JSON benchmark file.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="LLM Wiki API base URL.")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Knowledge Agent API base URL.")
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON report output path.")
     parser.add_argument("--markdown", type=Path, default=None, help="Optional Markdown report output path.")
     parser.add_argument("--save-answer", action="store_true", help="Ask the API to persist query answers.")

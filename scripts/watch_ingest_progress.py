@@ -13,7 +13,7 @@ TERMINAL_STATES = {"completed", "failed"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch the latest ingest run progress.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="LLM Wiki API base URL.")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Knowledge Agent API base URL.")
     parser.add_argument("--run-id", default="", help="Optional run id to watch. Defaults to latest ingest run.")
     parser.add_argument("--interval", type=float, default=3.0, help="Polling interval in seconds.")
     return parser.parse_args()
