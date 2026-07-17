@@ -46,6 +46,8 @@ def test_synthesize_auto_without_external_api_uses_local_ollama(monkeypatch) -> 
     assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
     assert len(result["warnings"]) == 0
     assert ollama.calls[0]["model"] == "qwen3:14b"
+    assert ollama.calls[0]["think"] is False
+    assert ollama.calls[0]["options"] == {"num_predict": 768}
     assert "entropy defined" in ollama.calls[0]["user_prompt"]
 
 

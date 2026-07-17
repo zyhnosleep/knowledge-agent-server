@@ -149,6 +149,8 @@ class OllamaClient:
         system_prompt: str,
         user_prompt: str,
         model: str | None = None,
+        think: bool | None = None,
+        options: dict[str, Any] | None = None,
     ) -> SchemaT:
         model_name = model or settings.ollama_generation_model
         payload = {
@@ -160,6 +162,10 @@ class OllamaClient:
             "stream": False,
             "format": schema.model_json_schema(),# 关键：强制大模型按JSON Schema输出
         }
+        if think is not None:
+            payload["think"] = think
+        if options:
+            payload["options"] = options
         data = self._post_chat(payload)
         content = self._message_content(data)
         try:
@@ -171,6 +177,8 @@ class OllamaClient:
                 model=model_name,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
+                think=think,
+                options=options,
             )
             retry_data = self._post_chat(retry_payload)
             return self._parse_structured_content(schema, self._message_content(retry_data))
@@ -265,6 +273,8 @@ class OllamaClient:
         system_prompt: str,
         user_prompt: str,
         images: list[str] | None = None,
+        think: bool | None = None,
+        options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         content = "\n\n".join(
             [
@@ -277,7 +287,7 @@ class OllamaClient:
         user_message: dict[str, Any] = {"role": "user", "content": content}
         if images:
             user_message["images"] = images
-        return {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -286,6 +296,11 @@ class OllamaClient:
             "stream": False,
             "format": "json",
         }
+        if think is not None:
+            payload["think"] = think
+        if options:
+            payload["options"] = options
+        return payload
 
     @classmethod
     def _compact_schema_shape(cls, annotation: Any, depth: int = 0) -> Any:

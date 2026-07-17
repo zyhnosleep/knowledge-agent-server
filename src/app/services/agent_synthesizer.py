@@ -175,6 +175,8 @@ class AgentSynthesizer:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
+                think=False,
+                options={"num_predict": 768},
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Local Ollama synthesis failed: %s", exc)
