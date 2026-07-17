@@ -73,3 +73,6 @@ class ReviewItemRead(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     app_name: str
+    api_status: str = "ok"
+    models: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    queues: dict[str, dict[str, int]] = Field(default_factory=dict)

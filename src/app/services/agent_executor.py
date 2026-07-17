@@ -1089,12 +1089,15 @@ class AgentExecutor:
         if target is not None:
             tool_args["target"] = asdict(target)
 
+        queue_wait_ms = 0
         if target is not None and target.profile in {"fast", "deep"}:
+            queue_started = time.monotonic()
             with self._model_runtime.acquire(
                 target.profile,
                 on_queue=lambda position: self._emit_queue_event(position, target),
                 cancel_event=self._cancel_event,
             ):
+                queue_wait_ms = int((time.monotonic() - queue_started) * 1000)
                 synth_result = self._tools.call_tool(
                     "answer.synthesize",
                     tool_args,
@@ -1123,7 +1126,11 @@ class AgentExecutor:
                 "model": sdata.get("model"),
                 "confidence": sdata.get("confidence", 1.0),
                 "cited_indexes": sdata.get("cited_indexes", []),
+                "queue_ms": queue_wait_ms,
             }
+            performance = sdata.get("performance")
+            if isinstance(performance, dict):
+                synth_meta.update(performance)
             if target is not None:
                 synth_meta.update(
                     {

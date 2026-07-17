@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -131,6 +132,9 @@ class AgentSynthesizer:
         )
         chunks: list[str] = []
         model = resolved_target.model
+        generation_started = time.monotonic()
+        first_token_ms: int | None = None
+        last_generated: dict[str, Any] = {}
         try:
             for generated in ollama.stream_chat(
                 messages=messages,
@@ -139,11 +143,16 @@ class AgentSynthesizer:
                 max_output_tokens=768,
                 cancel_event=cancel_event,
             ):
+                last_generated = generated
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError("Local Ollama synthesis cancelled")
                 delta = str(generated.get("content") or "")
                 model = str(generated.get("model") or model)
                 if delta:
+                    if first_token_ms is None:
+                        first_token_ms = int(
+                            (time.monotonic() - generation_started) * 1000
+                        )
                     chunks.append(delta)
                     event_sink("token", {"delta": delta, "model": model})
         except Exception as exc:  # noqa: BLE001
@@ -170,6 +179,9 @@ class AgentSynthesizer:
             "confidence": 1.0,
             "provider": "local",
             "model": model,
+            "performance": self._performance_metadata(
+                last_generated, first_token_ms=first_token_ms
+            ),
         }
         self._emit_citations(result, citations, event_sink)
         return result
@@ -272,6 +284,7 @@ class AgentSynthesizer:
             "confidence": 1.0,
             "provider": "local",
             "model": str(generated.get("model") or target.model),
+            "performance": self._performance_metadata(generated),
         }
 
     def _build_local_messages(
@@ -334,6 +347,35 @@ class AgentSynthesizer:
         for index in result.get("cited_indexes", []):
             if isinstance(index, int) and 0 <= index < len(citations):
                 event_sink("citation", {"index": index, **citations[index]})
+
+    @staticmethod
+    def _performance_metadata(
+        generated: dict[str, Any], *, first_token_ms: int | None = None
+    ) -> dict[str, Any]:
+        prompt_tokens = int(
+            generated.get("prompt_eval_count")
+            or generated.get("prompt_tokens")
+            or 0
+        )
+        completion_tokens = int(
+            generated.get("eval_count")
+            or generated.get("completion_tokens")
+            or 0
+        )
+        eval_duration = int(generated.get("eval_duration") or 0)
+        tokens_per_second = (
+            round(completion_tokens / (eval_duration / 1_000_000_000), 2)
+            if completion_tokens and eval_duration
+            else 0.0
+        )
+        return {
+            "first_token_ms": first_token_ms,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "tokens_per_second": tokens_per_second,
+            "load_ms": round(int(generated.get("load_duration") or 0) / 1_000_000, 1),
+            "total_ms": round(int(generated.get("total_duration") or 0) / 1_000_000, 1),
+        }
 
     def _default_target(self) -> InferenceTarget:
         """Provide a backward-compatible fast target for direct callers."""

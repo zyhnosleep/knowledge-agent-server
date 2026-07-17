@@ -242,6 +242,13 @@ _SENSITIVE_KEY_PATTERNS = (
     "raw_response",
 )
 
+_SAFE_METRIC_KEYS = {
+    "first_token_ms",
+    "prompt_tokens",
+    "completion_tokens",
+    "tokens_per_second",
+}
+
 
 def _sanitize_dict(data: dict[str, Any] | None) -> dict[str, Any]:
     """Return a copy of *data* with sensitive keys and values redacted."""
@@ -250,7 +257,9 @@ def _sanitize_dict(data: dict[str, Any] | None) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, value in data.items():
         key_lower = key.lower()
-        if any(pattern in key_lower for pattern in _SENSITIVE_KEY_PATTERNS):
+        if key_lower in _SAFE_METRIC_KEYS:
+            sanitized[key] = value
+        elif any(pattern in key_lower for pattern in _SENSITIVE_KEY_PATTERNS):
             sanitized[key] = "[redacted]"
         elif isinstance(value, str) and _looks_like_secret(value):
             sanitized[key] = "[redacted]"

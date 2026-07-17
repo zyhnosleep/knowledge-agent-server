@@ -35,3 +35,19 @@ def test_user_service_and_named_tunnel_templates_are_restartable() -> None:
     assert "hostname: research.example.com" in tunnel_config
     assert "service: http://127.0.0.1:8001" in tunnel_config
     assert "service: http_status:404" in tunnel_config
+
+
+def test_dual_ollama_services_pin_gpus_and_performance_flags() -> None:
+    fast = Path("deploy/systemd/llm-wiki-ollama-fast.service").read_text(encoding="utf-8")
+    deep = Path("deploy/systemd/llm-wiki-ollama-deep.service").read_text(encoding="utf-8")
+
+    assert "CUDA_VISIBLE_DEVICES=0" in fast
+    assert "OLLAMA_HOST=127.0.0.1:11435" in fast
+    assert "OLLAMA_FLASH_ATTENTION=1" in fast
+    assert "OLLAMA_KV_CACHE_TYPE=q8_0" in fast
+    assert "OLLAMA_KEEP_ALIVE=-1" in fast
+    assert "CUDA_VISIBLE_DEVICES=1" in deep
+    assert "OLLAMA_HOST=127.0.0.1:11436" in deep
+    assert "OLLAMA_FLASH_ATTENTION=1" in deep
+    assert "OLLAMA_KV_CACHE_TYPE=q8_0" in deep
+    assert "OLLAMA_KEEP_ALIVE=-1" in deep

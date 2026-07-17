@@ -40,6 +40,8 @@ from app.services.queue import JobDispatcher
 from app.services.repositories import get_or_create_project
 from app.services.search import QueryService
 from app.services.vector_store import get_vector_store
+from app.services.model_readiness import get_model_readiness
+from app.services.model_runtime import get_model_runtime
 
 router = APIRouter()
 settings = get_settings()
@@ -316,7 +318,14 @@ def _build_pipeline_run_item(run: PipelineRun | None, document: Document | None,
 
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", app_name=settings.app_name)
+    readiness = get_model_readiness().check()
+    return HealthResponse(
+        status=readiness["status"],
+        app_name=settings.app_name,
+        api_status="ok",
+        models=readiness["models"],
+        queues=get_model_runtime().snapshot(),
+    )
 
 
 @router.get("/projects", response_model=list[ProjectRead])

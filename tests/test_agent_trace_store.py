@@ -508,3 +508,43 @@ def test_trace_serialization_redacts_secrets_in_steps() -> None:
     assert run["constraints"].get("api_key") == "[redacted]"
     step_meta = run["steps"][0]["metadata"]
     assert step_meta.get("authorization") == "[redacted]"
+
+
+def test_trace_preserves_safe_model_performance_metadata() -> None:
+    db = make_db()
+    store = AgentTraceStore(db)
+    trace_id = store.persist_run(
+        request_id="req-perf",
+        session_id="s-perf",
+        project_slug="demo",
+        query="q",
+        constraints={},
+        route="simple_rag",
+        steps=[
+            AgentStep(
+                step_id=0,
+                step_type="synthesis",
+                summary="generated",
+                metadata={
+                    "queue_ms": 120,
+                    "first_token_ms": 340,
+                    "prompt_tokens": 200,
+                    "completion_tokens": 50,
+                    "tokens_per_second": 18.4,
+                },
+            )
+        ],
+        usage=_make_usage(),
+        final_answer="a",
+        citations=[],
+        warnings=[],
+        status="completed",
+        latency_ms=1000,
+        provider="local",
+        model="qwen3:14b",
+    )
+    db.commit()
+
+    metadata = store.get_trace(trace_id)["steps"][0]["metadata"]
+    assert metadata["first_token_ms"] == 340
+    assert metadata["tokens_per_second"] == 18.4

@@ -55,6 +55,36 @@ def make_client(db: Session, *, raise_server_exceptions: bool = True) -> TestCli
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
+def test_health_distinguishes_api_and_model_readiness(monkeypatch) -> None:
+    class FakeReadiness:
+        def check(self):
+            return {
+                "status": "degraded",
+                "models": {
+                    "fast": {"status": "ready", "model": "qwen3:14b", "context_length": 16384},
+                    "deep": {"status": "not_loaded", "model": "qwen3.6:27b", "context_length": 32768},
+                    "embedding": {"status": "ready", "model": "qwen3-embedding:8b", "dimensions": 4096},
+                },
+            }
+
+    class FakeRuntime:
+        def snapshot(self):
+            return {
+                "fast": {"capacity": 1, "active": 0, "queued": 0},
+                "deep": {"capacity": 1, "active": 1, "queued": 2},
+            }
+
+    monkeypatch.setattr(routes, "get_model_readiness", lambda: FakeReadiness())
+    monkeypatch.setattr(routes, "get_model_runtime", lambda: FakeRuntime())
+
+    payload = make_client(make_session()).get("/api/health").json()
+
+    assert payload["api_status"] == "ok"
+    assert payload["status"] == "degraded"
+    assert payload["models"]["deep"]["status"] == "not_loaded"
+    assert payload["queues"]["deep"]["queued"] == 2
+
+
 def test_list_endpoints_apply_limit_and_offset() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
