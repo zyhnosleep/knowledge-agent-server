@@ -46,8 +46,10 @@ def test_dual_ollama_services_pin_gpus_and_performance_flags() -> None:
     assert "OLLAMA_FLASH_ATTENTION=1" in fast
     assert "OLLAMA_KV_CACHE_TYPE=q8_0" in fast
     assert "OLLAMA_KEEP_ALIVE=-1" in fast
+    assert "OLLAMA_CONTEXT_LENGTH=16384" in fast
     assert "CUDA_VISIBLE_DEVICES=1" in deep
     assert "OLLAMA_HOST=127.0.0.1:11436" in deep
     assert "OLLAMA_FLASH_ATTENTION=1" in deep
     assert "OLLAMA_KV_CACHE_TYPE=q8_0" in deep
     assert "OLLAMA_KEEP_ALIVE=-1" in deep
+    assert "OLLAMA_CONTEXT_LENGTH=32768" in deep
