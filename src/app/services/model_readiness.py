@@ -57,7 +57,12 @@ class ModelReadiness:
                 dimensions=self._settings.ollama_embedding_dimensions,
             ),
         }
-        overall = "ok" if all(item["status"] == "ready" for item in profiles.values()) else "degraded"
+        healthy_statuses = {"ready", "idle"}
+        overall = (
+            "ok"
+            if all(item["status"] in healthy_statuses for item in profiles.values())
+            else "degraded"
+        )
         return {"status": overall, "models": profiles}
 
     def _probe_endpoint(self, base_url: str) -> dict[str, Any]:
@@ -92,7 +97,7 @@ class ModelReadiness:
         elif model not in probe["available"]:
             status = "missing"
         elif model not in probe["loaded"]:
-            status = "not_loaded"
+            status = "idle"
         else:
             status = "ready"
         result: dict[str, Any] = {"status": status, "model": model, **metadata}

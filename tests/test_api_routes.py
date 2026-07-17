@@ -59,10 +59,10 @@ def test_health_distinguishes_api_and_model_readiness(monkeypatch) -> None:
     class FakeReadiness:
         def check(self):
             return {
-                "status": "degraded",
+                "status": "ok",
                 "models": {
                     "fast": {"status": "ready", "model": "qwen3:14b", "context_length": 16384},
-                    "deep": {"status": "not_loaded", "model": "qwen3.6:27b", "context_length": 32768},
+                    "deep": {"status": "idle", "model": "qwen3.6:27b", "context_length": 32768},
                     "embedding": {"status": "ready", "model": "qwen3-embedding:8b", "dimensions": 4096},
                 },
             }
@@ -80,8 +80,8 @@ def test_health_distinguishes_api_and_model_readiness(monkeypatch) -> None:
     payload = make_client(make_session()).get("/api/health").json()
 
     assert payload["api_status"] == "ok"
-    assert payload["status"] == "degraded"
-    assert payload["models"]["deep"]["status"] == "not_loaded"
+    assert payload["status"] == "ok"
+    assert payload["models"]["deep"]["status"] == "idle"
     assert payload["queues"]["deep"]["queued"] == 2
 
 

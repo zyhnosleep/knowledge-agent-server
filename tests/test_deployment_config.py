@@ -14,6 +14,7 @@ def test_server_environment_template_matches_internal_pilot_architecture() -> No
     assert "FEISHU_APP_SECRET=" in template
     assert "FEISHU_REDIRECT_URI=https://" in template
     assert "EXTERNAL_API_ENABLED=false" in template
+    assert "OLLAMA_KEEP_ALIVE=5m" in template
 
 
 def test_user_service_and_named_tunnel_templates_are_restartable() -> None:
@@ -45,11 +46,11 @@ def test_dual_ollama_services_pin_gpus_and_performance_flags() -> None:
     assert "OLLAMA_HOST=127.0.0.1:11435" in fast
     assert "OLLAMA_FLASH_ATTENTION=1" in fast
     assert "OLLAMA_KV_CACHE_TYPE=q8_0" in fast
-    assert "OLLAMA_KEEP_ALIVE=-1" in fast
+    assert "OLLAMA_KEEP_ALIVE=5m" in fast
     assert "OLLAMA_CONTEXT_LENGTH=16384" in fast
     assert "CUDA_VISIBLE_DEVICES=1" in deep
     assert "OLLAMA_HOST=127.0.0.1:11436" in deep
     assert "OLLAMA_FLASH_ATTENTION=1" in deep
     assert "OLLAMA_KV_CACHE_TYPE=q8_0" in deep
-    assert "OLLAMA_KEEP_ALIVE=-1" in deep
+    assert "OLLAMA_KEEP_ALIVE=5m" in deep
     assert "OLLAMA_CONTEXT_LENGTH=32768" in deep

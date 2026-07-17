@@ -42,7 +42,8 @@ systemctl --user enable --now llm-wiki-pilot.service llm-wiki-tunnel.service
 The two GPU runtimes are separate user services. GPU 0 hosts the 14B fast
 model and the embedding model on port 11435; GPU 1 hosts the 27B deep model
 on port 11436. Both use Flash Attention, q8_0 KV cache, one generation at a
-time, and permanent model residency:
+time. Models stay loaded for five minutes after their last request, then release
+GPU memory automatically:
 
 ```sh
 systemctl --user enable --now \
@@ -55,9 +56,11 @@ OLLAMA_HOST=127.0.0.1:11436 ollama run qwen3.6:27b "warmup"
 curl -fsS http://127.0.0.1:8001/api/health
 ```
 
-The health response must report `api_status: ok` and all three model entries
-as `ready`. A missing, unreachable, or non-resident model deliberately makes
-the overall status `degraded` without marking the API process itself down.
+The health response must report `api_status: ok`. A model reports `ready` while
+loaded and `idle` after its five-minute GPU timeout; both are healthy. A missing
+or unreachable model makes the overall status `degraded` without marking the API
+process itself down. The first request after an idle release has a cold-start
+delay while Ollama reloads the model.
 
 For services to start before an interactive login, an administrator must run
 `loginctl enable-linger zhangyh` once.

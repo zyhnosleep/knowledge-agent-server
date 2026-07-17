@@ -15,7 +15,7 @@ class FakeResponse:
         return {"models": [{"model": model} for model in self._models]}
 
 
-def test_readiness_requires_available_and_prewarmed_models(monkeypatch) -> None:
+def test_readiness_treats_available_unloaded_models_as_healthy_idle(monkeypatch) -> None:
     calls: list[str] = []
 
     class FakeClient:
@@ -46,9 +46,36 @@ def test_readiness_requires_available_and_prewarmed_models(monkeypatch) -> None:
     first = readiness.check()
     second = readiness.check()
 
-    assert first["status"] == "degraded"
+    assert first["status"] == "ok"
     assert first["models"]["fast"]["status"] == "ready"
     assert first["models"]["deep"]["status"] == "ready"
-    assert first["models"]["embedding"]["status"] == "not_loaded"
+    assert first["models"]["embedding"]["status"] == "idle"
     assert second == first
     assert len(calls) == 4
+
+
+def test_readiness_still_degrades_when_a_configured_model_is_missing(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url):
+            if url.endswith("/api/tags") and "11435" in url:
+                return FakeResponse(["qwen3:14b"])
+            if url.endswith("/api/tags"):
+                return FakeResponse(["qwen3.6:27b"])
+            return FakeResponse([])
+
+    monkeypatch.setattr("app.services.model_readiness.httpx.Client", FakeClient)
+    readiness = ModelReadiness(Settings(), cache_seconds=0)
+
+    result = readiness.check()
+
+    assert result["status"] == "degraded"
+    assert result["models"]["embedding"]["status"] == "missing"

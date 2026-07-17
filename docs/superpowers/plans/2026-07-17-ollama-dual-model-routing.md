@@ -90,7 +90,7 @@ Create immutable `InferenceTarget(profile, base_url, model, context_length)` and
 
 - [ ] **Step 4: Document all aliases in both env examples**
 
-Use `-1` for `OLLAMA_KEEP_ALIVE`, set fast/deep contexts explicitly, and keep `OLLAMA_EMBEDDING_MODEL=qwen3-embedding:8b` independent of both generation models.
+Use `5m` for `OLLAMA_KEEP_ALIVE`, set fast/deep contexts explicitly, and keep `OLLAMA_EMBEDDING_MODEL=qwen3-embedding:8b` independent of both generation models.
 
 - [ ] **Step 5: Run tests and verify GREEN**
 
@@ -441,7 +441,7 @@ Store timing in trace step metadata and expose it through existing trace APIs. D
 
 - [ ] **Step 5: Add deployment services and benchmark script**
 
-Fast service uses GPU 0, port 11435, Flash Attention, q8 KV and permanent keep-alive. Deep service uses GPU 1 and port 11436 with the same runtime flags. Benchmark script runs fixed fast/deep requests and reports TTFT, total latency, tokens/s, selected model and citation count as JSON.
+Fast service uses GPU 0, port 11435, Flash Attention, q8 KV and a five-minute idle keep-alive. Deep service uses GPU 1 and port 11436 with the same runtime flags. Benchmark script runs fixed fast/deep requests and reports TTFT, total latency, tokens/s, selected model and citation count as JSON.
 
 - [ ] **Step 6: Run tests and verify GREEN**
 
