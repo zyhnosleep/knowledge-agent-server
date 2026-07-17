@@ -6,19 +6,12 @@ import re
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.services.ai import OllamaClient
+from app.services.agent_model_router import InferenceTarget
 
 logger = logging.getLogger(__name__)
-
-
-class LocalSynthesisPayload(BaseModel):
-    answer_markdown: str
-    cited_indexes: list[int] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    confidence: float = 1.0
 
 
 class AgentSynthesizer:
@@ -40,7 +33,7 @@ class AgentSynthesizer:
 
     def __init__(self, ollama_client: OllamaClient | None = None) -> None:
         self._settings = get_settings()
-        self._ollama = ollama_client or OllamaClient()
+        self._ollama = ollama_client
 
     # ------------------------------------------------------------------
     # public API
@@ -55,6 +48,7 @@ class AgentSynthesizer:
         rag_answer: str,
         citations: list[dict[str, Any]],
         evidence_pack: dict[str, Any] | None = None,
+        target: InferenceTarget | None = None,
     ) -> dict[str, Any]:
         """Synthesize a final answer from RAG evidence.
 
@@ -77,6 +71,7 @@ class AgentSynthesizer:
                 rag_answer=rag_answer,
                 citations=citations,
                 evidence_pack=evidence_pack,
+                target=target or self._default_target(),
             )
 
         # external_api path
@@ -136,6 +131,7 @@ class AgentSynthesizer:
         rag_answer: str,
         citations: list[dict[str, Any]],
         evidence_pack: dict[str, Any] | None = None,
+        target: InferenceTarget,
     ) -> dict[str, Any]:
         """Synthesize a cited answer with the configured local Ollama model."""
         if not citations and not (evidence_pack or {}).get("items"):
@@ -167,16 +163,21 @@ class AgentSynthesizer:
             + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
             + "Return a concise final answer grounded only in this evidence."
         )
-        model = self._settings.ollama_generation_model
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        ollama = self._ollama or OllamaClient(
+            base_url=target.base_url,
+            embedding_base_url=self._settings.ollama_embedding_base_url,
+        )
 
         try:
-            parsed = self._ollama.generate_structured(
-                LocalSynthesisPayload,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=model,
-                think=False,
-                options={"num_predict": 768},
+            generated = ollama.generate_chat(
+                messages=messages,
+                model=target.model,
+                context_length=target.context_length,
+                max_output_tokens=768,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Local Ollama synthesis failed: %s", exc)
@@ -186,10 +187,9 @@ class AgentSynthesizer:
             )
             return result
 
-        answer_markdown = parsed.answer_markdown.strip()
+        answer_markdown = str(generated.get("content") or "").strip()
         if not answer_markdown:
             result = self._local_fallback(rag_answer, citations)
-            result["warnings"].extend(parsed.warnings)
             result["warnings"].append(
                 "Local Ollama synthesis returned an empty answer; using evidence fallback."
             )
@@ -198,19 +198,29 @@ class AgentSynthesizer:
         max_index = len(citations)
         cited_indexes = list(
             dict.fromkeys(
-                index
-                for index in parsed.cited_indexes
-                if isinstance(index, int) and 0 <= index < max_index
+                int(index)
+                for index in re.findall(r"\[(\d+)\]", answer_markdown)
+                if 0 <= int(index) < max_index
             )
         )
         return {
             "answer_markdown": answer_markdown,
             "cited_indexes": cited_indexes,
-            "warnings": [str(warning) for warning in parsed.warnings],
-            "confidence": max(0.0, min(1.0, float(parsed.confidence))),
+            "warnings": [],
+            "confidence": 1.0,
             "provider": "local",
-            "model": model,
+            "model": str(generated.get("model") or target.model),
         }
+
+    def _default_target(self) -> InferenceTarget:
+        """Provide a backward-compatible fast target for direct callers."""
+        return InferenceTarget(
+            profile="fast",
+            base_url=self._settings.ollama_fast_base_url.rstrip("/"),
+            model=self._settings.ollama_fast_model,
+            context_length=self._settings.ollama_fast_context_length,
+            reason="Default local synthesis target",
+        )
 
     @staticmethod
     def _format_evidence_pack_section(

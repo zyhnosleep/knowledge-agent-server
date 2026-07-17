@@ -116,7 +116,9 @@ class ToolRegistry:
     # built-in tools
     # ------------------------------------------------------------------
 
-    def _register_builtins(self, rag_adapter: Any) -> None:
+    def _register_builtins(
+        self, rag_adapter: Any, *, synthesizer: Any | None = None
+    ) -> None:
         """Register the read-only ``rag.answer``, ``rag.retrieve_evidence``,
         ``answer.synthesize``, and ``answer.verify`` tools.
 
@@ -254,6 +256,10 @@ class ToolRegistry:
                                 "with status and items keys."
                             ),
                         },
+                        "target": {
+                            "type": "object",
+                            "description": "Resolved local inference profile.",
+                        },
                     },
                     "required": ["query", "rag_answer"],
                 },
@@ -271,7 +277,7 @@ class ToolRegistry:
                 side_effect_level="none",
                 timeout_ms=120000,
             ),
-            lambda args, ctx: _answer_synthesize_handler(args),
+            lambda args, ctx: _answer_synthesize_handler(args, synthesizer),
         )
 
         # ---- answer.verify ----
@@ -423,11 +429,16 @@ def _answer_verify_handler(
     )
 
 
-def _answer_synthesize_handler(args: dict[str, Any]) -> dict[str, Any]:
+def _answer_synthesize_handler(
+    args: dict[str, Any], synthesizer: Any | None = None
+) -> dict[str, Any]:
     """Call AgentSynthesizer.synthesize and return the result dict."""
     from app.services.agent_synthesizer import AgentSynthesizer
+    from app.services.agent_model_router import InferenceTarget
 
-    synthesizer = AgentSynthesizer()
+    synthesizer = synthesizer or AgentSynthesizer()
+    raw_target = args.get("target")
+    target = InferenceTarget(**raw_target) if isinstance(raw_target, dict) else None
     return synthesizer.synthesize(
         query=args.get("query", ""),
         route=args.get("route", "simple_rag"),
@@ -435,4 +446,5 @@ def _answer_synthesize_handler(args: dict[str, Any]) -> dict[str, Any]:
         rag_answer=args.get("rag_answer", ""),
         citations=args.get("citations") or [],
         evidence_pack=args.get("evidence_pack"),
+        target=target,
     )

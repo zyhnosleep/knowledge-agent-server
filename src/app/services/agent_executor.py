@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -20,6 +21,7 @@ from app.schemas.agent import (
 )
 from app.schemas.common import Citation
 from app.services.agent_policy import PolicyRouter
+from app.services.agent_model_router import AgentModelRouter, InferenceTarget
 from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
@@ -111,6 +113,10 @@ class AgentExecutor:
             # ==============================================================
             route_t0 = time.monotonic()
             route = PolicyRouter().route(request.query)
+            requested_answer_mode = self._memory.get_answer_mode(session_id)
+            inference_target = AgentModelRouter().select(
+                requested_answer_mode, route.route
+            )
             route_latency = int((time.monotonic() - route_t0) * 1000)
 
             route_step = AgentStep(
@@ -122,6 +128,11 @@ class AgentExecutor:
                     "route": route.route,
                     "reason": route.reason,
                     "max_retries": route.max_retries,
+                    "requested_answer_mode": requested_answer_mode,
+                    "inference_profile": inference_target.profile,
+                    "inference_model": inference_target.model,
+                    "inference_context_length": inference_target.context_length,
+                    "inference_reason": inference_target.reason,
                 },
             )
             steps.append(route_step)
@@ -362,6 +373,7 @@ class AgentExecutor:
                     usage,
                     session_id,
                     evidence_pack=evidence_pack,
+                    target=inference_target,
                 )
                 if synth_result.get("ok"):
                     synth_data = synth_result.get("result", {})
@@ -997,6 +1009,7 @@ class AgentExecutor:
         usage: AgentUsage,
         session_id: str,
         evidence_pack: dict[str, Any] | None = None,
+        target: InferenceTarget | None = None,
     ) -> dict[str, Any]:
         """Call answer.synthesize, record step, return tool result dict.
 
@@ -1050,6 +1063,8 @@ class AgentExecutor:
         }
         if evidence_pack is not None:
             tool_args["evidence_pack"] = evidence_pack
+        if target is not None:
+            tool_args["target"] = asdict(target)
 
         synth_result = self._tools.call_tool(
             "answer.synthesize",
@@ -1067,6 +1082,14 @@ class AgentExecutor:
                 "confidence": sdata.get("confidence", 1.0),
                 "cited_indexes": sdata.get("cited_indexes", []),
             }
+            if target is not None:
+                synth_meta.update(
+                    {
+                        "inference_profile": target.profile,
+                        "inference_context_length": target.context_length,
+                        "inference_reason": target.reason,
+                    }
+                )
             if evidence_pack and evidence_pack.get("items"):
                 items = evidence_pack["items"]
                 synth_meta["evidence_pack_items"] = len(items)

@@ -47,11 +47,11 @@ logger = logging.getLogger(__name__)
 def _build_executor(db: Session, owner_user_id: str | None = None) -> AgentExecutor:
     """Create an AgentExecutor with all standard dependencies."""
     rag = RAGAdapter()
+    synthesizer = AgentSynthesizer()
     tools = ToolRegistry()
-    tools._register_builtins(rag)
+    tools._register_builtins(rag, synthesizer=synthesizer)
     memory = ConversationMemory(db, owner_user_id=owner_user_id)
     trace_store = AgentTraceStore(db, owner_user_id=owner_user_id)
-    synthesizer = AgentSynthesizer()
     return AgentExecutor(
         rag=rag, tools=tools, memory=memory, db=db,
         trace_store=trace_store, synthesizer=synthesizer,

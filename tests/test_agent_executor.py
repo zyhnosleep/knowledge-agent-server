@@ -134,6 +134,42 @@ def test_execute_commits_session_turn_before_rag(monkeypatch) -> None:
     assert commit_counts_seen and commit_counts_seen[0] >= 1
 
 
+def test_manual_deep_mode_is_recorded_and_passed_to_synthesis() -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    executor = make_executor(db, rag_answer_text="test answer")
+    captured: dict = {}
+
+    def routed_synthesis(args, ctx):
+        captured.update(args["target"])
+        return {
+            "answer_markdown": "deep answer [0]",
+            "cited_indexes": [0],
+            "warnings": [],
+            "confidence": 1.0,
+            "provider": "local",
+            "model": args["target"]["model"],
+        }
+
+    executor._tools.get("answer.synthesize")["handler"] = routed_synthesis
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="hello",
+            session_id="deep-session",
+            answer_mode="deep",
+        )
+    )
+
+    route_step = next(step for step in response.steps if step.step_type == "route")
+    assert route_step.metadata["requested_answer_mode"] == "deep"
+    assert route_step.metadata["inference_profile"] == "deep"
+    assert route_step.metadata["inference_model"] == "qwen3.6:27b"
+    assert captured["context_length"] == 32768
+    assert response.answer_model == "qwen3.6:27b"
+
+
 def test_concurrent_sessions_release_initial_write_transaction(tmp_path) -> None:
     engine = create_engine(
         f"sqlite:///{tmp_path / 'agent-concurrency.db'}",

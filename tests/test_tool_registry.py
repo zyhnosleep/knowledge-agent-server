@@ -521,6 +521,50 @@ def test_answer_synthesize_schema_includes_evidence_pack() -> None:
     assert "evidence_pack" not in spec.input_schema.get("required", [])
 
 
+def test_answer_synthesize_uses_injected_synthesizer_and_target() -> None:
+    class FakeRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            pass
+
+    class FakeSynthesizer:
+        def __init__(self) -> None:
+            self.target = None
+
+        def synthesize(self, **kwargs):
+            self.target = kwargs["target"]
+            return {
+                "answer_markdown": "routed [0]",
+                "cited_indexes": [0],
+                "warnings": [],
+                "confidence": 1.0,
+                "provider": "local",
+                "model": self.target.model,
+            }
+
+    synthesizer = FakeSynthesizer()
+    reg = ToolRegistry()
+    reg._register_builtins(FakeRAG(), synthesizer=synthesizer)
+    result = reg.call_tool(
+        "answer.synthesize",
+        {
+            "query": "Question",
+            "rag_answer": "Draft",
+            "citations": [{"excerpt": "evidence"}],
+            "target": {
+                "profile": "deep",
+                "base_url": "http://deep:11434",
+                "model": "qwen3.6:27b",
+                "context_length": 32768,
+                "reason": "manual deep",
+            },
+        },
+    )
+
+    assert result["ok"] is True
+    assert synthesizer.target.profile == "deep"
+    assert result["result"]["model"] == "qwen3.6:27b"
+
+
 def test_answer_synthesize_accepts_evidence_pack_in_call() -> None:
     """Calling answer.synthesize with evidence_pack passes schema validation."""
     reg = ToolRegistry()
