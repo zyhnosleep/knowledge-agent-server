@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Literal, cast
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -206,7 +207,13 @@ class ConversationMemory:
         return count
 
     def touch_session(
-        self, session_id: str, *, project_slug: str, ttl_days: int, document_id: str | None = None
+        self,
+        session_id: str,
+        *,
+        project_slug: str,
+        ttl_days: int,
+        document_id: str | None = None,
+        answer_mode: Literal["auto", "fast", "deep"] | None = None,
     ) -> None:
         """Create or update a conversation session with an expiry time.
 
@@ -231,16 +238,28 @@ class ConversationMemory:
         if existing:
             existing.expires_at = expires_at
             existing.updated_at = datetime.utcnow()
+            if answer_mode is not None:
+                existing.answer_mode = answer_mode
         else:
             session = ConversationSession(
                 id=session_id,
                 owner_user_id=self._owner_user_id,
                 project_slug=project_slug,
                 document_id=document_id,
+                answer_mode=answer_mode or "auto",
                 expires_at=expires_at,
             )
             self._db.add(session)
         self._db.flush()
+
+    def get_answer_mode(
+        self, session_id: str
+    ) -> Literal["auto", "fast", "deep"]:
+        """Return the persisted mode, defaulting safely for unknown sessions/data."""
+        session = self._db.get(ConversationSession, session_id)
+        if session is None or session.answer_mode not in {"auto", "fast", "deep"}:
+            return "auto"
+        return cast(Literal["auto", "fast", "deep"], session.answer_mode)
 
     def purge_expired_sessions(self) -> int:
         """Delete expired sessions and their conversation turns and attachments.

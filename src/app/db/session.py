@@ -41,6 +41,7 @@ def _ensure_sqlite_columns() -> None:
         return
     columns = (
         ("conversation_sessions", "document_id", "TEXT"),
+        ("conversation_sessions", "answer_mode", "TEXT NOT NULL DEFAULT 'auto'"),
         ("conversation_turns", "citations", "TEXT"),
     )
     with engine.begin() as connection:

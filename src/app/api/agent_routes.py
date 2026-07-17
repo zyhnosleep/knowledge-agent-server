@@ -498,6 +498,7 @@ def _build_agent_session_read(
         scope_type="document" if row.document_id is not None else "project",
         document_id=row.document_id,
         document_title=document_title,
+        answer_mode=row.answer_mode,
         preview=(first_user_turn.content if first_user_turn else row.id),
         turn_count=memory.turn_count(row.id),
         created_at=row.created_at.isoformat(),

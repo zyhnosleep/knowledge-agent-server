@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,7 @@ class AgentQueryRequest(BaseModel):
     query: str
     session_id: str | None = None
     document_id: str | None = None
+    answer_mode: Literal["auto", "fast", "deep"] | None = None
     constraints: AgentConstraints = Field(default_factory=AgentConstraints)
 
 
@@ -193,6 +194,7 @@ class AgentSessionRead(BaseModel):
     scope_type: str  # "project" | "document"
     document_id: str | None = None
     document_title: str | None = None
+    answer_mode: Literal["auto", "fast", "deep"] = "auto"
     preview: str
     turn_count: int
     created_at: str

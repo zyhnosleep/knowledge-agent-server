@@ -25,10 +25,15 @@ def test_alembic_upgrade_builds_current_schema_on_sqlite(tmp_path: Path) -> None
 
     command.upgrade(_config(database_url), "head")
 
-    table_names = set(inspect(create_engine(database_url)).get_table_names())
+    inspector = inspect(create_engine(database_url))
+    table_names = set(inspector.get_table_names())
     expected_tables = set(Base.metadata.tables)
     assert expected_tables <= table_names
     assert "alembic_version" in table_names
+    session_columns = {
+        column["name"]: column for column in inspector.get_columns("conversation_sessions")
+    }
+    assert session_columns["answer_mode"]["nullable"] is False
 
 
 def test_alembic_history_has_one_head() -> None:
