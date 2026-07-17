@@ -308,7 +308,9 @@ class AgentSynthesizer:
 
         system_prompt = (
             "You are an evidence-grounded knowledge-base assistant. Answer the user's "
-            "question in the user's language by synthesizing the supplied evidence. "
+            "question by synthesizing the supplied evidence. The final answer MUST use the same language "
+            "as the user's question. When the question contains Chinese, write the answer in Chinese "
+            "except for necessary proper names, formulas, and quoted technical terms. "
             "Do not merely repeat the RAG draft. Do not add facts that are absent from "
             "the evidence. Cite supported statements with the supplied zero-based "
             "citation indexes, such as [0]. If evidence is insufficient, say exactly "
@@ -321,7 +323,7 @@ class AgentSynthesizer:
             f"RAG draft:\n{rag_answer}\n\n"
             f"Citation excerpts:\n{evidence_text}\n\n"
             + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
-            + "Return a concise final answer grounded only in this evidence."
+            + "Return a concise final answer grounded only in this evidence and match the question's language."
         )
         return [
             {"role": "system", "content": system_prompt},

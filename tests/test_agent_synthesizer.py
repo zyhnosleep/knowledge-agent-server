@@ -78,6 +78,7 @@ def test_synthesize_auto_without_external_api_uses_local_ollama(monkeypatch) -> 
     assert ollama.calls[0]["context_length"] == 16384
     assert ollama.calls[0]["max_output_tokens"] == 768
     assert "entropy defined" in ollama.calls[0]["messages"][1]["content"]
+    assert "MUST use the same language" in ollama.calls[0]["messages"][0]["content"]
 
 
 def test_synthesize_local_returns_structured_ollama_answer(monkeypatch) -> None:
