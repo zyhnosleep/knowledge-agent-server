@@ -67,17 +67,13 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - 重建校验：`/home/zhangyh/knowledge-agent-test/runtime/reindex-verify.json`
 - 固定题集与报告：备份目录下 `acceptance/knowledge_agent_retrieval_v1.json`、`baseline-8b.json`、`new-4b.json`
 
-### 回滚入口
+### 旧版本清理
 
-新环境只需停止，不删除任何目录或数据库：
+2026-07-18 经用户确认完成以下清理：
 
-```bash
-systemctl --user disable --now knowledge-agent-test-api.service
-systemctl --user disable --now knowledge-agent-test-worker.service
-systemctl --user disable --now knowledge-agent-test-ollama.service
-systemctl --user enable --now llm-wiki-ollama-fast.service
-systemctl --user enable --now llm-wiki-ollama-deep.service
-systemctl --user enable --now llm-wiki-pilot.service
-```
+- 删除三个旧 API/Ollama systemd 服务及其 unit 文件。
+- 删除旧代码与运行目录。
+- 删除旧应用数据库；PostgreSQL 仅保留 `knowledge_agent_dev` 和 `knowledge_agent_test`。
+- 公网 Caddy 配置迁移到 `/home/zhangyh/knowledge-agent-test/runtime/tunnel`，原 Cloudflare Quick Tunnel 进程保持运行，因此临时网址不变。
 
-旧目录、旧数据库、14B/27B/8B 模型和迁移前备份至少保留七天；清理必须在人工确认新环境稳定后另行执行。
+本次未授权删除的 14B/27B/8B 模型和 108 MB 迁移前备份继续保留。若需要回滚数据，应从 `/home/zhangyh/knowledge-agent-backups/20260718T015755Z` 恢复到新建数据库，不再依赖已删除的旧服务或旧目录。
