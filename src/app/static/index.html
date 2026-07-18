@@ -1591,10 +1591,17 @@
       .runs-overview-rail h3 { margin-top: 40px; color: var(--paper-500); font-size: 12px; }.runs-overview-rail ol { list-style: none; padding: 0; color: var(--paper-500); font-size: 10px; line-height: 1.7; }.runs-overview-rail li { border-left: 1px solid var(--line); padding: 0 0 18px 15px; }
       .runs-layout.drawer-open { grid-template-columns: minmax(430px, .82fr) minmax(620px, 1.18fr); }
       .runs-layout.drawer-open .runs-overview-rail { display: none; }
-      .source-drawer { position: relative; inset: auto; width: auto; max-height: none; min-height: calc(100vh - 250px); display: grid; grid-template-rows: auto 1fr auto; border: 1px solid var(--line); border-bottom: 0; background: var(--night-900); box-shadow: -24px 0 70px rgb(0 0 0 / 18%); }
+      .source-drawer { position: relative; inset: auto; width: auto; height: clamp(600px, calc(100dvh - 230px), 780px); max-height: 780px; min-height: 600px; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; border: 1px solid var(--line); border-bottom: 0; background: var(--night-900); box-shadow: -24px 0 70px rgb(0 0 0 / 18%); }
       .source-drawer[hidden] { display: none; }
-      .drawer-body { display: grid; grid-template-columns: minmax(350px, 1.2fr) minmax(240px, .8fr); gap: 14px; overflow: auto; padding: 14px; }
-      .pdf-panel, .markdown-panel { grid-row: 1 / span 2; }.pdf-frame { min-height: 580px; }.chunk-card { margin: 0; }.chunk-list { min-width: 0; }
+      .drawer-body { display: grid; grid-template-columns: minmax(350px, 1.2fr) minmax(240px, .8fr); gap: 14px; min-height: 0; overflow: hidden; padding: 14px; }
+      .pdf-panel, .markdown-panel { grid-row: auto; min-height: 0; height: 100%; margin: 0; align-self: stretch; }
+      .pdf-panel { grid-template-rows: auto minmax(0, 1fr); }
+      .pdf-frame { min-height: 0; height: 100%; }
+      .source-chunk-browser { display: grid; grid-template-rows: auto minmax(120px, .75fr) minmax(0, 1.25fr); gap: 12px; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+      .source-chunk-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; }
+      .source-chunk-summary strong { color: var(--ink); font-size: 13px; }
+      .source-chunk-browser .chunk-card { min-height: 0; margin: 0; overflow: auto; }
+      .source-chunk-browser .chunk-list { min-width: 0; min-height: 0; margin-top: 0; padding-right: 4px; overflow: auto; align-content: start; }
       .flow-card { display: none; }
 
       @media (max-width: 1200px) {
@@ -1620,7 +1627,7 @@
         .files-layout { grid-template-columns: 1fr; }.files-rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 25px; }
         .project-switch-bar { gap: 10px; }.project-switch-label { padding-right: 14px; }.project-tab { padding: 0 16px; }.project-sync-status { display: none; }
         .document-columns { display: none; }.document-index, .document-list { min-width: 0; overflow: hidden; }.document-row { width: 100%; grid-template-columns: 28px minmax(0, 1fr); }.document-row > .muted { display: none; }.document-row .row-actions { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
-        .drawer-body { grid-template-columns: 1fr; }.pdf-panel, .markdown-panel { grid-row: auto; }.pdf-frame { min-height: 460px; }
+        .source-drawer { height: auto; max-height: none; min-height: 0; }.drawer-body { grid-template-columns: 1fr; overflow: auto; }.pdf-panel, .markdown-panel { grid-row: auto; height: min(68dvh, 620px); }.source-chunk-browser { height: min(68dvh, 620px); }.pdf-frame { min-height: 0; }
       }
       @media (max-width: 480px) {
         .topbar-label i { display: none; }.status-pill { font-size: 10px; }.chat-welcome h1 { font-size: 34px; }.welcome-lede { font-size: 13px; }
@@ -2795,7 +2802,7 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.slice(0, 8).forEach(function (chunk, index) {
+        chunks.forEach(function (chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";
@@ -2857,13 +2864,25 @@
           $("sourceDrawerFoot").textContent = data.document_title || "";
           return;
         }
+        var chunkBrowser = document.createElement("section");
+        chunkBrowser.className = "source-chunk-browser";
+        var pageLabels = Array.from(new Set(chunks.map(function (chunk) { return chunk.page_label; }).filter(Boolean)));
+        var summary = document.createElement("div");
+        summary.className = "source-chunk-summary";
+        summary.innerHTML = "<strong></strong><span></span>";
+        summary.querySelector("strong").textContent = chunks.length + " 个 RAG Chunks";
+        summary.querySelector("span").textContent = pageLabels.length
+          ? "覆盖 " + pageLabels.length + " 页 · page " + pageLabels[0] + "–" + pageLabels[pageLabels.length - 1]
+          : "点击下方条目定位原文";
+        chunkBrowser.appendChild(summary);
         var current = document.createElement("article");
         current.className = "chunk-card";
         current.innerHTML = '<span class="chunk-label"></span><p class="chunk-text"></p>';
-        body.appendChild(current);
+        chunkBrowser.appendChild(current);
         var list = document.createElement("div");
         list.className = "chunk-list";
-        body.appendChild(list);
+        chunkBrowser.appendChild(list);
+        body.appendChild(chunkBrowser);
 
         function selectChunk(chunk, button) {
           current.querySelector(".chunk-label").textContent = chunk.label || "RAG Chunk";
@@ -2876,7 +2895,7 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.slice(0, 8).forEach(function (chunk, index) {
+        chunks.forEach(function (chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";

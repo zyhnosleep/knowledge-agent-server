@@ -647,6 +647,24 @@ def test_source_drawer_is_split_workspace() -> None:
     assert drawer.select_one(".chunk-list") is not None
 
 
+def test_source_drawer_does_not_truncate_chunk_navigation() -> None:
+    html = _html()
+
+    assert "chunks.slice(0, 8)" not in html
+    assert "chunks.forEach(function (chunk, index)" in html
+    assert "source-chunk-summary" in html
+
+
+def test_source_drawer_keeps_pdf_and_long_chunks_in_independent_viewports() -> None:
+    html = _html()
+
+    assert "source-chunk-browser" in html
+    assert ".source-chunk-browser" in html
+    assert "grid-template-rows: auto minmax(120px, .75fr) minmax(0, 1.25fr)" in html
+    assert ".source-chunk-browser .chunk-card" in html
+    assert ".source-chunk-browser .chunk-list" in html
+
+
 def test_source_drawer_restores_dashboard_on_close() -> None:
     html = _html()
     assert "sourceDrawerOpen" in html or "runs-layout" in html
