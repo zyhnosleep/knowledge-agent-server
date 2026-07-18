@@ -119,8 +119,10 @@ def run_cases(
 
     def query(case: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
-        response = rag.answer(db, project_slug, case["question"])
-        citations = [citation.model_dump() for citation in response.citations]
+        evidence = rag.retrieve_evidence(
+            db, project_slug, case["question"], limit=top_k
+        )
+        citations = [item.model_dump() for item in evidence.items]
         return {
             "retrieved_document_ids": [
                 citation["document_id"] for citation in citations

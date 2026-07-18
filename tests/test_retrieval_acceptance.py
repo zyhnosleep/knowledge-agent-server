@@ -1,6 +1,47 @@
 from __future__ import annotations
 
+from app.schemas.agent import EvidenceItem, EvidencePack
+from scripts import build_retrieval_acceptance as acceptance
 from scripts.build_retrieval_acceptance import build_report
+
+
+def test_run_cases_measures_retrieval_without_generating_answers(monkeypatch) -> None:
+    limits: list[int] = []
+
+    class StubRAG:
+        def answer(self, *args, **kwargs):
+            raise AssertionError("retrieval acceptance must not generate answers")
+
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit, document_id=None
+        ) -> EvidencePack:
+            limits.append(limit)
+            return EvidencePack(
+                status="ok",
+                items=[
+                    EvidenceItem(
+                        index=0,
+                        document_id=question,
+                        page_label="1",
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(acceptance, "RAGAdapter", StubRAG)
+    cases = [
+        {
+            "id": f"q{index}",
+            "question": f"document-{index}",
+            "expected_document_ids": [f"document-{index}"],
+        }
+        for index in range(20)
+    ]
+
+    report = acceptance.run_cases(object(), cases, project_slug="demo", top_k=5)
+
+    assert report["summary"]["recall_at_k"] == 1.0
+    assert report["summary"]["citation_validity"] == 1.0
+    assert limits == [5] * 20
 
 
 def test_report_calculates_recall_citation_validity_and_p95() -> None:
