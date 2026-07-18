@@ -61,7 +61,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - Redis 服务：`knowledge-agent-redis.service`
 - Redis 版本：服务器现有 Redis 7.4，仅监听 `127.0.0.1:6379`，AOF 位于 `/home/zhangyh/knowledge-agent-runtime/redis`
 - 共享依赖运行时：`/home/zhangyh/knowledge-agent-runtime/.venv`
-- 共享 Ollama 模型目录：`/home/zhangyh/knowledge-agent-models`
+- 共享 Ollama 模型实体目录：`/home/zhangyh/knowledge-agent-models`，不再依赖旧目录软链接
 - 迁移前备份：`/home/zhangyh/knowledge-agent-backups/20260718T015755Z`
 - 重建报告：`/home/zhangyh/knowledge-agent-test/runtime/reindex-report.json`
 - 重建校验：`/home/zhangyh/knowledge-agent-test/runtime/reindex-verify.json`
@@ -76,5 +76,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - 删除旧应用数据库；PostgreSQL 仅保留 `knowledge_agent_dev` 和 `knowledge_agent_test`。
 - 公网 Caddy 配置迁移到 `/home/zhangyh/knowledge-agent-test/runtime/tunnel`，原 Cloudflare Quick Tunnel 进程保持运行，因此临时网址不变。
 - 删除服务器主目录下剩余的 6 个 `llm_wiki*` 旧仓库与历史备份目录，释放约 11.56 GB；检查确认无活动服务、进程或软链接引用。
+- 将约 38 GB 模型实体原地迁移到 `knowledge-agent-models`，删除旧 `llm_runtime` 缓存、临时文件和日志，额外释放约 3.62 GB；开发、测试两端均通过 2560 维 embedding 与 9B 生成实测。
+- 删除 0 字节的失败备份 `20260718T014131Z`，仅保留已验证可恢复的 `20260718T015755Z`。
 
 本次未授权删除的 14B/27B/8B 模型和 108 MB 迁移前备份继续保留。若需要回滚数据，应从 `/home/zhangyh/knowledge-agent-backups/20260718T015755Z` 恢复到新建数据库，不再依赖已删除的旧服务或旧目录。
