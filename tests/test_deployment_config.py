@@ -55,6 +55,12 @@ def test_both_ollama_services_share_performance_and_idle_settings() -> None:
         assert "OLLAMA_CONTEXT_LENGTH=32768" in service
 
 
+def test_standalone_environment_templates_do_not_require_an_undeployed_redis() -> None:
+    for path in (".env.development.example", ".env.test.example"):
+        env = _read(path)
+        assert "REDIS_URL=" not in env
+
+
 def test_active_product_files_use_knowledge_agent_brand() -> None:
     files = [
         Path("README.md"),
