@@ -1,14 +1,15 @@
 [Unit]
-Description=Knowledge Agent test API
+Description=Knowledge Agent test ingestion worker
 After=network-online.target knowledge-agent-redis.service knowledge-agent-test-ollama.service
-Wants=network-online.target
+Wants=network-online.target knowledge-agent-test-ollama.service
 Requires=knowledge-agent-redis.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/knowledge-agent-test
 EnvironmentFile=%h/knowledge-agent-test/runtime/app.env
-ExecStart=%h/knowledge-agent-test/.venv/bin/python -m uvicorn app.main:app --app-dir src --host 127.0.0.1 --port 8001
+Environment=PYTHONPATH=%h/knowledge-agent-test/src
+ExecStart=%h/knowledge-agent-test/.venv/bin/python -m app.workers.runner
 Restart=on-failure
 RestartSec=5
 UMask=0077

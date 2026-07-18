@@ -1,0 +1,16 @@
+[Unit]
+Description=Knowledge Agent local Redis queue
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f knowledge-agent-redis
+ExecStart=/usr/bin/docker run --rm --name knowledge-agent-redis --publish 127.0.0.1:6379:6379 --volume knowledge-agent-redis-data:/data redis:7-alpine redis-server --appendonly yes
+ExecStop=/usr/bin/docker stop knowledge-agent-redis
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

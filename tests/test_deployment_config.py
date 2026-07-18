@@ -55,10 +55,24 @@ def test_both_ollama_services_share_performance_and_idle_settings() -> None:
         assert "OLLAMA_CONTEXT_LENGTH=32768" in service
 
 
-def test_standalone_environment_templates_do_not_require_an_undeployed_redis() -> None:
-    for path in (".env.development.example", ".env.test.example"):
-        env = _read(path)
-        assert "REDIS_URL=" not in env
+def test_redis_is_local_and_each_environment_has_an_isolated_worker() -> None:
+    redis = _read("deploy/systemd/knowledge-agent-redis.service")
+    dev_env = _read(".env.development.example")
+    test_env = _read(".env.test.example")
+    dev_worker = _read("deploy/systemd/knowledge-agent-dev-worker.service")
+    test_worker = _read("deploy/systemd/knowledge-agent-test-worker.service")
+
+    assert "127.0.0.1:6379:6379" in redis
+    assert "redis:7-alpine" in redis
+    assert "--appendonly yes" in redis
+    assert "REDIS_URL=redis://127.0.0.1:6379/1" in dev_env
+    assert "REDIS_URL=redis://127.0.0.1:6379/2" in test_env
+    assert "WorkingDirectory=%h/knowledge-agent-dev" in dev_worker
+    assert "WorkingDirectory=%h/knowledge-agent-test" in test_worker
+    assert "app.workers.runner" in dev_worker
+    assert "app.workers.runner" in test_worker
+    assert "EnvironmentFile=%h/knowledge-agent-dev/runtime/app.env" in dev_worker
+    assert "EnvironmentFile=%h/knowledge-agent-test/runtime/app.env" in test_worker
 
 
 def test_active_product_files_use_knowledge_agent_brand() -> None:
