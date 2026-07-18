@@ -6,7 +6,7 @@
 
 ## 架构
 
-- 部署一个仅监听 `127.0.0.1:6379` 的 Redis 7 实例，不开放公网。
+- 使用服务器现有的 Redis 7.4 可执行文件部署一个仅监听 `127.0.0.1:6379` 的实例，不开放公网。
 - 开发环境使用 Redis DB 1，测试环境使用 Redis DB 2。
 - 开发、测试各自运行一个 RQ worker，并连接各自的 Redis DB；两边可以使用相同的 `ingest` 队列名，但任务不会跨 DB 混用。
 - API 只负责保存上传文件、创建数据库记录并入队，随后立即返回任务标识与排队状态。
@@ -15,7 +15,7 @@
 
 ## 运行组件
 
-- `knowledge-agent-redis.service`：以本机 Docker 启动 Redis 7，绑定回环地址并使用独立持久卷。
+- `knowledge-agent-redis.service`：以原生进程启动服务器现有 Redis 7.4，绑定回环地址，并把 AOF 数据保存在 `%h/knowledge-agent-runtime/redis`。
 - `knowledge-agent-dev-worker.service`：在开发代码目录运行 RQ worker，读取开发环境配置。
 - `knowledge-agent-test-worker.service`：在测试代码目录运行 RQ worker，读取测试环境配置。
 - 两套 `.env` 模板恢复各自的 `REDIS_URL`：开发 `/1`，测试 `/2`。

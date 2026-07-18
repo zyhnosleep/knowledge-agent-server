@@ -4,9 +4,9 @@
 
 **Goal:** 为开发和测试环境部署本机 Redis 与隔离 RQ worker，使上传异步执行且任务不跨环境。
 
-**Architecture:** 一个仅绑定 `127.0.0.1:6379` 的 Redis 7 容器提供共享进程，开发和测试分别使用 DB 1、DB 2。两个 systemd user worker 分别读取自身环境文件、数据库、数据目录和 Ollama 地址，API 只负责入队。
+**Architecture:** 一个仅绑定 `127.0.0.1:6379` 的原生 Redis 7.4 进程提供共享队列，开发和测试分别使用 DB 1、DB 2。两个 systemd user worker 分别读取自身环境文件、数据库、数据目录和 Ollama 地址，API 只负责入队。
 
-**Tech Stack:** Redis 7、Docker、RQ、Python 3.12、systemd user services、pytest。
+**Tech Stack:** Redis 7.4、RQ、Python 3.12、systemd user services、pytest。
 
 ---
 
@@ -14,7 +14,7 @@
 
 - `.env.development.example`：开发队列连接 `redis://127.0.0.1:6379/1`。
 - `.env.test.example`：测试队列连接 `redis://127.0.0.1:6379/2`。
-- `deploy/systemd/knowledge-agent-redis.service`：启动只监听本机的持久化 Redis 7 容器。
+- `deploy/systemd/knowledge-agent-redis.service`：启动只监听本机并启用 AOF 的现有 Redis 7.4 可执行文件。
 - `deploy/systemd/knowledge-agent-dev-worker.service`：运行开发环境 `app.workers.runner`。
 - `deploy/systemd/knowledge-agent-test-worker.service`：运行测试环境 `app.workers.runner`。
 - `deploy/systemd/knowledge-agent-dev-api.service`：声明 Redis 启动顺序和依赖。
@@ -39,8 +39,9 @@ def test_redis_is_local_and_each_environment_has_an_isolated_worker() -> None:
     dev_worker = _read("deploy/systemd/knowledge-agent-dev-worker.service")
     test_worker = _read("deploy/systemd/knowledge-agent-test-worker.service")
 
-    assert "127.0.0.1:6379:6379" in redis
-    assert "redis:7-alpine" in redis
+    assert "%h/local/redis/bin/redis-server" in redis
+    assert "--bind 127.0.0.1 --port 6379" in redis
+    assert "--protected-mode yes" in redis
     assert "--appendonly yes" in redis
     assert "REDIS_URL=redis://127.0.0.1:6379/1" in dev_env
     assert "REDIS_URL=redis://127.0.0.1:6379/2" in test_env
@@ -91,13 +92,13 @@ REDIS_URL=redis://127.0.0.1:6379/2
 
 - [ ] **Step 2: 创建本机 Redis systemd 服务**
 
-服务必须使用以下核心配置：
+服务必须使用服务器已有的 Redis 7.4，并使用以下核心配置：
 
 ```ini
 [Service]
-ExecStartPre=-/usr/bin/docker rm -f knowledge-agent-redis
-ExecStart=/usr/bin/docker run --rm --name knowledge-agent-redis --publish 127.0.0.1:6379:6379 --volume knowledge-agent-redis-data:/data redis:7-alpine redis-server --appendonly yes
-ExecStop=/usr/bin/docker stop knowledge-agent-redis
+ExecStartPre=/usr/bin/mkdir -p %h/knowledge-agent-runtime/redis
+ExecStart=%h/local/redis/bin/redis-server --bind 127.0.0.1 --port 6379 --protected-mode yes --appendonly yes --dir %h/knowledge-agent-runtime/redis
+ExecStop=%h/local/redis/bin/redis-cli -h 127.0.0.1 -p 6379 shutdown
 Restart=on-failure
 ```
 
@@ -153,7 +154,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now knowledge-agent-redis.service
 systemctl --user enable --now knowledge-agent-dev-worker.service
 systemctl --user restart knowledge-agent-dev-api.service
-docker exec knowledge-agent-redis redis-cli ping
+%h/local/redis/bin/redis-cli -h 127.0.0.1 -p 6379 ping
 ```
 
 Expected: `PONG`，Redis 只映射 `127.0.0.1:6379`，开发 worker 为 active。

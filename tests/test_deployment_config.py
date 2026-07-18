@@ -62,8 +62,9 @@ def test_redis_is_local_and_each_environment_has_an_isolated_worker() -> None:
     dev_worker = _read("deploy/systemd/knowledge-agent-dev-worker.service")
     test_worker = _read("deploy/systemd/knowledge-agent-test-worker.service")
 
-    assert "127.0.0.1:6379:6379" in redis
-    assert "redis:7-alpine" in redis
+    assert "%h/local/redis/bin/redis-server" in redis
+    assert "--bind 127.0.0.1 --port 6379" in redis
+    assert "--protected-mode yes" in redis
     assert "--appendonly yes" in redis
     assert "REDIS_URL=redis://127.0.0.1:6379/1" in dev_env
     assert "REDIS_URL=redis://127.0.0.1:6379/2" in test_env
