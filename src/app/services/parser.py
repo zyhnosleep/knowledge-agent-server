@@ -457,9 +457,55 @@ def _mineru_content_to_parsed_doc(
     return ParsedDocument(
         title=display_title_from_path(path),
         text=full_text,
-        chunks=chunks or _fallback_chunks(full_text),
+        chunks=_coalesce_parsed_chunks(chunks) if chunks else _fallback_chunks(full_text),
         metadata=metadata,
     )
+
+
+def _coalesce_parsed_chunks(
+    chunks: list[ParsedChunk], target_size: int = 1200
+) -> list[ParsedChunk]:
+    """Merge adjacent text fragments while keeping structured evidence isolated."""
+    merged: list[ParsedChunk] = []
+    buffer: ParsedChunk | None = None
+    structured_types = ("-table", "-equation", "-formula", "-image", "-figure")
+
+    def flush() -> None:
+        nonlocal buffer
+        if buffer is not None:
+            buffer.ordinal = len(merged)
+            merged.append(buffer)
+            buffer = None
+
+    for chunk in chunks:
+        heading = chunk.heading or ""
+        is_structured = any(marker in heading for marker in structured_types)
+        if is_structured:
+            flush()
+            chunk.ordinal = len(merged)
+            merged.append(chunk)
+            continue
+        if buffer is None:
+            buffer = ParsedChunk(
+                ordinal=0,
+                text=chunk.text,
+                heading=chunk.heading,
+                page_label=chunk.page_label,
+            )
+            continue
+        candidate = f"{buffer.text}\n\n{chunk.text}"
+        if buffer.page_label == chunk.page_label and len(candidate) <= target_size:
+            buffer.text = candidate
+        else:
+            flush()
+            buffer = ParsedChunk(
+                ordinal=0,
+                text=chunk.text,
+                heading=chunk.heading,
+                page_label=chunk.page_label,
+            )
+    flush()
+    return merged
 
 
 def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_path: Path) -> None:
@@ -821,7 +867,7 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
     return ParsedDocument(
         title=display_title_from_path(path),
         text=full_text,
-        chunks=all_chunks or _fallback_chunks(full_text),
+        chunks=_coalesce_parsed_chunks(all_chunks) if all_chunks else _fallback_chunks(full_text),
         metadata=metadata,
     )
 

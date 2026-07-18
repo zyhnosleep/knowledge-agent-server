@@ -442,6 +442,52 @@ def test_execute_resumes_existing_session() -> None:
     assert len(history) >= 5
 
 
+def test_follow_up_question_uses_previous_user_question_for_retrieval() -> None:
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    received_questions: list[str] = []
+
+    class RecordingRAG:
+        def retrieve_evidence(
+            self, db, project_slug, question, *, limit=15, document_id=None
+        ):
+            received_questions.append(question)
+            return EvidencePack(status="empty", items=[])
+
+        def answer(self, db, project_slug, question, document_id=None):
+            received_questions.append(question)
+            return QueryResponse(
+                answer_markdown="ok",
+                citations=[],
+                verification_status="local-only",
+            )
+
+    executor = build_executor_with_rag(db, RecordingRAG())
+    executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            document_id="doc-1",
+            query="请说明文章采用的研究方法",
+            session_id="follow-up-session",
+        )
+    )
+    received_questions.clear()
+
+    executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            document_id="doc-1",
+            query="请详细讲解一下",
+            session_id="follow-up-session",
+        )
+    )
+
+    assert received_questions
+    assert all("请说明文章采用的研究方法" in question for question in received_questions)
+    assert all("请详细讲解一下" in question for question in received_questions)
+
+
 def test_execute_empty_answer() -> None:
     """Executor still succeeds when RAG returns empty answer."""
     db = make_db()

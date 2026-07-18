@@ -64,6 +64,33 @@ def test_parse_pdf_with_document_intelligence_uses_page_outputs(monkeypatch) -> 
     assert any("复查时间" in chunk.text for chunk in parsed.chunks)
 
 
+def test_document_intelligence_merges_small_sections_on_the_same_page(monkeypatch) -> None:
+    monkeypatch.setattr(parser, "_render_pdf_pages", lambda path, dpi: [b"fake-page"])
+    sections = [f"Sentence {index} " + "evidence " * 8 for index in range(12)]
+    monkeypatch.setattr(
+        parser,
+        "_analyze_pdf_page",
+        lambda **kwargs: DocumentPagePayload(
+            page_label="1",
+            page_summary="Page summary",
+            sections=sections,
+            tables=[],
+            formulas=[],
+            figures=[],
+            evidence_spans=sections,
+        ),
+    )
+
+    parsed = parser._parse_pdf_with_document_intelligence(
+        Path("dummy.pdf"), [""], 1
+    )
+
+    assert parsed is not None
+    assert len(parsed.chunks) < 8
+    assert "Sentence 0" in parsed.chunks[0].text
+    assert "Sentence 1" in parsed.chunks[0].text
+
+
 def test_parse_pdf_with_document_intelligence_returns_none_when_rendering_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(parser, "_render_pdf_pages", lambda path, dpi: [])
 
@@ -116,6 +143,25 @@ def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
         and "images/figure-1.png" in chunk.text
         for chunk in parsed.chunks
     )
+
+
+def test_mineru_merges_small_adjacent_text_blocks_on_the_same_page(tmp_path) -> None:
+    content_list = [
+        {"type": "paragraph", "text": f"Sentence {index} " + "evidence " * 8, "page_idx": 0}
+        for index in range(12)
+    ]
+
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=tmp_path / "fragmented.pdf",
+        content_list=content_list,
+        page_count=1,
+    )
+
+    assert len(parsed.chunks) < len(content_list)
+    assert all(chunk.page_label == "1" for chunk in parsed.chunks)
+    assert "Sentence 0" in parsed.chunks[0].text
+    assert "Sentence 1" in parsed.chunks[0].text
+    assert sum(len(chunk.text) for chunk in parsed.chunks) >= 900
 
 
 def test_mineru_real_content_list_v2_fixture_recovers_tables_and_images() -> None:

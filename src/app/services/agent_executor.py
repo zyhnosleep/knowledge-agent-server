@@ -289,6 +289,9 @@ class AgentExecutor:
             attachment_only_requested = self._is_attachment_only_query(request.query)
             attachment_only = False
             session_attachment_pack = None
+            retrieval_query = self._contextualize_retrieval_query(
+                session_id, request.query
+            )
 
             if attachment_only_requested:
                 session_attachment_pack = self._run_retrieve_session_attachments(
@@ -319,7 +322,7 @@ class AgentExecutor:
                 # ---- rag.retrieve_evidence (v4) ----
                 evidence_pack = self._run_retrieve_evidence(
                     request.project_slug,
-                    request.query,
+                    retrieval_query,
                     request.document_id,
                     constraints,
                     steps,
@@ -344,7 +347,7 @@ class AgentExecutor:
                 self._commit_progress()
                 answer_text, citations, tool_calls_used = self._run_rag_answer(
                     request.project_slug,
-                    request.query,
+                    retrieval_query,
                     request.document_id,
                     constraints,
                     steps,
@@ -440,7 +443,7 @@ class AgentExecutor:
             ):
                 retry_answer, retry_citations, retry_calls = self._run_rag_answer(
                     request.project_slug,
-                    request.query,
+                    retrieval_query,
                     request.document_id,
                     constraints,
                     steps,
@@ -1198,6 +1201,41 @@ class AgentExecutor:
             return "\n".join(parts[-6:])  # last 6 turns max
         except Exception:
             return ""
+
+    def _contextualize_retrieval_query(self, session_id: str, query: str) -> str:
+        """Turn short referential follow-ups into self-contained RAG queries."""
+        normalized = query.strip()
+        follow_up_markers = (
+            "详细",
+            "展开",
+            "继续",
+            "为什么",
+            "真的吗",
+            "是否",
+            "这个",
+            "那个",
+            "它",
+            "上述",
+            "前面",
+        )
+        if len(normalized) > 30 or not any(
+            marker in normalized for marker in follow_up_markers
+        ):
+            return query
+        try:
+            user_turns = [
+                turn
+                for turn in self._memory.get_history(session_id, last_n=12)
+                if turn.role == "user" or turn.step_type == "user_query"
+            ]
+        except Exception:
+            return query
+        if len(user_turns) < 2:
+            return query
+        previous_query = user_turns[-2].content.strip()
+        if not previous_query or previous_query == normalized:
+            return query
+        return f"上一轮问题：{previous_query}\n当前追问：{normalized}"
 
     def _run_retrieve_session_attachments(
         self,

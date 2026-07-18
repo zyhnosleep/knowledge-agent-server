@@ -5038,6 +5038,15 @@ def test_insufficient_evidence_answer_without_terms() -> None:
     assert "upload" in answer.lower() or "relevant" in answer.lower()
 
 
+def test_method_question_is_not_routed_as_generic_document_overview() -> None:
+    assert not QueryService._is_document_overview_query(
+        "请说明这篇文章采用的研究方法"
+    )
+    assert not QueryService._is_document_overview_query(
+        "What methodology does this paper use?"
+    )
+
+
 def test_overview_query_single_document_retrieves_substantive_chunks() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

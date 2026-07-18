@@ -4574,9 +4574,20 @@ class QueryService:
         )
         if not (chinese_overview or english_overview):
             return False
+        method_facet = bool(
+            re.search(
+                r"(?:研究方法|实验方法|方法论|实验流程|技术路线|算法|实现细节|如何实现|怎么做)",
+                question,
+            )
+            or re.search(
+                r"\b(?:methodology|methods?|approach|algorithm|pipeline|experimental\s+setup|implementation)\b",
+                lowered,
+            )
+        )
         # Exclude queries that already have a more specific routing path.
         if (
-            QueryService._is_table_query(question)
+            method_facet
+            or QueryService._is_table_query(question)
             or QueryService._is_metric_query(question)
             or QueryService._is_figure_query(question)
             or QueryService._is_scientific_evidence_query(question)

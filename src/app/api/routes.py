@@ -58,6 +58,12 @@ def _document_raw_path(document: Document) -> Path:
     raw_base = settings.raw_dir.expanduser().resolve()
     stored_path = Path(document.raw_path)
     candidate = stored_path if stored_path.is_absolute() else raw_base / stored_path
+    if stored_path.is_absolute() and not candidate.exists():
+        project_slug = document.project.slug if document.project is not None else ""
+        if stored_path.parent.name == project_slug:
+            migrated_candidate = raw_base / project_slug / stored_path.name
+            if migrated_candidate.exists():
+                candidate = migrated_candidate
     return _ensure_within(candidate, raw_base)
 
 

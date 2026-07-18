@@ -592,6 +592,35 @@ def test_document_file_route_serves_inline_pdf_and_source_metadata(tmp_path, mon
     assert client.get("/api/documents/d1/file").status_code == 422
 
 
+def test_document_file_route_rebases_missing_legacy_absolute_path(tmp_path, monkeypatch) -> None:
+    raw_root = tmp_path / "current-raw"
+    current_file = raw_root / "demo" / "paper.pdf"
+    current_file.parent.mkdir(parents=True)
+    current_file.write_bytes(b"%PDF-1.4 migrated")
+    monkeypatch.setattr(routes.settings, "raw_dir", raw_root)
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id=project.id,
+        title="Paper",
+        file_name="paper.pdf",
+        sha256="sha1",
+        raw_path=str(tmp_path / "deleted-deployment" / "raw" / "demo" / "paper.pdf"),
+        status="ready",
+    )
+    db.add_all([project, document])
+    db.commit()
+    client = make_client(db)
+
+    response = client.get("/api/documents/d1/file?project_slug=demo")
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-1.4 migrated"
+    assert client.get("/api/documents/d1/source").json()["source_file_available"] is True
+
+
 def test_document_file_route_rejects_missing_mismatch_and_out_of_root(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(routes.settings, "raw_dir", tmp_path / "raw")
     routes.settings.raw_dir.mkdir()
