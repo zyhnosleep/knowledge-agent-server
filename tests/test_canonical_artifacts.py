@@ -1030,3 +1030,17 @@ def test_promote_requires_exactly_one_staging_directory(
 
     with pytest.raises(ValueError, match="exactly one staging"):
         store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_promote_on_missing_store_root_preserves_empty_staging_contract(
+    tmp_path: Path,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path / "missing-store")
+
+    with pytest.raises(
+        ValueError,
+        match=r"promotion requires exactly one staging directory; found 0",
+    ):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert not store.root.exists()

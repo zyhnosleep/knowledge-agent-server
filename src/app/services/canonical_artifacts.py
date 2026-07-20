@@ -74,7 +74,7 @@ class CanonicalArtifactStore:
                 raise ValueError(f"store root is not a directory: {self.root}")
         elif create:
             self.root.mkdir(parents=True, exist_ok=True)
-        else:
+        elif not allow_missing:
             raise FileNotFoundError(f"store root does not exist: {self.root}")
 
         document_root = self.root / document_id
