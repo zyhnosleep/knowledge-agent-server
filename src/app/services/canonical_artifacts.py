@@ -33,6 +33,7 @@ _REQUIRED_FILES = {
     "formulas.json",
 }
 _REQUIRED_MANIFEST_FIELDS = {
+    "canonical_markdown_sha256",
     "document_id",
     "version",
     "parser",
@@ -58,6 +59,42 @@ _WINDOWS_FORBIDDEN_CHARACTERS = set('/\\<>:"|?*')
 class CanonicalArtifactStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+
+    def _prepare_document_root(
+        self,
+        document_id: str,
+        *,
+        create: bool,
+        allow_missing: bool = False,
+    ) -> Path:
+        if self._is_link_or_reparse_point(self.root):
+            raise ValueError(f"store root cannot be a symbolic link: {self.root}")
+        if self.root.exists():
+            if not self.root.is_dir():
+                raise ValueError(f"store root is not a directory: {self.root}")
+        elif create:
+            self.root.mkdir(parents=True, exist_ok=True)
+        else:
+            raise FileNotFoundError(f"store root does not exist: {self.root}")
+
+        document_root = self.root / document_id
+        if self._is_link_or_reparse_point(document_root):
+            raise ValueError(
+                f"document root cannot be a symbolic link: {document_root}"
+            )
+        if document_root.exists():
+            if not document_root.is_dir():
+                raise ValueError(f"document root is not a directory: {document_root}")
+        elif create:
+            document_root.mkdir()
+        elif not allow_missing:
+            raise FileNotFoundError(f"document root does not exist: {document_root}")
+
+        root_resolved = self.root.resolve()
+        document_resolved = document_root.resolve()
+        if document_resolved.parent != root_resolved:
+            raise ValueError(f"document root escapes store root: {document_root}")
+        return document_root
 
     def write_staging(
         self,
@@ -85,22 +122,26 @@ class CanonicalArtifactStore:
             document.quality,
         )
 
-        document_root = self.root / document_id
-        document_root.mkdir(parents=True, exist_ok=True)
+        document_root = self._prepare_document_root(document_id, create=True)
         staging = document_root / f"{version}.staging-{uuid4().hex}"
         staging.mkdir()
 
         try:
             (staging / "assets").mkdir()
-            self._copy_assets(staging, document.assets)
+            asset_hashes = self._copy_assets(staging, document.assets)
 
-            self._write_text(
-                staging / "canonical.md",
-                self._render_markdown(document_id, version, document),
-            )
+            canonical_markdown = self._render_markdown(document_id, version, document)
+            canonical_markdown_path = staging / "canonical.md"
+            self._write_text(canonical_markdown_path, canonical_markdown)
             self._write_json(
                 staging / "manifest.json",
-                self._build_manifest(document_id, version, document),
+                self._build_manifest(
+                    document_id,
+                    version,
+                    document,
+                    canonical_markdown_sha256=self._sha256(canonical_markdown_path),
+                    asset_hashes=asset_hashes,
+                ),
             )
             self._write_blocks(staging / "blocks.jsonl", document.blocks)
             self._write_json(
@@ -126,7 +167,11 @@ class CanonicalArtifactStore:
         self._validate_component(document_id)
         self._validate_component(version)
 
-        document_root = self.root / document_id
+        document_root = self._prepare_document_root(
+            document_id,
+            create=False,
+            allow_missing=True,
+        )
         final = document_root / version
         if final.exists():
             raise FileExistsError(f"canonical bundle already exists: {final}")
@@ -151,7 +196,8 @@ class CanonicalArtifactStore:
     def load(self, document_id: str, version: str) -> CanonicalDocument:
         self._validate_component(document_id)
         self._validate_component(version)
-        bundle = self.root / document_id / version
+        document_root = self._prepare_document_root(document_id, create=False)
+        bundle = document_root / version
         if not bundle.is_dir():
             raise FileNotFoundError(f"canonical bundle does not exist: {bundle}")
         self._validate_bundle(bundle, document_id, version)
@@ -198,8 +244,19 @@ class CanonicalArtifactStore:
         ):
             raise ValueError(f"invalid path component: {value!r}")
 
-    def _copy_assets(self, staging: Path, assets: list[CanonicalAsset]) -> None:
+    def _copy_assets(
+        self,
+        staging: Path,
+        assets: list[CanonicalAsset],
+    ) -> dict[str, str]:
+        asset_hashes: dict[str, str] = {}
         for asset in assets:
+            if asset.sha256 is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", asset.sha256
+            ):
+                raise ValueError(
+                    f"asset sha256 must be lowercase 64-hex for {asset.asset_id!r}"
+                )
             destination = self._asset_destination(staging, asset.path)
             if asset.source_path is None:
                 raise FileNotFoundError(
@@ -217,11 +274,13 @@ class CanonicalArtifactStore:
                 os.fsync(output_file.fileno())
 
             actual_sha256 = self._sha256(destination)
-            if actual_sha256 != asset.sha256.lower():
+            if asset.sha256 is not None and actual_sha256 != asset.sha256:
                 raise ValueError(
                     f"asset sha256 mismatch for {asset.asset_id!r}: "
                     f"expected {asset.sha256}, got {actual_sha256}"
                 )
+            asset_hashes[asset.asset_id] = actual_sha256
+        return asset_hashes
 
     @staticmethod
     def _asset_destination(staging: Path, asset_path: str) -> Path:
@@ -253,12 +312,17 @@ class CanonicalArtifactStore:
         document_id: str,
         version: str,
         document: CanonicalDocument,
+        *,
+        canonical_markdown_sha256: str,
+        asset_hashes: dict[str, str],
     ) -> dict[str, Any]:
-        assets = [
-            asset.model_dump(mode="json", exclude={"source_path"})
-            for asset in document.assets
-        ]
+        assets = []
+        for asset in document.assets:
+            item = asset.model_dump(mode="json", exclude={"source_path"})
+            item["sha256"] = asset_hashes[asset.asset_id]
+            assets.append(item)
         return {
+            "canonical_markdown_sha256": canonical_markdown_sha256,
             "document_id": document_id,
             "version": version,
             "document": {
@@ -480,6 +544,15 @@ class CanonicalArtifactStore:
         if manifest.get("document_id") != document_id or manifest.get("version") != version:
             raise ValueError("canonical manifest identity does not match promotion target")
         self._validate_manifest_fields(manifest)
+        markdown_sha256 = manifest["canonical_markdown_sha256"]
+        if not isinstance(markdown_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", markdown_sha256
+        ):
+            raise ValueError(
+                "canonical manifest canonical_markdown_sha256 must be lowercase 64-hex"
+            )
+        if self._sha256(bundle / "canonical.md") != markdown_sha256:
+            raise ValueError("canonical.md sha256 mismatch")
 
         blocks: list[CanonicalBlock] = []
         with (bundle / "blocks.jsonl").open("r", encoding="utf-8") as block_file:
@@ -501,13 +574,20 @@ class CanonicalArtifactStore:
                 raise ValueError("canonical manifest asset entries must be JSON objects")
             if "source_path" in item:
                 raise ValueError("canonical manifest asset entries cannot contain source_path")
+            persisted_sha256 = item.get("sha256")
+            if not isinstance(persisted_sha256, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", persisted_sha256
+            ):
+                raise ValueError(
+                    "canonical manifest asset sha256 must be lowercase 64-hex"
+                )
             asset = CanonicalAsset.model_validate(item)
             assets.append(asset)
             destination = self._asset_destination(bundle, asset.path)
             if not destination.is_file():
                 raise ValueError(f"declared canonical asset is missing: {asset.path}")
             actual_sha256 = self._sha256(destination)
-            if actual_sha256 != asset.sha256.lower():
+            if actual_sha256 != asset.sha256:
                 raise ValueError(f"canonical asset sha256 mismatch: {asset.path}")
         outline = [
             SectionNode.model_validate(section)

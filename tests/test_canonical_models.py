@@ -343,3 +343,66 @@ def test_nested_section_outline_round_trips_through_json() -> None:
 def test_models_forbid_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         SourceSpan(unknown_coordinate="x")
+
+
+def test_figure_analysis_fields_round_trip_and_defaults_are_isolated() -> None:
+    figure = CanonicalFigure(
+        figure_id="figure-analysis",
+        analysis_status="complete",
+        ai_figure_type="line_chart",
+        ai_axes={"x": "epoch", "y": "accuracy"},
+        ai_legend=["baseline", "proposed"],
+        ai_trends=["increasing"],
+        ai_observations=["Proposed remains higher."],
+        ai_confidence=0.8,
+    )
+
+    restored = CanonicalFigure.model_validate_json(figure.model_dump_json())
+    assert restored == figure
+
+    first = CanonicalFigure(figure_id="first")
+    second = CanonicalFigure(figure_id="second")
+    first.ai_legend.append("only-first")
+    assert second.ai_legend == []
+
+
+@pytest.mark.parametrize("confidence", [-0.01, 1.01])
+def test_figure_ai_confidence_is_bounded(confidence: float) -> None:
+    with pytest.raises(ValidationError):
+        CanonicalFigure(figure_id="figure", ai_confidence=confidence)
+
+
+def test_formula_analysis_fields_round_trip_with_structured_explanations() -> None:
+    formula = CanonicalFormula(
+        formula_id="formula-analysis",
+        latex="E=mc^2",
+        analysis_status="complete",
+        ai_variable_explanations=[
+            {"variable": "E", "meaning": "energy"},
+            {"variable": "m", "meaning": "mass"},
+        ],
+        ai_method_role="objective_function",
+        ai_confidence=0.65,
+    )
+
+    restored = CanonicalFormula.model_validate_json(formula.model_dump_json())
+    assert restored == formula
+
+
+@pytest.mark.parametrize("confidence", [-0.01, 1.01])
+def test_formula_ai_confidence_is_bounded(confidence: float) -> None:
+    with pytest.raises(ValidationError):
+        CanonicalFormula(
+            formula_id="formula",
+            latex="x",
+            ai_confidence=confidence,
+        )
+
+
+def test_formula_variable_explanations_reject_non_json_values() -> None:
+    with pytest.raises(ValidationError):
+        CanonicalFormula(
+            formula_id="formula",
+            latex="x",
+            ai_variable_explanations={"x": {1, 2}},
+        )

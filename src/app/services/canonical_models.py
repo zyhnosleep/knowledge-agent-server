@@ -3,7 +3,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 
 BBox = tuple[float, float, float, float]
@@ -125,6 +132,13 @@ class CanonicalFigure(CanonicalModel):
     asset_path: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     nearby_block_ids: list[str] = Field(default_factory=list)
+    analysis_status: str | None = None
+    ai_figure_type: str | None = None
+    ai_axes: list[JsonValue] | dict[str, JsonValue] = Field(default_factory=dict)
+    ai_legend: list[str] = Field(default_factory=list)
+    ai_trends: list[str] = Field(default_factory=list)
+    ai_observations: list[str] = Field(default_factory=list)
+    ai_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     generated_summary: str | None = None
     analysis_model: str | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -138,6 +152,13 @@ class CanonicalFormula(CanonicalModel):
     description: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     nearby_block_ids: list[str] = Field(default_factory=list)
+    analysis_status: str | None = None
+    ai_variable_explanations: (
+        list[dict[str, JsonValue]]
+        | dict[str, JsonValue]
+    ) = Field(default_factory=list)
+    ai_method_role: str | None = None
+    ai_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     generated_explanation: str | None = None
     analysis_model: str | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -148,7 +169,7 @@ class CanonicalAsset(CanonicalModel):
     asset_id: str
     path: str
     media_type: str
-    sha256: str
+    sha256: str | None = None
     source_path: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

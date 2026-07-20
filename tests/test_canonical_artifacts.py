@@ -227,6 +227,9 @@ def test_bundle_json_round_trips_canonical_models(
     assert manifest["quality"]["accepted"] is True
     assert manifest["warnings"] == ["Review one formula"]
     assert manifest["status"] == "ready"
+    assert manifest["canonical_markdown_sha256"] == hashlib.sha256(
+        (staging / "canonical.md").read_bytes()
+    ).hexdigest()
     assert blocks == canonical_document.blocks
     assert tables == canonical_document.tables
     assert figures == canonical_document.figures
@@ -358,6 +361,69 @@ def test_asset_is_copied_into_bundle(
     assert "source_path" not in manifest["assets"][0]
 
 
+def test_asset_hash_is_computed_when_caller_omits_hash(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    source_path = Path(canonical_document.assets[0].source_path or "")
+    expected_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    canonical_document.assets[0].sha256 = None
+    store = CanonicalArtifactStore(tmp_path)
+
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
+
+    assert manifest["assets"][0]["sha256"] == expected_digest
+    store.promote("doc-1", "canonical-v1-abcd")
+    restored = store.load("doc-1", "canonical-v1-abcd")
+    assert restored.assets[0].sha256 == expected_digest
+
+
+@pytest.mark.parametrize("provided_hash", ["not-a-hash", "A" * 64])
+def test_asset_hash_must_be_lowercase_64_hex_when_provided(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    provided_hash: str,
+) -> None:
+    canonical_document.assets[0].sha256 = provided_hash
+
+    with pytest.raises(ValueError, match="asset sha256"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+def test_promote_rejects_manifest_asset_without_persisted_hash(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["assets"][0]["sha256"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="asset sha256"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_load_rejects_manifest_asset_without_persisted_hash(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    final = store.promote("doc-1", "canonical-v1-abcd")
+    manifest_path = final / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["assets"][0]["sha256"] = ""
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="asset sha256"):
+        store.load("doc-1", "canonical-v1-abcd")
+
+
 @pytest.mark.parametrize(
     "asset_path",
     [
@@ -438,6 +504,80 @@ def test_asset_path_allows_unicode_and_internal_spaces(
         "![Source figure caption]"
         "(assets/%E5%9B%BE%20%E8%A1%A8/figure%20one.png)"
     ) in markdown
+
+
+def test_write_rejects_symlinked_document_root_without_writing_external_target(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store_root = tmp_path / "store"
+    external_document_root = tmp_path / "external-document"
+    store_root.mkdir()
+    external_document_root.mkdir()
+    document_root = store_root / "doc-1"
+    _create_directory_link(document_root, external_document_root)
+
+    with pytest.raises(ValueError, match="document root"):
+        CanonicalArtifactStore(store_root).write_staging(
+            "doc-1",
+            "canonical-v1-abcd",
+            canonical_document,
+        )
+
+    assert list(external_document_root.iterdir()) == []
+    if document_root.is_symlink():
+        document_root.unlink()
+    else:
+        os.rmdir(document_root)
+
+
+def test_promote_rejects_symlinked_document_root_without_renaming_external_staging(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    external_store_root = tmp_path / "external-store"
+    external_store = CanonicalArtifactStore(external_store_root)
+    external_staging = external_store.write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    document_root = store_root / "doc-1"
+    _create_directory_link(document_root, external_store_root / "doc-1")
+
+    with pytest.raises(ValueError, match="document root"):
+        CanonicalArtifactStore(store_root).promote("doc-1", "canonical-v1-abcd")
+
+    assert external_staging.exists()
+    assert not (external_store_root / "doc-1" / "canonical-v1-abcd").exists()
+    if document_root.is_symlink():
+        document_root.unlink()
+    else:
+        os.rmdir(document_root)
+
+
+def test_load_rejects_symlinked_document_root_without_reading_external_bundle(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    external_store_root = tmp_path / "external-store"
+    external_store = CanonicalArtifactStore(external_store_root)
+    external_store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    external_store.promote("doc-1", "canonical-v1-abcd")
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    document_root = store_root / "doc-1"
+    _create_directory_link(document_root, external_store_root / "doc-1")
+
+    with pytest.raises(ValueError, match="document root"):
+        CanonicalArtifactStore(store_root).load("doc-1", "canonical-v1-abcd")
+
+    if document_root.is_symlink():
+        document_root.unlink()
+    else:
+        os.rmdir(document_root)
 
 
 def test_missing_declared_asset_fails_without_leaving_staging(
@@ -627,6 +767,45 @@ def test_promote_rejects_malformed_bundle_metadata(
         store.promote("doc-1", "canonical-v1-abcd")
 
     assert staging.exists()
+
+
+def test_promote_rejects_canonical_markdown_body_tampering(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    markdown_path = staging / "canonical.md"
+    original = markdown_path.read_text("utf-8")
+    markdown_path.write_text(
+        original + "\nAI-injected interpretation not present in the source.\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="canonical.md sha256 mismatch"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert staging.exists()
+
+
+def test_load_rejects_canonical_markdown_body_tampering(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    final = store.promote("doc-1", "canonical-v1-abcd")
+    markdown_path = final / "canonical.md"
+    original = markdown_path.read_text("utf-8")
+    markdown_path.write_text(
+        original.replace("Second source paragraph.", "AI replacement text."),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ValueError, match="canonical.md sha256 mismatch"):
+        store.load("doc-1", "canonical-v1-abcd")
 
 
 def test_promote_rejects_malformed_manifest_field_types(
