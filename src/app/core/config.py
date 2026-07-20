@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -185,6 +185,27 @@ class Settings(BaseSettings):
         alias="FEISHU_USER_INFO_URL",
     )
     feishu_allowed_tenant: str | None = Field(default=None, alias="FEISHU_ALLOWED_TENANT")
+
+    @model_validator(mode="after")
+    def validate_semantic_token_limits(self) -> Settings:
+        if not (
+            self.semantic_parent_min_tokens
+            <= self.semantic_parent_target_tokens
+            <= self.semantic_parent_max_tokens
+        ):
+            raise ValueError("semantic parent token limits must satisfy min <= target <= max")
+
+        if not (
+            self.semantic_child_min_tokens
+            <= self.semantic_child_target_tokens
+            <= self.semantic_child_max_tokens
+        ):
+            raise ValueError("semantic child token limits must satisfy min <= target <= max")
+
+        if not (0 <= self.semantic_child_overlap_tokens < self.semantic_child_min_tokens):
+            raise ValueError("semantic child overlap tokens must satisfy 0 <= overlap < min")
+
+        return self
 
     @property
     def parent_token_limits(self) -> tuple[int, int, int]:
