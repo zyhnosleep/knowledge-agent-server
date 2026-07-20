@@ -29,7 +29,45 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     raw_dir: Path = Field(default=Path("./data/raw"), alias="RAW_DIR")
     cache_dir: Path = Field(default=Path("./data/cache"), alias="CACHE_DIR")
+    canonical_artifacts_dir: Path = Field(
+        default=Path("./data/parsed"), alias="CANONICAL_ARTIFACTS_DIR"
+    )
+    canonical_pipeline_version: str = Field(
+        default="canonical-v1", alias="CANONICAL_PIPELINE_VERSION"
+    )
     max_upload_bytes: int = Field(default=50 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
+
+    semantic_splitting_enabled: bool = Field(default=True, alias="SEMANTIC_SPLITTING_ENABLED")
+    semantic_splitting_model: str = Field(
+        default="qwen3-embedding:4b", alias="SEMANTIC_SPLITTING_MODEL"
+    )
+    semantic_break_percentile: int = Field(
+        default=20, ge=1, le=99, alias="SEMANTIC_BREAK_PERCENTILE"
+    )
+    semantic_parent_min_tokens: int = Field(
+        default=500, gt=0, alias="SEMANTIC_PARENT_MIN_TOKENS"
+    )
+    semantic_parent_target_tokens: int = Field(
+        default=1200, gt=0, alias="SEMANTIC_PARENT_TARGET_TOKENS"
+    )
+    semantic_parent_max_tokens: int = Field(
+        default=1800, gt=0, alias="SEMANTIC_PARENT_MAX_TOKENS"
+    )
+    semantic_child_min_tokens: int = Field(
+        default=180, gt=0, alias="SEMANTIC_CHILD_MIN_TOKENS"
+    )
+    semantic_child_target_tokens: int = Field(
+        default=400, gt=0, alias="SEMANTIC_CHILD_TARGET_TOKENS"
+    )
+    semantic_child_max_tokens: int = Field(
+        default=600, gt=0, alias="SEMANTIC_CHILD_MAX_TOKENS"
+    )
+    semantic_child_overlap_tokens: int = Field(
+        default=50, ge=0, alias="SEMANTIC_CHILD_OVERLAP_TOKENS"
+    )
+    semantic_tokenizer_name: str = Field(
+        default="Qwen/Qwen3-Embedding-4B", alias="SEMANTIC_TOKENIZER_NAME"
+    )
 
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")
@@ -58,16 +96,40 @@ class Settings(BaseSettings):
     ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
     ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")
 
+    contextualization_enabled: bool = Field(default=True, alias="CONTEXTUALIZATION_ENABLED")
+    contextualization_base_url: str = Field(
+        default="http://localhost:11435", alias="CONTEXTUALIZATION_BASE_URL"
+    )
+    contextualization_model: str = Field(default="qwen3.5:9b", alias="CONTEXTUALIZATION_MODEL")
+    contextualization_batch_size: int = Field(
+        default=12, gt=0, alias="CONTEXTUALIZATION_BATCH_SIZE"
+    )
+    contextualization_max_retries: int = Field(
+        default=2, ge=0, alias="CONTEXTUALIZATION_MAX_RETRIES"
+    )
+    contextualization_timeout: int = Field(
+        default=180, gt=0, alias="CONTEXTUALIZATION_TIMEOUT"
+    )
+    contextualization_max_sentences: int = Field(
+        default=2, ge=1, le=2, alias="CONTEXTUALIZATION_MAX_SENTENCES"
+    )
+    contextualization_prompt_version: str = Field(
+        default="context-v1", alias="CONTEXTUALIZATION_PROMPT_VERSION"
+    )
+
     document_intelligence_enabled: bool = Field(default=True, alias="DOCUMENT_INTELLIGENCE_ENABLED")
     pdf_render_dpi: int = Field(default=160, alias="PDF_RENDER_DPI")
     ocr_fallback_enabled: bool = Field(default=False, alias="OCR_FALLBACK_ENABLED")
-    mineru_enabled: bool = Field(default=False, alias="MINERU_ENABLED")
+    mineru_enabled: bool = Field(default=True, alias="MINERU_ENABLED")
     mineru_bin: str = Field(default_factory=_default_mineru_bin, alias="MINERU_BIN")
     mineru_backend: str = Field(default="pipeline", alias="MINERU_BACKEND")
     mineru_model_source: str | None = Field(default=None, alias="MINERU_MODEL_SOURCE")
     mineru_output_dir: Path | None = Field(default=None, alias="MINERU_OUTPUT_DIR")
     mineru_timeout: int = Field(default=3600, alias="MINERU_TIMEOUT")
     mineru_extra_args: str = Field(default="", alias="MINERU_EXTRA_ARGS")
+    figure_analysis_model: str = Field(default="qwen3.5:9b", alias="FIGURE_ANALYSIS_MODEL")
+    formula_analysis_model: str = Field(default="qwen3.5:9b", alias="FORMULA_ANALYSIS_MODEL")
+    maintenance_mode_enabled: bool = Field(default=False, alias="MAINTENANCE_MODE_ENABLED")
 
     external_api_enabled: bool = Field(default=False, alias="EXTERNAL_API_ENABLED")
     external_api_base_url: str = Field(default="https://api.openai.com/v1", alias="EXTERNAL_API_BASE_URL")
@@ -123,6 +185,26 @@ class Settings(BaseSettings):
         alias="FEISHU_USER_INFO_URL",
     )
     feishu_allowed_tenant: str | None = Field(default=None, alias="FEISHU_ALLOWED_TENANT")
+
+    @property
+    def parent_token_limits(self) -> tuple[int, int, int]:
+        return (
+            self.semantic_parent_min_tokens,
+            self.semantic_parent_target_tokens,
+            self.semantic_parent_max_tokens,
+        )
+
+    @property
+    def child_token_limits(self) -> tuple[int, int, int]:
+        return (
+            self.semantic_child_min_tokens,
+            self.semantic_child_target_tokens,
+            self.semantic_child_max_tokens,
+        )
+
+    @property
+    def child_overlap_tokens(self) -> int:
+        return self.semantic_child_overlap_tokens
 
 
 @lru_cache(maxsize=1)
