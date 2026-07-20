@@ -86,10 +86,12 @@ def test_contextual_ingestion_defaults_are_strict() -> None:
     assert settings.contextualization_model == "qwen3.5:9b"
     assert settings.contextualization_batch_size == 12
     assert settings.contextualization_max_retries == 2
+    assert settings.contextualization_max_sentences == 2
     assert settings.parent_token_limits == (500, 1200, 1800)
     assert settings.child_token_limits == (180, 400, 600)
     assert settings.child_overlap_tokens == 50
     assert settings.mineru_enabled is True
+    assert settings.maintenance_mode_enabled is False
 ```
 
 - [ ] **Step 2: Run the test and verify the missing settings fail**
@@ -122,9 +124,11 @@ contextualization_model: str = Field(default="qwen3.5:9b", alias="CONTEXTUALIZAT
 contextualization_batch_size: int = Field(default=12, gt=0, alias="CONTEXTUALIZATION_BATCH_SIZE")
 contextualization_max_retries: int = Field(default=2, ge=0, alias="CONTEXTUALIZATION_MAX_RETRIES")
 contextualization_timeout: int = Field(default=180, gt=0, alias="CONTEXTUALIZATION_TIMEOUT")
+contextualization_max_sentences: int = Field(default=2, ge=1, le=2, alias="CONTEXTUALIZATION_MAX_SENTENCES")
 contextualization_prompt_version: str = Field(default="context-v1", alias="CONTEXTUALIZATION_PROMPT_VERSION")
 figure_analysis_model: str = Field(default="qwen3.5:9b", alias="FIGURE_ANALYSIS_MODEL")
 formula_analysis_model: str = Field(default="qwen3.5:9b", alias="FORMULA_ANALYSIS_MODEL")
+maintenance_mode_enabled: bool = Field(default=False, alias="MAINTENANCE_MODE_ENABLED")
 
 @property
 def parent_token_limits(self) -> tuple[int, int, int]:
@@ -139,7 +143,7 @@ Change the default `mineru_enabled` to `True`. Add `transformers>=4.51.0,<5.0` t
 
 - [ ] **Step 4: Update both environment examples with explicit values**
 
-Add every field above and set `MINERU_ENABLED=true`, `SAC_KG_ENABLED=false`, `AGENT_SYNTHESIS_PROVIDER=local` in both files.
+Add every field above and set `MINERU_ENABLED=true`, `SAC_KG_ENABLED=false`, `AGENT_SYNTHESIS_PROVIDER=local`, and `MAINTENANCE_MODE_ENABLED=false` in both files. Use `CONTEXTUALIZATION_BASE_URL=http://127.0.0.1:11435` for development and `http://127.0.0.1:11436` for test. Set `CANONICAL_ARTIFACTS_DIR=./runtime/data/parsed` so artifacts follow each environment's `DATA_DIR`.
 
 - [ ] **Step 5: Run focused tests**
 
