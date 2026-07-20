@@ -121,6 +121,7 @@ class CanonicalTable(CanonicalModel):
 class CanonicalFigure(CanonicalModel):
     figure_id: str
     caption: str | None = None
+    description: str | None = None
     asset_path: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     nearby_block_ids: list[str] = Field(default_factory=list)
@@ -172,6 +173,14 @@ class CanonicalQualityReport(CanonicalModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class SectionNode(CanonicalModel):
+    title: str
+    level: int = Field(default=1, ge=1)
+    block_id: str | None = None
+    children: list[SectionNode] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class CanonicalDocument(CanonicalModel):
     document_id: str = ""
     source_path: str | None = None
@@ -180,9 +189,9 @@ class CanonicalDocument(CanonicalModel):
     parse_version: str = ""
 
     title: str = ""
-    abstract: str = ""
+    abstract: str | None = None
     keywords: list[str] = Field(default_factory=list)
-    outline: list[str] = Field(default_factory=list)
+    outline: list[SectionNode] = Field(default_factory=list)
     blocks: list[CanonicalBlock] = Field(default_factory=list)
     tables: list[CanonicalTable] = Field(default_factory=list)
     figures: list[CanonicalFigure] = Field(default_factory=list)

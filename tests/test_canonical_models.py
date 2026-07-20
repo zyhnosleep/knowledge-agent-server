@@ -13,6 +13,7 @@ from app.services.canonical_models import (
     CanonicalQualityIssue,
     CanonicalQualityReport,
     CanonicalTable,
+    SectionNode,
     SourceSpan,
 )
 
@@ -241,7 +242,14 @@ def test_all_canonical_models_round_trip_through_json() -> None:
         title="A Paper",
         abstract="Original abstract.",
         keywords=["knowledge graphs"],
-        outline=["Introduction"],
+        outline=[
+            SectionNode(
+                title="Introduction",
+                level=1,
+                block_id="b1",
+                children=[SectionNode(title="Background", level=2)],
+            )
+        ],
         blocks=[
             CanonicalBlock(
                 block_id="b1",
@@ -271,6 +279,7 @@ def test_all_canonical_models_round_trip_through_json() -> None:
     restored = CanonicalDocument.model_validate_json(document.model_dump_json())
 
     assert restored == document
+    assert restored.outline[0].children[0].title == "Background"
     assert restored.tables[0].cells[0].text == "74.7"
     assert restored.quality.issues[0].repairable is True
 
@@ -291,11 +300,44 @@ def test_document_core_fields_have_independent_defaults() -> None:
     first.metadata["language"] = "en"
 
     assert first.title == ""
-    assert first.abstract == ""
+    assert first.abstract is None
     assert first.keywords == []
     assert first.outline == []
     assert second.blocks == []
     assert second.metadata == {}
+
+
+def test_document_preserves_explicit_missing_abstract() -> None:
+    document = CanonicalDocument(abstract=None)
+
+    restored = CanonicalDocument.model_validate_json(document.model_dump_json())
+
+    assert restored.abstract is None
+
+
+def test_nested_section_outline_round_trips_through_json() -> None:
+    document = CanonicalDocument(
+        outline=[
+            SectionNode(
+                title="Experiments",
+                level=1,
+                block_id="heading-experiments",
+                metadata={"number": "4"},
+                children=[
+                    SectionNode(
+                        title="Main Results",
+                        level=2,
+                        block_id="heading-results",
+                    )
+                ],
+            )
+        ]
+    )
+
+    restored = CanonicalDocument.model_validate_json(document.model_dump_json())
+
+    assert restored.outline == document.outline
+    assert restored.outline[0].children[0].level == 2
 
 
 def test_models_forbid_unknown_fields() -> None:

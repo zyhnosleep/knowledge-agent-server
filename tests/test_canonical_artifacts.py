@@ -19,6 +19,8 @@ from app.services.canonical_models import (
     CanonicalQualityIssue,
     CanonicalQualityReport,
     CanonicalTable,
+    SectionNode,
+    SourceSpan,
 )
 
 
@@ -59,7 +61,15 @@ def canonical_document(source_asset: Path) -> CanonicalDocument:
         title="Faithful Paper Title",
         abstract="Original abstract from the document.",
         keywords=["retrieval", "provenance"],
-        outline=["Introduction", "Results"],
+        outline=[
+            SectionNode(
+                title="Introduction",
+                level=1,
+                block_id="first",
+                children=[SectionNode(title="Motivation", level=2)],
+            ),
+            SectionNode(title="Results", level=1),
+        ],
         blocks=[
             CanonicalBlock(
                 block_id="later",
@@ -68,6 +78,7 @@ def canonical_document(source_asset: Path) -> CanonicalDocument:
                 section_path=["Results"],
                 reading_order=20,
                 parser_source="mineru",
+                source_spans=[SourceSpan(page_index=3, source_block_id="pdf-20")],
             ),
             CanonicalBlock(
                 block_id="first",
@@ -92,6 +103,7 @@ def canonical_document(source_asset: Path) -> CanonicalDocument:
             CanonicalFigure(
                 figure_id="figure-1",
                 caption="Source figure caption",
+                description="Original source description",
                 asset_path="assets/figures/figure-1.png",
                 generated_summary="DO NOT RENDER GENERATED FIGURE SUMMARY",
                 analysis_model="vision-model",
@@ -221,6 +233,112 @@ def test_bundle_json_round_trips_canonical_models(
     assert formulas == canonical_document.formulas
 
 
+def test_promoted_bundle_loads_complete_canonical_document(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    store.promote("doc-1", "canonical-v1-abcd")
+
+    restored = store.load("doc-1", "canonical-v1-abcd")
+    expected = canonical_document.model_copy(deep=True)
+    for asset in expected.assets:
+        asset.source_path = None
+
+    assert restored == expected
+    assert restored.outline[0].children[0].title == "Motivation"
+    assert restored.blocks[0].source_spans[0].page_index == 3
+
+
+def test_manifest_document_section_persists_non_transient_fields(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+
+    manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
+
+    assert manifest["document"] == {
+        "title": canonical_document.title,
+        "abstract": canonical_document.abstract,
+        "keywords": canonical_document.keywords,
+        "outline": [item.model_dump(mode="json") for item in canonical_document.outline],
+        "metadata": canonical_document.metadata,
+    }
+
+
+@pytest.mark.parametrize(
+    ("document_id", "version", "field", "conflicting_value"),
+    [
+        ("doc-1", "canonical-v1-abcd", "document_id", "other-doc"),
+        ("doc-1", "canonical-v1-abcd", "parse_version", "other-version"),
+    ],
+)
+def test_write_rejects_document_identity_conflicts(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    document_id: str,
+    version: str,
+    field: str,
+    conflicting_value: str,
+) -> None:
+    setattr(canonical_document, field, conflicting_value)
+
+    with pytest.raises(ValueError, match="does not match"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            document_id,
+            version,
+            canonical_document,
+        )
+
+
+def test_empty_document_identity_is_filled_by_bundle_identity(tmp_path: Path) -> None:
+    document = CanonicalDocument(title="Untitled source")
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-empty", "canonical-v2", document)
+    store.promote("doc-empty", "canonical-v2")
+
+    restored = store.load("doc-empty", "canonical-v2")
+
+    assert restored.document_id == "doc-empty"
+    assert restored.parse_version == "canonical-v2"
+
+
+@pytest.mark.parametrize(
+    "absolute_source_path",
+    [
+        "C:/Users/secret/paper.pdf",
+        "/home/secret/paper.pdf",
+        "\\Users\\secret\\paper.pdf",
+        "C:Users\\secret\\paper.pdf",
+    ],
+)
+def test_manifest_does_not_disclose_absolute_source_directories(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    absolute_source_path: str,
+) -> None:
+    canonical_document.source_path = absolute_source_path
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+
+    manifest_text = (staging / "manifest.json").read_text("utf-8")
+    manifest = json.loads(manifest_text)
+
+    assert manifest["source"]["path"] == "paper.pdf"
+    assert "Users" not in manifest_text
+    assert "home" not in manifest_text
+    assert "secret" not in manifest_text
+
+
 def test_asset_is_copied_into_bundle(
     tmp_path: Path,
     source_asset: Path,
@@ -249,6 +367,12 @@ def test_asset_is_copied_into_bundle(
         "C:/absolute.png",
         "images/not-under-assets.png",
         "assets\\windows-ambiguous.png",
+        "assets/CON",
+        "assets/NUL.txt",
+        "assets/name.",
+        "assets/file:stream",
+        "assets/bad?.png",
+        "assets/control\x01.png",
     ],
 )
 def test_asset_path_must_be_relative_and_under_assets(
@@ -275,6 +399,9 @@ def test_asset_path_must_be_relative_and_under_assets(
         ("doc-1/nested", "canonical-v1"),
         ("doc-1", "v1/nested"),
         ("C:\\outside", "canonical-v1"),
+        ("CON", "canonical-v1"),
+        ("doc-1", "NUL.txt"),
+        ("doc-1", "name."),
     ],
 )
 def test_document_and_version_path_traversal_is_rejected(
@@ -289,6 +416,28 @@ def test_document_and_version_path_traversal_is_rejected(
             version,
             canonical_document,
         )
+
+
+def test_asset_path_allows_unicode_and_internal_spaces(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    asset_path = "assets/图 表/figure one.png"
+    canonical_document.assets[0].path = asset_path
+    canonical_document.figures[0].asset_path = asset_path
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+
+    assert (staging / "assets" / "图 表" / "figure one.png").is_file()
+    markdown = (staging / "canonical.md").read_text("utf-8")
+    assert (
+        "![Source figure caption]"
+        "(assets/%E5%9B%BE%20%E8%A1%A8/figure%20one.png)"
+    ) in markdown
 
 
 def test_missing_declared_asset_fails_without_leaving_staging(
@@ -345,6 +494,88 @@ def test_generated_analysis_and_contextual_prefix_are_excluded_from_markdown(
     assert "DO NOT RENDER CONTEXT PREFIX" not in markdown
     assert "DO NOT RENDER GENERATED FIGURE SUMMARY" not in markdown
     assert "DO NOT RENDER GENERATED FORMULA EXPLANATION" not in markdown
+
+
+def test_markdown_includes_unreferenced_structured_source_evidence(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+    canonical_document.tables[0].footnotes = ["Source table footnote."]
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+
+    markdown = (staging / "canonical.md").read_text("utf-8")
+
+    assert "Source table caption" in markdown
+    assert "| SAC-KG | 74.7 |" in markdown
+    assert "Source table footnote." in markdown
+    assert "![Source figure caption](assets/figures/figure-1.png)" in markdown
+    assert "Original source description" in markdown
+    assert "$$\nx = y + 1\n$$" in markdown
+    assert "Source formula description" in markdown
+    assert "DO NOT RENDER GENERATED FIGURE SUMMARY" not in markdown
+    assert "DO NOT RENDER GENERATED FORMULA EXPLANATION" not in markdown
+
+
+@pytest.mark.parametrize("table_source", ["source_markdown", "generated"])
+def test_markdown_uses_faithful_table_fallbacks(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    table_source: str,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    if table_source == "source_markdown":
+        table.source_markdown = "| Original | Value |\n|---|---|\n| Row | 1 |"
+        expected = "| Original | Value |"
+    else:
+        table.source_markdown = None
+        expected = "| Model | F1 |\n| --- | --- |\n| SAC-KG | 74.7 |"
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+
+    assert expected in (staging / "canonical.md").read_text("utf-8")
+
+
+def test_markdown_replaces_linked_structures_and_formats_heading_blocks(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks.append(
+        CanonicalBlock(
+            block_id="table-block",
+            block_type="table",
+            text="RAW TABLE BLOCK SHOULD BE REPLACED",
+            section_path=["Results"],
+            reading_order=10,
+            parser_source="mineru",
+            table_id="table-1",
+        )
+    )
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1",
+        "canonical-v1-abcd",
+        canonical_document,
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+
+    assert "# Introduction" in markdown
+    assert "RAW TABLE BLOCK SHOULD BE REPLACED" not in markdown
+    assert markdown.count("| SAC-KG | 74.7 |") == 1
 
 
 def test_promote_rejects_incomplete_bundle(
@@ -419,6 +650,23 @@ def test_promote_rejects_malformed_manifest_field_types(
     assert staging.exists()
 
 
+def test_promote_rejects_unknown_document_manifest_fields(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["document"]["contextual_prefix"] = "not canonical"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unexpected fields"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert staging.exists()
+
+
 def test_promote_rejects_symlinked_assets_directory(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
@@ -444,6 +692,148 @@ def test_promote_rejects_symlinked_assets_directory(
         asset_link.unlink()
     else:
         os.rmdir(asset_link)
+
+
+def test_promote_rejects_undeclared_extra_asset(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    (staging / "assets" / "extra.bin").write_bytes(b"undeclared")
+
+    with pytest.raises(ValueError, match="asset inventory"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert staging.exists()
+
+
+def test_promote_rejects_nested_asset_directory_link(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    external = tmp_path / "external-nested"
+    external.mkdir()
+    nested_link = staging / "assets" / "figures" / "linked"
+    _create_directory_link(nested_link, external)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert staging.exists()
+    if nested_link.is_symlink():
+        nested_link.unlink()
+    else:
+        os.rmdir(nested_link)
+
+
+def test_write_rejects_undeclared_figure_asset(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.figures[0].asset_path = "assets/not-declared.png"
+
+    with pytest.raises(ValueError, match="figure asset"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1",
+            "canonical-v1-abcd",
+            canonical_document,
+        )
+
+
+@pytest.mark.parametrize(
+    "duplicate_kind",
+    ["block", "table", "figure", "formula", "asset_id", "asset_path"],
+)
+def test_write_rejects_duplicate_canonical_identifiers(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    duplicate_kind: str,
+) -> None:
+    if duplicate_kind == "block":
+        canonical_document.blocks.append(canonical_document.blocks[0].model_copy())
+    elif duplicate_kind == "table":
+        canonical_document.tables.append(canonical_document.tables[0].model_copy())
+    elif duplicate_kind == "figure":
+        canonical_document.figures.append(canonical_document.figures[0].model_copy())
+    elif duplicate_kind == "formula":
+        canonical_document.formulas.append(canonical_document.formulas[0].model_copy())
+    elif duplicate_kind == "asset_id":
+        duplicate = canonical_document.assets[0].model_copy()
+        duplicate.path = "assets/figures/copy.png"
+        canonical_document.assets.append(duplicate)
+    else:
+        duplicate = canonical_document.assets[0].model_copy()
+        duplicate.asset_id = "asset-copy"
+        canonical_document.assets.append(duplicate)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1",
+            "canonical-v1-abcd",
+            canonical_document,
+        )
+
+
+@pytest.mark.parametrize("reference_field", ["table_id", "figure_id", "formula_id"])
+def test_write_rejects_broken_block_references(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    reference_field: str,
+) -> None:
+    setattr(canonical_document.blocks[0], reference_field, "missing-record")
+
+    with pytest.raises(ValueError, match="block reference"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1",
+            "canonical-v1-abcd",
+            canonical_document,
+        )
+
+
+@pytest.mark.parametrize(
+    "reference_kind",
+    ["outline", "figure_nearby", "formula_nearby", "quality_issue"],
+)
+def test_write_rejects_dangling_canonical_block_references(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    reference_kind: str,
+) -> None:
+    if reference_kind == "outline":
+        canonical_document.outline[0].children[0].block_id = "missing-block"
+    elif reference_kind == "figure_nearby":
+        canonical_document.figures[0].nearby_block_ids = ["missing-block"]
+    elif reference_kind == "formula_nearby":
+        canonical_document.formulas[0].nearby_block_ids = ["missing-block"]
+    else:
+        canonical_document.quality.issues[0].block_ids = ["missing-block"]
+
+    with pytest.raises(ValueError, match="canonical block reference"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1",
+            "canonical-v1-abcd",
+            canonical_document,
+        )
+
+
+def test_promote_rejects_tampered_outline_block_reference(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["document"]["outline"][0]["block_id"] = "missing-block"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical block reference"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+    assert staging.exists()
 
 
 def test_promote_requires_exactly_one_staging_directory(
