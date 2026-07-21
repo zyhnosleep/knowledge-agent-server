@@ -20,9 +20,11 @@ _SECTION_PREFIX = (
 )
 _SECTION_HEADING = re.compile(
     rf"^\s*{_SECTION_PREFIX}(?:"
-    r"introduction|keywords?|background|methods?|methodology|results?|"
-    r"conclusions?|\u5173\u952e\u8bcd|\u5f15\u8a00|\u80cc\u666f|\u65b9\u6cd5|"
-    r"\u7ed3\u679c|\u7ed3\u8bba)"
+    r"introduction|keywords?|background|materials?\s+and\s+methods?|"
+    r"methods?|methodology|results?\s+and\s+discussion|results?|discussion|"
+    r"related\s+work|conclusions?|\u5173\u952e\u8bcd|\u5f15\u8a00|"
+    r"\u80cc\u666f|\u7814\u7a76\u65b9\u6cd5|\u65b9\u6cd5|"
+    r"\u7ed3\u679c\u4e0e\u8ba8\u8bba|\u7ed3\u679c|\u7ed3\u8bba)"
     r"\s*(?:(?::|\uff1a)\s*.*)?$",
     re.IGNORECASE,
 )

@@ -1041,19 +1041,24 @@ def _analyze_pdf_page(
             "OCR fallback text (if available):\n" + (ocr_text[:3500] or "No OCR fallback text available."),
         ]
     )
-    return safe_model_call(
-        lambda: client.generate_structured_with_images(
-            DocumentPagePayload,
-            system_prompt=(
-                "You are a multimodal document intelligence parser. "
-                "Read the PDF page image, align it with any provided text layer, and output structured page Markdown."
+    analysis, analysis_source = safe_model_call(
+        lambda: (
+            client.generate_structured_with_images(
+                DocumentPagePayload,
+                system_prompt=(
+                    "You are a multimodal document intelligence parser. "
+                    "Read the PDF page image, align it with any provided text layer, and output structured page Markdown."
+                ),
+                user_prompt=prompt,
+                images=[image_bytes],
+                model=settings.ollama_vision_model or settings.ollama_generation_model,
             ),
-            user_prompt=prompt,
-            images=[image_bytes],
-            model=settings.ollama_vision_model or settings.ollama_generation_model,
+            "document_intelligence",
         ),
-        fallback,
+        (fallback, "pypdf_text_layer_fallback"),
     )
+    analysis._analysis_source = analysis_source
+    return analysis
 
 
 def _fallback_page_analysis(*, page_label: str, raw_text: str, text_quality: str) -> DocumentPagePayload:
@@ -1062,9 +1067,8 @@ def _fallback_page_analysis(*, page_label: str, raw_text: str, text_quality: str
     notes = []
     if text_quality != "high":
         notes.append("Text layer quality was limited; multimodal fallback used.")
-    return DocumentPagePayload(
+    analysis = DocumentPagePayload(
         page_label=page_label,
-        analysis_source="pypdf_text_layer_fallback",
         page_summary=summary[:400],
         page_markdown="\n\n".join(sections) if sections else raw_text,
         sections=sections,
@@ -1076,6 +1080,8 @@ def _fallback_page_analysis(*, page_label: str, raw_text: str, text_quality: str
         evidence_spans=sections,
         coverage_notes=notes,
     )
+    analysis._analysis_source = "pypdf_text_layer_fallback"
+    return analysis
 
 
 def _classify_text_layer_quality(text: str) -> str:

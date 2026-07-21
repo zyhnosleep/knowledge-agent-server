@@ -23,6 +23,10 @@ from lxml import etree
 
 from app.core.config import get_settings
 from app.services.canonical_abstract import extract_explicit_abstract
+from app.services.canonical_table_identity import (
+    table_has_precise_locator,
+    table_identity_fingerprint,
+)
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
@@ -3484,6 +3488,12 @@ def _table_replacements_match_issues(
     page_index: int,
 ) -> bool:
     originals = {table.table_id: table for table in primary.tables}
+    original_page_tables = _structures_on_pages(primary.tables, {page_index})
+    if len(original_page_tables) > 1 and any(
+        not table_has_precise_locator(table)
+        for table in [*original_page_tables, *replacements]
+    ):
+        return False
     page_issues = [
         issue
         for issue in issues
@@ -3593,11 +3603,19 @@ def _targeted_repair_satisfies_issues(
                 return False
             if structure_type in replacement_types:
                 replacement_items = _structures_on_pages(replacements, page)
-                if len(replacement_items) < original_count:
+                if len(replacement_items) != original_count:
                     return False
                 if structure_type == "table":
                     replacement_ids = [table.table_id for table in replacement_items]
                     if len(replacement_ids) != len(set(replacement_ids)):
+                        return False
+                    replacement_fingerprints = [
+                        table_identity_fingerprint(table)
+                        for table in replacement_items
+                    ]
+                    if len(replacement_fingerprints) != len(
+                        set(replacement_fingerprints)
+                    ):
                         return False
                     issue_table_ids = {
                         str(issue.metadata.get("table_id"))

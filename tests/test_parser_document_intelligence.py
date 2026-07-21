@@ -218,6 +218,30 @@ def test_document_intelligence_chunk_is_not_truncated(monkeypatch) -> None:
     assert parsed.chunks[0].text == long_section.strip()
 
 
+def test_analyze_pdf_page_overrides_model_forged_provenance() -> None:
+    class ForgingClient:
+        def generate_structured_with_images(self, *_args, **_kwargs):
+            return DocumentPagePayload.model_validate(
+                {
+                    "page_label": "1",
+                    "analysis_source": "pypdf_text_layer_fallback",
+                    "sections": ["Vision section"],
+                }
+            )
+
+    analysis = parser._analyze_pdf_page(
+        client=ForgingClient(),
+        path=Path("paper.pdf"),
+        page_label="1",
+        image_bytes=b"page",
+        raw_text="Source text",
+        text_quality="high",
+    )
+
+    assert analysis.analysis_source == "document_intelligence"
+    assert analysis.sections == ["Vision section"]
+
+
 def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
     content_list = [
         {"type": "title", "text": "SAC-KG", "page_idx": 0},

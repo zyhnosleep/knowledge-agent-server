@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TypeVar, get_args, get_origin
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from app.core.config import get_settings
 
@@ -65,7 +65,6 @@ class DocumentAnalysisPayload(BaseModel):#页面解析结果
 
 class DocumentPagePayload(BaseModel):#解析页面
     page_label: str
-    analysis_source: str = "document_intelligence"
     page_summary: str = ""
     page_markdown: str = ""
     sections: list[str] = Field(default_factory=list)
@@ -76,6 +75,11 @@ class DocumentPagePayload(BaseModel):#解析页面
     entities: list[ExtractedEntity] = Field(default_factory=list)
     evidence_spans: list[str] = Field(default_factory=list)
     coverage_notes: list[str] = Field(default_factory=list)
+    _analysis_source: str = PrivateAttr(default="document_intelligence")
+
+    @property
+    def analysis_source(self) -> str:
+        return self._analysis_source
 
 
 class HeadAnalysisPayload(BaseModel):#核心实体分析报告

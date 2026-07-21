@@ -4,6 +4,7 @@ import re
 from pathlib import PurePosixPath
 
 from app.services.canonical_abstract import has_explicit_abstract
+from app.services.canonical_table_identity import table_identity_fingerprint
 from app.services.canonical_models import (
     CanonicalDocument,
     CanonicalQualityIssue,
@@ -252,6 +253,29 @@ class CanonicalQualityGate:
                     severity="fatal",
                     message="Canonical table IDs must be unique.",
                     metadata={"table_ids": duplicate_ids},
+                )
+            )
+
+        by_fingerprint: dict[str, list[CanonicalTable]] = {}
+        for table in document.tables:
+            by_fingerprint.setdefault(table_identity_fingerprint(table), []).append(table)
+        duplicate_content = [
+            {
+                "fingerprint": fingerprint,
+                "table_ids": sorted(table.table_id for table in tables),
+            }
+            for fingerprint, tables in sorted(by_fingerprint.items())
+            if len(tables) > 1
+        ]
+        if duplicate_content:
+            issues.append(
+                CanonicalQualityIssue(
+                    code="table_content_duplicate",
+                    severity="fatal",
+                    message=(
+                        "Canonical tables contain indistinguishable content and source locators."
+                    ),
+                    metadata={"duplicates": duplicate_content},
                 )
             )
 

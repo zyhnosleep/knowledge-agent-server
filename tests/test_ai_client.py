@@ -1,5 +1,5 @@
 from app.services import ai
-from app.services.ai import HeadAnalysisPayload, OllamaClient
+from app.services.ai import DocumentPagePayload, HeadAnalysisPayload, OllamaClient
 
 
 def test_keep_alive_numeric_strings_are_normalized_for_ollama_compatibility(monkeypatch) -> None:
@@ -285,3 +285,39 @@ def test_json_mode_payload_uses_compact_schema_shape() -> None:
     assert "triples" in content
     assert "$defs" not in content
     assert "model_json_schema" not in content
+
+
+def test_document_page_provenance_is_absent_from_model_schema_and_retry_shape() -> None:
+    schema = DocumentPagePayload.model_json_schema()
+    compact = OllamaClient._compact_schema_shape(DocumentPagePayload)
+
+    assert "analysis_source" not in schema["properties"]
+    assert "analysis_source" not in compact
+
+
+def test_vision_json_retry_accepts_sections_without_provenance(monkeypatch) -> None:
+    client = OllamaClient()
+    calls: list[dict] = []
+
+    def fake_post_chat(payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"message": {"content": ""}}
+        return {
+            "message": {
+                "content": '{"page_label":"1","sections":["Recovered section"]}'
+            }
+        }
+
+    monkeypatch.setattr(client, "_post_chat", fake_post_chat)
+
+    parsed = client.generate_structured_with_images(
+        DocumentPagePayload,
+        system_prompt="Return page JSON.",
+        user_prompt="Analyze page.",
+        images=[b"page"],
+        model="fake-model",
+    )
+
+    assert parsed.sections == ["Recovered section"]
+    assert "analysis_source" not in calls[1]["messages"][1]["content"]

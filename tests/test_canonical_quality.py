@@ -537,6 +537,49 @@ def test_plain_pdf_abstract_stops_at_common_english_and_chinese_sections(
     )
 
 
+@pytest.mark.parametrize(
+    "section_heading",
+    [
+        "Materials and Methods",
+        "MATERIALS AND METHODS",
+        "2 Materials and Methods",
+        "III. Results and Discussion",
+        "Discussion",
+        "4. Related Work",
+        "研究方法",
+        "三、结果与讨论",
+    ],
+)
+def test_plain_pdf_abstract_stops_at_compound_section_headings(
+    section_heading: str,
+) -> None:
+    raw_page = (
+        "Abstract\nSource abstract sentence.\n\n"
+        f"{section_heading}\nSection content must not be included."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "Source abstract sentence."
+    )
+
+
+@pytest.mark.parametrize(
+    "body_line",
+    [
+        "This discussion summarizes the materials and methods used in the study.",
+        "本文在正文句子中讨论研究方法和结果与讨论的关系。",
+    ],
+)
+def test_plain_pdf_abstract_keeps_compound_heading_words_in_prose(
+    body_line: str,
+) -> None:
+    raw_page = f"Abstract\n{body_line}\nA final abstract sentence."
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        f"{body_line}\nA final abstract sentence."
+    )
+
+
 def test_pdf_uses_mineru_when_text_layer_extraction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1020,6 +1063,76 @@ def test_targeted_table_repair_matches_each_issue_to_a_distinct_locator() -> Non
         table("fixed-top-1", (0.0, 0.1, 1.0, 0.2), valid=True),
         table("fixed-top-2", (0.0, 0.15, 1.0, 0.25), valid=True),
     ]
+    issues = [issue for issue in CanonicalQualityGate().evaluate(primary).issues if issue.repairable]
+    candidate = primary.model_copy(deep=True)
+    candidate.tables = [item.model_copy(deep=True) for item in repair.tables]
+    CanonicalQualityGate().evaluate(candidate)
+
+    assert canonical_adapters._targeted_repair_satisfies_issues(
+        primary, repair, candidate, issues, {0}
+    ) is False
+
+
+def test_targeted_table_repair_rejects_same_content_with_different_ids() -> None:
+    def table(table_id: str, *, valid: bool) -> CanonicalTable:
+        return CanonicalTable(
+            table_id=table_id,
+            caption="Main results",
+            headers=["Model", "F1"],
+            rows=[["SAC-KG", "74.7"]] if valid else [["SAC-KG"]],
+            cells=(
+                [
+                    CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+                    CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+                    CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+                    CanonicalCell(text="74.7", row_index=1, column_index=1),
+                ]
+                if valid
+                else []
+            ),
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        )
+
+    primary = _document(_block("Page body"))
+    primary.tables = [table("bad-1", valid=False), table("bad-2", valid=False)]
+    repair = _document(_block("DI body", parser_source="document_intelligence"))
+    repair.tables = [table("fixed-index-1", valid=True), table("fixed-index-2", valid=True)]
+    issues = [issue for issue in CanonicalQualityGate().evaluate(primary).issues if issue.repairable]
+    candidate = primary.model_copy(deep=True)
+    candidate.tables = [item.model_copy(deep=True) for item in repair.tables]
+    CanonicalQualityGate().evaluate(candidate)
+
+    assert canonical_adapters._targeted_repair_satisfies_issues(
+        primary, repair, candidate, issues, {0}
+    ) is False
+
+
+def test_targeted_table_repair_requires_exact_replacement_inventory_size() -> None:
+    invalid = CanonicalTable(
+        table_id="bad",
+        headers=["A", "B"],
+        rows=[["1"]],
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+
+    def valid(table_id: str, value: str) -> CanonicalTable:
+        return CanonicalTable(
+            table_id=table_id,
+            headers=["A", "B"],
+            rows=[[value, "2"]],
+            cells=[
+                CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text=value, row_index=1, column_index=0),
+                CanonicalCell(text="2", row_index=1, column_index=1),
+            ],
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        )
+
+    primary = _document(_block("Page body"))
+    primary.tables = [invalid]
+    repair = _document(_block("DI body", parser_source="document_intelligence"))
+    repair.tables = [valid("fixed-1", "1"), valid("extra", "3")]
     issues = [issue for issue in CanonicalQualityGate().evaluate(primary).issues if issue.repairable]
     candidate = primary.model_copy(deep=True)
     candidate.tables = [item.model_copy(deep=True) for item in repair.tables]
