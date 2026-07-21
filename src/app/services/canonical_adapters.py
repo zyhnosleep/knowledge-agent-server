@@ -3212,23 +3212,56 @@ def _is_standalone_pdf_heading(text: str) -> bool:
 
 
 def _extract_explicit_abstract(candidates: list[str]) -> str | None:
-    heading = re.compile(r"(?i)^\s*#{0,6}\s*(?:abstract|摘要)\s*:?[ \t]*$")
-    inline = re.compile(
-        r"(?is)^\s*#{0,6}\s*(?:abstract|摘要)\s*:\s*(?P<body>.+)$"
+    abstract_heading = re.compile(
+        r"(?i)^\s*(?:#{1,6}\s*)?(?:abstract|\u6458\u8981)\s*"
+        r"(?:(?::|\uff1a|-|\u2014)\s*(?P<inline>.*))?$"
     )
-    multiline = re.compile(
-        r"(?is)^\s*#{0,6}\s*(?:abstract|摘要)\s*\n+(?P<body>.+)$"
-    )
+    atx_heading = re.compile(r"^\s*#{1,6}\s+\S")
+
+    def abstract_part(value: str) -> tuple[bool, str]:
+        lines = value.strip().splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if not lines:
+            return False, ""
+        match = abstract_heading.fullmatch(lines[0])
+        if match is None:
+            return False, ""
+        body_lines: list[str] = []
+        inline = (match.group("inline") or "").strip()
+        if inline:
+            body_lines.append(inline)
+        for line in lines[1:]:
+            if atx_heading.match(line):
+                break
+            body_lines.append(line)
+        return True, "\n".join(body_lines).strip()
+
     for index, candidate in enumerate(candidates):
-        value = candidate.strip()
-        match = inline.match(value) or multiline.match(value)
-        if match:
-            body = match.group("body").strip()
-            return body or None
-        if heading.match(value) and index + 1 < len(candidates):
-            body = candidates[index + 1].strip()
-            if body and not heading.match(body):
-                return body
+        matched, body = abstract_part(candidate)
+        if not matched:
+            continue
+        if body:
+            return body
+        following: list[str] = []
+        for next_candidate in candidates[index + 1 :]:
+            next_value = next_candidate.strip()
+            if not next_value:
+                continue
+            if atx_heading.match(next_value):
+                break
+            lines = next_value.splitlines()
+            collected: list[str] = []
+            for line in lines:
+                if atx_heading.match(line):
+                    break
+                collected.append(line)
+            if collected:
+                following.append("\n".join(collected).strip())
+            if len(collected) != len(lines):
+                break
+        joined = "\n\n".join(part for part in following if part).strip()
+        return joined or None
     return None
 
 
@@ -3270,16 +3303,18 @@ def _attach_pdf_audit(
     primary_parser: str,
     repair_scopes: list[str] | None = None,
 ) -> None:
-    block_pages = {
-        span.page_index
-        for block in document.blocks
-        for span in block.source_spans
-        if span.page_index is not None
+    explicit_pages = {
+        page
+        for page in document.metadata.get("parsed_page_indices", [])
+        if isinstance(page, int) and 0 <= page < page_count
     }
-    parsed_pages = [
+    parsed_pages = sorted(
+        explicit_pages | _document_structured_page_indices(document)
+    )
+    blank_text_layer_pages = [
         index
-        for index in range(page_count)
-        if index in block_pages or index >= len(page_texts) or not page_texts[index].strip()
+        for index in range(min(page_count, len(page_texts)))
+        if not page_texts[index].strip()
     ]
     scopes = list(dict.fromkeys(repair_scopes or document.metadata.get("repair_scopes", [])))
     document.metadata.update(
@@ -3287,6 +3322,7 @@ def _attach_pdf_audit(
             "expected_page_count": page_count,
             "parsed_page_indices": parsed_pages,
             "text_layer_pages": list(page_texts),
+            "text_layer_blank_page_indices": blank_text_layer_pages,
             "text_layer_warnings": list(text_layer_warnings),
             "primary_parser": primary_parser,
             "parser_attempts": list(attempts),
@@ -3358,6 +3394,76 @@ def _block_on_pages(block: CanonicalBlock, page_indices: set[int]) -> bool:
     )
 
 
+def _document_structured_page_indices(document: CanonicalDocument) -> set[int]:
+    structures = [
+        *document.blocks,
+        *document.tables,
+        *document.figures,
+        *document.formulas,
+    ]
+    return {
+        span.page_index
+        for structure in structures
+        for span in structure.source_spans
+        if span.page_index is not None
+    }
+
+
+def _targeted_repair_has_complete_coverage(
+    repair: CanonicalDocument,
+    page_indices: set[int],
+) -> bool:
+    return bool(page_indices) and page_indices.issubset(
+        _document_structured_page_indices(repair)
+    )
+
+
+def _asset_only_on_pages(asset: CanonicalAsset, page_indices: set[int]) -> bool:
+    located_pages = {
+        span.page_index
+        for span in asset.source_spans
+        if span.page_index is not None
+    }
+    return bool(located_pages) and located_pages.issubset(page_indices)
+
+
+def _reconcile_repair_assets(
+    primary_assets: list[CanonicalAsset],
+    repair_assets: list[CanonicalAsset],
+    figures: list[CanonicalFigure],
+    page_indices: set[int],
+) -> list[CanonicalAsset]:
+    referenced_paths = {
+        figure.asset_path for figure in figures if figure.asset_path
+    }
+    repair_paths = {asset.path for asset in repair_assets}
+    candidates = [
+        asset.model_copy(deep=True)
+        for asset in primary_assets
+        if asset.path not in repair_paths
+        and not (
+            asset.path not in referenced_paths
+            and _asset_only_on_pages(asset, page_indices)
+        )
+    ]
+    candidates.extend(
+        asset.model_copy(deep=True)
+        for asset in repair_assets
+        if asset.path in referenced_paths
+    )
+
+    by_path: dict[str, CanonicalAsset] = {}
+    for asset in candidates:
+        existing = by_path.get(asset.path)
+        if existing is None:
+            by_path[asset.path] = asset
+            continue
+        for span in asset.source_spans:
+            if span not in existing.source_spans:
+                existing.source_spans.append(span)
+    return list(by_path.values())
+
+
 def _merge_pdf_page_repairs(
     primary: CanonicalDocument,
     repair: CanonicalDocument,
@@ -3372,6 +3478,12 @@ def _merge_pdf_page_repairs(
     primary.figures = [
         figure for figure in primary.figures if not _structure_on_pages(figure, page_indices)
     ] + [figure.model_copy(deep=True) for figure in repair.figures]
+    primary.assets = _reconcile_repair_assets(
+        primary.assets,
+        repair.assets,
+        primary.figures,
+        page_indices,
+    )
     primary.formulas = [
         formula for formula in primary.formulas if not _structure_on_pages(formula, page_indices)
     ] + [formula.model_copy(deep=True) for formula in repair.formulas]
@@ -3468,13 +3580,27 @@ class PDFCanonicalAdapter:
                         else "document_intelligence:targeted:unavailable"
                     )
                 if repair is not None:
-                    mineru_document = _merge_pdf_page_repairs(
-                        mineru_document,
+                    if not _targeted_repair_has_complete_coverage(
+                        repair,
+                        targeted_pages,
+                    ):
+                        attempts.append("document_intelligence:targeted:partial")
+                        _attach_pdf_audit(
+                            mineru_document,
+                            page_count=page_count,
+                            page_texts=page_texts,
+                            text_layer_warnings=text_layer_warnings,
+                            attempts=attempts,
+                            primary_parser="mineru",
+                        )
+                        return _finalize_pdf_audit(mineru_document)
+                    candidate = _merge_pdf_page_repairs(
+                        mineru_document.model_copy(deep=True),
                         repair,
                         targeted_pages,
                     )
                     _attach_pdf_audit(
-                        mineru_document,
+                        candidate,
                         page_count=page_count,
                         page_texts=page_texts,
                         text_layer_warnings=text_layer_warnings,
@@ -3482,11 +3608,21 @@ class PDFCanonicalAdapter:
                         primary_parser="mineru",
                         repair_scopes=repair_scopes,
                     )
-                    repaired_report = gate.evaluate(mineru_document)
+                    repaired_report = gate.evaluate(candidate)
                     if not any(
                         issue.severity == "fatal" for issue in repaired_report.issues
                     ):
-                        return _finalize_pdf_audit(mineru_document)
+                        return _finalize_pdf_audit(candidate)
+                    attempts.append("document_intelligence:targeted:rejected")
+                    _attach_pdf_audit(
+                        mineru_document,
+                        page_count=page_count,
+                        page_texts=page_texts,
+                        text_layer_warnings=text_layer_warnings,
+                        attempts=attempts,
+                        primary_parser="mineru",
+                    )
+                    return _finalize_pdf_audit(mineru_document)
                 else:
                     _attach_pdf_audit(
                         mineru_document,

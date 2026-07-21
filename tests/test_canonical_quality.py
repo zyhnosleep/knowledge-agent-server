@@ -9,6 +9,7 @@ from app.services.canonical_adapters import PDFCanonicalAdapter
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
+    CanonicalCell,
     CanonicalDocument,
     CanonicalFigure,
     CanonicalFormula,
@@ -84,6 +85,30 @@ def test_quality_gate_detects_missing_pages_only_with_explicit_page_contract() -
     ]
     assert gated_report.status == "rejected"
     assert all(issue.code != "page_missing" for issue in ungated_report.issues)
+
+
+def test_blank_text_layer_page_does_not_count_as_structured_parser_coverage() -> None:
+    document = _document(
+        _block("Scanned page one", page=0),
+        expected_page_count=2,
+        parsed_page_indices=[0],
+    )
+
+    canonical_adapters._attach_pdf_audit(
+        document,
+        page_count=2,
+        page_texts=["", ""],
+        text_layer_warnings=[],
+        attempts=["mineru:success"],
+        primary_parser="mineru",
+    )
+    report = CanonicalQualityGate().evaluate(document)
+
+    assert document.metadata["parsed_page_indices"] == [0]
+    assert document.metadata["text_layer_blank_page_indices"] == [0, 1]
+    issue = next(issue for issue in report.issues if issue.code == "page_missing")
+    assert issue.metadata["missing_pages"] == [2]
+    assert issue.severity == "fatal"
 
 
 def test_quality_gate_detects_empty_content() -> None:
@@ -179,6 +204,92 @@ def test_quality_gate_requests_table_page_repair() -> None:
     assert report.status == "validation_failed"
 
 
+def test_table_gate_rejects_missing_and_incomplete_cell_inventory() -> None:
+    missing = CanonicalTable(
+        table_id="missing-cells",
+        headers=["Model", "F1"],
+        rows=[["SAC-KG", "74.7"]],
+    )
+    incomplete = CanonicalTable(
+        table_id="incomplete-cells",
+        headers=["Model", "F1"],
+        rows=[["SAC-KG", "74.7"]],
+        cells=[
+            CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+        ],
+    )
+
+    assert CanonicalQualityGate._invalid_table_reasons(missing) == ["cells_missing"]
+    assert "cells_incomplete" in CanonicalQualityGate._invalid_table_reasons(incomplete)
+
+
+def test_table_gate_compares_cell_and_markdown_representations() -> None:
+    table = CanonicalTable(
+        table_id="inconsistent",
+        headers=["A", "B"],
+        rows=[["1", "2"]],
+        cells=[
+            CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="1", row_index=1, column_index=0),
+            CanonicalCell(text="WRONG", row_index=1, column_index=1),
+        ],
+        normalized_markdown="| A | B |\n| --- | --- |\n| 1 | 999 |",
+        source_markdown="| A | B |\n| --- | --- |\n| 1 | 888 |",
+    )
+
+    reasons = CanonicalQualityGate._invalid_table_reasons(table)
+
+    assert "cell_value_mismatch" in reasons
+    assert "normalized_markdown_mismatch" in reasons
+    assert "source_markdown_mismatch" in reasons
+
+
+def test_table_gate_accepts_complete_rowspan_and_colspan_inventory() -> None:
+    table = CanonicalTable(
+        table_id="merged-cells",
+        headers=["A", "B", ""],
+        rows=[["R", "1", "2"], ["", "Wide", ""]],
+        cells=[
+            CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(
+                text="B", row_index=0, column_index=1, colspan=2, is_header=True
+            ),
+            CanonicalCell(text="R", row_index=1, column_index=0, rowspan=2),
+            CanonicalCell(text="1", row_index=1, column_index=1),
+            CanonicalCell(text="2", row_index=1, column_index=2),
+            CanonicalCell(text="Wide", row_index=2, column_index=1, colspan=2),
+        ],
+        normalized_markdown=(
+            "| A | B |  |\n| --- | --- | --- |\n"
+            "| R | 1 | 2 |\n|  | Wide |  |"
+        ),
+    )
+
+    assert CanonicalQualityGate._invalid_table_reasons(table) == []
+
+
+def test_table_gate_reports_short_rows_without_raising() -> None:
+    table = CanonicalTable(
+        table_id="short-row",
+        headers=["A", "B"],
+        rows=[["1"]],
+        cells=[
+            CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="1", row_index=1, column_index=0),
+            CanonicalCell(text="orphan", row_index=1, column_index=1),
+        ],
+    )
+
+    reasons = CanonicalQualityGate._invalid_table_reasons(table)
+
+    assert "row_width_mismatch" in reasons
+    assert "cell_value_mismatch" in reasons
+
+
 def test_figure_and_formula_warnings_do_not_block_acceptance() -> None:
     document = _document(_block())
     document.figures = [CanonicalFigure(figure_id="figure-1")]
@@ -238,6 +349,33 @@ def test_quality_issue_repair_scope_round_trips_through_json() -> None:
     assert restored.repair_scope == "page:7"
 
 
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        (
+            [
+                "### Abstract\n\nSource abstract sentence.\n\n"
+                "### 1. Introduction\n\nIntroduction must not be included."
+            ],
+            "Source abstract sentence.",
+        ),
+        (
+            ["## ABSTRACT", "First sentence.\nSecond sentence.", "## Introduction", "Intro"],
+            "First sentence.\nSecond sentence.",
+        ),
+        (
+            ["Abstract\nSource body.\n# Keywords\nRAG, MinerU"],
+            "Source body.",
+        ),
+    ],
+)
+def test_explicit_abstract_stops_at_next_markdown_heading(
+    candidates: list[str],
+    expected: str,
+) -> None:
+    assert canonical_adapters._extract_explicit_abstract(candidates) == expected
+
+
 def test_pdf_uses_mineru_when_text_layer_extraction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -275,12 +413,19 @@ def test_pdf_repairable_issue_calls_document_intelligence_only_for_scoped_pages(
     mineru = _accepted_mineru_document(page_count=3)
     mineru.blocks = [
         _block("Abstract source text was left as narrative", page=0),
-        _block("Unchanged page three", order=1, page=2),
+        _block("MinerU introduction", order=1, page=1),
+        _block("Unchanged page three", order=2, page=2),
     ]
     repaired = _document(
         _block("Abstract\nRecovered source abstract", page=0, parser_source="document_intelligence"),
+        _block(
+            "Introduction source",
+            order=1,
+            page=1,
+            parser_source="document_intelligence",
+        ),
         expected_page_count=3,
-        parsed_page_indices=[0],
+        parsed_page_indices=[0, 1],
     )
     repaired.parser_source = "document_intelligence"
     repaired.abstract = "Recovered source abstract"
@@ -290,7 +435,7 @@ def test_pdf_repairable_issue_calls_document_intelligence_only_for_scoped_pages(
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nRecovered source abstract", "", ""], 3),
+        lambda _path: (["Abstract\nRecovered source abstract", "Introduction source", ""], 3),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
 
@@ -368,6 +513,57 @@ def test_pdf_targeted_repair_failure_does_not_escalate_to_full_document_intellig
     assert calls == [{0}]
     assert result.metadata["primary_parser"] == "mineru"
     assert result.quality.status == "validation_failed"
+
+
+@pytest.mark.parametrize("repair_kind", ["partial", "empty"])
+def test_pdf_incomplete_targeted_repair_preserves_mineru_without_full_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repair_kind: str,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    mineru = _document(
+        _block("MinerU page one", page=0),
+        _block("MinerU page two", order=1, page=1),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    repair = _document(
+        _block("Partial repair", page=0, parser_source="document_intelligence"),
+        expected_page_count=2,
+        parsed_page_indices=[0],
+    )
+    repair.parser_source = "document_intelligence"
+    if repair_kind == "empty":
+        repair.blocks = []
+        repair.metadata["parsed_page_indices"] = []
+    calls: list[set[int] | None] = []
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 2)
+    monkeypatch.setattr(
+        parser,
+        "_extract_pdf_text_layer",
+        lambda _path: (["Abstract\nSource abstract", "Second-page source"], 2),
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+
+    def incomplete_di(_path, _page_count, _page_texts, page_indices=None):
+        calls.append(None if page_indices is None else set(page_indices))
+        return repair
+
+    monkeypatch.setattr(canonical_adapters, "run_document_intelligence", incomplete_di)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert calls == [{0, 1}]
+    assert [block.text for block in result.blocks] == [
+        "MinerU page one",
+        "MinerU page two",
+    ]
+    assert result.metadata["primary_parser"] == "mineru"
+    assert result.quality.status == "validation_failed"
+    assert any("targeted:partial" in attempt for attempt in result.metadata["parser_attempts"])
 
 
 def test_pdf_audit_preserves_best_effort_text_layer_warnings(
@@ -503,6 +699,110 @@ def test_mineru_existing_figure_file_is_registered_as_canonical_asset(
     assert document.assets[0].path.startswith("assets/")
     assert document.assets[0].source_path == str(image_path.resolve())
     assert document.figures[0].asset_path == document.assets[0].path
+
+
+def test_targeted_page_repair_reconciles_figure_asset_inventory() -> None:
+    primary = _document(
+        CanonicalBlock(
+            block_id="old-figure-block",
+            block_type="figure",
+            text="Old figure",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="mineru",
+            figure_id="old-figure",
+        ),
+        CanonicalBlock(
+            block_id="kept-figure-block",
+            block_type="figure",
+            text="Kept figure",
+            reading_order=1,
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+            parser_source="mineru",
+            figure_id="kept-figure",
+        ),
+    )
+    primary.figures = [
+        CanonicalFigure(
+            figure_id="old-figure",
+            caption="Old",
+            asset_path="assets/old.png",
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        ),
+        CanonicalFigure(
+            figure_id="kept-figure",
+            caption="Kept",
+            asset_path="assets/kept.png",
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+        ),
+    ]
+    primary.assets = [
+        CanonicalAsset(
+            asset_id="old-asset",
+            path="assets/old.png",
+            media_type="image/png",
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        ),
+        CanonicalAsset(
+            asset_id="kept-asset",
+            path="assets/kept.png",
+            media_type="image/png",
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+        ),
+    ]
+    repair = _document(
+        CanonicalBlock(
+            block_id="new-figure-block",
+            block_type="figure",
+            text="New figure",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="document_intelligence",
+            figure_id="new-figure",
+        )
+    )
+    repair.figures = [
+        CanonicalFigure(
+            figure_id="new-figure",
+            caption="New",
+            asset_path="assets/new.png",
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        )
+    ]
+    repair.assets = [
+        CanonicalAsset(
+            asset_id="new-asset",
+            path="assets/new.png",
+            media_type="image/png",
+            sha256="a" * 64,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        ),
+        CanonicalAsset(
+            asset_id="duplicate-new-asset",
+            path="assets/new.png",
+            media_type="image/png",
+            sha256="a" * 64,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        ),
+    ]
+
+    merged = canonical_adapters._merge_pdf_page_repairs(primary, repair, {0})
+
+    assert {asset.path for asset in merged.assets} == {
+        "assets/kept.png",
+        "assets/new.png",
+    }
+    assert len(merged.assets) == 2
+    assert {figure.asset_path for figure in merged.figures} == {
+        "assets/kept.png",
+        "assets/new.png",
+    }
+    assert all(
+        figure.asset_path in {asset.path for asset in merged.assets}
+        for figure in merged.figures
+        if figure.asset_path
+    )
+    assert all(issue.code != "asset_invalid" for issue in CanonicalQualityGate().evaluate(merged).issues)
 
 
 def test_parser_sources_have_no_structured_4000_character_truncation() -> None:

@@ -217,20 +217,139 @@ class CanonicalQualityGate:
     @staticmethod
     def _invalid_table_reasons(table: CanonicalTable) -> list[str]:
         reasons: list[str] = []
+
+        def add(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
         width = len(table.headers)
         if width == 0:
-            reasons.append("header_missing")
+            add("header_missing")
         if not table.rows:
-            reasons.append("data_rows_missing")
+            add("data_rows_missing")
         if width and any(len(row) != width for row in table.rows):
-            reasons.append("row_width_mismatch")
-        if table.cells:
+            add("row_width_mismatch")
+
+        grid = [table.headers, *table.rows]
+        height = len(grid)
+        if not table.cells:
+            add("cells_missing")
+        elif width:
             coordinates = [(cell.row_index, cell.column_index) for cell in table.cells]
             if len(coordinates) != len(set(coordinates)):
-                reasons.append("duplicate_cell_coordinate")
-            if width and any(cell.column_index >= width for cell in table.cells):
-                reasons.append("cell_out_of_bounds")
+                add("duplicate_cell_coordinate")
+            occupied: dict[tuple[int, int], object] = {}
+            for cell in table.cells:
+                row_end = cell.row_index + cell.rowspan
+                column_end = cell.column_index + cell.colspan
+                if (
+                    cell.row_index >= height
+                    or cell.column_index >= width
+                    or row_end > height
+                    or column_end > width
+                ):
+                    add("cell_out_of_bounds")
+                    continue
+                source_row = grid[cell.row_index]
+                if (
+                    cell.column_index >= len(source_row)
+                    or source_row[cell.column_index] != cell.text
+                ):
+                    add("cell_value_mismatch")
+                for row_index in range(cell.row_index, row_end):
+                    for column_index in range(cell.column_index, column_end):
+                        coordinate = (row_index, column_index)
+                        if coordinate in occupied:
+                            add("cell_overlap")
+                        else:
+                            occupied[coordinate] = cell
+                        if coordinate != (cell.row_index, cell.column_index):
+                            covered_row = grid[row_index]
+                            covered_value = (
+                                covered_row[column_index]
+                                if column_index < len(covered_row)
+                                else ""
+                            )
+                            if covered_value not in {"", cell.text}:
+                                add("cell_span_value_mismatch")
+            expected_coordinates = {
+                (row_index, column_index)
+                for row_index in range(height)
+                for column_index in range(width)
+            }
+            if not expected_coordinates.issubset(occupied):
+                add("cells_incomplete")
+
+        expected_markdown = CanonicalQualityGate._table_markdown(
+            table.headers,
+            table.rows,
+        )
+        if table.normalized_markdown is not None and (
+            table.normalized_markdown.strip() != expected_markdown
+        ):
+            add("normalized_markdown_mismatch")
+        if table.source_markdown is not None:
+            source_data = CanonicalQualityGate._markdown_table_data(
+                table.source_markdown
+            )
+            if source_data is None:
+                add("source_markdown_invalid")
+            elif source_data != (table.headers, table.rows):
+                add("source_markdown_mismatch")
         return reasons
+
+    @staticmethod
+    def _table_markdown(headers: list[str], rows: list[list[str]]) -> str:
+        def escape(value: str) -> str:
+            return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
+        if not headers:
+            return ""
+        lines = [
+            "| " + " | ".join(escape(cell) for cell in headers) + " |",
+            "| " + " | ".join("---" for _ in headers) + " |",
+        ]
+        lines.extend(
+            "| "
+            + " | ".join(
+                escape(cell) for cell in (row + [""] * len(headers))[: len(headers)]
+            )
+            + " |"
+            for row in rows
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _markdown_table_data(
+        markdown: str,
+    ) -> tuple[list[str], list[list[str]]] | None:
+        def split_row(value: str) -> list[str]:
+            value = value.strip()
+            if value.startswith("|"):
+                value = value[1:]
+            if value.endswith("|") and not value.endswith("\\|"):
+                value = value[:-1]
+            return [
+                part.strip().replace("\\|", "|").replace("\\\\", "\\")
+                for part in re.split(r"(?<!\\)\|", value)
+            ]
+
+        lines = [line.strip() for line in markdown.splitlines() if line.strip()]
+        for index in range(len(lines) - 1):
+            separator = split_row(lines[index + 1])
+            if not separator or not all(
+                re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
+                for cell in separator
+            ):
+                continue
+            headers = split_row(lines[index])
+            rows: list[list[str]] = []
+            for line in lines[index + 2 :]:
+                if "|" not in line:
+                    break
+                rows.append(split_row(line))
+            return headers, rows
+        return None
 
     @staticmethod
     def _figure_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
