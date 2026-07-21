@@ -50,6 +50,29 @@ _CHUNK_SELF_FOREIGN_KEYS = {
     "previous_chunk_id": ("fk_document_chunks_previous_chunk_id", "SET NULL"),
     "next_chunk_id": ("fk_document_chunks_next_chunk_id", "SET NULL"),
 }
+_CHUNK_SELF_REFERENCE_CHECKS = (
+    (
+        "parent_chunk_id",
+        "SELECT 1 FROM document_chunks AS source "
+        "LEFT JOIN document_chunks AS target "
+        "ON target.id = source.parent_chunk_id "
+        "WHERE source.parent_chunk_id IS NOT NULL AND target.id IS NULL LIMIT 1",
+    ),
+    (
+        "previous_chunk_id",
+        "SELECT 1 FROM document_chunks AS source "
+        "LEFT JOIN document_chunks AS target "
+        "ON target.id = source.previous_chunk_id "
+        "WHERE source.previous_chunk_id IS NOT NULL AND target.id IS NULL LIMIT 1",
+    ),
+    (
+        "next_chunk_id",
+        "SELECT 1 FROM document_chunks AS source "
+        "LEFT JOIN document_chunks AS target "
+        "ON target.id = source.next_chunk_id "
+        "WHERE source.next_chunk_id IS NOT NULL AND target.id IS NULL LIMIT 1",
+    ),
+)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -142,6 +165,8 @@ def _ensure_sqlite_chunk_schema() -> None:
             for foreign_key in schema.get_foreign_keys("document_chunks")
             if foreign_key["referred_table"] == "document_chunks"
         }
+        _check_sqlite_chunk_self_references(connection)
+        _check_sqlite_chunk_foreign_keys(connection)
         nullable_mismatch = any(
             columns[column_name]["nullable"]
             for column_name in _REQUIRED_CHUNK_COLUMNS
@@ -194,17 +219,34 @@ def _rebuild_sqlite_chunk_schema(
                             ["id"],
                             ondelete=ondelete,
                         )
+                _check_sqlite_chunk_foreign_keys(connection)
         finally:
             if connection.in_transaction():
                 connection.rollback()
             connection.exec_driver_sql("PRAGMA foreign_keys=ON")
             connection.commit()
 
-        violations = connection.exec_driver_sql("PRAGMA foreign_key_check").all()
-        if violations:
-            raise RuntimeError(
-                "SQLite document_chunks rebuild produced foreign-key violations."
-            )
+
+def _check_sqlite_chunk_self_references(connection) -> None:
+    orphaned_columns = [
+        column_name
+        for column_name, statement in _CHUNK_SELF_REFERENCE_CHECKS
+        if connection.exec_driver_sql(statement).first() is not None
+    ]
+    if orphaned_columns:
+        names = ", ".join(orphaned_columns)
+        raise RuntimeError(
+            "SQLite document_chunks has foreign-key violations in self-reference "
+            f"columns: {names}."
+        )
+
+
+def _check_sqlite_chunk_foreign_keys(connection) -> None:
+    violations = connection.exec_driver_sql(
+        "PRAGMA foreign_key_check(document_chunks)"
+    ).all()
+    if violations:
+        raise RuntimeError("SQLite document_chunks has foreign-key violations.")
 
 
 def _backfill_sqlite_parse_versions() -> None:

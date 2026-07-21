@@ -1179,6 +1179,149 @@ def test_init_db_upgrades_legacy_sqlite_chunk_columns_and_indexes(
         assert next_ref.next_chunk_id is None
 
 
+def test_init_db_rejects_orphaned_legacy_chunk_before_schema_rebuild(
+    tmp_path, monkeypatch
+) -> None:
+    from app.db import session as session_module
+
+    database_path = tmp_path / "legacy-orphan.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    engine = create_engine(database_url, future=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE projects ("
+                "id VARCHAR(36) PRIMARY KEY, slug VARCHAR(120) NOT NULL UNIQUE, "
+                "name VARCHAR(255) NOT NULL, description TEXT, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE documents ("
+                "id VARCHAR(36) PRIMARY KEY, project_id VARCHAR(36) NOT NULL, "
+                "title VARCHAR(255) NOT NULL, file_name VARCHAR(255) NOT NULL, "
+                "sha256 VARCHAR(64) NOT NULL, source_type VARCHAR(40) NOT NULL, "
+                "source_uri TEXT, raw_path TEXT NOT NULL, object_key TEXT, raw_text TEXT, "
+                "metadata_json JSON NOT NULL, status VARCHAR(40) NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "FOREIGN KEY(project_id) REFERENCES projects(id))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE document_chunks ("
+                "id VARCHAR(36) PRIMARY KEY, document_id VARCHAR(36) NOT NULL, "
+                "parent_chunk_id VARCHAR(36), ordinal INTEGER NOT NULL, "
+                "heading VARCHAR(255), page_label VARCHAR(32), text TEXT NOT NULL, "
+                "token_estimate INTEGER NOT NULL, embedding JSON, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                "FOREIGN KEY(document_id) REFERENCES documents(id))"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO projects VALUES "
+                "('p1', 'research', 'Research', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO documents VALUES "
+                "('d1', 'p1', 'Paper', 'paper.pdf', 'abc', 'file', NULL, "
+                "'raw/paper.pdf', NULL, NULL, '{}', 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO document_chunks VALUES "
+                "('orphan', 'd1', 'missing-parent', 0, NULL, '1', "
+                "'Orphan evidence', 3, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    monkeypatch.setattr(session_module, "engine", engine)
+    monkeypatch.setattr(session_module.settings, "database_url", database_url)
+
+    with pytest.raises(RuntimeError):
+        session_module.init_db()
+
+    inspector = inspect(engine)
+    column_details = {
+        column["name"]: column for column in inspector.get_columns("document_chunks")
+    }
+    self_foreign_keys = [
+        foreign_key
+        for foreign_key in inspector.get_foreign_keys("document_chunks")
+        if foreign_key["referred_table"] == "document_chunks"
+    ]
+    with engine.connect() as connection:
+        orphan = connection.execute(
+            text(
+                "SELECT text, parent_chunk_id FROM document_chunks "
+                "WHERE id = 'orphan'"
+            )
+        ).mappings().one()
+
+    assert column_details["parse_version"]["nullable"]
+    assert column_details["embedding_text"]["nullable"]
+    assert self_foreign_keys == []
+    assert dict(orphan) == {
+        "text": "Orphan evidence",
+        "parent_chunk_id": "missing-parent",
+    }
+    with pytest.raises(RuntimeError):
+        session_module.init_db()
+
+
+def test_init_db_checks_matching_schema_for_foreign_key_off_orphans(
+    tmp_path, monkeypatch
+) -> None:
+    from app.db import session as session_module
+
+    database_path = tmp_path / "matching-schema-orphan.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    engine = create_engine(database_url, future=True)
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        assert connection.scalar(text("PRAGMA foreign_keys")) == 0
+        connection.execute(
+            Project.__table__.insert().values(
+                id="p1", slug="research", name="Research"
+            )
+        )
+        connection.execute(
+            Document.__table__.insert().values(
+                id="d1",
+                project_id="p1",
+                title="Paper",
+                file_name="paper.pdf",
+                sha256="abc",
+                raw_path="raw/paper.pdf",
+            )
+        )
+        connection.execute(
+            DocumentChunk.__table__.insert().values(
+                id="orphan",
+                document_id="d1",
+                parent_chunk_id="missing-parent",
+                ordinal=0,
+                text="Orphan evidence",
+            )
+        )
+
+    monkeypatch.setattr(session_module, "engine", engine)
+    monkeypatch.setattr(session_module.settings, "database_url", database_url)
+
+    with pytest.raises(RuntimeError, match="foreign-key violations"):
+        session_module.init_db()
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT COUNT(*) FROM document_chunks WHERE id = 'orphan'")
+        ) == 1
+
+
 CHUNK_SCHEMA_COLUMNS = {
     "parse_version",
     "parent_chunk_id",
