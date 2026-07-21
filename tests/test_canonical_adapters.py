@@ -424,6 +424,79 @@ def test_markdown_direct_image_allows_empty_destination(tmp_path: Path) -> None:
     assert figure_block.metadata["source_markdown"] == "![Empty destination]()"
 
 
+def test_markdown_empty_atx_headings_preserve_structure_spans_and_stable_ids(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    source = "#\n###\n  ##\n    ####\n"
+    first_path = first_dir / "empty-headings.md"
+    second_path = second_dir / "empty-headings.md"
+    first_path.write_bytes(source.encode("utf-8"))
+    second_path.write_bytes(source.encode("utf-8"))
+
+    first = parse_canonical_document(first_path)
+    second = parse_canonical_document(second_path)
+
+    headings = [block for block in first.blocks if block.block_type == "heading"]
+    assert [(block.text, block.metadata["heading_level"]) for block in headings] == [
+        ("", 1),
+        ("", 3),
+        ("", 2),
+    ]
+    assert [
+        source[block.source_spans[0].char_start : block.source_spans[0].char_end]
+        for block in headings
+    ] == ["#", "###", "  ##"]
+    assert [node.level for node in first.outline] == [1]
+    assert [node.level for node in first.outline[0].children] == [3, 2]
+    assert any(
+        block.block_type == "narrative" and block.text == "    ####"
+        for block in first.blocks
+    )
+    assert first.document_id == second.document_id
+    assert [block.block_id for block in first.blocks] == [
+        block.block_id for block in second.blocks
+    ]
+
+
+def test_markdown_empty_angle_reference_target_preserves_span_and_stable_ids(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    source = "before ![x][empty] after\n\n[empty]: <>\n"
+    first_path = first_dir / "empty-target.md"
+    second_path = second_dir / "empty-target.md"
+    first_path.write_bytes(source.encode("utf-8"))
+    second_path.write_bytes(source.encode("utf-8"))
+
+    first = parse_canonical_document(first_path)
+    second = parse_canonical_document(second_path)
+
+    assert len(first.figures) == 1
+    figure = first.figures[0]
+    assert figure.asset_path in {None, ""}
+    assert figure.metadata["target"] == ""
+    figure_block = next(block for block in first.blocks if block.figure_id == figure.figure_id)
+    span = figure_block.source_spans[0]
+    assert source[span.char_start : span.char_end] == "![x][empty]"
+    assert figure_block.metadata["source_markdown"] == "![x][empty]"
+    assert figure_block.metadata["target"] == ""
+    assert "<>" not in {figure.asset_path, figure.metadata["target"]}
+    assert first.document_id == second.document_id
+    assert [item.figure_id for item in first.figures] == [
+        item.figure_id for item in second.figures
+    ]
+    assert [block.block_id for block in first.blocks] == [
+        block.block_id for block in second.blocks
+    ]
+
+
 @pytest.mark.parametrize("suffix", [".md", ".txt"])
 def test_bom_crlf_non_ascii_source_spans_use_original_character_stream(
     tmp_path: Path, suffix: str

@@ -354,12 +354,14 @@ class TextCanonicalAdapter:
 
 class MarkdownCanonicalAdapter:
     parser_source = "markdown"
-    _heading_re = re.compile(r"^[ ]{0,3}(#{1,6})[ \t]+(?P<title>.*?)[ \t]*$")
+    _heading_re = re.compile(
+        r"^[ ]{0,3}(#{1,6})(?:[ \t]+(?P<title>.*?))?[ \t]*$"
+    )
     _fence_re = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
     _setext_re = re.compile(r"^[ \t]*(?P<underline>=+|-+)[ \t]*$")
     _definition_re = re.compile(
         r"^[ ]{0,3}\[(?P<label>[^]]+)\]:[ \t]*"
-        r"(?:<(?P<angle>[^>]+)>|(?P<bare>\S+))"
+        r"(?:<(?P<angle>[^>]*)>|(?P<bare>\S+))"
         r"(?:[ \t]+(?:\"(?P<double_title>[^\"]*)\"|'(?P<single_title>[^']*)'|"
         r"\((?P<paren_title>[^)]*)\)))?[ \t]*$"
     )
@@ -383,7 +385,7 @@ class MarkdownCanonicalAdapter:
 
             heading_match = self._heading_re.match(lines[index].text)
             if heading_match:
-                title = heading_match.group("title").strip()
+                title = (heading_match.group("title") or "").strip()
                 closing = re.fullmatch(r"(?P<title>.*?)[ \t]+#+[ \t]*", title)
                 if closing is not None:
                     title = closing.group("title")
@@ -655,7 +657,8 @@ class MarkdownCanonicalAdapter:
             if match is None:
                 continue
             label = cls._normalize_reference_label(match.group("label"))
-            target = match.group("angle") or match.group("bare")
+            angle_target = match.group("angle")
+            target = angle_target if angle_target is not None else match.group("bare")
             title = (
                 match.group("double_title")
                 or match.group("single_title")
