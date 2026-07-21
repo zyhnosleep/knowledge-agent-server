@@ -355,7 +355,7 @@ class TextCanonicalAdapter:
 class MarkdownCanonicalAdapter:
     parser_source = "markdown"
     _heading_re = re.compile(
-        r"^[ ]{0,3}(#{1,6})(?:[ \t]+(?P<title>.*?))?[ \t]*$"
+        r"^[ ]{0,3}(#{1,6})(?P<content>(?:[ \t]+.*)?)$"
     )
     _fence_re = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
     _setext_re = re.compile(r"^[ \t]*(?P<underline>=+|-+)[ \t]*$")
@@ -385,13 +385,10 @@ class MarkdownCanonicalAdapter:
 
             heading_match = self._heading_re.match(lines[index].text)
             if heading_match:
-                title = (heading_match.group("title") or "").strip()
-                closing = re.fullmatch(r"(?P<title>.*?)[ \t]+#+[ \t]*", title)
-                if closing is not None:
-                    title = closing.group("title")
+                title = self._atx_heading_title(heading_match.group("content"))
                 builder.add_heading(title, len(heading_match.group(1)), _text_span(lines, index, index))
                 if not document.title or document.title == display_title_from_path(path):
-                    if len(heading_match.group(1)) == 1:
+                    if title and len(heading_match.group(1)) == 1:
                         document.title = title
                 index += 1
                 continue
@@ -545,6 +542,16 @@ class MarkdownCanonicalAdapter:
         if match is None:
             return None
         return 1 if match.group("underline").startswith("=") else 2
+
+    @staticmethod
+    def _atx_heading_title(raw_content: str) -> str:
+        closing = re.fullmatch(
+            r"(?P<title>.*?)[ \t]+#+[ \t]*",
+            raw_content,
+        )
+        if closing is not None:
+            raw_content = closing.group("title")
+        return raw_content.strip(" \t")
 
     def _add_paragraph(
         self,

@@ -462,6 +462,49 @@ def test_markdown_empty_atx_headings_preserve_structure_spans_and_stable_ids(
     ]
 
 
+def test_markdown_closing_only_atx_headings_keep_crlf_spans_and_title_fallback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fallback-title.md"
+    source = "# ###\r\nBody under empty heading.\r\n# #\r\n## ##\r\n"
+    path.write_bytes(source.encode("utf-8"))
+
+    document = parse_canonical_document(path)
+
+    headings = [block for block in document.blocks if block.block_type == "heading"]
+    assert [(block.text, block.metadata["heading_level"]) for block in headings] == [
+        ("", 1),
+        ("", 1),
+        ("", 2),
+    ]
+    assert [
+        source[block.source_spans[0].char_start : block.source_spans[0].char_end]
+        for block in headings
+    ] == ["# ###", "# #", "## ##"]
+    body = next(block for block in document.blocks if block.text == "Body under empty heading.")
+    assert body.section_path == [""]
+    assert document.title == "fallback-title"
+    assert [node.title for node in document.outline] == ["", ""]
+    assert document.outline[1].children[0].title == ""
+
+
+def test_markdown_atx_closing_hashes_require_whitespace_and_no_escape(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "closing-hashes.md"
+    source = "# foo ###\r\n# foo###\r\n# \\###\r\n"
+    path.write_bytes(source.encode("utf-8"))
+
+    document = parse_canonical_document(path)
+
+    headings = [block for block in document.blocks if block.block_type == "heading"]
+    assert [block.text for block in headings] == ["foo", "foo###", r"\###"]
+    assert [
+        source[block.source_spans[0].char_start : block.source_spans[0].char_end]
+        for block in headings
+    ] == ["# foo ###", "# foo###", r"# \###"]
+
+
 def test_markdown_empty_angle_reference_target_preserves_span_and_stable_ids(
     tmp_path: Path,
 ) -> None:
