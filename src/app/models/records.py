@@ -4,7 +4,16 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -25,6 +34,19 @@ class DocumentStatus(str, Enum):
     processing = "processing"
     ready = "ready"
     failed = "failed"
+    parsing = "parsing"
+    quality_checking = "quality_checking"
+    repairing = "repairing"
+    canonicalizing = "canonicalizing"
+    chunking = "chunking"
+    contextualizing = "contextualizing"
+    embedding = "embedding"
+    indexing = "indexing"
+    parse_failed = "parse_failed"
+    table_repair_failed = "table_repair_failed"
+    contextualization_failed = "contextualization_failed"
+    embedding_failed = "embedding_failed"
+    activation_failed = "activation_failed"
 
 
 class ReviewSeverity(str, Enum):
@@ -80,25 +102,114 @@ class Document(Base, TimestampMixin):
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(40), default=DocumentStatus.pending.value)
+    active_parse_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+    parse_versions: Mapped[list["DocumentParseVersion"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     runs: Mapped[list["PipelineRun"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+
+
+class DocumentParseVersion(Base, TimestampMixin):
+    __tablename__ = "document_parse_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "version_key",
+            name="uq_document_parse_versions_document_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    version_key: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(40), default="queued")
+    artifact_dir: Mapped[str] = mapped_column(Text)
+    parser_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    parser_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    manifest_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stage_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    document: Mapped["Document"] = relationship(back_populates="parse_versions")
+
+
+def _embedding_text_default(context) -> str:
+    return str(context.get_current_parameters().get("text") or "")
 
 
 class DocumentChunk(Base, TimestampMixin):
     __tablename__ = "document_chunks"
+    __table_args__ = (
+        Index(
+            "ix_document_chunks_document_parse_version_role",
+            "document_id",
+            "parse_version",
+            "chunk_role",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    parse_version: Mapped[str] = mapped_column(String(128), default="legacy")
+    parent_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="CASCADE"), nullable=True
+    )
+    chunk_role: Mapped[str] = mapped_column(String(20), default="child")
+    block_type: Mapped[str] = mapped_column(String(40), default="narrative")
     ordinal: Mapped[int] = mapped_column(Integer)
     heading: Mapped[str | None] = mapped_column(String(255), nullable=True)
     page_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    section_path: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_block_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_spans: Mapped[list[dict]] = mapped_column(JSON, default=list)
     text: Mapped[str] = mapped_column(Text)
+    contextual_prefix: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_text: Mapped[str] = mapped_column(Text, default=_embedding_text_default)
+    contextualization_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    contextualization_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    contextualization_prompt_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    contextualized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    parser_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    parser_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    splitter_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    splitter_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    splitting_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    semantic_boundary_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    previous_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="SET NULL"), nullable=True
+    )
+    next_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="SET NULL"), nullable=True
+    )
     token_estimate: Mapped[int] = mapped_column(Integer, default=0)
     embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+    parent: Mapped["DocumentChunk | None"] = relationship(
+        remote_side=[id],
+        foreign_keys=[parent_chunk_id],
+        back_populates="children",
+    )
+    children: Mapped[list["DocumentChunk"]] = relationship(
+        foreign_keys=[parent_chunk_id],
+        back_populates="parent",
+        passive_deletes=True,
+    )
+    previous_chunk: Mapped["DocumentChunk | None"] = relationship(
+        remote_side=[id], foreign_keys=[previous_chunk_id]
+    )
+    next_chunk: Mapped["DocumentChunk | None"] = relationship(
+        remote_side=[id], foreign_keys=[next_chunk_id]
+    )
 
 
 class Entity(Base, TimestampMixin):
