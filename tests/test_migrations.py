@@ -151,3 +151,19 @@ def test_canonical_migration_versions_postgresql_pgvector_rows() -> None:
     assert "SET parse_version = 'legacy'" in migration_text
     assert "ALTER COLUMN parse_version SET NOT NULL" in migration_text
     assert "ix_document_chunk_pgvector_index_document_parse_version" in migration_text
+
+
+def test_pgvector_parse_version_keeps_legacy_default_during_writer_transition() -> None:
+    migration_path = (
+        ROOT
+        / "src/app/db/alembic/versions/a4e2c7f90120_add_canonical_parse_versions.py"
+    )
+    migration_text = migration_path.read_text(encoding="utf-8")
+
+    not_null_position = migration_text.index(
+        "ALTER COLUMN parse_version SET NOT NULL"
+    )
+    default_position = migration_text.index(
+        "ALTER COLUMN parse_version SET DEFAULT 'legacy'"
+    )
+    assert default_position > not_null_position

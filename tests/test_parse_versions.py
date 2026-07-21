@@ -217,6 +217,27 @@ def test_activate_updates_pointer_and_version_in_one_uncommitted_transaction(
     assert db.in_transaction()
 
 
+def test_same_session_activation_persists_locked_instances(
+    db: Session, document: Document
+) -> None:
+    version = ParseVersionService(db).create(document.id, "v1", "parsed/document-1/v1")
+    version.status = "ready_to_activate"
+    db.flush()
+
+    activated = ParseVersionService(db).activate(document, version)
+    db.commit()
+
+    with Session(db.get_bind()) as verification:
+        stored_document = verification.get(Document, document.id)
+        stored_version = verification.get(DocumentParseVersion, version.id)
+        assert stored_document is not None
+        assert stored_version is not None
+        assert stored_document.active_parse_version == "v1"
+        assert stored_version.status == "active"
+        assert stored_version.activated_at is not None
+    assert activated is version
+
+
 def test_activate_supersedes_previous_active_version(
     db: Session, document: Document
 ) -> None:
@@ -270,6 +291,91 @@ def test_activate_rejects_non_ready_version_without_partial_changes(
 
     assert document.active_parse_version is None
     assert version.status == "embedding"
+
+
+def _prepare_active_and_ready_versions(
+    db: Session, document: Document
+) -> tuple[DocumentParseVersion, DocumentParseVersion]:
+    service = ParseVersionService(db)
+    previous = service.create(document.id, "v1", "parsed/document-1/v1")
+    previous.status = "active"
+    current = service.create(document.id, "v2", "parsed/document-1/v2")
+    current.status = "ready_to_activate"
+    document.active_parse_version = "v1"
+    db.commit()
+    return previous, current
+
+
+def _assert_activation_was_not_partially_applied(
+    db: Session,
+    document_id: str,
+    previous_id: str,
+    current_id: str,
+) -> None:
+    db.expire_all()
+    stored_document = db.get(Document, document_id)
+    stored_previous = db.get(DocumentParseVersion, previous_id)
+    stored_current = db.get(DocumentParseVersion, current_id)
+    assert stored_document is not None
+    assert stored_previous is not None
+    assert stored_current is not None
+    assert stored_document.active_parse_version == "v1"
+    assert stored_previous.status == "active"
+    assert stored_current.status == "ready_to_activate"
+    assert stored_current.activated_at is None
+
+
+def test_activate_rejects_detached_document_before_database_changes(
+    db: Session, document: Document
+) -> None:
+    previous, current = _prepare_active_and_ready_versions(db, document)
+    document_id = document.id
+    previous_id = previous.id
+    current_id = current.id
+    db.expunge(document)
+
+    with pytest.raises(ValueError, match="current session"):
+        ParseVersionService(db).activate(document, current)
+
+    _assert_activation_was_not_partially_applied(
+        db, document_id, previous_id, current_id
+    )
+
+
+def test_activate_rejects_detached_version_before_database_changes(
+    db: Session, document: Document
+) -> None:
+    previous, current = _prepare_active_and_ready_versions(db, document)
+    document_id = document.id
+    previous_id = previous.id
+    current_id = current.id
+    db.expunge(current)
+
+    with pytest.raises(ValueError, match="current session"):
+        ParseVersionService(db).activate(document, current)
+
+    _assert_activation_was_not_partially_applied(
+        db, document_id, previous_id, current_id
+    )
+
+
+def test_activate_rejects_version_from_another_session_before_database_changes(
+    db: Session, document: Document
+) -> None:
+    previous, current = _prepare_active_and_ready_versions(db, document)
+    document_id = document.id
+    previous_id = previous.id
+    current_id = current.id
+    with Session(db.get_bind()) as other_session:
+        other_current = other_session.get(DocumentParseVersion, current_id)
+        assert other_current is not None
+
+        with pytest.raises(ValueError, match="current session"):
+            ParseVersionService(db).activate(document, other_current)
+
+    _assert_activation_was_not_partially_applied(
+        db, document_id, previous_id, current_id
+    )
 
 
 def test_activate_restores_in_memory_state_when_flush_fails(

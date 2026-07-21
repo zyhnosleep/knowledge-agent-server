@@ -255,6 +255,10 @@ def _upgrade_pgvector() -> None:
             "ALTER COLUMN parse_version SET NOT NULL"
         )
         op.execute(
+            "ALTER TABLE document_chunk_pgvector_index "
+            "ALTER COLUMN parse_version SET DEFAULT 'legacy'"
+        )
+        op.execute(
             "CREATE INDEX ix_document_chunk_pgvector_index_document_parse_version "
             "ON document_chunk_pgvector_index (document_id, parse_version)"
         )

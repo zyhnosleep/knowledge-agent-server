@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.models.records import Document, DocumentParseVersion
 
@@ -82,11 +82,13 @@ class ParseVersionService:
     ) -> DocumentParseVersion:
         if self.db is None:
             raise RuntimeError("A database session is required to activate a parse version.")
-        if version.document_id != document.id:
-            raise ValueError("Parse version and document must belong to the same document.")
-        if version.status != "ready_to_activate":
+        if object_session(document) is not self.db:
             raise ValueError(
-                "Parse version must be in ready_to_activate status before activation."
+                "Document must be attached to the current session before activation."
+            )
+        if object_session(version) is not self.db:
+            raise ValueError(
+                "Parse version must be attached to the current session before activation."
             )
 
         with self.db.no_autoflush:
@@ -95,33 +97,48 @@ class ParseVersionService:
             )
             if locked_document is None:
                 raise ValueError(f"Document {document.id!r} does not exist.")
+            locked_version = self.db.scalar(
+                select(DocumentParseVersion)
+                .where(DocumentParseVersion.id == version.id)
+                .with_for_update()
+            )
+            if locked_version is None:
+                raise ValueError(f"Parse version {version.id!r} does not exist.")
+            if locked_version.document_id != locked_document.id:
+                raise ValueError(
+                    "Parse version and document must belong to the same document."
+                )
+            if locked_version.status != "ready_to_activate":
+                raise ValueError(
+                    "Parse version must be in ready_to_activate status before activation."
+                )
             previous_versions = self.db.scalars(
                 select(DocumentParseVersion)
                 .where(
-                    DocumentParseVersion.document_id == document.id,
+                    DocumentParseVersion.document_id == locked_document.id,
                     DocumentParseVersion.status == "active",
-                    DocumentParseVersion.id != version.id,
+                    DocumentParseVersion.id != locked_version.id,
                 )
                 .with_for_update()
             ).all()
 
         activated_at = datetime.utcnow()
-        previous_pointer = document.active_parse_version
+        previous_pointer = locked_document.active_parse_version
         previous_statuses = [(previous, previous.status) for previous in previous_versions]
-        version_status = version.status
-        version_activated_at = version.activated_at
+        version_status = locked_version.status
+        version_activated_at = locked_version.activated_at
         for previous in previous_versions:
             previous.status = "superseded"
-        document.active_parse_version = version.version_key
-        version.status = "active"
-        version.activated_at = activated_at
+        locked_document.active_parse_version = locked_version.version_key
+        locked_version.status = "active"
+        locked_version.activated_at = activated_at
         try:
             self.db.flush()
         except Exception:
-            document.active_parse_version = previous_pointer
+            locked_document.active_parse_version = previous_pointer
             for previous, status in previous_statuses:
                 previous.status = status
-            version.status = version_status
-            version.activated_at = version_activated_at
+            locked_version.status = version_status
+            locked_version.activated_at = version_activated_at
             raise
-        return version
+        return locked_version
