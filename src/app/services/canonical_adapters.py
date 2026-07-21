@@ -193,6 +193,7 @@ class _DocumentBuilder:
         table_id: str | None = None,
         figure_id: str | None = None,
         formula_id: str | None = None,
+        retrievable: bool | None = None,
     ) -> CanonicalBlock:
         if block_type == "narrative":
             if self._reference_level is not None:
@@ -207,6 +208,7 @@ class _DocumentBuilder:
             table_id=table_id,
             figure_id=figure_id,
             formula_id=formula_id,
+            retrievable=retrievable,
         )
 
     def _append_block(
@@ -219,7 +221,9 @@ class _DocumentBuilder:
         table_id: str | None = None,
         figure_id: str | None = None,
         formula_id: str | None = None,
+        retrievable: bool | None = None,
     ) -> CanonicalBlock:
+        default_retrievable = block_type != "heading" and self._reference_level is None
         block = CanonicalBlock(
             block_id=self._block_id(block_type, span, text),
             block_type=block_type,
@@ -232,7 +236,7 @@ class _DocumentBuilder:
             figure_id=figure_id,
             formula_id=formula_id,
             metadata=metadata,
-            retrievable=block_type != "heading" and self._reference_level is None,
+            retrievable=default_retrievable and retrievable is not False,
         )
         self.document.blocks.append(block)
         return block
@@ -271,11 +275,11 @@ def _text_span(lines: list[_Line], start: int, end: int) -> SourceSpan:
 
 def _span_for_chars(lines: list[_Line], char_start: int, char_end: int) -> SourceSpan:
     start_line = next(
-        line for line in lines if line.start <= char_start <= max(line.content_end, line.start)
+        line for line in lines if line.start <= char_start < max(line.end, line.start + 1)
     )
     end_position = max(char_start, char_end - 1)
     end_line = next(
-        line for line in lines if line.start <= end_position <= max(line.content_end, line.start)
+        line for line in lines if line.start <= end_position < max(line.end, line.start + 1)
     )
     return SourceSpan(
         line_start=start_line.number,
@@ -350,7 +354,7 @@ class TextCanonicalAdapter:
 
 class MarkdownCanonicalAdapter:
     parser_source = "markdown"
-    _heading_re = re.compile(r"^(#{1,6})[ \t]+(?P<title>.*?)[ \t]*$")
+    _heading_re = re.compile(r"^[ ]{0,3}(#{1,6})[ \t]+(?P<title>.*?)[ \t]*$")
     _fence_re = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
     _setext_re = re.compile(r"^[ \t]*(?P<underline>=+|-+)[ \t]*$")
     _definition_re = re.compile(
@@ -634,7 +638,19 @@ class MarkdownCanonicalAdapter:
     ) -> tuple[dict[str, tuple[str, str | None]], set[int]]:
         definitions: dict[str, tuple[str, str | None]] = {}
         definition_lines: set[int] = set()
+        active_fence: str | None = None
         for index, line in enumerate(lines):
+            if active_fence is not None:
+                close_re = re.compile(
+                    rf"^[ \t]*{re.escape(active_fence[0])}{{{len(active_fence)},}}[ \t]*$"
+                )
+                if close_re.match(line.text):
+                    active_fence = None
+                continue
+            fence_match = cls._fence_re.match(line.text)
+            if fence_match is not None:
+                active_fence = fence_match.group(1)
+                continue
             match = cls._definition_re.fullmatch(line.text)
             if match is None:
                 continue
@@ -726,6 +742,8 @@ class MarkdownCanonicalAdapter:
             cursor += 1
         if cursor >= len(text):
             return None
+        if text[cursor] == ")":
+            return cursor + 1, "", None
         if text[cursor] == "<":
             target_end = cls._find_unescaped(text, ">", cursor + 1)
             if target_end < 0:
@@ -1018,6 +1036,7 @@ class HtmlCanonicalAdapter:
             parent_column_index,
             parent_figure_id,
         )
+        covered_context = self._with_table_retrieval_coverage(context)
 
         def visit(node: Tag | NavigableString) -> None:
             if not isinstance(node, Tag):
@@ -1030,8 +1049,13 @@ class HtmlCanonicalAdapter:
                     metadata={
                         "kind": "code",
                         "language": self._code_language(node.find("code")),
-                        **context,
+                        **covered_context,
                     },
+                    retrievable=(
+                        False
+                        if covered_context.get("retrieval_covered_by_table_id")
+                        else None
+                    ),
                 )
                 return
             if node.name == "code":
@@ -1041,16 +1065,21 @@ class HtmlCanonicalAdapter:
                     metadata={
                         "kind": "code",
                         "language": self._code_language(node),
-                        **context,
+                        **covered_context,
                     },
+                    retrievable=(
+                        False
+                        if covered_context.get("retrieval_covered_by_table_id")
+                        else None
+                    ),
                 )
                 return
             if _is_math_element(node):
-                self._add_formula(document, builder, node, context=context)
+                self._add_formula(document, builder, node, context=covered_context)
                 return
             if node.name == "img":
                 if node is not skip_image:
-                    self._add_image(document, builder, node, context=context)
+                    self._add_image(document, builder, node, context=covered_context)
                 return
             if node.name == "table":
                 self._walk_table_tree(
@@ -1064,7 +1093,7 @@ class HtmlCanonicalAdapter:
                 )
                 return
             if node.name == "figure":
-                self._add_figure(document, builder, node, context=context)
+                self._add_figure(document, builder, node, context=covered_context)
                 return
             if node.name == "figcaption":
                 return
@@ -1090,6 +1119,15 @@ class HtmlCanonicalAdapter:
         return {key: value for key, value in values.items() if value is not None}
 
     @staticmethod
+    def _with_table_retrieval_coverage(
+        context: dict[str, object],
+    ) -> dict[str, object]:
+        table_id = context.get("parent_table_id")
+        if table_id is None:
+            return context
+        return {**context, "retrieval_covered_by_table_id": table_id}
+
+    @staticmethod
     def _context_span(element: Tag, context: dict[str, object]) -> SourceSpan:
         span = _html_span(element)
         return span.model_copy(
@@ -1106,7 +1144,10 @@ class HtmlCanonicalAdapter:
         document: CanonicalDocument,
         builder: _DocumentBuilder,
         container: Tag,
+        *,
+        context: dict[str, object] | None = None,
     ) -> None:
+        context = dict(context or {})
         buffer: list[str] = []
         text_index = 0
 
@@ -1116,13 +1157,17 @@ class HtmlCanonicalAdapter:
             buffer.clear()
             if not text.strip():
                 return
-            parent_span = _html_span(container)
+            parent_span = self._context_span(container, context)
             builder.add_content(
                 text,
                 parent_span.model_copy(
                     update={
-                        "metadata": {"segment_index": text_index},
+                        "metadata": {**context, "segment_index": text_index},
                     }
+                ),
+                metadata=dict(context),
+                retrievable=(
+                    False if context.get("retrieval_covered_by_table_id") else None
                 ),
             )
             text_index += 1
@@ -1138,19 +1183,39 @@ class HtmlCanonicalAdapter:
                 return
             if node.name == "code":
                 flush()
+                structure_context = self._with_table_retrieval_coverage(context)
                 builder.add_content(
                     node.get_text("", strip=False),
-                    _html_span(node),
-                    metadata={"kind": "code", "language": self._code_language(node)},
+                    self._context_span(node, structure_context),
+                    metadata={
+                        "kind": "code",
+                        "language": self._code_language(node),
+                        **structure_context,
+                    },
+                    retrievable=(
+                        False
+                        if structure_context.get("retrieval_covered_by_table_id")
+                        else None
+                    ),
                 )
                 return
             if _is_math_element(node):
                 flush()
-                self._add_formula(document, builder, node)
+                self._add_formula(
+                    document,
+                    builder,
+                    node,
+                    context=self._with_table_retrieval_coverage(context),
+                )
                 return
             if node.name == "img":
                 flush()
-                self._add_image(document, builder, node)
+                self._add_image(
+                    document,
+                    builder,
+                    node,
+                    context=self._with_table_retrieval_coverage(context),
+                )
                 return
             for child in list(node.children):
                 visit(child)
@@ -1222,12 +1287,16 @@ class HtmlCanonicalAdapter:
             if row_index == 0:
                 header_row = any(cell.name == "th" for cell in direct_cells)
             for cell in direct_cells:
+                remaining_group_rows = (
+                    group_last_row[id(row_groups[row_index])] - row_index + 1
+                )
                 rowspan = cls._safe_span_value(
                     document,
                     cell,
                     "rowspan",
-                    zero_value=group_last_row[id(row_groups[row_index])] - row_index + 1,
+                    zero_value=remaining_group_rows,
                 )
+                rowspan = min(rowspan, remaining_group_rows)
                 colspan = cls._safe_span_value(
                     document, cell, "colspan"
                 )
@@ -1336,11 +1405,39 @@ class HtmlCanonicalAdapter:
 
     @staticmethod
     def _cell_text(table: Tag, cell: Tag) -> str:
-        pieces = [
-            str(item).strip()
-            for item in cell.find_all(string=True)
-            if item.find_parent("table") is table and str(item).strip()
-        ]
+        pieces: list[str] = []
+
+        def visit(node: Tag | NavigableString) -> None:
+            if isinstance(node, NavigableString):
+                if node.find_parent("table") is table and str(node).strip():
+                    pieces.append(str(node).strip())
+                return
+            if not isinstance(node, Tag):
+                return
+            if node.name == "table":
+                return
+            if node.name == "img":
+                value = node.get("alt") or node.get("src")
+                if value:
+                    pieces.append(value.strip())
+                return
+            if _is_math_element(node):
+                annotation = node.find(
+                    "annotation", attrs={"encoding": re.compile("tex", re.I)}
+                )
+                value = node.get("data-latex") or (
+                    annotation.get_text("", strip=True)
+                    if annotation
+                    else node.get_text(" ", strip=True)
+                )
+                if value:
+                    pieces.append(value.strip())
+                return
+            for child in list(node.children):
+                visit(child)
+
+        for child in list(cell.children):
+            visit(child)
         return " ".join(pieces)
 
     def _add_figure(
@@ -1389,6 +1486,7 @@ class HtmlCanonicalAdapter:
         )
         child_context = {**context, "parent_figure_id": figure_id}
         emitted_figure = False
+        narrative_index = 0
 
         def emit_figure() -> None:
             nonlocal emitted_figure
@@ -1400,6 +1498,9 @@ class HtmlCanonicalAdapter:
                 block_type="figure",
                 figure_id=figure_id,
                 metadata=dict(context),
+                retrievable=(
+                    False if context.get("retrieval_covered_by_table_id") else None
+                ),
             )
             emitted_figure = True
 
@@ -1407,6 +1508,31 @@ class HtmlCanonicalAdapter:
             emit_figure()
 
         def visit(node: Tag | NavigableString) -> None:
+            nonlocal narrative_index
+            if isinstance(node, NavigableString):
+                text = str(node)
+                if text.strip():
+                    parent = node.parent if isinstance(node.parent, Tag) else element
+                    text_span = self._context_span(parent, child_context)
+                    builder.add_content(
+                        text,
+                        text_span.model_copy(
+                            update={
+                                "metadata": {
+                                    **child_context,
+                                    "segment_index": narrative_index,
+                                }
+                            }
+                        ),
+                        metadata=dict(child_context),
+                        retrievable=(
+                            False
+                            if child_context.get("retrieval_covered_by_table_id")
+                            else None
+                        ),
+                    )
+                    narrative_index += 1
+                return
             if not isinstance(node, Tag):
                 return
             if node is image:
@@ -1420,7 +1546,20 @@ class HtmlCanonicalAdapter:
                         block_type="caption",
                         figure_id=figure_id,
                         metadata=dict(context),
+                        retrievable=(
+                            False
+                            if context.get("retrieval_covered_by_table_id")
+                            else None
+                        ),
                     )
+                return
+            if node.name == "p":
+                self._walk_inline_container(
+                    document,
+                    builder,
+                    node,
+                    context=child_context,
+                )
                 return
             if node.name == "pre":
                 builder.add_content(
@@ -1431,6 +1570,11 @@ class HtmlCanonicalAdapter:
                         "language": self._code_language(node.find("code")),
                         **child_context,
                     },
+                    retrievable=(
+                        False
+                        if child_context.get("retrieval_covered_by_table_id")
+                        else None
+                    ),
                 )
                 return
             if node.name == "code":
@@ -1442,6 +1586,11 @@ class HtmlCanonicalAdapter:
                         "language": self._code_language(node),
                         **child_context,
                     },
+                    retrievable=(
+                        False
+                        if child_context.get("retrieval_covered_by_table_id")
+                        else None
+                    ),
                 )
                 return
             if _is_math_element(node):
@@ -1505,6 +1654,9 @@ class HtmlCanonicalAdapter:
             block_type="figure",
             figure_id=figure_id,
             metadata=dict(context),
+            retrievable=(
+                False if context.get("retrieval_covered_by_table_id") else None
+            ),
         )
 
     @classmethod
@@ -1541,6 +1693,9 @@ class HtmlCanonicalAdapter:
             block_type="formula",
             formula_id=formula_id,
             metadata=dict(context),
+            retrievable=(
+                False if context.get("retrieval_covered_by_table_id") else None
+            ),
         )
 
 
@@ -1630,24 +1785,38 @@ class DocxCanonicalAdapter:
         events = list(self._paragraph_events(paragraph))
         style_name = paragraph.style.name if paragraph.style is not None else ""
         heading_match = re.match(r"Heading\s+(\d+)", style_name, re.I)
-        heading_text = "".join(event.text for event in events if event.kind == "text")
+        heading_text = "".join(self._heading_event_text(event) for event in events)
         if not structures_only and heading_match and heading_text.strip():
-            builder.add_heading(
+            heading_block = builder.add_heading(
                 heading_text, int(heading_match.group(1)), span, style=style_name
             )
             for event_index, event in enumerate(events):
                 if event.kind != "text":
                     self._emit_structure_event(
-                        document, builder, docx, event, span, event_index
+                        document,
+                        builder,
+                        docx,
+                        event,
+                        span,
+                        event_index,
+                        parent_heading_block_id=heading_block.block_id,
+                        inline_event_index=event_index,
                     )
             return
         if not structures_only and style_name.lower() == "title" and heading_text.strip():
             document.title = heading_text.strip()
-            builder.add_heading(heading_text, 1, span, style=style_name)
+            heading_block = builder.add_heading(heading_text, 1, span, style=style_name)
             for event_index, event in enumerate(events):
                 if event.kind != "text":
                     self._emit_structure_event(
-                        document, builder, docx, event, span, event_index
+                        document,
+                        builder,
+                        docx,
+                        event,
+                        span,
+                        event_index,
+                        parent_heading_block_id=heading_block.block_id,
+                        inline_event_index=event_index,
                     )
             return
 
@@ -1666,6 +1835,22 @@ class DocxCanonicalAdapter:
             flush()
             self._emit_structure_event(document, builder, docx, event, span, event_index)
         flush()
+
+    @staticmethod
+    def _heading_event_text(event: _DocxEvent) -> str:
+        if event.kind == "text":
+            return event.text
+        if event.kind == "formula":
+            return event.text.strip() or "[OMML formula]"
+        if event.kind == "image":
+            metadata = event.metadata or {}
+            return (
+                metadata.get("descr")
+                or metadata.get("title")
+                or metadata.get("name")
+                or "[Image]"
+            )
+        return ""
 
     @classmethod
     def _paragraph_events(cls, paragraph: Paragraph):
@@ -1713,11 +1898,31 @@ class DocxCanonicalAdapter:
         event: _DocxEvent,
         span: SourceSpan,
         event_index: int,
+        *,
+        parent_heading_block_id: str | None = None,
+        inline_event_index: int | None = None,
     ) -> None:
         if event.kind == "image":
-            self._add_image(document, builder, docx, event, span, event_index)
+            self._add_image(
+                document,
+                builder,
+                docx,
+                event,
+                span,
+                event_index,
+                parent_heading_block_id=parent_heading_block_id,
+                inline_event_index=inline_event_index,
+            )
         elif event.kind == "formula":
-            self._add_formula(document, builder, event, span, event_index)
+            self._add_formula(
+                document,
+                builder,
+                event,
+                span,
+                event_index,
+                parent_heading_block_id=parent_heading_block_id,
+                inline_event_index=inline_event_index,
+            )
 
     def _add_image(
         self,
@@ -1727,6 +1932,9 @@ class DocxCanonicalAdapter:
         event: _DocxEvent,
         span: SourceSpan,
         event_index: int,
+        *,
+        parent_heading_block_id: str | None = None,
+        inline_event_index: int | None = None,
     ) -> None:
         relationship_id = event.relationship_id
         if not relationship_id or relationship_id not in docx.part.rels:
@@ -1744,6 +1952,14 @@ class DocxCanonicalAdapter:
             mimetypes.guess_type(target_name)[0] or "application/octet-stream"
         )
         source_target = str(relationship.target_ref).replace("\\", "/")
+        heading_link = {
+            key: value
+            for key, value in {
+                "parent_heading_block_id": parent_heading_block_id,
+                "inline_event_index": inline_event_index,
+            }.items()
+            if value is not None
+        }
         image_span = span.model_copy(
             update={
                 "image_relationship_id": relationship_id,
@@ -1751,6 +1967,7 @@ class DocxCanonicalAdapter:
                 "metadata": {
                     **span.metadata,
                     "relationship_target": source_target,
+                    **heading_link,
                 },
             }
         )
@@ -1795,6 +2012,7 @@ class DocxCanonicalAdapter:
                     "relationship_id": relationship_id,
                     "relationship_target": source_target,
                     **metadata,
+                    **heading_link,
                 },
             )
         )
@@ -1803,7 +2021,7 @@ class DocxCanonicalAdapter:
             image_span,
             block_type="figure",
             figure_id=figure_id,
-            metadata={"relationship_id": relationship_id, **metadata},
+            metadata={"relationship_id": relationship_id, **metadata, **heading_link},
         )
 
     def _materialize_asset(
@@ -1857,9 +2075,20 @@ class DocxCanonicalAdapter:
         event: _DocxEvent,
         span: SourceSpan,
         event_index: int,
+        *,
+        parent_heading_block_id: str | None = None,
+        inline_event_index: int | None = None,
     ) -> None:
         omml = (event.metadata or {}).get("omml", "")
         source_text = event.text.strip()
+        heading_link = {
+            key: value
+            for key, value in {
+                "parent_heading_block_id": parent_heading_block_id,
+                "inline_event_index": inline_event_index,
+            }.items()
+            if value is not None
+        }
         formula_id = _stable_id(
             "formula",
             document.document_id,
@@ -1876,6 +2105,7 @@ class DocxCanonicalAdapter:
                 "metadata": {
                     **span.metadata,
                     "formula_event_index": event_index,
+                    **heading_link,
                 },
             }
         )
@@ -1885,7 +2115,7 @@ class DocxCanonicalAdapter:
                 latex=source_text or "[OMML formula]",
                 source_spans=[formula_span],
                 warnings=["OMML source text is preserved but is not normalized LaTeX."],
-                metadata={"source_format": "omml", "omml": omml},
+                metadata={"source_format": "omml", "omml": omml, **heading_link},
             )
         )
         builder.add_content(
@@ -1893,7 +2123,7 @@ class DocxCanonicalAdapter:
             formula_span,
             block_type="formula",
             formula_id=formula_id,
-            metadata={"source_format": "omml"},
+            metadata={"source_format": "omml", **heading_link},
         )
 
     def _add_table(

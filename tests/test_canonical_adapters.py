@@ -372,6 +372,58 @@ print("ok")
         assert source[span.char_start : span.char_end] == block.metadata["source_markdown"]
 
 
+def test_markdown_reference_definitions_inside_fences_are_ignored(tmp_path: Path) -> None:
+    path = tmp_path / "fenced-definition.md"
+    path.write_text(
+        """```text
+[hidden]: hidden.png
+```
+
+![Hidden][hidden]
+![Visible][visible]
+
+[visible]: visible.png
+""",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+
+    assert [figure.asset_path for figure in document.figures] == ["visible.png"]
+    assert any("![Hidden][hidden]" in block.text for block in document.blocks)
+
+
+def test_markdown_atx_headings_allow_up_to_three_leading_spaces(tmp_path: Path) -> None:
+    path = tmp_path / "indented-headings.md"
+    path.write_text(
+        "  ## Two-space heading\n\n    ## Four-space text\n",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+
+    headings = [block for block in document.blocks if block.block_type == "heading"]
+    assert [(block.text, block.metadata["heading_level"]) for block in headings] == [
+        ("Two-space heading", 2)
+    ]
+    assert any("## Four-space text" in block.text for block in document.blocks)
+
+
+def test_markdown_direct_image_allows_empty_destination(tmp_path: Path) -> None:
+    path = tmp_path / "empty-image.md"
+    source = "before ![Empty destination]() after\n"
+    path.write_text(source, encoding="utf-8")
+
+    document = parse_canonical_document(path)
+
+    assert len(document.figures) == 1
+    figure = document.figures[0]
+    assert figure.asset_path in {None, ""}
+    assert figure.metadata["target"] == ""
+    figure_block = next(block for block in document.blocks if block.figure_id == figure.figure_id)
+    assert figure_block.metadata["source_markdown"] == "![Empty destination]()"
+
+
 @pytest.mark.parametrize("suffix", [".md", ".txt"])
 def test_bom_crlf_non_ascii_source_spans_use_original_character_stream(
     tmp_path: Path, suffix: str
@@ -414,9 +466,9 @@ def test_html_preserves_dom_order_structures_and_locators() -> None:
     assert code.source_spans[0].css_selector == "#example-code"
 
     table = document.tables[0]
-    assert table.headers == ["Metric", "Score", "", ""]
-    assert table.rows == [["", "Recall", "0.91", "high"]]
-    assert any(cell.rowspan == 2 for cell in table.cells)
+    assert table.headers == ["Metric", "Score", ""]
+    assert table.rows == [["Recall", "0.91", "high"]]
+    assert next(cell for cell in table.cells if cell.text == "Metric").rowspan == 1
     assert any(cell.colspan == 2 for cell in table.cells)
     assert table.source_html.startswith("<table")
     assert table.source_spans[0].css_selector == "#results-table"
@@ -603,6 +655,101 @@ def test_html_rowspan_zero_stops_at_direct_row_group_boundary(tmp_path: Path) ->
     ]
 
 
+def test_html_positive_rowspan_is_capped_at_direct_row_group_boundary(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rowspan-positive.html"
+    path.write_text(
+        """<table><thead><tr><td rowspan="5">Head</td><td>H</td></tr></thead>
+<tbody><tr><td rowspan="9">Body</td><td>1</td></tr><tr><td>2</td></tr></tbody>
+<tfoot><tr><td>Foot</td><td>3</td></tr></tfoot></table>""",
+        encoding="utf-8",
+    )
+
+    table = parse_canonical_document(path).tables[0]
+
+    head = next(cell for cell in table.cells if cell.text == "Head")
+    body = next(cell for cell in table.cells if cell.text == "Body")
+    foot = next(cell for cell in table.cells if cell.text == "Foot")
+    assert head.rowspan == 1
+    assert body.rowspan == 2
+    assert (foot.row_index, foot.column_index) == (3, 0)
+    assert table.rows[-1] == ["Foot", "3"]
+
+
+def test_html_figure_narrative_and_structures_follow_dom_order(tmp_path: Path) -> None:
+    path = tmp_path / "figure-narrative.html"
+    path.write_text(
+        """<figure id="sequence"><img src="main.png" alt="Main">direct text
+<p>paragraph text</p><code>figure()</code>
+<span class="math" data-latex="x=1">rendered</span>
+<figcaption>Caption</figcaption></figure>""",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+
+    figure = document.figures[0]
+    related = [
+        block
+        for block in document.blocks
+        if block.figure_id == figure.figure_id
+        or block.metadata.get("parent_figure_id") == figure.figure_id
+    ]
+    assert [block.text.strip() for block in related] == [
+        "Main",
+        "direct text",
+        "paragraph text",
+        "figure()",
+        "x=1",
+        "Caption",
+    ]
+    assert [block.block_type for block in related] == [
+        "figure",
+        "narrative",
+        "narrative",
+        "narrative",
+        "formula",
+        "caption",
+    ]
+    assert related[3].metadata["kind"] == "code"
+    assert len([item for item in document.figures if item.metadata.get("src") == "main.png"]) == 1
+    assert len([block for block in related if block.block_type == "caption"]) == 1
+
+
+def test_html_table_child_structures_are_not_retrieved_twice(tmp_path: Path) -> None:
+    path = tmp_path / "table-retrieval.html"
+    path.write_text(
+        """<table id="evidence"><tr><td><code>same_code()</code>
+<span class="math" data-latex="same_math=1">rendered math</span>
+<img src="same.png" alt="Same image"></td></tr></table>""",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+
+    table = document.tables[0]
+    assert "same_code()" in table.cells[0].text
+    assert "same_math=1" in table.cells[0].text
+    assert "Same image" in table.cells[0].text
+    table_block = next(block for block in document.blocks if block.table_id == table.table_id)
+    assert table_block.retrievable is True
+    children = [
+        block
+        for block in document.blocks
+        if block.metadata.get("parent_table_id") == table.table_id
+    ]
+    assert [block.block_type for block in children] == ["narrative", "formula", "figure"]
+    assert all(block.retrievable is False for block in children)
+    assert all(
+        block.metadata["retrieval_covered_by_table_id"] == table.table_id
+        for block in children
+    )
+    retrievable_text = "\n".join(block.text for block in document.blocks if block.retrievable)
+    assert retrievable_text.count("same_code()") == 1
+    assert retrievable_text.count("same_math=1") == 1
+
+
 def test_html_text_segment_locator_points_to_real_container(tmp_path: Path) -> None:
     path = tmp_path / "locator.html"
     source = '<html><body><p id="locator">before <em>emphasis</em> after</p></body></html>'
@@ -755,6 +902,34 @@ def test_docx_wrappers_and_cell_nested_tables_follow_recursive_xml_order(
     assert nested.metadata["locator"].startswith("body/1/cell-0-0/")
     assert nested_block.metadata["parent_table_id"] == outer.table_id
     assert nested_block.source_spans[0].metadata["parent_table_id"] == outer.table_id
+
+
+def test_docx_heading_inline_omml_contributes_to_heading_and_keeps_formula_link(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "heading-formula.docx"
+    source = Document()
+    heading = source.add_paragraph(style="Heading 2")
+    heading.add_run("before ")
+    _append_omml(heading, "x=1")
+    heading.add_run(" after")
+    source.add_paragraph("Section body.")
+    source.save(path)
+
+    document = parse_canonical_document(path)
+
+    heading_block = next(block for block in document.blocks if block.block_type == "heading")
+    assert heading_block.text == "before x=1 after"
+    assert document.outline[0].title == "before x=1 after"
+    body = next(block for block in document.blocks if block.text == "Section body.")
+    assert body.section_path == ["before x=1 after"]
+    assert len(document.formulas) == 1
+    formula_blocks = [block for block in document.blocks if block.block_type == "formula"]
+    assert len(formula_blocks) == 1
+    formula_block = formula_blocks[0]
+    assert formula_block.metadata["parent_heading_block_id"] == heading_block.block_id
+    assert formula_block.metadata["inline_event_index"] == 1
+    assert document.formulas[0].metadata["parent_heading_block_id"] == heading_block.block_id
 
 
 @pytest.mark.parametrize("name", ["sample.md", "sample.html", "sample.docx"])
