@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import shutil
+from base64 import b64decode
 from pathlib import Path
 
 import pytest
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches
 
+from app.services.canonical_artifacts import CanonicalArtifactStore
+from app.services import canonical_adapters
 from app.services.canonical_adapters import (
+    DocxCanonicalAdapter,
     PDFCanonicalAdapter,
     parse_canonical_document,
 )
@@ -12,6 +21,60 @@ from app.services.parser import DocumentParseError, parse_document
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "canonical"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_adapter_asset_cache(monkeypatch, tmp_path: Path) -> None:
+    class TestSettings:
+        cache_dir = tmp_path / "adapter-cache"
+
+    monkeypatch.setattr(canonical_adapters, "get_settings", lambda: TestSettings())
+
+
+def _append_omml(paragraph, text: str = "x + y = 1") -> None:
+    formula = OxmlElement("m:oMath")
+    run = OxmlElement("m:r")
+    text_node = OxmlElement("m:t")
+    text_node.set(qn("xml:space"), "preserve")
+    text_node.text = text
+    run.append(text_node)
+    formula.append(run)
+    paragraph._p.append(formula)
+
+
+def _write_png(path: Path) -> None:
+    path.write_bytes(
+        b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+            "x8AAusB9Wl2nKsAAAAASUVORK5CYII="
+        )
+    )
+
+
+def _write_structured_docx(path: Path, image_path: Path) -> None:
+    document = Document()
+    paragraph = document.add_paragraph()
+    paragraph.add_run("before ")
+    _append_omml(paragraph)
+    paragraph.add_run(" after ")
+    shape = paragraph.add_run().add_picture(str(image_path), width=Inches(0.1))
+    shape._inline.docPr.set("descr", "Inline chart")
+    paragraph.add_run(" tail")
+
+    table = document.add_table(rows=3, cols=3)
+    table.cell(0, 0).text = "Metric"
+    table.cell(0, 1).merge(table.cell(0, 2)).text = "Scores"
+    table.cell(1, 0).merge(table.cell(2, 0)).text = "Recall"
+    table.cell(1, 1).text = "0.91"
+    media_cell = table.cell(1, 2)
+    media_cell.text = "Evidence"
+    media_shape = media_cell.paragraphs[0].add_run().add_picture(
+        str(image_path), width=Inches(0.1)
+    )
+    media_shape._inline.docPr.set("descr", "Cell chart")
+    _append_omml(media_cell.paragraphs[0], "z = 2")
+    table.cell(2, 1).merge(table.cell(2, 2)).text = "Aggregate"
+    document.save(path)
 
 
 def _assert_common_contract(document) -> None:
@@ -98,13 +161,152 @@ def test_markdown_preserves_structure_and_exact_source_ranges() -> None:
 
 def test_markdown_references_stop_at_appendix_and_appendix_is_retrievable() -> None:
     document = parse_canonical_document(FIXTURE_DIR / "sample.md")
-    references = [block for block in document.blocks if block.block_type == "reference"]
-    assert [block.text for block in references] == ["Doe, J. Canonical Parsing. 2026."]
-    assert all(not block.retrievable for block in references)
+    reference = next(block for block in document.blocks if block.text.startswith("Doe, J."))
+    assert reference.block_type == "narrative"
+    assert reference.retrievable is False
 
     appendix = next(block for block in document.blocks if block.block_type == "appendix")
     assert appendix.retrievable is True
     assert appendix.section_path[-1] == "Appendix"
+
+
+def test_reference_state_applies_to_every_structure_until_peer_heading(tmp_path: Path) -> None:
+    path = tmp_path / "references.md"
+    path.write_text(
+        """# Study
+
+## References
+
+Reference prose.
+
+```text
+reference code
+```
+
+| Source | Year |
+| --- | --- |
+| Paper | 2026 |
+
+$$
+r = 1
+$$
+
+![Reference figure](ref.png)
+
+### Archived Sources
+
+Nested reference prose.
+
+## Appendix
+
+Appendix prose.
+""",
+        encoding="utf-8",
+    )
+    document = parse_canonical_document(path)
+    appendix_heading = next(
+        block for block in document.blocks if block.block_type == "heading" and block.text == "Appendix"
+    )
+    references = [
+        block
+        for block in document.blocks
+        if block.reading_order < appendix_heading.reading_order and block.block_type != "heading"
+    ]
+    assert [block.block_type for block in references] == [
+        "narrative",
+        "narrative",
+        "table",
+        "formula",
+        "figure",
+        "narrative",
+    ]
+    assert all(not block.retrievable for block in references)
+    appendix = next(block for block in document.blocks if block.text == "Appendix prose.")
+    assert appendix.retrievable is True
+
+    html_path = tmp_path / "reference-caption.html"
+    html_path.write_text(
+        """<h1>Study</h1><h2>References</h2>
+<table><caption>Reference caption</caption><tr><td>Source</td></tr></table>
+<figure><img src="ref.png"><figcaption>Figure caption</figcaption></figure>
+<h2>Appendix</h2><p>Recovered</p>""",
+        encoding="utf-8",
+    )
+    html_document = parse_canonical_document(html_path)
+    reference_structures = [
+        block
+        for block in html_document.blocks
+        if block.block_type in {"caption", "table", "figure"}
+    ]
+    assert reference_structures and all(
+        not block.retrievable for block in reference_structures
+    )
+    assert next(block for block in html_document.blocks if block.text == "Recovered").retrievable
+
+
+def test_markdown_setext_inline_image_and_fence_payload_are_exact(tmp_path: Path) -> None:
+    path = tmp_path / "structures.md"
+    source = (
+        "Setext Title\r\n"
+        "============\r\n"
+        "\r\n"
+        "before ![Inline alt](<images/chart one.png> \"Chart title\") after\r\n"
+        "\r\n"
+        "```text\r\n"
+        "value\r\n"
+        "\r\n"
+        "\r\n"
+        "```\r\n"
+        "\r\n"
+        "~~~raw\r\n"
+        "unclosed\r\n"
+    )
+    path.write_bytes(source.encode("utf-8"))
+    document = parse_canonical_document(path)
+    assert document.title == "Setext Title"
+    assert document.blocks[0].metadata["heading_level"] == 1
+    inline = [block for block in document.blocks if 1 <= block.reading_order <= 3]
+    assert [block.block_type for block in inline] == ["narrative", "figure", "narrative"]
+    assert [block.text.strip() for block in inline] == ["before", "Inline alt", "after"]
+    figure = document.figures[0]
+    assert figure.asset_path == "images/chart one.png"
+    assert figure.metadata["title"] == "Chart title"
+    for block in inline:
+        span = block.source_spans[0]
+        assert source[span.char_start : span.char_end] == block.metadata.get(
+            "source_markdown", block.text
+        )
+
+    closed, unclosed = [
+        block for block in document.blocks if block.metadata.get("kind") == "code"
+    ]
+    assert closed.text == "value\r\n\r\n\r\n"
+    assert unclosed.text == "unclosed\r\n"
+    assert unclosed.metadata["closed"] is False
+    unclosed_span = unclosed.source_spans[0]
+    assert source[unclosed_span.char_start : unclosed_span.char_end] == (
+        "~~~raw\r\nunclosed\r\n"
+    )
+
+
+@pytest.mark.parametrize("suffix", [".md", ".txt"])
+def test_bom_crlf_non_ascii_source_spans_use_original_character_stream(
+    tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / f"bom{suffix}"
+    body = "# 标题\r\n\r\n中文段落。" if suffix == ".md" else "中文第一段。\r\n\r\n第二段。"
+    path.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+    with path.open("r", encoding="utf-8", newline="") as source_file:
+        source = source_file.read()
+    document = parse_canonical_document(path)
+    assert document.blocks[0].source_spans[0].char_start == 1
+    for block in document.blocks:
+        span = block.source_spans[0]
+        excerpt = source[span.char_start : span.char_end]
+        if block.block_type == "heading":
+            assert excerpt.startswith("# ") and block.text in excerpt
+        else:
+            assert excerpt == block.text
 
 
 def test_html_preserves_dom_order_structures_and_locators() -> None:
@@ -129,8 +331,8 @@ def test_html_preserves_dom_order_structures_and_locators() -> None:
     assert code.source_spans[0].css_selector == "#example-code"
 
     table = document.tables[0]
-    assert table.headers == ["Metric", "Score"]
-    assert table.rows == [["Recall", "0.91", "high"]]
+    assert table.headers == ["Metric", "Score", "", ""]
+    assert table.rows == [["", "Recall", "0.91", "high"]]
     assert any(cell.rowspan == 2 for cell in table.cells)
     assert any(cell.colspan == 2 for cell in table.cells)
     assert table.source_html.startswith("<table")
@@ -145,6 +347,103 @@ def test_html_preserves_dom_order_structures_and_locators() -> None:
     formula = document.formulas[0]
     assert formula.latex == r"L = -\log p(y|x)"
     assert formula.source_spans[0].css_selector == "#loss-equation"
+
+
+def test_html_inline_content_is_split_in_exact_dom_order_without_parent_duplication(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inline.html"
+    path.write_text(
+        '<html><body><h1>Inline</h1>\n<p id="mixed">before '
+        '<code>code()</code> middle <span id="inline-math" class="math" '
+        'data-latex="x=1">rendered</span> after <img id="inline-image" '
+        'src="chart.png" alt="Chart"> tail</p>\n</body></html>',
+        encoding="utf-8",
+    )
+    document = parse_canonical_document(path)
+    blocks = document.blocks[1:]
+    assert [block.block_type for block in blocks] == [
+        "narrative",
+        "narrative",
+        "narrative",
+        "formula",
+        "narrative",
+        "figure",
+        "narrative",
+    ]
+    assert [block.text.strip() for block in blocks] == [
+        "before",
+        "code()",
+        "middle",
+        "x=1",
+        "after",
+        "Chart",
+        "tail",
+    ]
+    assert blocks[1].metadata["kind"] == "code"
+    assert "rendered" not in "\n".join(block.text for block in blocks)
+    assert blocks[3].source_spans[0].css_selector == "#inline-math"
+    assert blocks[5].source_spans[0].css_selector == "#inline-image"
+
+
+def test_html_captions_nested_tables_and_spans_have_structural_coordinates(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tables.html"
+    path.write_text(
+        """<html><body><h1>Tables</h1>
+<table id="outer"><caption id="outer-caption">Outer results</caption>
+<tr><th>A</th><th colspan="2">B</th></tr>
+<tr><td rowspan="2">R</td><td>1</td><td>outer<table id="inner">
+<caption id="inner-caption">Inner results</caption><tr><th>I</th></tr>
+<tr><td>2</td></tr></table></td></tr>
+<tr><td colspan="2">Aggregate</td></tr></table>
+<figure id="figure"><img src="chart.png" alt="Chart">
+<figcaption id="figure-caption">Figure caption</figcaption></figure>
+<table id="malformed"><tr><td rowspan="bad" colspan="nope">safe</td></tr></table>
+</body></html>""",
+        encoding="utf-8",
+    )
+    document = parse_canonical_document(path)
+    outer, inner, malformed = document.tables
+    assert outer.headers == ["A", "B", ""]
+    assert outer.rows == [["R", "1", "outer"], ["", "Aggregate", ""]]
+    assert {
+        (cell.text, cell.row_index, cell.column_index, cell.rowspan, cell.colspan)
+        for cell in outer.cells
+    } == {
+        ("A", 0, 0, 1, 1),
+        ("B", 0, 1, 1, 2),
+        ("R", 1, 0, 2, 1),
+        ("1", 1, 1, 1, 1),
+        ("outer", 1, 2, 1, 1),
+        ("Aggregate", 2, 1, 1, 2),
+    }
+    assert inner.headers == ["I"] and inner.rows == [["2"]]
+    assert malformed.cells[0].rowspan == 1 and malformed.cells[0].colspan == 1
+    assert any("rowspan" in warning or "colspan" in warning for warning in document.warnings)
+
+    captions = [block for block in document.blocks if block.block_type == "caption"]
+    outer_caption = next(block for block in captions if block.text == "Outer results")
+    figure_caption = next(block for block in captions if block.text == "Figure caption")
+    assert outer_caption.table_id == outer.table_id
+    assert outer_caption.source_spans[0].css_selector == "#outer-caption"
+    assert figure_caption.figure_id == document.figures[0].figure_id
+    assert figure_caption.source_spans[0].css_selector == "#figure-caption"
+    assert len([block for block in document.blocks if block.table_id == outer.table_id]) == 2
+
+
+def test_html_colspan_moves_past_every_active_rowspan_column(tmp_path: Path) -> None:
+    path = tmp_path / "overlap.html"
+    path.write_text(
+        """<table><tr><td>A</td><td rowspan="2">Held</td></tr>
+<tr><td colspan="2">Wide</td></tr></table>""",
+        encoding="utf-8",
+    )
+    table = parse_canonical_document(path).tables[0]
+    wide = next(cell for cell in table.cells if cell.text == "Wide")
+    assert (wide.row_index, wide.column_index, wide.colspan) == (1, 2, 2)
+    assert table.rows[1] == ["", "", "Wide", ""]
 
 
 def test_docx_preserves_body_order_locators_image_and_omml() -> None:
@@ -184,6 +483,117 @@ def test_docx_preserves_body_order_locators_image_and_omml() -> None:
     assert "x + y = 1" in formula.latex
     assert formula.metadata["source_format"] == "omml"
     assert "oMath" in formula.metadata["omml"]
+
+
+def test_docx_inline_events_and_merged_table_cells_preserve_structure(tmp_path: Path) -> None:
+    image_path = tmp_path / "pixel.png"
+    docx_path = tmp_path / "structured.docx"
+    _write_png(image_path)
+    _write_structured_docx(docx_path, image_path)
+    document = DocxCanonicalAdapter(asset_cache_root=tmp_path / "asset-cache").parse(docx_path)
+
+    table_order = next(block.reading_order for block in document.blocks if block.block_type == "table")
+    inline_blocks = [block for block in document.blocks if block.reading_order < table_order]
+    assert [block.block_type for block in inline_blocks] == [
+        "narrative",
+        "formula",
+        "narrative",
+        "figure",
+        "narrative",
+    ]
+    assert [block.text.strip() for block in inline_blocks] == [
+        "before",
+        "x + y = 1",
+        "after",
+        "Inline chart",
+        "tail",
+    ]
+    assert "before" not in document.figures[0].caption
+
+    table = document.tables[0]
+    coordinates = {
+        (cell.text, cell.row_index, cell.column_index, cell.rowspan, cell.colspan)
+        for cell in table.cells
+    }
+    assert ("Scores", 0, 1, 1, 2) in coordinates
+    assert ("Recall", 1, 0, 2, 1) in coordinates
+    assert len([cell for cell in table.cells if cell.text == "Scores"]) == 1
+    assert len([cell for cell in table.cells if cell.text == "Recall"]) == 1
+    assert table.headers == ["Metric", "Scores", ""]
+    assert table.rows[0][:2] == ["Recall", "0.91"]
+    assert table.rows[1] == ["", "Aggregate", ""]
+
+    cell_figures = [
+        block
+        for block in document.blocks
+        if block.block_type == "figure" and block.source_spans[0].table_id == table.table_id
+    ]
+    cell_formulas = [
+        block
+        for block in document.blocks
+        if block.block_type == "formula" and block.source_spans[0].table_id == table.table_id
+    ]
+    assert len(cell_figures) == 1 and len(cell_formulas) == 1
+    assert (cell_figures[0].source_spans[0].row_index, cell_figures[0].source_spans[0].column_index) == (1, 2)
+    assert cell_formulas[0].text == "z = 2"
+
+
+def test_docx_assets_can_be_promoted_and_loaded_without_touching_source_directory(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    docx_path = source_dir / "sample.docx"
+    shutil.copy2(FIXTURE_DIR / "sample.docx", docx_path)
+    before = {item.name for item in source_dir.iterdir()}
+
+    document = DocxCanonicalAdapter(asset_cache_root=tmp_path / "asset-cache").parse(docx_path)
+    assert {item.name for item in source_dir.iterdir()} == before
+    asset = document.assets[0]
+    assert asset.path.startswith("assets/")
+    assert Path(asset.source_path).is_file()
+    assert Path(asset.source_path).parent != source_dir
+
+    store = CanonicalArtifactStore(tmp_path / "artifacts")
+    staging = store.write_staging(document.document_id, document.parse_version, document)
+    assert (staging / asset.path).is_file()
+    final = store.promote(document.document_id, document.parse_version)
+    loaded = store.load(document.document_id, document.parse_version)
+    assert (final / loaded.assets[0].path).is_file()
+    assert loaded.assets[0].sha256 == asset.sha256
+
+
+@pytest.mark.parametrize("name", ["sample.md", "sample.html", "sample.docx"])
+def test_canonical_resource_ids_are_stable_after_source_relocation(
+    tmp_path: Path, name: str
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_path = first_dir / name
+    second_path = second_dir / name
+    shutil.copy2(FIXTURE_DIR / name, first_path)
+    shutil.copy2(FIXTURE_DIR / name, second_path)
+    if name.endswith(".docx"):
+        adapter = DocxCanonicalAdapter(asset_cache_root=tmp_path / "asset-cache")
+        first = adapter.parse(first_path)
+        second = adapter.parse(second_path)
+    else:
+        first = parse_canonical_document(first_path)
+        second = parse_canonical_document(second_path)
+
+    def ids(document) -> tuple:
+        return (
+            document.document_id,
+            [block.block_id for block in document.blocks],
+            [table.table_id for table in document.tables],
+            [figure.figure_id for figure in document.figures],
+            [formula.formula_id for formula in document.formulas],
+            [asset.asset_id for asset in document.assets],
+        )
+
+    assert ids(first) == ids(second)
 
 
 def test_text_and_unknown_suffix_preserve_exact_ranges_and_empty_file_warning(tmp_path: Path) -> None:
