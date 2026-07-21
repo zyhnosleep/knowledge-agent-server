@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.records import Document, DocumentParseVersion
 
@@ -109,16 +110,30 @@ class ParseVersionService:
                 .where(Document.id == locked_document.id)
                 .with_for_update()
             ).scalar_one()
-            database_status = self.db.execute(
-                select(DocumentParseVersion.status)
+            (
+                database_document_id,
+                database_version_key,
+                database_status,
+            ) = self.db.execute(
+                select(
+                    DocumentParseVersion.document_id,
+                    DocumentParseVersion.version_key,
+                    DocumentParseVersion.status,
+                )
                 .where(DocumentParseVersion.id == locked_version.id)
                 .with_for_update()
-            ).scalar_one()
-            if locked_version.document_id != locked_document.id:
+            ).one()
+            if database_document_id != locked_document.id:
                 raise ValueError(
                     "Parse version and document must belong to the same document."
                 )
             self._validate_activation_status(locked_version, database_status)
+            set_committed_value(
+                locked_version, "document_id", database_document_id
+            )
+            set_committed_value(
+                locked_version, "version_key", database_version_key
+            )
             previous_versions = self.db.scalars(
                 select(DocumentParseVersion)
                 .where(
@@ -136,7 +151,7 @@ class ParseVersionService:
         version_activated_at = locked_version.activated_at
         for previous in previous_versions:
             previous.status = "superseded"
-        locked_document.active_parse_version = locked_version.version_key
+        locked_document.active_parse_version = database_version_key
         locked_version.status = "active"
         locked_version.activated_at = activated_at
         try:

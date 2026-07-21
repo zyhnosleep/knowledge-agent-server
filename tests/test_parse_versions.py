@@ -453,6 +453,125 @@ def test_activation_refreshes_stale_cached_previous_active_version(tmp_path) -> 
         assert stored_version.status == "active"
 
 
+def test_activate_rejects_stale_cached_version_document_id(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'stale-owner.db').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with factory() as seed:
+        seed.add(Project(id="p1", slug="research", name="Research"))
+        seed.add_all(
+            [
+                Document(
+                    id="d1",
+                    project_id="p1",
+                    title="Paper One",
+                    file_name="one.pdf",
+                    sha256="abc",
+                    raw_path="raw/one.pdf",
+                ),
+                Document(
+                    id="d2",
+                    project_id="p1",
+                    title="Paper Two",
+                    file_name="two.pdf",
+                    sha256="def",
+                    raw_path="raw/two.pdf",
+                ),
+            ]
+        )
+        seed.add(
+            DocumentParseVersion(
+                id="version-id",
+                document_id="d1",
+                version_key="v1",
+                status="ready_to_activate",
+                artifact_dir="parsed/d1/v1",
+            )
+        )
+        seed.commit()
+
+    with factory() as first, factory() as second:
+        document = first.get(Document, "d1")
+        version = first.get(DocumentParseVersion, "version-id")
+        assert document is not None
+        assert version is not None
+        assert version.document_id == "d1"
+        concurrent_version = second.get(DocumentParseVersion, "version-id")
+        assert concurrent_version is not None
+        concurrent_version.document_id = "d2"
+        second.commit()
+
+        with pytest.raises(ValueError, match="same document"):
+            ParseVersionService(first).activate(document, version)
+        first.rollback()
+
+    with factory() as verification:
+        first_document = verification.get(Document, "d1")
+        second_document = verification.get(Document, "d2")
+        stored_version = verification.get(DocumentParseVersion, "version-id")
+        assert first_document is not None
+        assert second_document is not None
+        assert stored_version is not None
+        assert first_document.active_parse_version is None
+        assert second_document.active_parse_version is None
+        assert stored_version.document_id == "d2"
+        assert stored_version.status == "ready_to_activate"
+
+
+def test_activate_uses_locked_database_version_key_in_pointer_and_result(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'stale-key.db').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with factory() as seed:
+        seed.add(Project(id="p1", slug="research", name="Research"))
+        seed.add(
+            Document(
+                id="d1",
+                project_id="p1",
+                title="Paper",
+                file_name="paper.pdf",
+                sha256="abc",
+                raw_path="raw/paper.pdf",
+            )
+        )
+        seed.add(
+            DocumentParseVersion(
+                id="version-id",
+                document_id="d1",
+                version_key="v1",
+                status="ready_to_activate",
+                artifact_dir="parsed/d1/v1",
+            )
+        )
+        seed.commit()
+
+    with factory() as first, factory() as second:
+        document = first.get(Document, "d1")
+        version = first.get(DocumentParseVersion, "version-id")
+        assert document is not None
+        assert version is not None
+        assert version.version_key == "v1"
+        concurrent_version = second.get(DocumentParseVersion, "version-id")
+        assert concurrent_version is not None
+        concurrent_version.version_key = "v2"
+        second.commit()
+
+        activated = ParseVersionService(first).activate(document, version)
+        first.commit()
+        assert activated.version_key == "v2"
+
+    with factory() as verification:
+        stored_document = verification.get(Document, "d1")
+        stored_version = verification.get(DocumentParseVersion, "version-id")
+        assert stored_document is not None
+        assert stored_version is not None
+        assert stored_document.active_parse_version == "v2"
+        assert stored_version.version_key == "v2"
+        assert stored_version.status == "active"
+
+
 def test_same_session_activation_persists_locked_instances(
     db: Session, document: Document
 ) -> None:
