@@ -13,6 +13,7 @@ from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
+    CanonicalCell,
     CanonicalDocument,
     CanonicalFigure,
     CanonicalFormula,
@@ -1467,6 +1468,158 @@ def test_bundle_rejects_structured_record_with_omitted_persisted_default(
 
     with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
         store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_markdown_renders_cells_only_table_evidence(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = []
+    table.rows = []
+    table.cells = [
+        CanonicalCell(
+            text="Model", row_index=0, column_index=0, is_header=True
+        ),
+        CanonicalCell(
+            text="Score", row_index=0, column_index=1, is_header=True
+        ),
+        CanonicalCell(text="SAC|KG", row_index=1, column_index=0),
+        CanonicalCell(text="74.7", row_index=1, column_index=1),
+    ]
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+
+    assert "| Model | Score |" in markdown
+    assert "| SAC\\|KG | 74.7 |" in markdown
+
+
+def test_markdown_renders_source_html_table_without_unsafe_content(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = []
+    table.rows = []
+    table.cells = []
+    table.source_html = """
+        <table>
+          <thead><tr><th>Model</th><th>Score</th></tr></thead>
+          <tbody><tr><td>SAC-KG<script>unsafe()</script></td><td>74.7</td></tr></tbody>
+        </table>
+        <style>unsafe-style</style>
+    """
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+
+    assert "| Model | Score |" in markdown
+    assert "| SAC-KG | 74.7 |" in markdown
+    assert "unsafe()" not in markdown
+    assert "unsafe-style" not in markdown
+
+
+def test_write_rejects_nonempty_table_without_renderable_rows(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = []
+    table.rows = []
+    table.cells = []
+    table.source_html = "<div>No table rows</div>"
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    with pytest.raises(ValueError, match="no renderable rows"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+def test_file_uri_paths_are_sanitized_in_source_and_all_metadata(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    windows_uri = "file:///C:/Users/secret/paper%20one.pdf"
+    posix_uri = "file:///home/secret/private%20data.json"
+    unc_uri = "file://server/share/private%20figure.png"
+    canonical_document.source_path = windows_uri
+    canonical_document.metadata = {
+        "file": windows_uri,
+        "https": "https://example.test/secret/paper.pdf",
+        "relative": "docs/paper.pdf",
+    }
+    canonical_document.parser_metadata = {"file": posix_uri}
+    canonical_document.source_metadata = {"file": unc_uri}
+    canonical_document.blocks[0].metadata = {"file": windows_uri}
+    canonical_document.blocks[0].source_spans[0].metadata = {"file": posix_uri}
+    canonical_document.tables[0].metadata = {"file": posix_uri}
+    canonical_document.figures[0].metadata = {"file": unc_uri}
+    canonical_document.formulas[0].metadata = {"file": windows_uri}
+    canonical_document.assets[0].metadata = {"file": unc_uri}
+    canonical_document.quality.metadata = {"file": posix_uri}
+    canonical_document.quality.issues[0].metadata = {"file": windows_uri}
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    persisted = "\n".join(
+        path.read_text("utf-8")
+        for path in [
+            staging / "manifest.json",
+            staging / "blocks.jsonl",
+            staging / "tables.json",
+            staging / "figures.json",
+            staging / "formulas.json",
+        ]
+    )
+    manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
+
+    assert "file://" not in persisted
+    assert "Users" not in persisted
+    assert "/home/secret" not in persisted
+    assert manifest["source"]["path"] == "paper one.pdf"
+    assert "paper one.pdf" in persisted
+    assert "private data.json" in persisted
+    assert "private figure.png" in persisted
+    assert "https://example.test/secret/paper.pdf" in persisted
+    assert "docs/paper.pdf" in persisted
+
+
+@pytest.mark.parametrize("target", ["block_metadata", "figure_ai"])
+def test_write_rejects_non_finite_values_added_after_model_validation(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    target: str,
+) -> None:
+    if target == "block_metadata":
+        canonical_document.blocks[0].metadata["bad"] = float("nan")
+    else:
+        canonical_document.figures[0].ai_axes = {"bad": float("inf")}
+
+    with pytest.raises(ValueError, match="finite JSON"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
 
 
 def test_write_staging_rejects_existing_final_without_orphan(

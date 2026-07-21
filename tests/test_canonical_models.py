@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -513,3 +515,74 @@ def test_document_status_accepts_canonical_states(status: str) -> None:
 def test_canonical_state_typos_are_rejected(factory: object) -> None:
     with pytest.raises(ValidationError):
         factory()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: SourceSpan(metadata={"nested": [value]}),
+        lambda value: CanonicalBlock(
+            block_id="block",
+            block_type="narrative",
+            text="text",
+            reading_order=0,
+            parser_source="parser",
+            metadata={"nested": [value]},
+        ),
+        lambda value: CanonicalCell(
+            text="cell", row_index=0, column_index=0, metadata={"value": value}
+        ),
+        lambda value: CanonicalTable(table_id="table", metadata={"value": value}),
+        lambda value: CanonicalFigure(figure_id="figure", metadata={"value": value}),
+        lambda value: CanonicalFormula(
+            formula_id="formula", latex="x", metadata={"value": value}
+        ),
+        lambda value: CanonicalAsset(
+            asset_id="asset",
+            path="assets/file.bin",
+            media_type="application/octet-stream",
+            metadata={"value": value},
+        ),
+        lambda value: CanonicalQualityIssue(
+            code="issue",
+            severity="warning",
+            message="message",
+            metadata={"value": value},
+        ),
+        lambda value: CanonicalQualityReport(metadata={"value": value}),
+        lambda value: CanonicalDocument(
+            metadata={"document": value},
+            parser_metadata={"parser": value},
+            source_metadata={"source": value},
+        ),
+    ],
+)
+def test_canonical_metadata_rejects_non_finite_numbers(
+    factory: object,
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError, match="finite JSON"):
+        factory(value)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: CanonicalFigure(figure_id="figure", ai_axes={"x": float("nan")}),
+        lambda: CanonicalFormula(
+            formula_id="formula",
+            latex="x",
+            ai_variable_explanations={"x": float("inf")},
+        ),
+    ],
+)
+def test_canonical_ai_json_rejects_non_finite_numbers(factory: object) -> None:
+    with pytest.raises(ValidationError):
+        factory()
+
+
+@pytest.mark.parametrize("value", [{"not-json"}, Path("not-json")])
+def test_canonical_metadata_rejects_non_json_values(value: object) -> None:
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        CanonicalDocument(metadata={"value": value})

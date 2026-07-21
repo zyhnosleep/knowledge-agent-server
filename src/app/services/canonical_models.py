@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -45,6 +46,36 @@ CanonicalDocumentStatus = Literal["draft", "staged", "ready", "failed"]
 
 class CanonicalModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_finite_json_values(self) -> CanonicalModel:
+        self.ensure_json_compatible()
+        return self
+
+    def ensure_json_compatible(self) -> None:
+        self._validate_json_value(self.model_dump(mode="python"))
+
+    @classmethod
+    def _validate_json_value(cls, value: Any) -> None:
+        if value is None or isinstance(value, (str, bool, int)):
+            return
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("canonical models require finite JSON numbers")
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("canonical models require string JSON object keys")
+                cls._validate_json_value(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                cls._validate_json_value(item)
+            return
+        raise ValueError(
+            f"canonical models require JSON-compatible values, got {type(value).__name__}"
+        )
 
 
 class SourceSpan(CanonicalModel):

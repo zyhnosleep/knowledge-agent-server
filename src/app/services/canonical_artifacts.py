@@ -9,12 +9,15 @@ import shutil
 import stat
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
+
+from bs4 import BeautifulSoup
 
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
+    CanonicalCell,
     CanonicalDocument,
     CanonicalFigure,
     CanonicalFormula,
@@ -55,6 +58,7 @@ _WINDOWS_DEVICE_NAMES = {
     *(f"LPT{index}" for index in range(1, 10)),
 }
 _WINDOWS_FORBIDDEN_CHARACTERS = set('/\\<>:"|?*')
+_REMOTE_URI_SCHEMES = {"http", "https", "s3", "gs", "minio"}
 
 
 class CanonicalArtifactStore:
@@ -113,6 +117,7 @@ class CanonicalArtifactStore:
             raise ValueError(
                 f"parse_version {document.parse_version!r} does not match {version!r}"
             )
+        document.ensure_json_compatible()
         self._validate_record_contract(
             document.blocks,
             document.tables,
@@ -475,6 +480,7 @@ class CanonicalArtifactStore:
     def _serialize_input_payload(payload: dict[str, Any]) -> bytes:
         return json.dumps(
             payload,
+            allow_nan=False,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -492,9 +498,9 @@ class CanonicalArtifactStore:
     ) -> str:
         lines = [
             "---",
-            f"document_id: {json.dumps(document_id, ensure_ascii=False)}",
-            f"version: {json.dumps(version, ensure_ascii=False)}",
-            f"title: {json.dumps(document.title, ensure_ascii=False)}",
+            f"document_id: {json.dumps(document_id, ensure_ascii=False, allow_nan=False)}",
+            f"version: {json.dumps(version, ensure_ascii=False, allow_nan=False)}",
+            f"title: {json.dumps(document.title, ensure_ascii=False, allow_nan=False)}",
             "---",
             "",
         ]
@@ -546,8 +552,8 @@ class CanonicalArtifactStore:
 
         return "\n".join(lines).rstrip() + "\n"
 
-    @staticmethod
-    def _render_table(table: CanonicalTable) -> list[str]:
+    @classmethod
+    def _render_table(cls, table: CanonicalTable) -> list[str]:
         lines: list[str] = []
         if table.caption:
             lines.extend([f"### {table.caption}", ""])
@@ -555,43 +561,17 @@ class CanonicalArtifactStore:
         if markdown is None:
             headers = table.headers
             rows = table.rows
-            if headers:
-                wrong_widths = [
-                    index for index, row in enumerate(rows) if len(row) != len(headers)
-                ]
-                if wrong_widths:
+            if not headers and not rows and table.cells:
+                headers, rows = cls._table_grid_from_cells(table.cells)
+            if not headers and not rows and table.source_html:
+                html_cells = cls._table_cells_from_html(table.source_html)
+                headers, rows = cls._table_grid_from_cells(html_cells)
+            if table.cells or table.source_html or headers or rows:
+                if not any(value for row in [headers, *rows] for value in row):
                     raise ValueError(
-                        f"table row width does not match headers for {table.table_id!r}: "
-                        f"rows={wrong_widths}"
+                        f"canonical table {table.table_id!r} has no renderable rows"
                     )
-                lines.append(
-                    "| "
-                    + " | ".join(
-                        CanonicalArtifactStore._escape_table_value(value)
-                        for value in headers
-                    )
-                    + " |"
-                )
-                lines.append("| " + " | ".join("---" for _ in headers) + " |")
-                lines.extend(
-                    "| "
-                    + " | ".join(
-                        CanonicalArtifactStore._escape_table_value(value)
-                        for value in row
-                    )
-                    + " |"
-                    for row in rows
-                )
-            elif rows:
-                lines.extend(
-                    "| "
-                    + " | ".join(
-                        CanonicalArtifactStore._escape_table_value(value)
-                        for value in row
-                    )
-                    + " |"
-                    for row in rows
-                )
+                lines.extend(cls._render_table_grid(table.table_id, headers, rows))
         elif markdown:
             lines.extend(markdown.rstrip().splitlines())
         if lines and lines[-1] != "":
@@ -599,6 +579,118 @@ class CanonicalArtifactStore:
         for footnote in table.footnotes:
             lines.extend([f"*{footnote}*", ""])
         return lines
+
+    @classmethod
+    def _render_table_grid(
+        cls,
+        table_id: str,
+        headers: list[str],
+        rows: list[list[str]],
+    ) -> list[str]:
+        if headers:
+            wrong_widths = [
+                index for index, row in enumerate(rows) if len(row) != len(headers)
+            ]
+            if wrong_widths:
+                raise ValueError(
+                    f"table row width does not match headers for {table_id!r}: "
+                    f"rows={wrong_widths}"
+                )
+        rendered: list[str] = []
+        if headers:
+            rendered.append(
+                "| "
+                + " | ".join(cls._escape_table_value(value) for value in headers)
+                + " |"
+            )
+            rendered.append("| " + " | ".join("---" for _ in headers) + " |")
+        rendered.extend(
+            "| " + " | ".join(cls._escape_table_value(value) for value in row) + " |"
+            for row in rows
+        )
+        return rendered
+
+    @staticmethod
+    def _table_grid_from_cells(
+        cells: list[CanonicalCell],
+    ) -> tuple[list[str], list[list[str]]]:
+        if not cells:
+            return [], []
+        row_count = max(cell.row_index + cell.rowspan for cell in cells)
+        column_count = max(cell.column_index + cell.colspan for cell in cells)
+        matrix = [["" for _ in range(column_count)] for _ in range(row_count)]
+        occupied: set[tuple[int, int]] = set()
+        header_rows: set[int] = set()
+        for cell in sorted(cells, key=lambda item: (item.row_index, item.column_index)):
+            span_coordinates = {
+                (row_index, column_index)
+                for row_index in range(cell.row_index, cell.row_index + cell.rowspan)
+                for column_index in range(
+                    cell.column_index,
+                    cell.column_index + cell.colspan,
+                )
+            }
+            if occupied.intersection(span_coordinates):
+                raise ValueError("canonical table cells contain overlapping spans")
+            matrix[cell.row_index][cell.column_index] = cell.text
+            if cell.is_header:
+                header_rows.add(cell.row_index)
+            occupied.update(span_coordinates)
+        if not header_rows:
+            return [], matrix
+        header_index = min(header_rows)
+        return matrix[header_index], [
+            row for index, row in enumerate(matrix) if index != header_index
+        ]
+
+    @staticmethod
+    def _table_cells_from_html(source_html: str) -> list[CanonicalCell]:
+        soup = BeautifulSoup(source_html, "html.parser")
+        for unsafe in soup.find_all(["script", "style"]):
+            unsafe.decompose()
+        table = soup.find("table")
+        if table is None:
+            return []
+        cells: list[CanonicalCell] = []
+        occupied: set[tuple[int, int]] = set()
+        rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
+        for row_index, row in enumerate(rows):
+            column_index = 0
+            for element in row.find_all(["th", "td"], recursive=False):
+                try:
+                    rowspan = max(1, int(element.get("rowspan", 1)))
+                    colspan = max(1, int(element.get("colspan", 1)))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid HTML table span") from exc
+                while any(
+                    (row_index, candidate_column) in occupied
+                    for candidate_column in range(
+                        column_index,
+                        column_index + colspan,
+                    )
+                ):
+                    column_index += 1
+                cells.append(
+                    CanonicalCell(
+                        text=element.get_text(" ", strip=True),
+                        row_index=row_index,
+                        column_index=column_index,
+                        rowspan=rowspan,
+                        colspan=colspan,
+                        is_header=(
+                            element.name == "th"
+                            or element.find_parent("thead") is not None
+                        ),
+                    )
+                )
+                for span_row in range(row_index, row_index + rowspan):
+                    for span_column in range(
+                        column_index,
+                        column_index + colspan,
+                    ):
+                        occupied.add((span_row, span_column))
+                column_index += colspan
+        return cells
 
     @staticmethod
     def _render_figure(figure: CanonicalFigure) -> list[str]:
@@ -632,6 +724,7 @@ class CanonicalArtifactStore:
             path,
             json.dumps(
                 value,
+                allow_nan=False,
                 ensure_ascii=False,
                 sort_keys=True,
                 indent=2,
@@ -644,6 +737,7 @@ class CanonicalArtifactStore:
         lines = [
             json.dumps(
                 cls._bundle_model_dump(block),
+                allow_nan=False,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -654,6 +748,7 @@ class CanonicalArtifactStore:
 
     @classmethod
     def _bundle_model_dump(cls, model: Any, **kwargs: Any) -> Any:
+        model.ensure_json_compatible()
         return cls._sanitize_metadata_paths(
             model.model_dump(mode="json", **kwargs)
         )
@@ -687,16 +782,33 @@ class CanonicalArtifactStore:
             return cls._safe_metadata_string(value)
         return value
 
+    @classmethod
+    def _safe_metadata_string(cls, value: str) -> str:
+        return cls._safe_path_string(value)
+
     @staticmethod
-    def _safe_metadata_string(value: str) -> str:
-        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
+    def _safe_path_string(value: str) -> str:
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        if scheme in _REMOTE_URI_SCHEMES:
             return value
-        is_posix_rooted = value.startswith("/")
-        windows_path = PureWindowsPath(value)
+        if scheme == "file":
+            candidate = unquote(parsed.path)
+            if parsed.netloc:
+                candidate = f"//{parsed.netloc}{candidate}"
+        elif re.match(r"^[A-Za-z]:", value):
+            candidate = value
+        elif scheme and parsed.path:
+            candidate = unquote(parsed.path)
+        else:
+            candidate = value
+
+        is_posix_rooted = candidate.startswith("/")
+        windows_path = PureWindowsPath(candidate)
         is_windows_rooted_or_driven = bool(windows_path.root or windows_path.drive)
         if not is_posix_rooted and not is_windows_rooted_or_driven:
             return value
-        path = PurePosixPath(value) if is_posix_rooted else windows_path
+        path = PurePosixPath(candidate) if is_posix_rooted else windows_path
         return path.name or value
 
     @staticmethod
@@ -1166,17 +1278,11 @@ class CanonicalArtifactStore:
                 digest.update(chunk)
         return digest.hexdigest()
 
-    @staticmethod
-    def _safe_source_path(source_path: str | None) -> str | None:
+    @classmethod
+    def _safe_source_path(cls, source_path: str | None) -> str | None:
         if source_path is None:
             return None
-        windows_path = PureWindowsPath(source_path)
-        posix_path = PurePosixPath(source_path)
-        if windows_path.is_absolute() or windows_path.drive or windows_path.root:
-            return windows_path.name
-        if posix_path.is_absolute():
-            return posix_path.name
-        return source_path
+        return cls._safe_path_string(source_path)
 
     @staticmethod
     def _is_link_or_reparse_point(path: Path) -> bool:
