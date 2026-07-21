@@ -405,6 +405,50 @@ def test_plain_pdf_abstract_keeps_introduction_word_inside_body_sentence() -> No
     )
 
 
+@pytest.mark.parametrize(
+    "section_heading",
+    [
+        "I. INTRODUCTION",
+        "II INTRODUCTION",
+        "关键词",
+        "关键词：RAG，MinerU",
+        "引言",
+        "一、引言",
+        "1 引言",
+        "1. 引言",
+    ],
+)
+def test_plain_pdf_abstract_stops_at_roman_or_chinese_section_heading(
+    section_heading: str,
+) -> None:
+    raw_page = (
+        "Abstract\nSource abstract sentence.\n\n"
+        f"{section_heading}\nSection content must not be included."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "Source abstract sentence."
+    )
+
+
+@pytest.mark.parametrize(
+    "body_line",
+    [
+        "This sentence discusses keywords and introduction in ordinary prose.",
+        "本文在正文句子中讨论关键词及其定义。",
+        "本文的引言部分解释了研究背景。",
+    ],
+)
+def test_plain_pdf_abstract_keeps_english_and_chinese_boundary_words_in_prose(
+    body_line: str,
+) -> None:
+    raw_page = f"Abstract\n{body_line}\nA final abstract sentence."
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        f"{body_line}\nA final abstract sentence."
+    )
+
+
 def test_pdf_uses_mineru_when_text_layer_extraction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

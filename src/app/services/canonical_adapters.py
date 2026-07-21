@@ -3219,8 +3219,15 @@ def _extract_explicit_abstract(candidates: list[str]) -> str | None:
     )
     atx_heading = re.compile(r"^\s*#{1,6}\s+\S")
     plain_section_heading = re.compile(
-        r"(?i)^\s*(?:(?:\d+(?:\.\d+)*)\.?\s+)?introduction\s*:?\s*$"
+        r"(?i)^\s*(?:(?:\d+(?:\.\d+)*)\.?\s+|[ivxlcdm]+\.?\s+)?"
+        r"introduction\s*:?\s*$"
         r"|^\s*keywords?\s*(?::.*)?$"
+        r"|^\s*\u5173\u952e\u8bcd\s*(?:(?::|\uff1a).*)?$"
+        r"|^\s*(?:"
+        r"\u7b2c(?:\d+|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\u7ae0\u8282]\s*"
+        r"|[\uff08(](?:\d+|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\uff09)]\s*"
+        r"|(?:\d+(?:\.\d+)*|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\u3001.\uff0e]?\s*"
+        r")?\u5f15\u8a00\s*(?::|\uff1a)?\s*$"
     )
 
     def is_section_boundary(line: str) -> bool:
