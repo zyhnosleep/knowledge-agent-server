@@ -842,7 +842,50 @@ def _parse_pdf_with_document_intelligence(
     page_count: int,
     page_indices: set[int] | list[int] | tuple[int, ...] | None = None,
 ) -> ParsedDocument | None:
-    rendered_pages = _render_pdf_pages(path, dpi=settings.pdf_render_dpi)
+    requested_indices = (
+        None
+        if page_indices is None
+        else sorted(
+            {
+                index
+                for index in page_indices
+                if isinstance(index, int) and 0 <= index < page_count
+            }
+        )
+    )
+    try:
+        rendered_payload = _render_pdf_pages(
+            path,
+            dpi=settings.pdf_render_dpi,
+            page_indices=requested_indices,
+        )
+    except TypeError:
+        # Preserve compatibility with integrations that still expose the
+        # historical two-argument renderer while production uses page scopes.
+        rendered_payload = _render_pdf_pages(path, dpi=settings.pdf_render_dpi)
+
+    rendered_pages: dict[int, bytes] = {}
+    if isinstance(rendered_payload, dict):
+        rendered_pages = {
+            index: image
+            for index, image in rendered_payload.items()
+            if isinstance(index, int) and isinstance(image, bytes)
+        }
+    elif isinstance(rendered_payload, list):
+        if rendered_payload and all(
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], int)
+            and isinstance(item[1], bytes)
+            for item in rendered_payload
+        ):
+            rendered_pages = dict(rendered_payload)
+        else:
+            raw_images = [item for item in rendered_payload if isinstance(item, bytes)]
+            if requested_indices is not None and len(raw_images) == len(requested_indices):
+                rendered_pages = dict(zip(requested_indices, raw_images))
+            else:
+                rendered_pages = dict(enumerate(raw_images))
     if not rendered_pages:
         logger.info("PDF document intelligence skipped because page rendering was unavailable.")
         return None
@@ -855,20 +898,10 @@ def _parse_pdf_with_document_intelligence(
     figures: list[dict] = []
     client = OllamaClient()
 
-    selected_indices = (
-        None
-        if page_indices is None
-        else sorted(
-            {
-                index
-                for index in page_indices
-                if isinstance(index, int) and 0 <= index < len(rendered_pages)
-            }
-        )
-    )
+    selected_indices = requested_indices
     selected_set = None if selected_indices is None else set(selected_indices)
 
-    for page_index, image_bytes in enumerate(rendered_pages):
+    for page_index, image_bytes in sorted(rendered_pages.items()):
         if selected_set is not None and page_index not in selected_set:
             continue
         page_label = str(page_index + 1)
@@ -882,6 +915,13 @@ def _parse_pdf_with_document_intelligence(
             raw_text=raw_text,
             text_quality=quality,
         )
+        if analysis.analysis_source != "document_intelligence":
+            logger.info(
+                "PDF document intelligence page %s used %s; treating the parser attempt as unavailable.",
+                page_label,
+                analysis.analysis_source,
+            )
+            return None
         fused = _fuse_pdf_page_content(page_label=page_label, raw_text=raw_text, text_quality=quality, analysis=analysis)
         full_pages.append(fused["page_text"])
         page_outputs.append(
@@ -942,7 +982,11 @@ def _parse_pdf_with_document_intelligence(
     )
 
 
-def _render_pdf_pages(path: Path, dpi: int) -> list[bytes]:
+def _render_pdf_pages(
+    path: Path,
+    dpi: int,
+    page_indices: list[int] | set[int] | tuple[int, ...] | None = None,
+) -> dict[int, bytes]:
     try:
         import fitz  # type: ignore[import-not-found]
     except Exception as exc:  # noqa: BLE001
@@ -951,11 +995,21 @@ def _render_pdf_pages(path: Path, dpi: int) -> list[bytes]:
 
     zoom = max(dpi, 72) / 72
     document = fitz.open(str(path))
-    images: list[bytes] = []
+    selected = (
+        set(range(len(document)))
+        if page_indices is None
+        else {
+            index
+            for index in page_indices
+            if isinstance(index, int) and 0 <= index < len(document)
+        }
+    )
+    images: dict[int, bytes] = {}
     try:
-        for page in document:
+        for page_index in sorted(selected):
+            page = document[page_index]
             pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            images.append(pixmap.tobytes("png"))
+            images[page_index] = pixmap.tobytes("png")
     finally:
         document.close()
     return images
@@ -1010,6 +1064,7 @@ def _fallback_page_analysis(*, page_label: str, raw_text: str, text_quality: str
         notes.append("Text layer quality was limited; multimodal fallback used.")
     return DocumentPagePayload(
         page_label=page_label,
+        analysis_source="pypdf_text_layer_fallback",
         page_summary=summary[:400],
         page_markdown="\n\n".join(sections) if sections else raw_text,
         sections=sections,

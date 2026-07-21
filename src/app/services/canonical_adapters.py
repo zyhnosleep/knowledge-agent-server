@@ -22,6 +22,7 @@ from docx.text.paragraph import Paragraph
 from lxml import etree
 
 from app.core.config import get_settings
+from app.services.canonical_abstract import extract_explicit_abstract
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
@@ -3213,71 +3214,7 @@ def _is_standalone_pdf_heading(text: str) -> bool:
 
 
 def _extract_explicit_abstract(candidates: list[str]) -> str | None:
-    abstract_heading = re.compile(
-        r"(?i)^\s*(?:#{1,6}\s*)?(?:abstract|\u6458\u8981)\s*"
-        r"(?:(?::|\uff1a|-|\u2014)\s*(?P<inline>.*))?$"
-    )
-    atx_heading = re.compile(r"^\s*#{1,6}\s+\S")
-    plain_section_heading = re.compile(
-        r"(?i)^\s*(?:(?:\d+(?:\.\d+)*)\.?\s+|[ivxlcdm]+\.?\s+)?"
-        r"introduction\s*:?\s*$"
-        r"|^\s*keywords?\s*(?::.*)?$"
-        r"|^\s*\u5173\u952e\u8bcd\s*(?:(?::|\uff1a).*)?$"
-        r"|^\s*(?:"
-        r"\u7b2c(?:\d+|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\u7ae0\u8282]\s*"
-        r"|[\uff08(](?:\d+|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\uff09)]\s*"
-        r"|(?:\d+(?:\.\d+)*|[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)[\u3001.\uff0e]?\s*"
-        r")?\u5f15\u8a00\s*(?::|\uff1a)?\s*$"
-    )
-
-    def is_section_boundary(line: str) -> bool:
-        return bool(atx_heading.match(line) or plain_section_heading.fullmatch(line))
-
-    def abstract_part(value: str) -> tuple[bool, str]:
-        lines = value.strip().splitlines()
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        if not lines:
-            return False, ""
-        match = abstract_heading.fullmatch(lines[0])
-        if match is None:
-            return False, ""
-        body_lines: list[str] = []
-        inline = (match.group("inline") or "").strip()
-        if inline:
-            body_lines.append(inline)
-        for line in lines[1:]:
-            if is_section_boundary(line):
-                break
-            body_lines.append(line)
-        return True, "\n".join(body_lines).strip()
-
-    for index, candidate in enumerate(candidates):
-        matched, body = abstract_part(candidate)
-        if not matched:
-            continue
-        if body:
-            return body
-        following: list[str] = []
-        for next_candidate in candidates[index + 1 :]:
-            next_value = next_candidate.strip()
-            if not next_value:
-                continue
-            if is_section_boundary(next_value):
-                break
-            lines = next_value.splitlines()
-            collected: list[str] = []
-            for line in lines:
-                if is_section_boundary(line):
-                    break
-                collected.append(line)
-            if collected:
-                following.append("\n".join(collected).strip())
-            if len(collected) != len(lines):
-                break
-        joined = "\n\n".join(part for part in following if part).strip()
-        return joined or None
-    return None
+    return extract_explicit_abstract(candidates)
 
 
 def _read_text_layer_for_audit(path: Path, page_count: int) -> tuple[list[str], list[str]]:
@@ -3391,6 +3328,17 @@ def _repair_page_indices(scopes: list[str], page_count: int) -> set[int]:
             start, end = map(int, page_range.groups())
             pages.update(range(start - 1, end))
     return {page for page in pages if 0 <= page < page_count}
+
+
+def _repair_scope_page_indices(scope: str) -> set[int]:
+    single = re.fullmatch(r"page:(\d+)", scope)
+    if single:
+        return {int(single.group(1)) - 1}
+    page_range = re.fullmatch(r"pages:(\d+)-(\d+)", scope)
+    if page_range:
+        start, end = map(int, page_range.groups())
+        return set(range(start - 1, end)) if end >= start else set()
+    return set()
 
 
 def _structure_on_pages(structure, page_indices: set[int]) -> bool:
@@ -3509,6 +3457,93 @@ def _structures_on_pages(structures: list, page_indices: set[int]) -> list:
     ]
 
 
+def _structure_bbox(structure) -> tuple[float, float, float, float] | None:
+    for span in structure.source_spans:
+        box = span.normalized_bbox or span.bbox
+        if box is not None:
+            return box
+    return None
+
+
+def _bboxes_overlap(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    return not (
+        left[2] < right[0]
+        or right[2] < left[0]
+        or left[3] < right[1]
+        or right[3] < left[1]
+    )
+
+
+def _table_replacements_match_issues(
+    primary: CanonicalDocument,
+    replacements: list[CanonicalTable],
+    issues: list[CanonicalQualityIssue],
+    page_index: int,
+) -> bool:
+    originals = {table.table_id: table for table in primary.tables}
+    page_issues = [
+        issue
+        for issue in issues
+        if issue.code == "table_invalid"
+        and issue.repair_scope
+        and page_index in _repair_scope_page_indices(issue.repair_scope)
+    ]
+    used_ids: set[str] = set()
+    for issue in page_issues:
+        original = originals.get(str(issue.metadata.get("table_id") or ""))
+        if original is None:
+            return False
+        original_bbox = _structure_bbox(original)
+        available = [table for table in replacements if table.table_id not in used_ids]
+        if original_bbox is not None:
+            located = [table for table in available if _structure_bbox(table) is not None]
+            if located:
+                available = [
+                    table
+                    for table in located
+                    if _bboxes_overlap(original_bbox, _structure_bbox(table))
+                ]
+        if not available:
+            return False
+
+        def replacement_key(table: CanonicalTable) -> tuple[float, str]:
+            replacement_bbox = _structure_bbox(table)
+            distance = (
+                abs(replacement_bbox[1] - original_bbox[1])
+                if replacement_bbox is not None and original_bbox is not None
+                else 0.0
+            )
+            return distance, table.table_id
+
+        available.sort(key=replacement_key)
+        used_ids.add(available[0].table_id)
+    return True
+
+
+def _narrative_blocks_on_pages(
+    document: CanonicalDocument,
+    page_indices: set[int],
+) -> list[CanonicalBlock]:
+    return [
+        block
+        for block in document.blocks
+        if _block_on_pages(block, page_indices)
+        and _block_structure_type(block) is None
+    ]
+
+
+def _block_fingerprint(block: CanonicalBlock) -> tuple[object, ...]:
+    return (
+        block.block_id,
+        block.block_type,
+        block.text,
+        tuple(span.model_dump(mode="json") for span in block.source_spans),
+    )
+
+
 def _targeted_repair_satisfies_issues(
     primary: CanonicalDocument,
     repair: CanonicalDocument,
@@ -3529,6 +3564,20 @@ def _targeted_repair_satisfies_issues(
         if issue.code == "abstract_missing" and not (repair.abstract or "").strip():
             return False
 
+    primary_narrative = {
+        block.block_id: _block_fingerprint(block)
+        for block in _narrative_blocks_on_pages(primary, page_indices)
+    }
+    candidate_narrative = {
+        block.block_id: _block_fingerprint(block)
+        for block in _narrative_blocks_on_pages(candidate, page_indices)
+    }
+    if any(
+        candidate_narrative.get(block_id) != fingerprint
+        for block_id, fingerprint in primary_narrative.items()
+    ):
+        return False
+
     inventories = (
         (primary.tables, repair.tables, candidate.tables, "table"),
         (primary.figures, repair.figures, candidate.figures, "figure"),
@@ -3546,6 +3595,27 @@ def _targeted_repair_satisfies_issues(
                 replacement_items = _structures_on_pages(replacements, page)
                 if len(replacement_items) < original_count:
                     return False
+                if structure_type == "table":
+                    replacement_ids = [table.table_id for table in replacement_items]
+                    if len(replacement_ids) != len(set(replacement_ids)):
+                        return False
+                    issue_table_ids = {
+                        str(issue.metadata.get("table_id"))
+                        for issue in issues
+                        if issue.code == "table_invalid"
+                        and issue.metadata.get("table_id") is not None
+                        and issue.repair_scope
+                        and page_index in _repair_scope_page_indices(issue.repair_scope)
+                    }
+                    if issue_table_ids and len(replacement_items) < len(issue_table_ids):
+                        return False
+                    if not _table_replacements_match_issues(
+                        primary,
+                        replacement_items,
+                        issues,
+                        page_index,
+                    ):
+                        return False
                 if structure_type == "table" and any(
                     CanonicalQualityGate._invalid_table_reasons(table)
                     for table in replacement_items
@@ -3565,12 +3635,10 @@ def _merge_pdf_page_repairs(
         if issues is None
         else _issue_replacement_types(issues)
     )
-    replace_page_text = issues is None or any(
-        issue.code == "abstract_missing" or not issue.code.startswith(
-            ("table_", "figure_", "formula_")
-        )
-        for issue in issues
-    )
+    # Targeted repairs replace only the explicitly requested structures.  In
+    # particular, abstract recovery updates the document-level field and does
+    # not replace ordinary narrative blocks on the target pages.
+    replace_page_text = issues is None
 
     def replace_block(block: CanonicalBlock) -> bool:
         if not _block_on_pages(block, page_indices):
@@ -3580,7 +3648,10 @@ def _merge_pdf_page_repairs(
             return structure_type in replacement_types
         return replace_page_text
 
-    primary.blocks = [block for block in primary.blocks if not replace_block(block)] + [
+    original_blocks = list(primary.blocks)
+    removed_blocks = [block for block in original_blocks if replace_block(block)]
+    retained_blocks = [block for block in original_blocks if not replace_block(block)]
+    incoming_blocks = [
         block.model_copy(deep=True)
         for block in repair.blocks
         if (
@@ -3588,6 +3659,83 @@ def _merge_pdf_page_repairs(
             or (_block_structure_type(block) is None and replace_page_text)
         )
     ]
+
+    def block_page(block: CanonicalBlock) -> int | None:
+        return next(
+            (
+                span.page_index
+                for span in block.source_spans
+                if span.page_index is not None
+            ),
+            None,
+        )
+
+    def block_kind(block: CanonicalBlock) -> str:
+        return _block_structure_type(block) or block.block_type
+
+    def block_position(block: CanonicalBlock) -> tuple[float, ...] | None:
+        span = next(iter(block.source_spans), None)
+        if span is None:
+            return None
+        box = span.normalized_bbox or span.bbox
+        if box is not None:
+            return (
+                box[1],
+                box[0],
+                float(span.line_start or 0),
+                float(span.char_start or 0),
+            )
+        if span.line_start is not None or span.char_start is not None:
+            return (float(span.line_start or 0), float(span.char_start or 0))
+        return None
+
+    def group(block: CanonicalBlock) -> tuple[int | None, str]:
+        return block_page(block), block_kind(block)
+
+    anchors: dict[str, int] = {
+        block.block_id: block.reading_order for block in retained_blocks
+    }
+    block_id_map: dict[str, str] = {}
+    for key in {
+        group(block)
+        for block in removed_blocks
+    }:
+        old_group = sorted(
+            (block for block in removed_blocks if group(block) == key),
+            key=lambda block: block.reading_order,
+        )
+        new_group = sorted(
+            (block for block in incoming_blocks if group(block) == key),
+            key=lambda block: block.reading_order,
+        )
+        for old_block, new_block in zip(old_group, new_group):
+            block_id_map[old_block.block_id] = new_block.block_id
+            anchors[new_block.block_id] = old_block.reading_order
+    for block in incoming_blocks:
+        anchors.setdefault(block.block_id, block.reading_order)
+
+    retained_ids = {block.block_id for block in retained_blocks}
+    occupied_ids = set(retained_ids)
+    occupied_ids.update(block.block_id for block in incoming_blocks)
+    seen_incoming: set[str] = set()
+    for block in incoming_blocks:
+        original_id = block.block_id
+        if original_id in seen_incoming or original_id in retained_ids:
+            block.block_id = _stable_id(
+                "block", primary.document_id, "repair", len(seen_incoming), original_id
+            )
+            while block.block_id in occupied_ids:
+                block.block_id = _stable_id(
+                    "block", primary.document_id, "repair", len(occupied_ids), block.block_id
+                )
+            for old_id, replacement_id in list(block_id_map.items()):
+                if replacement_id == original_id:
+                    block_id_map[old_id] = block.block_id
+            anchors[block.block_id] = anchors.pop(original_id, block.reading_order)
+        seen_incoming.add(block.block_id)
+        occupied_ids.add(block.block_id)
+
+    primary.blocks = retained_blocks + incoming_blocks
     if "table" in replacement_types:
         primary.tables = [
             table for table in primary.tables if not _structure_on_pages(table, page_indices)
@@ -3611,25 +3759,52 @@ def _merge_pdf_page_repairs(
 
     primary.blocks.sort(
         key=lambda block: (
-            next(
-                (
-                    span.page_index
-                    for span in block.source_spans
-                    if span.page_index is not None
-                ),
-                10**9,
-            ),
-            block.reading_order,
+            block_page(block) if block_page(block) is not None else 10**9,
+            0 if block_position(block) is not None else 1,
+            *(block_position(block) or ()),
+            anchors.get(block.block_id, block.reading_order),
             block.block_id,
         )
     )
-    seen: set[str] = set()
-    for reading_order, block in enumerate(primary.blocks):
-        if block.block_id in seen:
-            block.block_id = _stable_id(
-                "block", primary.document_id, "repair", reading_order, block.block_id
+    final_block_ids = {block.block_id for block in primary.blocks}
+    for figure in primary.figures:
+        figure.nearby_block_ids = [
+            block_id_map.get(block_id, block_id)
+            for block_id in figure.nearby_block_ids
+            if block_id_map.get(block_id, block_id) in final_block_ids
+        ]
+    for formula in primary.formulas:
+        formula.nearby_block_ids = [
+            block_id_map.get(block_id, block_id)
+            for block_id in formula.nearby_block_ids
+            if block_id_map.get(block_id, block_id) in final_block_ids
+        ]
+
+    def remap_outline(nodes: list[SectionNode]) -> list[SectionNode]:
+        remapped: list[SectionNode] = []
+        for node in nodes:
+            mapped_id = block_id_map.get(node.block_id, node.block_id) if node.block_id else None
+            if node.block_id and mapped_id not in final_block_ids:
+                continue
+            remapped.append(
+                node.model_copy(
+                    update={
+                        "block_id": mapped_id,
+                        "children": remap_outline(node.children),
+                    },
+                    deep=True,
+                )
             )
-        seen.add(block.block_id)
+        return remapped
+
+    primary.outline = remap_outline(primary.outline)
+    for issue in primary.quality.issues:
+        issue.block_ids = [
+            block_id_map.get(block_id, block_id)
+            for block_id in issue.block_ids
+            if block_id_map.get(block_id, block_id) in final_block_ids
+        ]
+    for reading_order, block in enumerate(primary.blocks):
         block.reading_order = reading_order
     return primary
 

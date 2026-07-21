@@ -15,6 +15,7 @@ from app.services.canonical_models import (
     CanonicalFormula,
     CanonicalQualityIssue,
     CanonicalTable,
+    SectionNode,
     SourceSpan,
 )
 from app.services.canonical_quality import CanonicalQualityGate
@@ -204,6 +205,32 @@ def test_quality_gate_requests_table_page_repair() -> None:
     assert report.status == "validation_failed"
 
 
+def test_quality_gate_rejects_duplicate_table_ids_even_when_tables_are_valid() -> None:
+    def valid_table() -> CanonicalTable:
+        return CanonicalTable(
+            table_id="duplicate-table",
+            headers=["Model", "F1"],
+            rows=[["SAC-KG", "74.7"]],
+            cells=[
+                CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+                CanonicalCell(text="74.7", row_index=1, column_index=1),
+            ],
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+        )
+
+    document = _document(_block())
+    document.tables = [valid_table(), valid_table()]
+
+    report = CanonicalQualityGate().evaluate(document)
+
+    duplicate = next(issue for issue in report.issues if issue.code == "table_id_duplicate")
+    assert duplicate.severity == "fatal"
+    assert duplicate.metadata["table_ids"] == ["duplicate-table"]
+    assert report.accepted is False
+
+
 def test_table_gate_rejects_missing_and_incomplete_cell_inventory() -> None:
     missing = CanonicalTable(
         table_id="missing-cells",
@@ -245,6 +272,22 @@ def test_table_gate_compares_cell_and_markdown_representations() -> None:
     assert "cell_value_mismatch" in reasons
     assert "normalized_markdown_mismatch" in reasons
     assert "source_markdown_mismatch" in reasons
+
+
+def test_markdown_table_parser_uses_backslash_parity_for_pipe_escaping() -> None:
+    markdown = "\n".join(
+        [
+            "| Path | Note |",
+            "| --- | --- |",
+            r"|C:\\|A\|B|",
+            r"|D:\\|A\\\|B|",
+        ]
+    )
+
+    assert CanonicalQualityGate._markdown_table_data(markdown) == (
+        ["Path", "Note"],
+        [["C:\\", "A|B"], ["D:\\", "A\\|B"]],
+    )
 
 
 def test_table_gate_accepts_complete_rowspan_and_colspan_inventory() -> None:
@@ -446,6 +489,51 @@ def test_plain_pdf_abstract_keeps_english_and_chinese_boundary_words_in_prose(
 
     assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
         f"{body_line}\nA final abstract sentence."
+    )
+
+
+@pytest.mark.parametrize(
+    "abstract_heading",
+    ["Abstract:", "Abstract：", "Abstract -", "Abstract —", "摘要："],
+)
+def test_quality_detector_recognizes_explicit_abstract_heading_variants(
+    abstract_heading: str,
+) -> None:
+    document = _document(
+        _block("Body"),
+        text_layer_pages=[f"{abstract_heading}\nSource abstract body."],
+    )
+
+    report = CanonicalQualityGate().evaluate(document)
+
+    assert any(issue.code == "abstract_missing" for issue in report.issues)
+
+
+@pytest.mark.parametrize(
+    "section_heading",
+    [
+        "Background",
+        "2. Methods",
+        "III. Methodology",
+        "Results",
+        "Conclusion",
+        "Conclusions",
+        "背景",
+        "3、方法",
+        "结果",
+        "结论",
+    ],
+)
+def test_plain_pdf_abstract_stops_at_common_english_and_chinese_sections(
+    section_heading: str,
+) -> None:
+    raw_page = (
+        "Abstract\nSource abstract sentence.\n\n"
+        f"{section_heading}\nSection content must not be included."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "Source abstract sentence."
     )
 
 
@@ -826,6 +914,206 @@ def test_table_repair_requires_replacement_inventory_on_each_target_page() -> No
     ) is False
 
 
+def test_targeted_table_repair_rejects_duplicate_valid_replacements() -> None:
+    invalid = CanonicalTable(
+        table_id="bad-table",
+        headers=["A", "B"],
+        rows=[["1"]],
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+    valid = CanonicalTable(
+        table_id="fixed-table",
+        headers=["A", "B"],
+        rows=[["1", "2"]],
+        cells=[
+            CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="1", row_index=1, column_index=0),
+            CanonicalCell(text="2", row_index=1, column_index=1),
+        ],
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+    primary = _document(
+        CanonicalBlock(
+            block_id="bad-table-block",
+            block_type="table",
+            text="bad",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="mineru",
+            table_id="bad-table",
+        ),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+    primary.tables = [invalid]
+    repair = _document(
+        CanonicalBlock(
+            block_id="fixed-table-block-1",
+            block_type="table",
+            text="fixed one",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="document_intelligence",
+            table_id="fixed-table",
+        ),
+        CanonicalBlock(
+            block_id="fixed-table-block-2",
+            block_type="table",
+            text="fixed two",
+            reading_order=1,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="document_intelligence",
+            table_id="fixed-table",
+        ),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+    repair.parser_source = "document_intelligence"
+    repair.tables = [valid.model_copy(deep=True), valid.model_copy(deep=True)]
+    issues = [issue for issue in CanonicalQualityGate().evaluate(primary).issues if issue.repairable]
+    candidate = canonical_adapters._merge_pdf_page_repairs(
+        primary.model_copy(deep=True), repair, {0}, issues=issues
+    )
+    CanonicalQualityGate().evaluate(candidate)
+
+    assert canonical_adapters._targeted_repair_satisfies_issues(
+        primary, repair, candidate, issues, {0}
+    ) is False
+
+
+def test_targeted_table_repair_matches_each_issue_to_a_distinct_locator() -> None:
+    def table(
+        table_id: str,
+        bbox: tuple[float, float, float, float],
+        *,
+        valid: bool,
+    ) -> CanonicalTable:
+        rows = [["1", "2"]] if valid else [["1"]]
+        cells = (
+            [
+                CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text="1", row_index=1, column_index=0),
+                CanonicalCell(text="2", row_index=1, column_index=1),
+            ]
+            if valid
+            else []
+        )
+        return CanonicalTable(
+            table_id=table_id,
+            headers=["A", "B"],
+            rows=rows,
+            cells=cells,
+            source_spans=[
+                SourceSpan(page_index=0, page_label="1", normalized_bbox=bbox)
+            ],
+        )
+
+    primary = _document(_block("Page body"))
+    primary.tables = [
+        table("bad-top", (0.0, 0.1, 1.0, 0.2), valid=False),
+        table("bad-bottom", (0.0, 0.7, 1.0, 0.8), valid=False),
+    ]
+    repair = _document(_block("DI body", parser_source="document_intelligence"))
+    repair.tables = [
+        table("fixed-top-1", (0.0, 0.1, 1.0, 0.2), valid=True),
+        table("fixed-top-2", (0.0, 0.15, 1.0, 0.25), valid=True),
+    ]
+    issues = [issue for issue in CanonicalQualityGate().evaluate(primary).issues if issue.repairable]
+    candidate = primary.model_copy(deep=True)
+    candidate.tables = [item.model_copy(deep=True) for item in repair.tables]
+    CanonicalQualityGate().evaluate(candidate)
+
+    assert canonical_adapters._targeted_repair_satisfies_issues(
+        primary, repair, candidate, issues, {0}
+    ) is False
+
+
+def test_targeted_merge_rebuilds_references_and_uses_source_order_not_local_reading_order() -> None:
+    primary = _document(
+        _block("Narrative before", order=100, page=0, block_id="before"),
+        CanonicalBlock(
+            block_id="old-figure-block",
+            block_type="figure",
+            text="Old figure",
+            reading_order=101,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="mineru",
+            figure_id="old-figure",
+        ),
+        _block("Narrative after", order=102, page=0, block_id="after"),
+        _block("Page two", order=103, page=1, block_id="page-two"),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    primary.figures = [
+        CanonicalFigure(
+            figure_id="old-figure",
+            caption="Old",
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            nearby_block_ids=["before", "old-figure-block", "missing-block"],
+        )
+    ]
+    primary.formulas = [
+        CanonicalFormula(
+            formula_id="formula-one",
+            latex="x = 1",
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+            nearby_block_ids=["old-figure-block"],
+        )
+    ]
+    primary.outline = [SectionNode(title="Deleted heading", level=1, block_id="old-figure-block")]
+    repair = _document(
+        CanonicalBlock(
+            block_id="new-figure-block",
+            block_type="figure",
+            text="New figure",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="document_intelligence",
+            figure_id="new-figure",
+        ),
+        expected_page_count=2,
+        parsed_page_indices=[0],
+    )
+    repair.parser_source = "document_intelligence"
+    repair.figures = [
+        CanonicalFigure(
+            figure_id="new-figure",
+            caption="New",
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            nearby_block_ids=["new-figure-block", "before"],
+        )
+    ]
+
+    issue = CanonicalQualityIssue(
+        code="figure_invalid",
+        severity="error",
+        message="figure repair",
+        repairable=True,
+        repair_scope="page:1",
+    )
+    merged = canonical_adapters._merge_pdf_page_repairs(
+        primary, repair, {0}, issues=[issue]
+    )
+
+    assert [block.text for block in merged.blocks] == [
+        "Narrative before",
+        "New figure",
+        "Narrative after",
+        "Page two",
+    ]
+    block_ids = {block.block_id for block in merged.blocks}
+    assert all(
+        node.block_id in block_ids
+        for node in merged.outline
+        if node.block_id is not None
+    )
+    assert set(merged.formulas[0].nearby_block_ids).issubset(block_ids)
+    assert set(merged.figures[0].nearby_block_ids).issubset(block_ids)
+
+
 def test_abstract_repair_without_explicit_abstract_preserves_mineru_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -866,6 +1154,105 @@ def test_abstract_repair_without_explicit_abstract_preserves_mineru_source(
     assert result.abstract is None
     assert any(issue.code == "abstract_missing" for issue in result.quality.issues)
     assert any("targeted:incomplete" in attempt for attempt in result.metadata["parser_attempts"])
+
+
+def test_abstract_targeted_repair_preserves_all_mineru_narrative(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+
+    def valid_table(table_id: str, page: int) -> CanonicalTable:
+        span = SourceSpan(page_index=page, page_label=str(page + 1))
+        return CanonicalTable(
+            table_id=table_id,
+            headers=["Metric", "Value"],
+            rows=[["F1", "74.7"]],
+            cells=[
+                CanonicalCell(text="Metric", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="Value", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text="F1", row_index=1, column_index=0),
+                CanonicalCell(text="74.7", row_index=1, column_index=1),
+            ],
+            source_spans=[span],
+        )
+
+    mineru = _document(
+        _block("MinerU page one narrative", order=0, page=0, block_id="p1-text"),
+        CanonicalBlock(
+            block_id="p1-table",
+            block_type="table",
+            text="MinerU table one",
+            reading_order=1,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="mineru",
+            table_id="mineru-table-1",
+        ),
+        _block("MinerU page two narrative", order=2, page=1, block_id="p2-text"),
+        CanonicalBlock(
+            block_id="p2-table",
+            block_type="table",
+            text="MinerU table two",
+            reading_order=3,
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+            parser_source="mineru",
+            table_id="mineru-table-2",
+        ),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    mineru.tables = [
+        valid_table("mineru-table-1", 0),
+        valid_table("mineru-table-2", 1),
+    ]
+
+    repair = _document(
+        CanonicalBlock(
+            block_id="di-table-1-block",
+            block_type="table",
+            text="DI table one",
+            reading_order=0,
+            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            parser_source="document_intelligence",
+            table_id="di-table-1",
+        ),
+        CanonicalBlock(
+            block_id="di-table-2-block",
+            block_type="table",
+            text="DI table two",
+            reading_order=1,
+            source_spans=[SourceSpan(page_index=1, page_label="2")],
+            parser_source="document_intelligence",
+            table_id="di-table-2",
+        ),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    repair.parser_source = "document_intelligence"
+    repair.tables = [valid_table("di-table-1", 0), valid_table("di-table-2", 1)]
+    repair.abstract = "Recovered source abstract."
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 2)
+    monkeypatch.setattr(
+        parser,
+        "_extract_pdf_text_layer",
+        lambda _path: (["Abstract\nSource abstract", "Body"], 2),
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(
+        canonical_adapters,
+        "run_document_intelligence",
+        lambda *_args, **_kwargs: repair,
+    )
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert result.abstract == "Recovered source abstract."
+    assert [
+        block.text for block in result.blocks if block.block_type == "narrative"
+    ] == ["MinerU page one narrative", "MinerU page two narrative"]
+    assert result.quality.accepted is True
 
 
 def test_pdf_audit_preserves_best_effort_text_layer_warnings(
@@ -914,6 +1301,37 @@ def test_pdf_mineru_exception_and_di_failure_use_complete_text_layer_fallback(
     assert result.metadata["primary_parser"] == "pypdf_text_layer"
     assert result.blocks[0].text == long_text
     assert any("mineru" in attempt and "failed" in attempt for attempt in result.metadata["parser_attempts"])
+
+
+def test_document_intelligence_model_fallback_is_audited_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(parser, "_extract_pdf_text_layer", lambda _path: (["Source body"], 1))
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: None)
+    monkeypatch.setattr(
+        parser,
+        "_render_pdf_pages",
+        lambda _path, dpi, page_indices=None: {0: b"page"},
+    )
+    monkeypatch.setattr(
+        parser,
+        "_analyze_pdf_page",
+        lambda **kwargs: parser._fallback_page_analysis(
+            page_label=kwargs["page_label"],
+            raw_text=kwargs["raw_text"],
+            text_quality=kwargs["text_quality"],
+        ),
+    )
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert result.metadata["primary_parser"] == "pypdf_text_layer"
+    assert "document_intelligence:full:unavailable" in result.metadata["parser_attempts"]
+    assert "document_intelligence:full:success" not in result.metadata["parser_attempts"]
 
 
 def test_mineru_long_table_conversion_is_not_truncated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -65,6 +65,7 @@ class DocumentAnalysisPayload(BaseModel):#页面解析结果
 
 class DocumentPagePayload(BaseModel):#解析页面
     page_label: str
+    analysis_source: str = "document_intelligence"
     page_summary: str = ""
     page_markdown: str = ""
     sections: list[str] = Field(default_factory=list)

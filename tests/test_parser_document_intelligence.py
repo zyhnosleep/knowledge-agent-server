@@ -167,6 +167,34 @@ def test_targeted_document_intelligence_preserves_real_page_labels(monkeypatch) 
     assert parsed.metadata["document_intelligence"]["page_indices"] == [1]
 
 
+def test_targeted_document_intelligence_renders_only_requested_pages(monkeypatch) -> None:
+    render_calls = []
+
+    def render(path, dpi, page_indices=None):
+        render_calls.append(None if page_indices is None else set(page_indices))
+        return {1: b"page-two"}
+
+    monkeypatch.setattr(parser, "_render_pdf_pages", render)
+    monkeypatch.setattr(
+        parser,
+        "_analyze_pdf_page",
+        lambda **kwargs: DocumentPagePayload(
+            page_label=kwargs["page_label"],
+            page_summary="Target page",
+            sections=["Only target page"],
+            evidence_spans=["Only target page"],
+        ),
+    )
+
+    parsed = parser._parse_pdf_with_document_intelligence(
+        Path("dummy.pdf"), ["one", "two", "three"], 3, page_indices={1}
+    )
+
+    assert parsed is not None
+    assert render_calls == [{1}]
+    assert [chunk.page_label for chunk in parsed.chunks] == ["2"]
+
+
 def test_document_intelligence_chunk_is_not_truncated(monkeypatch) -> None:
     long_section = "evidence " * 700
     monkeypatch.setattr(parser, "_render_pdf_pages", lambda path, dpi: [b"page"])

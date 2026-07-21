@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+from app.services.canonical_abstract import has_explicit_abstract
 from app.services.canonical_models import (
     CanonicalDocument,
     CanonicalQualityIssue,
@@ -17,9 +18,6 @@ _SEVERITY_PENALTIES = {
     "error": 0.15,
     "fatal": 0.35,
 }
-_ABSTRACT_HEADING = re.compile(r"(?im)^\s*(?:abstract|摘要)\s*(?::|$)")
-
-
 class CanonicalQualityGate:
     """Apply deterministic, source-only validation to a canonical document."""
 
@@ -30,6 +28,7 @@ class CanonicalQualityGate:
         issues.extend(self._reading_order_issues(document))
         issues.extend(self._asset_issues(document))
         issues.extend(self._abstract_issues(document))
+        issues.extend(self._table_inventory_issues(document))
         issues.extend(self._table_issues(document))
         issues.extend(self._figure_issues(document))
         issues.extend(self._formula_issues(document))
@@ -172,7 +171,7 @@ class CanonicalQualityGate:
         if not isinstance(page_texts, list):
             return []
         source_has_abstract = any(
-            isinstance(text, str) and _ABSTRACT_HEADING.search(text)
+            isinstance(text, str) and has_explicit_abstract(text)
             for text in page_texts[:2]
         )
         if not source_has_abstract:
@@ -209,9 +208,97 @@ class CanonicalQualityGate:
                     message=f"Table {table.table_id} failed deterministic validation.",
                     repairable=True,
                     repair_scope=f"page:{page}" if page is not None else "document",
-                    metadata={"table_id": table.table_id, "reasons": reasons},
+                    metadata={
+                        "table_id": table.table_id,
+                        "reasons": reasons,
+                        "locator": cls._table_locator(table),
+                    },
                 )
             )
+        return issues
+
+    @staticmethod
+    def _table_locator(table: CanonicalTable) -> dict[str, object]:
+        span = next(iter(table.source_spans), None)
+        if span is None:
+            return {}
+        box = span.normalized_bbox or span.bbox
+        return {
+            key: value
+            for key, value in {
+                "page_index": span.page_index,
+                "bbox": list(box) if box is not None else None,
+                "source_block_id": span.source_block_id,
+            }.items()
+            if value is not None
+        }
+
+    @staticmethod
+    def _table_inventory_issues(
+        document: CanonicalDocument,
+    ) -> list[CanonicalQualityIssue]:
+        by_id: dict[str, list[CanonicalTable]] = {}
+        for table in document.tables:
+            by_id.setdefault(table.table_id, []).append(table)
+
+        issues: list[CanonicalQualityIssue] = []
+        duplicate_ids = sorted(
+            table_id for table_id, items in by_id.items() if len(items) > 1
+        )
+        if duplicate_ids:
+            issues.append(
+                CanonicalQualityIssue(
+                    code="table_id_duplicate",
+                    severity="fatal",
+                    message="Canonical table IDs must be unique.",
+                    metadata={"table_ids": duplicate_ids},
+                )
+            )
+
+        table_pages = {
+            table_id: {
+                span.page_index
+                for table in items
+                for span in table.source_spans
+                if span.page_index is not None
+            }
+            for table_id, items in by_id.items()
+        }
+        valid_ids = set(by_id)
+        for block in document.blocks:
+            if not block.table_id:
+                continue
+            if block.table_id not in valid_ids:
+                issues.append(
+                    CanonicalQualityIssue(
+                        code="table_reference_invalid",
+                        severity="fatal",
+                        message=f"Block {block.block_id} references an unknown table.",
+                        block_ids=[block.block_id],
+                        metadata={"table_id": block.table_id},
+                    )
+                )
+                continue
+            block_pages = {
+                span.page_index
+                for span in block.source_spans
+                if span.page_index is not None
+            }
+            known_pages = table_pages[block.table_id]
+            if block_pages and known_pages and block_pages.isdisjoint(known_pages):
+                issues.append(
+                    CanonicalQualityIssue(
+                        code="table_reference_conflict",
+                        severity="fatal",
+                        message=f"Block {block.block_id} is associated with a table on another page.",
+                        block_ids=[block.block_id],
+                        metadata={
+                            "table_id": block.table_id,
+                            "block_pages": sorted(block_pages),
+                            "table_pages": sorted(known_pages),
+                        },
+                    )
+                )
         return issues
 
     @staticmethod
@@ -324,15 +411,43 @@ class CanonicalQualityGate:
         markdown: str,
     ) -> tuple[list[str], list[list[str]]] | None:
         def split_row(value: str) -> list[str]:
+            def pipe_is_escaped(index: int) -> bool:
+                backslashes = 0
+                cursor = index - 1
+                while cursor >= 0 and value[cursor] == "\\":
+                    backslashes += 1
+                    cursor -= 1
+                return backslashes % 2 == 1
+
+            def unescape(cell: str) -> str:
+                decoded: list[str] = []
+                index = 0
+                while index < len(cell):
+                    if (
+                        cell[index] == "\\"
+                        and index + 1 < len(cell)
+                        and cell[index + 1] in {"\\", "|"}
+                    ):
+                        decoded.append(cell[index + 1])
+                        index += 2
+                        continue
+                    decoded.append(cell[index])
+                    index += 1
+                return "".join(decoded)
+
             value = value.strip()
             if value.startswith("|"):
                 value = value[1:]
-            if value.endswith("|") and not value.endswith("\\|"):
+            if value.endswith("|") and not pipe_is_escaped(len(value) - 1):
                 value = value[:-1]
-            return [
-                part.strip().replace("\\|", "|").replace("\\\\", "\\")
-                for part in re.split(r"(?<!\\)\|", value)
-            ]
+            parts: list[str] = []
+            start = 0
+            for index, character in enumerate(value):
+                if character == "|" and not pipe_is_escaped(index):
+                    parts.append(value[start:index])
+                    start = index + 1
+            parts.append(value[start:])
+            return [unescape(part.strip()) for part in parts]
 
         lines = [line.strip() for line in markdown.splitlines() if line.strip()]
         for index in range(len(lines) - 1):
