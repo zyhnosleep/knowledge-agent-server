@@ -1549,7 +1549,7 @@ def test_write_rejects_nonempty_table_without_renderable_rows(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    with pytest.raises(ValueError, match="no renderable rows"):
+    with pytest.raises(ValueError, match="no renderable table evidence"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1", "canonical-v1-abcd", canonical_document
         )
@@ -1617,6 +1617,77 @@ def test_write_rejects_non_finite_values_added_after_model_validation(
         canonical_document.figures[0].ai_axes = {"bad": float("inf")}
 
     with pytest.raises(ValueError, match="finite JSON"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        CanonicalCell(text="too many rows", row_index=10_000, column_index=0),
+        CanonicalCell(text="too many columns", row_index=0, column_index=1_000),
+        CanonicalCell(text="too many cells", row_index=1_999, column_index=500),
+    ],
+)
+def test_cells_table_rejects_oversized_dense_matrix(cell: CanonicalCell) -> None:
+    with pytest.raises(ValueError, match="table matrix exceeds canonical limits"):
+        CanonicalArtifactStore._table_grid_from_cells([cell])
+
+
+def test_source_html_rejects_oversized_span_before_matrix_allocation(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = []
+    table.rows = []
+    table.cells = []
+    table.source_html = '<table><tr><td rowspan="10001">value</td></tr></table>'
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    with pytest.raises(ValueError, match="table matrix exceeds canonical limits"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+@pytest.mark.parametrize(
+    "empty_kind",
+    ["empty", "normalized_empty", "source_html_empty", "empty_html", "decorations"],
+)
+def test_write_rejects_table_without_actual_table_evidence(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    empty_kind: str,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = []
+    table.rows = []
+    table.cells = []
+    table.source_html = None
+    table.caption = None
+    table.footnotes = []
+    if empty_kind == "normalized_empty":
+        table.normalized_markdown = ""
+    elif empty_kind == "source_html_empty":
+        table.source_html = ""
+    elif empty_kind == "empty_html":
+        table.source_html = "<table></table>"
+    elif empty_kind == "decorations":
+        table.caption = "Caption is not table evidence"
+        table.footnotes = ["Footnote is not table evidence"]
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    with pytest.raises(ValueError, match="no renderable table evidence"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1", "canonical-v1-abcd", canonical_document
         )

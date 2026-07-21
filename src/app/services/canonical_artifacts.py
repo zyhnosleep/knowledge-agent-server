@@ -59,6 +59,9 @@ _WINDOWS_DEVICE_NAMES = {
 }
 _WINDOWS_FORBIDDEN_CHARACTERS = set('/\\<>:"|?*')
 _REMOTE_URI_SCHEMES = {"http", "https", "s3", "gs", "minio"}
+_MAX_TABLE_ROWS = 10_000
+_MAX_TABLE_COLUMNS = 1_000
+_MAX_TABLE_GRID_CELLS = 1_000_000
 
 
 class CanonicalArtifactStore:
@@ -554,11 +557,11 @@ class CanonicalArtifactStore:
 
     @classmethod
     def _render_table(cls, table: CanonicalTable) -> list[str]:
-        lines: list[str] = []
-        if table.caption:
-            lines.extend([f"### {table.caption}", ""])
+        table_lines: list[str] = []
         markdown = table.normalized_markdown or table.source_markdown
-        if markdown is None:
+        if markdown and markdown.strip():
+            table_lines.extend(markdown.rstrip().splitlines())
+        else:
             headers = table.headers
             rows = table.rows
             if not headers and not rows and table.cells:
@@ -566,14 +569,19 @@ class CanonicalArtifactStore:
             if not headers and not rows and table.source_html:
                 html_cells = cls._table_cells_from_html(table.source_html)
                 headers, rows = cls._table_grid_from_cells(html_cells)
-            if table.cells or table.source_html or headers or rows:
-                if not any(value for row in [headers, *rows] for value in row):
-                    raise ValueError(
-                        f"canonical table {table.table_id!r} has no renderable rows"
-                    )
-                lines.extend(cls._render_table_grid(table.table_id, headers, rows))
-        elif markdown:
-            lines.extend(markdown.rstrip().splitlines())
+            if any(value.strip() for row in [headers, *rows] for value in row):
+                table_lines.extend(
+                    cls._render_table_grid(table.table_id, headers, rows)
+                )
+        if not any(line.strip() for line in table_lines):
+            raise ValueError(
+                f"canonical table {table.table_id!r} has no renderable table evidence"
+            )
+
+        lines: list[str] = []
+        if table.caption:
+            lines.extend([f"### {table.caption}", ""])
+        lines.extend(table_lines)
         if lines and lines[-1] != "":
             lines.append("")
         for footnote in table.footnotes:
@@ -610,14 +618,22 @@ class CanonicalArtifactStore:
         )
         return rendered
 
-    @staticmethod
+    @classmethod
     def _table_grid_from_cells(
+        cls,
         cells: list[CanonicalCell],
     ) -> tuple[list[str], list[list[str]]]:
         if not cells:
             return [], []
-        row_count = max(cell.row_index + cell.rowspan for cell in cells)
-        column_count = max(cell.column_index + cell.colspan for cell in cells)
+        row_count = 0
+        column_count = 0
+        for cell in cells:
+            end_row = cell.row_index + cell.rowspan
+            end_column = cell.column_index + cell.colspan
+            cls._validate_table_dimensions(end_row, end_column)
+            row_count = max(row_count, end_row)
+            column_count = max(column_count, end_column)
+            cls._validate_table_dimensions(row_count, column_count)
         matrix = [["" for _ in range(column_count)] for _ in range(row_count)]
         occupied: set[tuple[int, int]] = set()
         header_rows: set[int] = set()
@@ -643,8 +659,8 @@ class CanonicalArtifactStore:
             row for index, row in enumerate(matrix) if index != header_index
         ]
 
-    @staticmethod
-    def _table_cells_from_html(source_html: str) -> list[CanonicalCell]:
+    @classmethod
+    def _table_cells_from_html(cls, source_html: str) -> list[CanonicalCell]:
         soup = BeautifulSoup(source_html, "html.parser")
         for unsafe in soup.find_all(["script", "style"]):
             unsafe.decompose()
@@ -653,6 +669,8 @@ class CanonicalArtifactStore:
             return []
         cells: list[CanonicalCell] = []
         occupied: set[tuple[int, int]] = set()
+        max_row_count = 0
+        max_column_count = 0
         rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
         for row_index, row in enumerate(rows):
             column_index = 0
@@ -662,6 +680,10 @@ class CanonicalArtifactStore:
                     colspan = max(1, int(element.get("colspan", 1)))
                 except (TypeError, ValueError) as exc:
                     raise ValueError("invalid HTML table span") from exc
+                cls._validate_table_dimensions(
+                    row_index + rowspan,
+                    column_index + colspan,
+                )
                 while any(
                     (row_index, candidate_column) in occupied
                     for candidate_column in range(
@@ -670,6 +692,15 @@ class CanonicalArtifactStore:
                     )
                 ):
                     column_index += 1
+                end_row = row_index + rowspan
+                end_column = column_index + colspan
+                cls._validate_table_dimensions(end_row, end_column)
+                max_row_count = max(max_row_count, end_row)
+                max_column_count = max(max_column_count, end_column)
+                cls._validate_table_dimensions(
+                    max_row_count,
+                    max_column_count,
+                )
                 cells.append(
                     CanonicalCell(
                         text=element.get_text(" ", strip=True),
@@ -691,6 +722,18 @@ class CanonicalArtifactStore:
                         occupied.add((span_row, span_column))
                 column_index += colspan
         return cells
+
+    @staticmethod
+    def _validate_table_dimensions(row_count: int, column_count: int) -> None:
+        if (
+            row_count > _MAX_TABLE_ROWS
+            or column_count > _MAX_TABLE_COLUMNS
+            or row_count * column_count > _MAX_TABLE_GRID_CELLS
+        ):
+            raise ValueError(
+                "table matrix exceeds canonical limits: "
+                f"rows={row_count}, columns={column_count}"
+            )
 
     @staticmethod
     def _render_figure(figure: CanonicalFigure) -> list[str]:
