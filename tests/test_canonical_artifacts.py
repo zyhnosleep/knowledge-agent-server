@@ -690,7 +690,7 @@ def test_markdown_uses_faithful_table_fallbacks(
     assert expected in (staging / "canonical.md").read_text("utf-8")
 
 
-def test_markdown_replaces_linked_structures_and_formats_heading_blocks(
+def test_markdown_keeps_linked_block_text_and_formats_heading_blocks(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
 ) -> None:
@@ -714,8 +714,195 @@ def test_markdown_replaces_linked_structures_and_formats_heading_blocks(
     markdown = (staging / "canonical.md").read_text("utf-8")
 
     assert "# Introduction" in markdown
-    assert "RAW TABLE BLOCK SHOULD BE REPLACED" not in markdown
+    assert "RAW TABLE BLOCK SHOULD BE REPLACED" in markdown
     assert markdown.count("| SAC-KG | 74.7 |") == 1
+
+
+def test_bundle_rejects_extra_top_level_regular_file(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    (staging / "unexpected.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="top-level bundle inventory"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_rejects_extra_top_level_directory(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    (staging / "unexpected").mkdir()
+
+    with pytest.raises(ValueError, match="top-level bundle inventory"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_rejects_extra_top_level_link(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    target = tmp_path / "outside.txt"
+    target.write_text("outside", encoding="utf-8")
+    link = staging / "unexpected-link"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="top-level bundle inventory"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_rejects_extra_top_level_directory_link(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    target = tmp_path / "outside-directory"
+    target.mkdir()
+    _create_directory_link(staging / "unexpected-directory-link", target)
+
+    with pytest.raises(ValueError, match="top-level bundle inventory"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_metadata_paths_are_sanitized_without_touching_text_or_urls(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    secret = "C:\\secret\\project\\private.pdf"
+    canonical_document.metadata = {
+        "absolute": secret,
+        "posix": "/srv/secret/private.json",
+        "drive_relative": "C:relative\\private.txt",
+        "relative": "docs/private.txt",
+        "url": "https://example.test/secret/private.pdf",
+        "nested": [{"path": "/nested/secret.bin"}],
+    }
+    canonical_document.blocks[0].metadata = {"path": secret}
+    canonical_document.source_metadata = {"path": secret}
+    canonical_document.parser_metadata = {"path": secret}
+    canonical_document.tables[0].metadata = {"path": secret}
+    canonical_document.figures[0].metadata = {"path": secret}
+    canonical_document.formulas[0].metadata = {"path": secret}
+    canonical_document.assets[0].metadata = {"path": secret}
+    canonical_document.quality.metadata = {"path": secret}
+    canonical_document.quality.issues[0].metadata = {"path": secret}
+    canonical_document.blocks[0].source_spans[0].metadata = {"path": secret}
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    persisted = "\n".join(
+        path.read_text("utf-8")
+        for path in [
+            staging / "manifest.json",
+            staging / "blocks.jsonl",
+            staging / "tables.json",
+            staging / "figures.json",
+            staging / "formulas.json",
+        ]
+    )
+    assert "secret\\\\project" not in persisted
+    assert "/srv/secret" not in persisted
+    assert '"absolute": "private.pdf"' in persisted
+    assert '"relative": "docs/private.txt"' in persisted
+    assert "https://example.test/secret/private.pdf" in persisted
+    store = CanonicalArtifactStore(tmp_path)
+    store.promote("doc-1", "canonical-v1-abcd")
+    loaded = store.load("doc-1", "canonical-v1-abcd")
+    assert loaded.metadata["absolute"] == "private.pdf"
+    assert loaded.metadata["nested"] == [{"path": "secret.bin"}]
+    assert loaded.metadata["relative"] == "docs/private.txt"
+    assert loaded.metadata["url"] == "https://example.test/secret/private.pdf"
+
+
+def test_markdown_keeps_block_text_and_renders_multiple_references_in_order(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks = [
+        CanonicalBlock(
+            block_id="multi",
+            block_type="narrative",
+            text="Narrative source text.",
+            section_path=["Results"],
+            reading_order=1,
+            parser_source="mineru",
+            table_id="table-1",
+            figure_id="figure-1",
+            formula_id="formula-1",
+        )
+    ]
+    canonical_document.outline = [SectionNode(title="Results", level=1, block_id="multi")]
+    canonical_document.quality.issues[0].block_ids = ["multi"]
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+    text_index = markdown.index("Narrative source text.")
+    assert text_index < markdown.index("Source table caption", text_index)
+    assert markdown.index("Source table caption", text_index) < markdown.index(
+        "Source figure caption", text_index
+    )
+    assert markdown.index("Source figure caption", text_index) < markdown.index(
+        "x = y + 1", text_index
+    )
+
+
+def test_fallback_table_and_figure_markdown_escape_special_characters(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = ["H|1", "H\\2"]
+    table.rows = [["a|b", "line1\r\nline2"]]
+    figure = canonical_document.figures[0]
+    figure.caption = "alt [caption]\\value\nnext"
+    figure.asset_path = "assets/figures/figure%20one.png"
+    canonical_document.assets[0].path = figure.asset_path
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+    assert "H\\|1" in markdown
+    assert "H\\\\2" in markdown
+    assert "a\\|b" in markdown
+    assert "line1<br>line2" in markdown
+    assert "![alt \\[caption\\]\\\\value next](assets/figures/figure%20one.png)" in markdown
+
+
+def test_fallback_table_rejects_rows_with_wrong_width(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    table = canonical_document.tables[0]
+    table.normalized_markdown = None
+    table.source_markdown = None
+    table.headers = ["H1", "H2"]
+    table.rows = [["only-one"]]
+    canonical_document.blocks = []
+    canonical_document.outline[0].block_id = None
+    canonical_document.quality.issues[0].block_ids = []
+
+    with pytest.raises(ValueError, match="table row width"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
 
 
 def test_promote_rejects_incomplete_bundle(
@@ -1044,3 +1231,68 @@ def test_promote_on_missing_store_root_preserves_empty_staging_contract(
         store.promote("doc-1", "canonical-v1-abcd")
 
     assert not store.root.exists()
+
+
+def test_write_staging_is_idempotent_and_reuses_valid_bundle(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+
+    first = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    second = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+
+    assert second == first
+    assert list((tmp_path / "doc-1").glob("canonical-v1-abcd.staging-*")) == [first]
+    assert store.promote("doc-1", "canonical-v1-abcd").is_dir()
+
+
+def test_write_staging_rejects_existing_final_without_orphan(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    final = store.promote("doc-1", "canonical-v1-abcd")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+
+    assert final.is_dir()
+    assert not list((tmp_path / "doc-1").glob("canonical-v1-abcd.staging-*"))
+
+
+def test_write_staging_rejects_invalid_existing_staging_without_replacing_it(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    existing = tmp_path / "doc-1" / "canonical-v1-abcd.staging-existing"
+    existing.mkdir(parents=True)
+    marker = existing / "untrusted.txt"
+    marker.write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="existing staging bundle is invalid"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+    assert marker.read_text("utf-8") == "preserve"
+    assert list(existing.parent.glob("canonical-v1-abcd.staging-*")) == [existing]
+
+
+def test_write_staging_rejects_multiple_existing_staging_directories(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    document_root = tmp_path / "doc-1"
+    first = document_root / "canonical-v1-abcd.staging-first"
+    second = document_root / "canonical-v1-abcd.staging-second"
+    first.mkdir(parents=True)
+    second.mkdir()
+
+    with pytest.raises(ValueError, match="multiple staging directories"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+    assert set(document_root.glob("canonical-v1-abcd.staging-*")) == {first, second}

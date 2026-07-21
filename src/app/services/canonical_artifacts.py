@@ -112,6 +112,29 @@ class CanonicalArtifactStore:
             raise ValueError(
                 f"parse_version {document.parse_version!r} does not match {version!r}"
             )
+        document_root = self._prepare_document_root(document_id, create=True)
+        final = document_root / version
+        if final.exists():
+            raise FileExistsError(f"canonical bundle already exists: {final}")
+
+        staging_candidates = list(document_root.glob(f"{version}.staging-*"))
+        if len(staging_candidates) > 1:
+            raise ValueError(
+                "write_staging found multiple staging directories; "
+                f"found {len(staging_candidates)}"
+            )
+        if staging_candidates:
+            existing_staging = staging_candidates[0]
+            try:
+                if self._is_link_or_reparse_point(existing_staging):
+                    raise ValueError("staging path is a symbolic link")
+                self._validate_bundle(existing_staging, document_id, version)
+            except Exception as exc:
+                raise ValueError(
+                    f"existing staging bundle is invalid: {existing_staging}"
+                ) from exc
+            return existing_staging
+
         self._validate_record_contract(
             document.blocks,
             document.tables,
@@ -122,7 +145,6 @@ class CanonicalArtifactStore:
             document.quality,
         )
 
-        document_root = self._prepare_document_root(document_id, create=True)
         staging = document_root / f"{version}.staging-{uuid4().hex}"
         staging.mkdir()
 
@@ -146,15 +168,15 @@ class CanonicalArtifactStore:
             self._write_blocks(staging / "blocks.jsonl", document.blocks)
             self._write_json(
                 staging / "tables.json",
-                [table.model_dump(mode="json") for table in document.tables],
+                [self._bundle_model_dump(table) for table in document.tables],
             )
             self._write_json(
                 staging / "figures.json",
-                [figure.model_dump(mode="json") for figure in document.figures],
+                [self._bundle_model_dump(figure) for figure in document.figures],
             )
             self._write_json(
                 staging / "formulas.json",
-                [formula.model_dump(mode="json") for formula in document.formulas],
+                [self._bundle_model_dump(formula) for formula in document.formulas],
             )
             self._validate_bundle(staging, document_id, version)
         except Exception:
@@ -318,7 +340,10 @@ class CanonicalArtifactStore:
     ) -> dict[str, Any]:
         assets = []
         for asset in document.assets:
-            item = asset.model_dump(mode="json", exclude={"source_path"})
+            item = CanonicalArtifactStore._bundle_model_dump(
+                asset,
+                exclude={"source_path"},
+            )
             item["sha256"] = asset_hashes[asset.asset_id]
             assets.append(item)
         return {
@@ -330,7 +355,8 @@ class CanonicalArtifactStore:
                 "abstract": document.abstract,
                 "keywords": document.keywords,
                 "outline": [
-                    section.model_dump(mode="json") for section in document.outline
+                    CanonicalArtifactStore._bundle_model_dump(section)
+                    for section in document.outline
                 ],
                 "metadata": document.metadata,
             },
@@ -343,7 +369,7 @@ class CanonicalArtifactStore:
                 "media_type": document.source_media_type,
                 "metadata": document.source_metadata,
             },
-            "quality": document.quality.model_dump(mode="json"),
+            "quality": CanonicalArtifactStore._bundle_model_dump(document.quality),
             "warnings": document.warnings,
             "assets": assets,
             "status": document.status,
@@ -386,20 +412,18 @@ class CanonicalArtifactStore:
                 heading_level = min(max(len(block.section_path), 1), 6)
                 text = block.text.lstrip("# ").strip()
                 lines.extend([f"{'#' * heading_level} {text}", ""])
-            elif block.table_id and block.table_id in tables:
-                if block.table_id not in emitted_tables:
-                    lines.extend(CanonicalArtifactStore._render_table(tables[block.table_id]))
-                    emitted_tables.add(block.table_id)
-            elif block.figure_id and block.figure_id in figures:
-                if block.figure_id not in emitted_figures:
-                    lines.extend(CanonicalArtifactStore._render_figure(figures[block.figure_id]))
-                    emitted_figures.add(block.figure_id)
-            elif block.formula_id and block.formula_id in formulas:
-                if block.formula_id not in emitted_formulas:
-                    lines.extend(CanonicalArtifactStore._render_formula(formulas[block.formula_id]))
-                    emitted_formulas.add(block.formula_id)
             else:
                 lines.extend([block.text, ""])
+
+            if block.table_id and block.table_id not in emitted_tables:
+                lines.extend(CanonicalArtifactStore._render_table(tables[block.table_id]))
+                emitted_tables.add(block.table_id)
+            if block.figure_id and block.figure_id not in emitted_figures:
+                lines.extend(CanonicalArtifactStore._render_figure(figures[block.figure_id]))
+                emitted_figures.add(block.figure_id)
+            if block.formula_id and block.formula_id not in emitted_formulas:
+                lines.extend(CanonicalArtifactStore._render_formula(formulas[block.formula_id]))
+                emitted_formulas.add(block.formula_id)
 
         for table in document.tables:
             if table.table_id not in emitted_tables:
@@ -423,11 +447,42 @@ class CanonicalArtifactStore:
             headers = table.headers
             rows = table.rows
             if headers:
-                lines.append("| " + " | ".join(headers) + " |")
+                wrong_widths = [
+                    index for index, row in enumerate(rows) if len(row) != len(headers)
+                ]
+                if wrong_widths:
+                    raise ValueError(
+                        f"table row width does not match headers for {table.table_id!r}: "
+                        f"rows={wrong_widths}"
+                    )
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        CanonicalArtifactStore._escape_table_value(value)
+                        for value in headers
+                    )
+                    + " |"
+                )
                 lines.append("| " + " | ".join("---" for _ in headers) + " |")
-                lines.extend("| " + " | ".join(row) + " |" for row in rows)
+                lines.extend(
+                    "| "
+                    + " | ".join(
+                        CanonicalArtifactStore._escape_table_value(value)
+                        for value in row
+                    )
+                    + " |"
+                    for row in rows
+                )
             elif rows:
-                lines.extend("| " + " | ".join(row) + " |" for row in rows)
+                lines.extend(
+                    "| "
+                    + " | ".join(
+                        CanonicalArtifactStore._escape_table_value(value)
+                        for value in row
+                    )
+                    + " |"
+                    for row in rows
+                )
         elif markdown:
             lines.extend(markdown.rstrip().splitlines())
         if lines and lines[-1] != "":
@@ -442,8 +497,10 @@ class CanonicalArtifactStore:
         if figure.caption:
             lines.extend([f"### {figure.caption}", ""])
         if figure.asset_path:
-            alt = figure.caption or figure.figure_id
-            destination = quote(figure.asset_path, safe="/")
+            alt = CanonicalArtifactStore._escape_figure_alt(
+                figure.caption or figure.figure_id
+            )
+            destination = quote(figure.asset_path, safe="/%")
             lines.extend([f"![{alt}]({destination})", ""])
         if figure.description:
             lines.extend([figure.description, ""])
@@ -461,6 +518,7 @@ class CanonicalArtifactStore:
 
     @classmethod
     def _write_json(cls, path: Path, value: Any) -> None:
+        value = cls._sanitize_metadata_paths(value)
         cls._write_text(
             path,
             json.dumps(
@@ -476,7 +534,7 @@ class CanonicalArtifactStore:
     def _write_blocks(cls, path: Path, blocks: list[CanonicalBlock]) -> None:
         lines = [
             json.dumps(
-                block.model_dump(mode="json"),
+                cls._bundle_model_dump(block),
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -484,6 +542,67 @@ class CanonicalArtifactStore:
             for block in blocks
         ]
         cls._write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+    @classmethod
+    def _bundle_model_dump(cls, model: Any, **kwargs: Any) -> Any:
+        return cls._sanitize_metadata_paths(
+            model.model_dump(mode="json", **kwargs)
+        )
+
+    @classmethod
+    def _sanitize_metadata_paths(
+        cls,
+        value: Any,
+        *,
+        in_metadata: bool = False,
+    ) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: cls._sanitize_metadata_paths(
+                    item,
+                    in_metadata=in_metadata or key == "metadata",
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                cls._sanitize_metadata_paths(item, in_metadata=in_metadata)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return [
+                cls._sanitize_metadata_paths(item, in_metadata=in_metadata)
+                for item in value
+            ]
+        if in_metadata and isinstance(value, str):
+            return cls._safe_metadata_string(value)
+        return value
+
+    @staticmethod
+    def _safe_metadata_string(value: str) -> str:
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
+            return value
+        is_posix_rooted = value.startswith("/")
+        windows_path = PureWindowsPath(value)
+        is_windows_rooted_or_driven = bool(windows_path.root or windows_path.drive)
+        if not is_posix_rooted and not is_windows_rooted_or_driven:
+            return value
+        path = PurePosixPath(value) if is_posix_rooted else windows_path
+        return path.name or value
+
+    @staticmethod
+    def _escape_table_value(value: str) -> str:
+        normalized = re.sub(r"\r\n|\r|\n", "<br>", value)
+        return normalized.replace("\\", "\\\\").replace("|", "\\|")
+
+    @staticmethod
+    def _escape_figure_alt(value: str) -> str:
+        normalized = re.sub(r"\r\n|\r|\n", " ", value)
+        return (
+            normalized.replace("\\", "\\\\")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
 
     @staticmethod
     def _write_text(path: Path, content: str) -> None:
@@ -501,27 +620,46 @@ class CanonicalArtifactStore:
         if self._is_link_or_reparse_point(bundle):
             raise ValueError(f"canonical bundle cannot be a symbolic link: {bundle}")
 
-        missing = [name for name in sorted(_REQUIRED_FILES) if not (bundle / name).is_file()]
-        if not (bundle / "assets").is_dir():
+        expected_entries = _REQUIRED_FILES | {"assets"}
+        actual_entries: set[str] = set()
+        linked_entries: list[str] = []
+        entry_stats: dict[str, os.stat_result] = {}
+        for entry in bundle.iterdir():
+            entry_stat = entry.lstat()
+            actual_entries.add(entry.name)
+            entry_stats[entry.name] = entry_stat
+            if self._is_link_or_reparse_point(entry):
+                linked_entries.append(entry.name)
+        if actual_entries != expected_entries:
+            missing_entries = sorted(expected_entries.difference(actual_entries))
+            extra_entries = sorted(actual_entries.difference(expected_entries))
+            if missing_entries and not extra_entries:
+                raise ValueError(
+                    "incomplete canonical bundle; missing required artifacts: "
+                    + ", ".join(missing_entries)
+                )
+            raise ValueError(
+                "canonical top-level bundle inventory mismatch; "
+                f"missing={missing_entries}, extra={extra_entries}"
+            )
+        if linked_entries:
+            raise ValueError(
+                "canonical bundle cannot contain a symbolic link: "
+                + ", ".join(sorted(linked_entries))
+            )
+
+        missing = [
+            name
+            for name in sorted(_REQUIRED_FILES)
+            if not stat.S_ISREG(entry_stats[name].st_mode)
+        ]
+        if not stat.S_ISDIR(entry_stats["assets"].st_mode):
             missing.append("assets/")
         if missing:
             raise ValueError(
                 "incomplete canonical bundle; missing required artifacts: "
                 + ", ".join(missing)
             )
-        linked_artifacts = [
-            name
-            for name in sorted(_REQUIRED_FILES)
-            if self._is_link_or_reparse_point(bundle / name)
-        ]
-        if self._is_link_or_reparse_point(bundle / "assets"):
-            linked_artifacts.append("assets/")
-        if linked_artifacts:
-            raise ValueError(
-                "canonical bundle cannot contain a symbolic link: "
-                + ", ".join(linked_artifacts)
-            )
-
         with (bundle / "canonical.md").open("r", encoding="utf-8") as markdown_file:
             if markdown_file.read(4) != "---\n":
                 raise ValueError("canonical.md must start with YAML front matter")

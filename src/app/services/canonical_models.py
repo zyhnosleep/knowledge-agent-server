@@ -24,6 +24,23 @@ BlockType = Literal[
     "appendix",
     "reference",
 ]
+TableStatus = Literal[
+    "parsed",
+    "accepted_mineru",
+    "repaired_by_vision",
+    "cross_page_merged",
+    "validation_failed",
+]
+AnalysisStatus = Literal["pending", "complete", "failed", "skipped"]
+QualitySeverity = Literal["info", "warning", "error", "fatal"]
+QualityStatus = Literal[
+    "pending",
+    "accepted",
+    "accepted_with_warnings",
+    "rejected",
+    "validation_failed",
+]
+CanonicalDocumentStatus = Literal["draft", "staged", "ready", "failed"]
 
 
 class CanonicalModel(BaseModel):
@@ -63,6 +80,25 @@ class SourceSpan(CanonicalModel):
         if x1 < x0 or y1 < y0:
             raise ValueError("bbox coordinates must satisfy x1 >= x0 and y1 >= y0")
         return value
+
+    @field_validator("normalized_bbox")
+    @classmethod
+    def validate_normalized_bbox_range(cls, value: BBox | None) -> BBox | None:
+        if value is not None and any(coordinate < 0.0 or coordinate > 1.0 for coordinate in value):
+            raise ValueError("normalized_bbox coordinates must be within 0..1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_ranges(self) -> SourceSpan:
+        if (self.line_start is None) != (self.line_end is None):
+            raise ValueError("line_start and line_end must be provided together")
+        if self.line_start is not None and self.line_end < self.line_start:
+            raise ValueError("line_end must be >= line_start")
+        if (self.char_start is None) != (self.char_end is None):
+            raise ValueError("char_start and char_end must be provided together")
+        if self.char_start is not None and self.char_end < self.char_start:
+            raise ValueError("char_end must be >= char_start")
+        return self
 
 
 class CanonicalBlock(CanonicalModel):
@@ -121,7 +157,7 @@ class CanonicalTable(CanonicalModel):
     normalized_markdown: str | None = None
     footnotes: list[str] = Field(default_factory=list)
     source_spans: list[SourceSpan] = Field(default_factory=list)
-    status: str = "parsed"
+    status: TableStatus = "parsed"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -132,7 +168,7 @@ class CanonicalFigure(CanonicalModel):
     asset_path: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     nearby_block_ids: list[str] = Field(default_factory=list)
-    analysis_status: str | None = None
+    analysis_status: AnalysisStatus = "pending"
     ai_figure_type: str | None = None
     ai_axes: list[JsonValue] | dict[str, JsonValue] = Field(default_factory=dict)
     ai_legend: list[str] = Field(default_factory=list)
@@ -152,7 +188,7 @@ class CanonicalFormula(CanonicalModel):
     description: str | None = None
     source_spans: list[SourceSpan] = Field(default_factory=list)
     nearby_block_ids: list[str] = Field(default_factory=list)
-    analysis_status: str | None = None
+    analysis_status: AnalysisStatus = "pending"
     ai_variable_explanations: (
         list[dict[str, JsonValue]]
         | dict[str, JsonValue]
@@ -177,7 +213,7 @@ class CanonicalAsset(CanonicalModel):
 
 class CanonicalQualityIssue(CanonicalModel):
     code: str
-    severity: str
+    severity: QualitySeverity
     message: str
     block_ids: list[str] = Field(default_factory=list)
     repairable: bool = False
@@ -186,7 +222,7 @@ class CanonicalQualityIssue(CanonicalModel):
 
 class CanonicalQualityReport(CanonicalModel):
     accepted: bool = False
-    status: str = "pending"
+    status: QualityStatus = "pending"
     score: float | None = Field(default=None, ge=0.0, le=1.0)
     issues: list[CanonicalQualityIssue] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
@@ -224,4 +260,4 @@ class CanonicalDocument(CanonicalModel):
     parser_metadata: dict[str, Any] = Field(default_factory=dict)
     quality: CanonicalQualityReport = Field(default_factory=CanonicalQualityReport)
     warnings: list[str] = Field(default_factory=list)
-    status: str = "draft"
+    status: CanonicalDocumentStatus = "draft"

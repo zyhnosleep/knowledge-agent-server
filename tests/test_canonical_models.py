@@ -135,6 +135,52 @@ def test_invalid_source_span_bbox_is_rejected(bbox: list[float]) -> None:
         SourceSpan(bbox=bbox)
 
 
+@pytest.mark.parametrize(
+    "normalized_bbox",
+    [
+        [-0.01, 0.0, 0.5, 1.0],
+        [0.0, 0.0, 1.01, 1.0],
+        [0.9, 0.0, 0.8, 0.8],
+        [0.0, 0.9, 0.9, 0.8],
+    ],
+)
+def test_invalid_normalized_bbox_is_rejected(normalized_bbox: list[float]) -> None:
+    with pytest.raises(ValidationError):
+        SourceSpan(normalized_bbox=normalized_bbox)
+
+
+def test_normalized_bbox_accepts_unit_boundaries() -> None:
+    span = SourceSpan(normalized_bbox=[0.0, 0.0, 1.0, 1.0])
+
+    assert span.normalized_bbox == (0.0, 0.0, 1.0, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"line_start": 1}, "line_start and line_end"),
+        ({"line_end": 1}, "line_start and line_end"),
+        ({"char_start": 1}, "char_start and char_end"),
+        ({"char_end": 1}, "char_start and char_end"),
+        ({"line_start": 3, "line_end": 2}, "line_end must be >= line_start"),
+        ({"char_start": 3, "char_end": 2}, "char_end must be >= char_start"),
+    ],
+)
+def test_source_span_line_and_char_ranges_are_consistent(
+    kwargs: dict[str, int],
+    match: str,
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        SourceSpan(**kwargs)
+
+
+def test_source_span_accepts_complete_equal_ranges() -> None:
+    span = SourceSpan(line_start=2, line_end=2, char_start=5, char_end=5)
+
+    assert span.line_end == span.line_start
+    assert span.char_end == span.char_start
+
+
 def test_source_span_supports_all_adapter_coordinates() -> None:
     span = SourceSpan(
         page_index=0,
@@ -406,3 +452,64 @@ def test_formula_variable_explanations_reject_non_json_values() -> None:
             latex="x",
             ai_variable_explanations={"x": {1, 2}},
         )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "parsed",
+        "accepted_mineru",
+        "repaired_by_vision",
+        "cross_page_merged",
+        "validation_failed",
+    ],
+)
+def test_table_status_accepts_canonical_states(status: str) -> None:
+    assert CanonicalTable(table_id="table", status=status).status == status
+
+
+@pytest.mark.parametrize("status", ["pending", "complete", "failed", "skipped"])
+def test_analysis_status_accepts_canonical_states(status: str) -> None:
+    assert CanonicalFigure(figure_id="figure", analysis_status=status).analysis_status == status
+    assert CanonicalFormula(
+        formula_id="formula", latex="x", analysis_status=status
+    ).analysis_status == status
+
+
+@pytest.mark.parametrize("severity", ["info", "warning", "error", "fatal"])
+def test_quality_severity_accepts_canonical_states(severity: str) -> None:
+    issue = CanonicalQualityIssue(code="code", severity=severity, message="message")
+    assert issue.severity == severity
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "accepted", "accepted_with_warnings", "rejected", "validation_failed"],
+)
+def test_quality_status_accepts_canonical_states(status: str) -> None:
+    assert CanonicalQualityReport(status=status).status == status
+
+
+@pytest.mark.parametrize("status", ["draft", "staged", "ready", "failed"])
+def test_document_status_accepts_canonical_states(status: str) -> None:
+    assert CanonicalDocument(status=status).status == status
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: CanonicalTable(table_id="table", status="parseed"),
+        lambda: CanonicalFigure(figure_id="figure", analysis_status="complet"),
+        lambda: CanonicalFormula(
+            formula_id="formula", latex="x", analysis_status="complet"
+        ),
+        lambda: CanonicalQualityIssue(
+            code="code", severity="warn", message="message"
+        ),
+        lambda: CanonicalQualityReport(status="acceptd"),
+        lambda: CanonicalDocument(status="redy"),
+    ],
+)
+def test_canonical_state_typos_are_rejected(factory: object) -> None:
+    with pytest.raises(ValidationError):
+        factory()
