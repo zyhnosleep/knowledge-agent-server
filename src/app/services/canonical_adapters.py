@@ -29,6 +29,7 @@ from app.services.canonical_models import (
     CanonicalDocument,
     CanonicalFigure,
     CanonicalFormula,
+    CanonicalQualityIssue,
     CanonicalTable,
     SectionNode,
     SourceSpan,
@@ -3217,6 +3218,13 @@ def _extract_explicit_abstract(candidates: list[str]) -> str | None:
         r"(?:(?::|\uff1a|-|\u2014)\s*(?P<inline>.*))?$"
     )
     atx_heading = re.compile(r"^\s*#{1,6}\s+\S")
+    plain_section_heading = re.compile(
+        r"(?i)^\s*(?:(?:\d+(?:\.\d+)*)\.?\s+)?introduction\s*:?\s*$"
+        r"|^\s*keywords?\s*(?::.*)?$"
+    )
+
+    def is_section_boundary(line: str) -> bool:
+        return bool(atx_heading.match(line) or plain_section_heading.fullmatch(line))
 
     def abstract_part(value: str) -> tuple[bool, str]:
         lines = value.strip().splitlines()
@@ -3232,7 +3240,7 @@ def _extract_explicit_abstract(candidates: list[str]) -> str | None:
         if inline:
             body_lines.append(inline)
         for line in lines[1:]:
-            if atx_heading.match(line):
+            if is_section_boundary(line):
                 break
             body_lines.append(line)
         return True, "\n".join(body_lines).strip()
@@ -3248,12 +3256,12 @@ def _extract_explicit_abstract(candidates: list[str]) -> str | None:
             next_value = next_candidate.strip()
             if not next_value:
                 continue
-            if atx_heading.match(next_value):
+            if is_section_boundary(next_value):
                 break
             lines = next_value.splitlines()
             collected: list[str] = []
             for line in lines:
-                if atx_heading.match(line):
+                if is_section_boundary(line):
                     break
                 collected.append(line)
             if collected:
@@ -3464,29 +3472,133 @@ def _reconcile_repair_assets(
     return list(by_path.values())
 
 
+def _block_structure_type(block: CanonicalBlock) -> str | None:
+    if block.table_id or block.block_type == "table":
+        return "table"
+    if block.figure_id or block.block_type == "figure":
+        return "figure"
+    if block.formula_id or block.block_type == "formula":
+        return "formula"
+    return None
+
+
+def _issue_replacement_types(issues: list[CanonicalQualityIssue]) -> set[str]:
+    replacements: set[str] = set()
+    for issue in issues:
+        if issue.code.startswith("table_"):
+            replacements.add("table")
+        elif issue.code.startswith("figure_"):
+            replacements.add("figure")
+        elif issue.code.startswith("formula_"):
+            replacements.add("formula")
+    return replacements
+
+
+def _structures_on_pages(structures: list, page_indices: set[int]) -> list:
+    return [
+        structure
+        for structure in structures
+        if _structure_on_pages(structure, page_indices)
+    ]
+
+
+def _targeted_repair_satisfies_issues(
+    primary: CanonicalDocument,
+    repair: CanonicalDocument,
+    candidate: CanonicalDocument,
+    issues: list[CanonicalQualityIssue],
+    page_indices: set[int],
+) -> bool:
+    from app.services.canonical_quality import CanonicalQualityGate
+
+    unresolved = {
+        (issue.code, issue.repair_scope)
+        for issue in candidate.quality.issues
+        if issue.repairable
+    }
+    for issue in issues:
+        if (issue.code, issue.repair_scope) in unresolved:
+            return False
+        if issue.code == "abstract_missing" and not (repair.abstract or "").strip():
+            return False
+
+    inventories = (
+        (primary.tables, repair.tables, candidate.tables, "table"),
+        (primary.figures, repair.figures, candidate.figures, "figure"),
+        (primary.formulas, repair.formulas, candidate.formulas, "formula"),
+    )
+    replacement_types = _issue_replacement_types(issues)
+    for original, replacements, merged, structure_type in inventories:
+        for page_index in sorted(page_indices):
+            page = {page_index}
+            original_count = len(_structures_on_pages(original, page))
+            merged_count = len(_structures_on_pages(merged, page))
+            if merged_count < original_count:
+                return False
+            if structure_type in replacement_types:
+                replacement_items = _structures_on_pages(replacements, page)
+                if len(replacement_items) < original_count:
+                    return False
+                if structure_type == "table" and any(
+                    CanonicalQualityGate._invalid_table_reasons(table)
+                    for table in replacement_items
+                ):
+                    return False
+    return True
+
+
 def _merge_pdf_page_repairs(
     primary: CanonicalDocument,
     repair: CanonicalDocument,
     page_indices: set[int],
+    issues: list[CanonicalQualityIssue] | None = None,
 ) -> CanonicalDocument:
-    primary.blocks = [
-        block for block in primary.blocks if not _block_on_pages(block, page_indices)
-    ] + [block.model_copy(deep=True) for block in repair.blocks]
-    primary.tables = [
-        table for table in primary.tables if not _structure_on_pages(table, page_indices)
-    ] + [table.model_copy(deep=True) for table in repair.tables]
-    primary.figures = [
-        figure for figure in primary.figures if not _structure_on_pages(figure, page_indices)
-    ] + [figure.model_copy(deep=True) for figure in repair.figures]
-    primary.assets = _reconcile_repair_assets(
-        primary.assets,
-        repair.assets,
-        primary.figures,
-        page_indices,
+    replacement_types = (
+        {"table", "figure", "formula"}
+        if issues is None
+        else _issue_replacement_types(issues)
     )
-    primary.formulas = [
-        formula for formula in primary.formulas if not _structure_on_pages(formula, page_indices)
-    ] + [formula.model_copy(deep=True) for formula in repair.formulas]
+    replace_page_text = issues is None or any(
+        issue.code == "abstract_missing" or not issue.code.startswith(
+            ("table_", "figure_", "formula_")
+        )
+        for issue in issues
+    )
+
+    def replace_block(block: CanonicalBlock) -> bool:
+        if not _block_on_pages(block, page_indices):
+            return False
+        structure_type = _block_structure_type(block)
+        if structure_type is not None:
+            return structure_type in replacement_types
+        return replace_page_text
+
+    primary.blocks = [block for block in primary.blocks if not replace_block(block)] + [
+        block.model_copy(deep=True)
+        for block in repair.blocks
+        if (
+            (_block_structure_type(block) in replacement_types)
+            or (_block_structure_type(block) is None and replace_page_text)
+        )
+    ]
+    if "table" in replacement_types:
+        primary.tables = [
+            table for table in primary.tables if not _structure_on_pages(table, page_indices)
+        ] + [table.model_copy(deep=True) for table in repair.tables]
+    if "figure" in replacement_types:
+        primary.figures = [
+            figure for figure in primary.figures if not _structure_on_pages(figure, page_indices)
+        ] + [figure.model_copy(deep=True) for figure in repair.figures]
+        primary.assets = _reconcile_repair_assets(
+            primary.assets,
+            repair.assets,
+            primary.figures,
+            page_indices,
+        )
+    if "formula" in replacement_types:
+        primary.formulas = [
+            formula for formula in primary.formulas if not _structure_on_pages(formula, page_indices)
+        ] + [formula.model_copy(deep=True) for formula in repair.formulas]
     if repair.abstract and repair.abstract.strip():
         primary.abstract = repair.abstract
 
@@ -3559,6 +3671,7 @@ class PDFCanonicalAdapter:
                 for issue in report.issues
                 if issue.repairable and issue.repair_scope
             ]
+            repair_issues = [issue for issue in report.issues if issue.repairable]
             targeted_pages = _repair_page_indices(repair_scopes, page_count)
             if not fatal and repair_scopes and targeted_pages and parser.settings.document_intelligence_enabled:
                 try:
@@ -3598,6 +3711,7 @@ class PDFCanonicalAdapter:
                         mineru_document.model_copy(deep=True),
                         repair,
                         targeted_pages,
+                        issues=repair_issues,
                     )
                     _attach_pdf_audit(
                         candidate,
@@ -3609,11 +3723,21 @@ class PDFCanonicalAdapter:
                         repair_scopes=repair_scopes,
                     )
                     repaired_report = gate.evaluate(candidate)
-                    if not any(
-                        issue.severity == "fatal" for issue in repaired_report.issues
+                    if (
+                        not any(
+                            issue.severity == "fatal"
+                            for issue in repaired_report.issues
+                        )
+                        and _targeted_repair_satisfies_issues(
+                            mineru_document,
+                            repair,
+                            candidate,
+                            repair_issues,
+                            targeted_pages,
+                        )
                     ):
                         return _finalize_pdf_audit(candidate)
-                    attempts.append("document_intelligence:targeted:rejected")
+                    attempts.append("document_intelligence:targeted:incomplete")
                     _attach_pdf_audit(
                         mineru_document,
                         page_count=page_count,

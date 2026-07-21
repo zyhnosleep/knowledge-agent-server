@@ -376,6 +376,35 @@ def test_explicit_abstract_stops_at_next_markdown_heading(
     assert canonical_adapters._extract_explicit_abstract(candidates) == expected
 
 
+@pytest.mark.parametrize(
+    "section_heading",
+    ["Introduction", "1 Introduction", "1. Introduction", "Keywords: RAG, MinerU"],
+)
+def test_plain_pdf_abstract_stops_at_common_section_heading(
+    section_heading: str,
+) -> None:
+    raw_page = (
+        "Abstract\nSource abstract sentence one.\nSource abstract sentence two.\n\n"
+        f"{section_heading}\nSection content must not be included."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "Source abstract sentence one.\nSource abstract sentence two."
+    )
+
+
+def test_plain_pdf_abstract_keeps_introduction_word_inside_body_sentence() -> None:
+    raw_page = (
+        "Abstract\nThis sentence provides an introduction to the method.\n"
+        "A second abstract sentence follows."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "This sentence provides an introduction to the method.\n"
+        "A second abstract sentence follows."
+    )
+
+
 def test_pdf_uses_mineru_when_text_layer_extraction_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -564,6 +593,235 @@ def test_pdf_incomplete_targeted_repair_preserves_mineru_without_full_fallback(
     assert result.metadata["primary_parser"] == "mineru"
     assert result.quality.status == "validation_failed"
     assert any("targeted:partial" in attempt for attempt in result.metadata["parser_attempts"])
+
+
+def _table_document(
+    table: CanonicalTable,
+    *,
+    parser_source: str,
+) -> CanonicalDocument:
+    return CanonicalDocument(
+        document_id=f"doc-{parser_source}",
+        parser_source=parser_source,
+        parse_version="canonical-v1",
+        title="Paper",
+        blocks=[
+            _block("Page narrative", parser_source=parser_source),
+            CanonicalBlock(
+                block_id=f"{table.table_id}-block",
+                block_type="table",
+                text=table.normalized_markdown or table.source_markdown or "table",
+                reading_order=1,
+                source_spans=[SourceSpan(page_index=0, page_label="1")],
+                parser_source=parser_source,
+                table_id=table.table_id,
+            ),
+        ],
+        tables=[table],
+        metadata={"expected_page_count": 1, "parsed_page_indices": [0]},
+    )
+
+
+def test_table_repair_with_narrative_only_preserves_invalid_mineru_table(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    invalid = CanonicalTable(
+        table_id="mineru-invalid",
+        headers=["Model", "F1"],
+        rows=[["SAC-KG"]],
+        cells=[
+            CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+        ],
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+    mineru = _table_document(invalid, parser_source="mineru")
+    narrative_only = _document(
+        _block("DI returned only prose", parser_source="document_intelligence"),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+    narrative_only.parser_source = "document_intelligence"
+    calls: list[set[int] | None] = []
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(parser, "_extract_pdf_text_layer", lambda _path: (["Body"], 1))
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+
+    def fake_di(_path, _page_count, _page_texts, page_indices=None):
+        calls.append(None if page_indices is None else set(page_indices))
+        return narrative_only
+
+    monkeypatch.setattr(canonical_adapters, "run_document_intelligence", fake_di)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert calls == [{0}]
+    assert [table.table_id for table in result.tables] == ["mineru-invalid"]
+    assert result.quality.accepted is False
+    assert any(issue.code == "table_invalid" for issue in result.quality.issues)
+    assert any("targeted:incomplete" in attempt for attempt in result.metadata["parser_attempts"])
+
+
+def test_table_repair_with_valid_replacement_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    invalid = CanonicalTable(
+        table_id="mineru-invalid",
+        headers=["Model", "F1"],
+        rows=[["SAC-KG"]],
+        cells=[
+            CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+        ],
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+    replacement = CanonicalTable(
+        table_id="di-valid",
+        headers=["Model", "F1"],
+        rows=[["SAC-KG", "74.7"]],
+        cells=[
+            CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+            CanonicalCell(text="74.7", row_index=1, column_index=1),
+        ],
+        normalized_markdown=(
+            "| Model | F1 |\n| --- | --- |\n| SAC-KG | 74.7 |"
+        ),
+        source_spans=[SourceSpan(page_index=0, page_label="1")],
+    )
+    mineru = _table_document(invalid, parser_source="mineru")
+    repaired = _table_document(replacement, parser_source="document_intelligence")
+    calls: list[set[int] | None] = []
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(parser, "_extract_pdf_text_layer", lambda _path: (["Body"], 1))
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+
+    def fake_di(_path, _page_count, _page_texts, page_indices=None):
+        calls.append(None if page_indices is None else set(page_indices))
+        return repaired
+
+    monkeypatch.setattr(canonical_adapters, "run_document_intelligence", fake_di)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert calls == [{0}]
+    assert [table.table_id for table in result.tables] == ["di-valid"]
+    assert result.quality.accepted is True
+    assert all(issue.code != "table_invalid" for issue in result.quality.issues)
+
+
+def test_table_repair_requires_replacement_inventory_on_each_target_page() -> None:
+    def invalid_table(table_id: str, page: int) -> CanonicalTable:
+        return CanonicalTable(
+            table_id=table_id,
+            headers=["A", "B"],
+            rows=[["1"]],
+            cells=[
+                CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text="1", row_index=1, column_index=0),
+            ],
+            source_spans=[SourceSpan(page_index=page, page_label=str(page + 1))],
+        )
+
+    def valid_table(table_id: str, page: int) -> CanonicalTable:
+        return CanonicalTable(
+            table_id=table_id,
+            headers=["A", "B"],
+            rows=[["1", "2"]],
+            cells=[
+                CanonicalCell(text="A", row_index=0, column_index=0, is_header=True),
+                CanonicalCell(text="B", row_index=0, column_index=1, is_header=True),
+                CanonicalCell(text="1", row_index=1, column_index=0),
+                CanonicalCell(text="2", row_index=1, column_index=1),
+            ],
+            source_spans=[SourceSpan(page_index=page, page_label=str(page + 1))],
+        )
+
+    primary = _document(
+        _block("Page one", page=0),
+        _block("Page two", order=1, page=1),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    primary.tables = [invalid_table("bad-1", 0), invalid_table("bad-2", 1)]
+    repair = _document(
+        _block("Page one repair", page=0, parser_source="document_intelligence"),
+        _block("Page two prose", order=1, page=1, parser_source="document_intelligence"),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+    repair.tables = [valid_table("fixed-1", 0), valid_table("fixed-2-wrong-page", 0)]
+    original_report = CanonicalQualityGate().evaluate(primary)
+    repair_issues = [issue for issue in original_report.issues if issue.repairable]
+    candidate = canonical_adapters._merge_pdf_page_repairs(
+        primary.model_copy(deep=True),
+        repair,
+        {0, 1},
+        issues=repair_issues,
+    )
+    CanonicalQualityGate().evaluate(candidate)
+
+    assert canonical_adapters._targeted_repair_satisfies_issues(
+        primary,
+        repair,
+        candidate,
+        repair_issues,
+        {0, 1},
+    ) is False
+
+
+def test_abstract_repair_without_explicit_abstract_preserves_mineru_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    mineru = _document(
+        _block("Original MinerU page"),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+    prose_only = _document(
+        _block("DI prose without the source abstract", parser_source="document_intelligence"),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+    prose_only.parser_source = "document_intelligence"
+    calls: list[set[int] | None] = []
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(
+        parser,
+        "_extract_pdf_text_layer",
+        lambda _path: (["Abstract\nSource abstract"], 1),
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+
+    def fake_di(_path, _page_count, _page_texts, page_indices=None):
+        calls.append(None if page_indices is None else set(page_indices))
+        return prose_only
+
+    monkeypatch.setattr(canonical_adapters, "run_document_intelligence", fake_di)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert calls == [{0}]
+    assert [block.text for block in result.blocks] == ["Original MinerU page"]
+    assert result.abstract is None
+    assert any(issue.code == "abstract_missing" for issue in result.quality.issues)
+    assert any("targeted:incomplete" in attempt for attempt in result.metadata["parser_attempts"])
 
 
 def test_pdf_audit_preserves_best_effort_text_layer_warnings(
