@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+  <title>Canonical HTML Study</title>
+  <style>.hidden { display: none; }</style>
+  <script>window.secret = "script-content";</script>
+</head>
+<body>
+  <nav>Navigation content must not become a block.</nav>
+  <h1 id="study-title">Canonical HTML Study</h1>
+  <section id="methods">
+    <h2>Methods</h2>
+    <p id="method-summary">The adapter follows DOM reading order.</p>
+    <pre id="example-code"><code class="language-python">result = parse(source)</code></pre>
+    <table id="results-table">
+      <caption>Evaluation results</caption>
+      <thead><tr><th rowspan="2">Metric</th><th colspan="2">Score</th></tr></thead>
+      <tbody><tr><td>Recall</td><td>0.91</td><td>high</td></tr></tbody>
+    </table>
+    <figure id="evaluation-figure">
+      <img src="figures/evaluation.png" alt="Evaluation curve">
+      <figcaption>Figure 1. Evaluation curve</figcaption>
+    </figure>
+    <div id="loss-equation" class="math" data-latex="L = -\log p(y|x)"><p>Rendered loss</p></div>
+  </section>
+  <noscript>noscript-content</noscript>
+  <template>template-content</template>
+</body>
+</html>

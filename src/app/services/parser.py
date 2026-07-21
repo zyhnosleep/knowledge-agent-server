@@ -52,11 +52,45 @@ def parse_document(path: Path) -> ParsedDocument:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         return _parse_pdf(path)
-    if suffix == ".docx":
-        return _parse_docx(path)
-    if suffix in {".html", ".htm"}:
-        return _parse_html(path)
-    return _parse_text(path)
+    from app.services.canonical_adapters import parse_canonical_document
+
+    return _canonical_to_parsed_document(parse_canonical_document(path))
+
+
+def _canonical_to_parsed_document(document) -> ParsedDocument:
+    chunks = [
+        ParsedChunk(
+            ordinal=block.reading_order,
+            text=block.text,
+            heading=block.section_path[-1] if block.section_path else None,
+            page_label=next(
+                (span.page_label for span in block.source_spans if span.page_label is not None),
+                None,
+            ),
+        )
+        for block in document.blocks
+    ]
+    metadata = dict(document.parser_metadata)
+    metadata.update(
+        {
+            "canonical": {
+                "document_id": document.document_id,
+                "parse_version": document.parse_version,
+                "parser_source": document.parser_source,
+                "source_path": document.source_path,
+                "source_media_type": document.source_media_type,
+                "warnings": list(document.warnings),
+            },
+            "parser_metadata": dict(document.parser_metadata),
+            "source_metadata": dict(document.source_metadata),
+        }
+    )
+    return ParsedDocument(
+        title=document.title,
+        text="\n\n".join(block.text for block in document.blocks),
+        chunks=chunks,
+        metadata=metadata,
+    )
 
 
 def _parse_pdf(path: Path) -> ParsedDocument:
