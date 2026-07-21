@@ -34,6 +34,7 @@ _REQUIRED_FILES = {
 }
 _REQUIRED_MANIFEST_FIELDS = {
     "canonical_markdown_sha256",
+    "input_fingerprint",
     "document_id",
     "version",
     "parser",
@@ -112,6 +113,15 @@ class CanonicalArtifactStore:
             raise ValueError(
                 f"parse_version {document.parse_version!r} does not match {version!r}"
             )
+        self._validate_record_contract(
+            document.blocks,
+            document.tables,
+            document.figures,
+            document.formulas,
+            document.assets,
+            document.outline,
+            document.quality,
+        )
         document_root = self._prepare_document_root(document_id, create=True)
         final = document_root / version
         if final.exists():
@@ -133,17 +143,19 @@ class CanonicalArtifactStore:
                 raise ValueError(
                     f"existing staging bundle is invalid: {existing_staging}"
                 ) from exc
+            incoming_asset_hashes = self._resolve_asset_hashes(document.assets)
+            incoming_payload = self._build_persisted_input_payload(
+                document_id,
+                version,
+                document,
+                incoming_asset_hashes,
+            )
+            manifest = self._read_json(existing_staging / "manifest.json")
+            if manifest["input_fingerprint"] != self._input_fingerprint(
+                incoming_payload
+            ):
+                raise ValueError("existing staging input fingerprint mismatch")
             return existing_staging
-
-        self._validate_record_contract(
-            document.blocks,
-            document.tables,
-            document.figures,
-            document.formulas,
-            document.assets,
-            document.outline,
-            document.quality,
-        )
 
         staging = document_root / f"{version}.staging-{uuid4().hex}"
         staging.mkdir()
@@ -304,6 +316,39 @@ class CanonicalArtifactStore:
             asset_hashes[asset.asset_id] = actual_sha256
         return asset_hashes
 
+    def _resolve_asset_hashes(
+        self,
+        assets: list[CanonicalAsset],
+    ) -> dict[str, str]:
+        asset_hashes: dict[str, str] = {}
+        for asset in assets:
+            if asset.sha256 is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", asset.sha256
+            ):
+                raise ValueError(
+                    f"asset sha256 must be lowercase 64-hex for {asset.asset_id!r}"
+                )
+            if asset.source_path is None:
+                if asset.sha256 is None:
+                    raise FileNotFoundError(
+                        "asset source or persisted sha256 is required for "
+                        f"{asset.asset_id!r}"
+                    )
+                asset_hashes[asset.asset_id] = asset.sha256
+                continue
+
+            source = Path(asset.source_path)
+            if not source.is_file():
+                raise FileNotFoundError(f"asset source does not exist: {source}")
+            actual_sha256 = self._sha256(source)
+            if asset.sha256 is not None and actual_sha256 != asset.sha256:
+                raise ValueError(
+                    f"asset sha256 mismatch for {asset.asset_id!r}: "
+                    f"expected {asset.sha256}, got {actual_sha256}"
+                )
+            asset_hashes[asset.asset_id] = actual_sha256
+        return asset_hashes
+
     @staticmethod
     def _asset_destination(staging: Path, asset_path: str) -> Path:
         posix_path = CanonicalArtifactStore._validate_asset_relative_path(asset_path)
@@ -329,8 +374,9 @@ class CanonicalArtifactStore:
             raise ValueError(f"asset path escapes assets directory: {asset_path!r}") from exc
         return destination
 
-    @staticmethod
+    @classmethod
     def _build_manifest(
+        cls,
         document_id: str,
         version: str,
         document: CanonicalDocument,
@@ -338,16 +384,43 @@ class CanonicalArtifactStore:
         canonical_markdown_sha256: str,
         asset_hashes: dict[str, str],
     ) -> dict[str, Any]:
+        payload = cls._build_persisted_input_payload(
+            document_id,
+            version,
+            document,
+            asset_hashes,
+        )
+        return {
+            "canonical_markdown_sha256": canonical_markdown_sha256,
+            "input_fingerprint": cls._input_fingerprint(payload),
+            "document_id": payload["document_id"],
+            "version": payload["version"],
+            "document": payload["document"],
+            "parser": payload["parser"],
+            "source": payload["source"],
+            "quality": payload["quality"],
+            "warnings": payload["warnings"],
+            "assets": payload["assets"],
+            "status": payload["status"],
+        }
+
+    @classmethod
+    def _build_persisted_input_payload(
+        cls,
+        document_id: str,
+        version: str,
+        document: CanonicalDocument,
+        asset_hashes: dict[str, str],
+    ) -> dict[str, Any]:
         assets = []
         for asset in document.assets:
-            item = CanonicalArtifactStore._bundle_model_dump(
+            item = cls._bundle_model_dump(
                 asset,
                 exclude={"source_path"},
             )
             item["sha256"] = asset_hashes[asset.asset_id]
             assets.append(item)
-        return {
-            "canonical_markdown_sha256": canonical_markdown_sha256,
+        payload = {
             "document_id": document_id,
             "version": version,
             "document": {
@@ -355,7 +428,7 @@ class CanonicalArtifactStore:
                 "abstract": document.abstract,
                 "keywords": document.keywords,
                 "outline": [
-                    CanonicalArtifactStore._bundle_model_dump(section)
+                    cls._bundle_model_dump(section)
                     for section in document.outline
                 ],
                 "metadata": document.metadata,
@@ -365,15 +438,30 @@ class CanonicalArtifactStore:
                 "metadata": document.parser_metadata,
             },
             "source": {
-                "path": CanonicalArtifactStore._safe_source_path(document.source_path),
+                "path": cls._safe_source_path(document.source_path),
                 "media_type": document.source_media_type,
                 "metadata": document.source_metadata,
             },
-            "quality": CanonicalArtifactStore._bundle_model_dump(document.quality),
+            "quality": cls._bundle_model_dump(document.quality),
             "warnings": document.warnings,
             "assets": assets,
             "status": document.status,
+            "blocks": [cls._bundle_model_dump(block) for block in document.blocks],
+            "tables": [cls._bundle_model_dump(table) for table in document.tables],
+            "figures": [cls._bundle_model_dump(figure) for figure in document.figures],
+            "formulas": [cls._bundle_model_dump(formula) for formula in document.formulas],
         }
+        return cls._sanitize_metadata_paths(payload)
+
+    @staticmethod
+    def _input_fingerprint(payload: dict[str, Any]) -> str:
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest()
 
     @staticmethod
     def _render_markdown(
@@ -500,7 +588,7 @@ class CanonicalArtifactStore:
             alt = CanonicalArtifactStore._escape_figure_alt(
                 figure.caption or figure.figure_id
             )
-            destination = quote(figure.asset_path, safe="/%")
+            destination = quote(figure.asset_path, safe="/")
             lines.extend([f"![{alt}]({destination})", ""])
         if figure.description:
             lines.extend([figure.description, ""])
@@ -682,6 +770,13 @@ class CanonicalArtifactStore:
         if manifest.get("document_id") != document_id or manifest.get("version") != version:
             raise ValueError("canonical manifest identity does not match promotion target")
         self._validate_manifest_fields(manifest)
+        input_fingerprint = manifest["input_fingerprint"]
+        if not isinstance(input_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", input_fingerprint
+        ):
+            raise ValueError(
+                "canonical manifest input_fingerprint must be lowercase 64-hex"
+            )
         markdown_sha256 = manifest["canonical_markdown_sha256"]
         if not isinstance(markdown_sha256, str) or not re.fullmatch(
             r"[0-9a-f]{64}", markdown_sha256
@@ -742,6 +837,39 @@ class CanonicalArtifactStore:
             quality,
         )
         self._validate_asset_tree(bundle, assets)
+        persisted_document = CanonicalDocument(
+            document_id=document_id,
+            parse_version=version,
+            source_path=manifest["source"]["path"],
+            source_media_type=manifest["source"]["media_type"],
+            source_metadata=manifest["source"]["metadata"],
+            parser_source=manifest["parser"]["source"],
+            parser_metadata=manifest["parser"]["metadata"],
+            title=manifest["document"]["title"],
+            abstract=manifest["document"]["abstract"],
+            keywords=manifest["document"]["keywords"],
+            outline=outline,
+            metadata=manifest["document"]["metadata"],
+            blocks=blocks,
+            tables=tables,
+            figures=figures,
+            formulas=formulas,
+            assets=assets,
+            quality=quality,
+            warnings=manifest["warnings"],
+            status=manifest["status"],
+        )
+        persisted_asset_hashes = {
+            asset.asset_id: asset.sha256 for asset in assets if asset.sha256 is not None
+        }
+        persisted_payload = self._build_persisted_input_payload(
+            document_id,
+            version,
+            persisted_document,
+            persisted_asset_hashes,
+        )
+        if self._input_fingerprint(persisted_payload) != input_fingerprint:
+            raise ValueError("canonical input fingerprint mismatch")
 
     @classmethod
     def _validate_record_contract(

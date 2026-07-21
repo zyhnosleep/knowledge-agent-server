@@ -883,7 +883,7 @@ def test_fallback_table_and_figure_markdown_escape_special_characters(
     assert "H\\\\2" in markdown
     assert "a\\|b" in markdown
     assert "line1<br>line2" in markdown
-    assert "![alt \\[caption\\]\\\\value next](assets/figures/figure%20one.png)" in markdown
+    assert "![alt \\[caption\\]\\\\value next](assets/figures/figure%2520one.png)" in markdown
 
 
 def test_fallback_table_rejects_rows_with_wrong_width(
@@ -1245,6 +1245,87 @@ def test_write_staging_is_idempotent_and_reuses_valid_bundle(
     assert second == first
     assert list((tmp_path / "doc-1").glob("canonical-v1-abcd.staging-*")) == [first]
     assert store.promote("doc-1", "canonical-v1-abcd").is_dir()
+
+
+def test_write_staging_rejects_reuse_with_different_canonical_input(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    first = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    changed = canonical_document.model_copy(deep=True)
+    changed.source_path = "different/source.pdf"
+    changed.title = "Different title"
+    changed.parser_metadata = {"backend_version": "9.9.9"}
+    changed.blocks[0].text = "Different source paragraph."
+
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        store.write_staging("doc-1", "canonical-v1-abcd", changed)
+
+    assert list((tmp_path / "doc-1").glob("canonical-v1-abcd.staging-*")) == [first]
+
+
+def test_write_staging_validates_incoming_records_before_reusing_bundle(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    first = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    broken = canonical_document.model_copy(deep=True)
+    broken.blocks[0].table_id = "missing-table"
+
+    with pytest.raises(ValueError, match="broken block reference"):
+        store.write_staging("doc-1", "canonical-v1-abcd", broken)
+
+    assert list((tmp_path / "doc-1").glob("canonical-v1-abcd.staging-*")) == [first]
+
+
+def test_promote_rejects_blocks_tampered_without_updating_input_fingerprint(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    blocks_path = staging / "blocks.jsonl"
+    blocks = [json.loads(line) for line in blocks_path.read_text("utf-8").splitlines()]
+    blocks[0]["text"] = "Tampered block text."
+    blocks_path.write_text(
+        "\n".join(json.dumps(block) for block in blocks) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_promote_rejects_invalid_input_fingerprint_format(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["input_fingerprint"] = "not-a-fingerprint"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input_fingerprint must be lowercase 64-hex"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_markdown_percent_encodes_literal_percent_in_asset_path(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.figures[0].asset_path = "assets/figure%20one.png"
+    canonical_document.assets[0].path = "assets/figure%20one.png"
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+
+    markdown = (staging / "canonical.md").read_text("utf-8")
+    assert "](assets/figure%2520one.png)" in markdown
+    assert (staging / "assets" / "figure%20one.png").is_file()
 
 
 def test_write_staging_rejects_existing_final_without_orphan(
