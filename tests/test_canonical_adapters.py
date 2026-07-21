@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 from base64 import b64decode
 from pathlib import Path
@@ -8,9 +10,12 @@ import pytest
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.rel import _Relationship
 from docx.shared import Inches
 from lxml import html as lxml_html
 
+from app.services import canonical_artifacts
 from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services import canonical_adapters
 from app.services.canonical_adapters import (
@@ -50,6 +55,24 @@ def _write_png(path: Path) -> None:
             "x8AAusB9Wl2nKsAAAAASUVORK5CYII="
         )
     )
+
+
+def _append_relationship_image(paragraph, relationship_id: str, *, linked: bool) -> None:
+    drawing = OxmlElement("w:drawing")
+    inline = OxmlElement("wp:inline")
+    graphic = OxmlElement("a:graphic")
+    graphic_data = OxmlElement("a:graphicData")
+    picture = OxmlElement("pic:pic")
+    blip_fill = OxmlElement("pic:blipFill")
+    blip = OxmlElement("a:blip")
+    blip.set(qn("r:link" if linked else "r:embed"), relationship_id)
+    blip_fill.append(blip)
+    picture.append(blip_fill)
+    graphic_data.append(picture)
+    graphic.append(graphic_data)
+    inline.append(graphic)
+    drawing.append(inline)
+    paragraph._p.append(drawing)
 
 
 def _write_structured_docx(path: Path, image_path: Path) -> None:
@@ -303,7 +326,8 @@ def test_markdown_setext_inline_image_and_fence_payload_are_exact(tmp_path: Path
     assert [block.block_type for block in inline] == ["narrative", "figure", "narrative"]
     assert [block.text.strip() for block in inline] == ["before", "Inline alt", "after"]
     figure = document.figures[0]
-    assert figure.asset_path == "images/chart one.png"
+    assert figure.asset_path is None
+    assert figure.metadata["target"] == "images/chart one.png"
     assert figure.metadata["title"] == "Chart title"
     for block in inline:
         span = block.source_spans[0]
@@ -351,19 +375,20 @@ print("ok")
         source = source_file.read()
     document = parse_canonical_document(path)
     assert document.blocks[0].text == "title#"
-    assert [figure.asset_path for figure in document.figures] == [
+    assert [figure.metadata["target"] for figure in document.figures] == [
         "plots/a_(b).png",
         "nested.png",
         "images/reference chart.png",
         "collapsed.png",
     ]
+    assert all(figure.asset_path is None for figure in document.figures)
     assert [figure.caption for figure in document.figures] == [
         "Balanced",
         "Nested [alt]",
         "Reference",
         "Collapsed",
     ]
-    assert all("skip-" not in figure.asset_path for figure in document.figures)
+    assert all("skip-" not in figure.metadata["target"] for figure in document.figures)
     code = next(block for block in document.blocks if block.metadata.get("kind") == "code")
     assert code.metadata["language"] == "python"
     assert code.metadata["info"] == "python linenos"
@@ -389,7 +414,8 @@ def test_markdown_reference_definitions_inside_fences_are_ignored(tmp_path: Path
 
     document = parse_canonical_document(path)
 
-    assert [figure.asset_path for figure in document.figures] == ["visible.png"]
+    assert [figure.metadata["target"] for figure in document.figures] == ["visible.png"]
+    assert document.figures[0].asset_path is None
     assert any("![Hidden][hidden]" in block.text for block in document.blocks)
 
 
@@ -1174,3 +1200,420 @@ def test_compatibility_parse_document_preserves_long_canonical_block(tmp_path: P
     assert parsed.text == content
     assert parsed.metadata["format"] == "text"
     assert parsed.metadata["canonical"]["parser_source"] == "text"
+
+
+@pytest.mark.parametrize(
+    ("suffix", "source"),
+    [
+        (
+            ".md",
+            "![local](images/chart%20one.png?download=1#view)\n\n"
+            "![remote](https://example.test/chart.png)\n\n"
+            "![inline](data:image/png;base64,AAAA)\n\n![empty]()\n",
+        ),
+        (
+            ".html",
+            '<img alt="local" src="images/chart%20one.png?download=1#view">'
+            '<img alt="remote" src="https://example.test/chart.png">'
+            '<img alt="inline" src="data:image/png;base64,AAAA">'
+            '<img alt="empty" src="">',
+        ),
+    ],
+)
+def test_local_figure_assets_round_trip_and_nonlocal_targets_stay_metadata_only(
+    tmp_path: Path, suffix: str, source: str
+) -> None:
+    source_dir = tmp_path / "paper"
+    image_dir = source_dir / "images"
+    image_dir.mkdir(parents=True)
+    image = image_dir / "chart one.png"
+    _write_png(image)
+    path = source_dir / f"paper{suffix}"
+    path.write_text(source, encoding="utf-8")
+
+    document = parse_canonical_document(path)
+
+    assert len(document.figures) == 4
+    local, remote, inline, empty = document.figures
+    assert local.asset_path and local.asset_path.startswith("assets/")
+    assert remote.asset_path is None
+    assert inline.asset_path is None
+    assert empty.asset_path is None
+    assert len(document.assets) == 1
+    asset = document.assets[0]
+    expected_hash = hashlib.sha256(image.read_bytes()).hexdigest()
+    assert asset.sha256 == expected_hash
+    assert Path(asset.source_path) == image.resolve()
+    assert asset.path == local.asset_path
+    assert any("not materialized" in warning.lower() for warning in document.warnings)
+
+    store = CanonicalArtifactStore(tmp_path / "artifacts")
+    staging = store.write_staging(document.document_id, document.parse_version, document)
+    assert (staging / asset.path).read_bytes() == image.read_bytes()
+    final = store.promote(document.document_id, document.parse_version)
+    loaded = store.load(document.document_id, document.parse_version)
+    assert (final / loaded.assets[0].path).read_bytes() == image.read_bytes()
+    assert loaded.assets[0].sha256 == expected_hash
+    assert loaded.figures[0].asset_path == loaded.assets[0].path
+
+
+def test_absolute_file_uri_figure_target_is_materialized(tmp_path: Path) -> None:
+    image = tmp_path / "absolute image.png"
+    _write_png(image)
+    path = tmp_path / "absolute.html"
+    path.write_text(f'<img alt="absolute" src="{image.as_uri()}">', encoding="utf-8")
+
+    document = parse_canonical_document(path)
+
+    assert document.figures[0].asset_path == document.assets[0].path
+    assert Path(document.assets[0].source_path) == image.resolve()
+
+
+def test_repeated_local_figure_content_uses_one_canonical_asset(tmp_path: Path) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    _write_png(first)
+    shutil.copy2(first, second)
+    path = tmp_path / "deduplicated.md"
+    path.write_text("![first](first.png)\n\n![second](second.png)\n", encoding="utf-8")
+
+    document = parse_canonical_document(path)
+
+    assert len(document.assets) == 1
+    assert {figure.asset_path for figure in document.figures} == {document.assets[0].path}
+    assert len(document.assets[0].source_spans) == 2
+
+
+def test_missing_and_linked_local_figure_targets_are_not_declared_as_assets(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "paper"
+    source_dir.mkdir()
+    real = source_dir / "real.png"
+    _write_png(real)
+    link = source_dir / "linked.png"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+    path = source_dir / "paper.md"
+    path.write_text("![missing](missing.png)\n\n![linked](linked.png)\n", encoding="utf-8")
+
+    document = parse_canonical_document(path)
+
+    assert not document.assets
+    assert all(figure.asset_path is None for figure in document.figures)
+    assert all(figure.metadata["target"] for figure in document.figures)
+    assert len(document.warnings) >= 2
+
+
+def test_adapter_table_limits_match_artifact_store_contract() -> None:
+    assert canonical_adapters.MAX_TABLE_ROWS == canonical_artifacts._MAX_TABLE_ROWS
+    assert canonical_adapters.MAX_TABLE_COLUMNS == canonical_artifacts._MAX_TABLE_COLUMNS
+    assert canonical_adapters.MAX_TABLE_GRID_CELLS == canonical_artifacts._MAX_TABLE_GRID_CELLS
+
+
+def test_html_table_column_limit_is_checked_before_grid_allocation(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed.html"
+    allowed.write_text('<table><tr><td colspan="1000">ok</td></tr></table>', encoding="utf-8")
+    assert parse_canonical_document(allowed).tables[0].cells[0].colspan == 1000
+
+    rejected = tmp_path / "too-wide.html"
+    rejected.write_text('<table><tr><td colspan="1001">no</td></tr></table>', encoding="utf-8")
+    with pytest.raises(DocumentParseError, match=r"too-wide\.html: HTML table.*column"):
+        parse_canonical_document(rejected)
+
+
+def test_html_table_grid_cell_limit_is_checked_before_padding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(canonical_adapters, "MAX_TABLE_GRID_CELLS", 4)
+    boundary = tmp_path / "boundary.html"
+    boundary.write_text(
+        '<table><tr><td colspan="2">a</td></tr><tr><td colspan="2">b</td></tr></table>',
+        encoding="utf-8",
+    )
+    assert len(parse_canonical_document(boundary).tables[0].rows) == 2
+
+    rejected = tmp_path / "too-many-cells.html"
+    rejected.write_text(
+        '<table><tr><td colspan="3">a</td></tr><tr><td colspan="3">b</td></tr></table>',
+        encoding="utf-8",
+    )
+    with pytest.raises(DocumentParseError, match=r"too-many-cells\.html: HTML table.*grid"):
+        parse_canonical_document(rejected)
+
+
+def test_html_table_row_limit_is_checked_before_cell_parsing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(canonical_adapters, "MAX_TABLE_ROWS", 1)
+    path = tmp_path / "too-many-rows.html"
+    path.write_text("<table><tr><td>1</td></tr><tr><td>2</td></tr></table>", encoding="utf-8")
+    with pytest.raises(DocumentParseError, match=r"too-many-rows\.html: HTML table.*row"):
+        parse_canonical_document(path)
+
+
+def test_docx_table_grid_span_limit_is_checked_before_grid_allocation(tmp_path: Path) -> None:
+    path = tmp_path / "too-wide.docx"
+    source = Document()
+    table = source.add_table(rows=1, cols=1)
+    grid_span = OxmlElement("w:gridSpan")
+    grid_span.set(qn("w:val"), "1001")
+    table.cell(0, 0)._tc.get_or_add_tcPr().append(grid_span)
+    source.save(path)
+
+    with pytest.raises(DocumentParseError, match=r"too-wide\.docx: DOCX table.*column"):
+        parse_canonical_document(path)
+
+
+def test_docx_table_grid_before_limit_is_checked_before_grid_allocation(tmp_path: Path) -> None:
+    path = tmp_path / "grid-before.docx"
+    source = Document()
+    table = source.add_table(rows=1, cols=1)
+    raw_row = table._tbl.findall(qn("w:tr"))[0]
+    row_properties = OxmlElement("w:trPr")
+    grid_before = OxmlElement("w:gridBefore")
+    grid_before.set(qn("w:val"), "1001")
+    row_properties.append(grid_before)
+    raw_row.insert(0, row_properties)
+    source.save(path)
+
+    with pytest.raises(DocumentParseError, match=r"grid-before\.docx: DOCX table.*column"):
+        parse_canonical_document(path)
+
+
+def test_docx_grid_before_counts_toward_projected_grid_before_padding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(canonical_adapters, "MAX_TABLE_GRID_CELLS", 4)
+    path = tmp_path / "grid-before-cells.docx"
+    source = Document()
+    table = source.add_table(rows=2, cols=1)
+    for raw_row in table._tbl.findall(qn("w:tr")):
+        for raw_cell in raw_row.findall(qn("w:tc")):
+            raw_row.remove(raw_cell)
+        row_properties = OxmlElement("w:trPr")
+        grid_before = OxmlElement("w:gridBefore")
+        grid_before.set(qn("w:val"), "3")
+        row_properties.append(grid_before)
+        raw_row.insert(0, row_properties)
+    source.save(path)
+
+    with pytest.raises(DocumentParseError, match=r"grid-before-cells\.docx: DOCX table.*grid"):
+        parse_canonical_document(path)
+
+
+def test_identical_html_siblings_have_distinct_identity_locators_and_ids(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "identical.html"
+    path.write_text(
+        "<html><body>"
+        "<table><tr><td>same</td></tr></table><table><tr><td>same</td></tr></table>"
+        '<img src="https://example.test/same.png" alt="same">'
+        '<img src="https://example.test/same.png" alt="same">'
+        '<math><mi>x</mi></math><math><mi>x</mi></math>'
+        "</body></html>",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+    table_locators = [table.source_spans[0].xpath for table in document.tables]
+    figure_locators = [figure.source_spans[0].xpath for figure in document.figures]
+    formula_locators = [formula.source_spans[0].xpath for formula in document.formulas]
+    assert len(set(table_locators)) == 2
+    assert len(set(figure_locators)) == 2
+    assert len(set(formula_locators)) == 2
+    assert len({table.table_id for table in document.tables}) == 2
+    assert len({figure.figure_id for figure in document.figures}) == 2
+    assert len({formula.formula_id for formula in document.formulas}) == 2
+
+    store = CanonicalArtifactStore(tmp_path / "artifacts")
+    store.write_staging(document.document_id, document.parse_version, document)
+    store.promote(document.document_id, document.parse_version)
+    loaded = store.load(document.document_id, document.parse_version)
+    assert len(loaded.tables) == len(loaded.figures) == len(loaded.formulas) == 2
+
+
+def test_docx_external_linked_image_is_metadata_only_and_never_reads_target_part(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "external.docx"
+    source = Document()
+    paragraph = source.add_paragraph()
+    relationship_id = paragraph.part.relate_to(
+        "https://example.test/chart.png", RT.IMAGE, is_external=True
+    )
+    _append_relationship_image(paragraph, relationship_id, linked=True)
+    source.save(path)
+
+    document = parse_canonical_document(path)
+
+    assert len(document.figures) == 1
+    assert document.figures[0].asset_path is None
+    assert document.figures[0].metadata["relationship_target"] == "https://example.test/chart.png"
+    assert document.figures[0].metadata["external"] is True
+    assert not document.assets
+    assert any("external" in warning.lower() for warning in document.warnings)
+
+
+def test_docx_missing_image_relationship_warns_and_skips(tmp_path: Path) -> None:
+    path = tmp_path / "missing-relation.docx"
+    source = Document()
+    paragraph = source.add_paragraph()
+    _append_relationship_image(paragraph, "rId404", linked=False)
+    source.save(path)
+
+    document = parse_canonical_document(path)
+
+    assert not document.figures
+    assert not document.assets
+    assert any("relationship" in warning.lower() for warning in document.warnings)
+
+
+def test_docx_asset_cache_io_failure_is_wrapped_with_source_and_cause(
+    monkeypatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "cache-failure.docx"
+    shutil.copy2(FIXTURE_DIR / "sample.docx", path)
+
+    def fail_replace(source, destination):
+        raise PermissionError("cache denied")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(DocumentParseError, match=r"cache-failure\.docx:.*cache") as raised:
+        DocxCanonicalAdapter(asset_cache_root=tmp_path / "cache").parse(path)
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
+def test_docx_internal_target_part_failure_is_wrapped_with_source_and_cause(
+    monkeypatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "target-part-failure.docx"
+    shutil.copy2(FIXTURE_DIR / "sample.docx", path)
+    loaded = Document(path)
+    original_getter = _Relationship.target_part.fget
+
+    def fail_image_target(relationship):
+        if relationship.reltype == RT.IMAGE:
+            raise OSError("broken image part")
+        return original_getter(relationship)
+
+    monkeypatch.setattr(canonical_adapters, "DocxDocument", lambda _: loaded)
+    monkeypatch.setattr(_Relationship, "target_part", property(fail_image_target))
+    with pytest.raises(
+        DocumentParseError, match=r"target-part-failure\.docx:.*embedded DOCX image"
+    ) as raised:
+        DocxCanonicalAdapter(asset_cache_root=tmp_path / "cache").parse(path)
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_html_nesting_depth_is_bounded_before_recursive_walk(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(canonical_adapters, "MAX_NESTING_DEPTH", 6)
+    near = tmp_path / "near.html"
+    near.write_text("<div>" * 5 + "<p>ok</p>" + "</div>" * 5, encoding="utf-8")
+    assert any(block.text == "ok" for block in parse_canonical_document(near).blocks)
+
+    over = tmp_path / "over.html"
+    over.write_text("<div>" * 7 + "<p>no</p>" + "</div>" * 7, encoding="utf-8")
+    with pytest.raises(DocumentParseError, match=r"over\.html: HTML nesting depth"):
+        parse_canonical_document(over)
+
+
+def _write_wrapped_depth_docx(path: Path, wrapper_count: int) -> None:
+    source = Document()
+    paragraph = source.add_paragraph("wrapped")
+    body = source.element.body
+    body.remove(paragraph._p)
+    current = paragraph._p
+    for _ in range(wrapper_count):
+        wrapper = OxmlElement("w:sdt")
+        content = OxmlElement("w:sdtContent")
+        content.append(current)
+        wrapper.append(content)
+        current = wrapper
+    body.insert(0, current)
+    source.save(path)
+
+
+def test_docx_wrapper_nesting_depth_is_bounded_without_python_recursion(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(canonical_adapters, "MAX_NESTING_DEPTH", 8)
+    near = tmp_path / "near.docx"
+    _write_wrapped_depth_docx(near, 3)
+    assert any(block.text == "wrapped" for block in parse_canonical_document(near).blocks)
+
+    over = tmp_path / "over.docx"
+    _write_wrapped_depth_docx(over, 5)
+    with pytest.raises(DocumentParseError, match=r"over\.docx: DOCX nesting depth"):
+        parse_canonical_document(over)
+
+
+def test_docx_asset_cache_rejects_linked_root_and_source_hash_directory(tmp_path: Path) -> None:
+    path = tmp_path / "source.docx"
+    shutil.copy2(FIXTURE_DIR / "sample.docx", path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_root = tmp_path / "linked-cache"
+    try:
+        linked_root.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(DocumentParseError, match=r"source\.docx:.*symbolic link|reparse"):
+        DocxCanonicalAdapter(asset_cache_root=linked_root).parse(path)
+
+    real_root = tmp_path / "real-cache"
+    real_root.mkdir()
+    source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    (real_root / source_hash).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(DocumentParseError, match=r"source\.docx:.*symbolic link|reparse"):
+        DocxCanonicalAdapter(asset_cache_root=real_root).parse(path)
+
+
+@pytest.mark.parametrize("linked_component", ["root", "source", "destination"])
+def test_docx_asset_cache_rejects_simulated_reparse_components(
+    monkeypatch, tmp_path: Path, linked_component: str
+) -> None:
+    path = tmp_path / "source.docx"
+    shutil.copy2(FIXTURE_DIR / "sample.docx", path)
+    root = tmp_path / "cache"
+    source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    original = canonical_adapters._is_link_or_reparse_point
+
+    def simulated(candidate: Path) -> bool:
+        candidate = Path(candidate)
+        if linked_component == "root" and candidate == root:
+            return True
+        if linked_component == "source" and candidate == root / source_hash:
+            return True
+        if (
+            linked_component == "destination"
+            and candidate.parent == root / source_hash
+            and candidate.name.startswith("image-")
+            and not candidate.name.endswith(".tmp")
+        ):
+            return True
+        return original(candidate)
+
+    monkeypatch.setattr(canonical_adapters, "_is_link_or_reparse_point", simulated)
+    with pytest.raises(DocumentParseError, match=r"source\.docx:.*symbolic link|reparse"):
+        DocxCanonicalAdapter(asset_cache_root=root).parse(path)
+
+
+@pytest.mark.parametrize("content", ["", " \r\n\t\r\n"])
+def test_compatibility_text_parse_keeps_raw_text_and_emits_fallback_chunk(
+    tmp_path: Path, content: str
+) -> None:
+    path = tmp_path / "blank.custom"
+    path.write_bytes(content.encode("utf-8"))
+
+    parsed = parse_document(path)
+
+    assert parsed.text == content
+    assert len(parsed.chunks) == 1
+    assert parsed.chunks[0].text == content

@@ -5,9 +5,11 @@ import json
 import mimetypes
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -32,6 +34,12 @@ from app.services.canonical_models import (
     SourceSpan,
 )
 from app.services.filesystem import display_title_from_path
+
+
+MAX_TABLE_ROWS = 10_000
+MAX_TABLE_COLUMNS = 1_000
+MAX_TABLE_GRID_CELLS = 1_000_000
+MAX_NESTING_DEPTH = 256
 
 
 class CanonicalAdapter(Protocol):
@@ -84,6 +92,133 @@ def _read_text(path: Path) -> str:
             return source_file.read()
     except (OSError, UnicodeError) as exc:
         raise _parse_error(path, f"Unable to read text: {exc}", exc)
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return False
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    return stat.S_ISLNK(path_stat.st_mode) or bool(file_attributes & reparse_attribute)
+
+
+def _has_link_or_reparse_component(path: Path) -> bool:
+    current = path
+    while True:
+        if _is_link_or_reparse_point(current):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _safe_local_asset_name(path: Path, asset_sha: str) -> str:
+    suffix = path.suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+        suffix = ""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip(". -") or "asset"
+    return f"{asset_sha[:24]}-{stem[:80]}{suffix}"
+
+
+def _register_local_figure_asset(
+    document: CanonicalDocument,
+    raw_target: str | None,
+    span: SourceSpan,
+) -> str | None:
+    target = (raw_target or "").strip()
+    if not target:
+        return None
+
+    source_path = Path(document.source_path or "")
+    try:
+        split = urlsplit(target)
+        scheme = split.scheme.lower()
+        windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", target))
+        if scheme and not windows_absolute and scheme != "file":
+            document.warnings.append(
+                f"Figure target {target!r} is a non-local URI and was not materialized."
+            )
+            return None
+        if scheme == "file":
+            if split.netloc not in {"", "localhost"}:
+                document.warnings.append(
+                    f"Figure target {target!r} is a non-local file URI and was not materialized."
+                )
+                return None
+            decoded = unquote(split.path)
+            if re.match(r"^/[A-Za-z]:/", decoded):
+                decoded = decoded[1:]
+            candidate = Path(decoded)
+        elif windows_absolute:
+            candidate = Path(unquote(target.split("?", 1)[0].split("#", 1)[0]))
+        else:
+            candidate = Path(unquote(split.path))
+            if not candidate.is_absolute():
+                candidate = source_path.parent / candidate
+
+        if (
+            not candidate.exists()
+            or not candidate.is_file()
+            or _has_link_or_reparse_component(candidate)
+        ):
+            document.warnings.append(
+                f"Figure target {target!r} is missing, not a regular file, or is a link; "
+                "it was not materialized."
+            )
+            return None
+        resolved = candidate.resolve(strict=True)
+        with resolved.open("rb") as source:
+            asset_sha = hashlib.file_digest(source, "sha256").hexdigest()
+        size_bytes = resolved.stat().st_size
+    except (OSError, ValueError) as exc:
+        document.warnings.append(
+            f"Figure target {target!r} could not be read and was not materialized: {exc}."
+        )
+        return None
+
+    existing = next((asset for asset in document.assets if asset.sha256 == asset_sha), None)
+    if existing is not None:
+        if span not in existing.source_spans:
+            existing.source_spans.append(span)
+        return existing.path
+
+    safe_name = _safe_local_asset_name(resolved, asset_sha)
+    asset_path = f"assets/{safe_name}"
+    media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+    document.assets.append(
+        CanonicalAsset(
+            asset_id=_stable_id("asset", document.document_id, asset_sha),
+            path=asset_path,
+            media_type=media_type,
+            sha256=asset_sha,
+            source_path=str(resolved),
+            source_spans=[span],
+            metadata={"source_target": target, "size_bytes": size_bytes},
+        )
+    )
+    return asset_path
+
+
+def _raise_table_limit(document: CanonicalDocument, source_format: str, detail: str) -> None:
+    raise _parse_error(
+        Path(document.source_path or f"document.{source_format.lower()}"),
+        f"{source_format} table exceeds canonical {detail} limit.",
+    )
+
+
+def _validate_html_nesting_depth(root: Tag, path: Path) -> None:
+    stack: list[tuple[Tag, int]] = [(root, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_NESTING_DEPTH:
+            raise _parse_error(
+                path,
+                f"HTML nesting depth exceeds the {MAX_NESTING_DEPTH} element limit.",
+            )
+        children = [child for child in node.children if isinstance(child, Tag)]
+        stack.extend((child, depth + 1) for child in reversed(children))
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -615,6 +750,8 @@ class MarkdownCanonicalAdapter:
         target = image.target
         title = image.title
         caption = image.alt or title or None
+        figure_span = span.model_copy(update={"heading_path": builder.heading_path})
+        asset_path = _register_local_figure_asset(document, target, figure_span)
         figure_id = _stable_id(
             "figure", document.document_id, span.char_start, target, caption
         )
@@ -622,8 +759,8 @@ class MarkdownCanonicalAdapter:
             CanonicalFigure(
                 figure_id=figure_id,
                 caption=caption,
-                asset_path=target,
-                source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
+                asset_path=asset_path,
+                source_spans=[figure_span],
                 metadata={
                     "target": target,
                     "alt": image.alt,
@@ -892,7 +1029,10 @@ def _html_selector(element: Tag) -> str:
         siblings = (
             current.parent.find_all(current.name, recursive=False) if current.parent else []
         )
-        position = siblings.index(current) + 1 if current in siblings else 1
+        position = next(
+            (index for index, sibling in enumerate(siblings, start=1) if sibling is current),
+            1,
+        )
         parts.append(f"{current.name}:nth-of-type({position})")
         current = current.parent if isinstance(current.parent, Tag) else None
     return " > ".join(reversed(parts))
@@ -905,7 +1045,10 @@ def _html_xpath(element: Tag) -> str:
         siblings = (
             current.parent.find_all(current.name, recursive=False) if current.parent else []
         )
-        position = siblings.index(current) + 1 if current in siblings else 1
+        position = next(
+            (index for index, sibling in enumerate(siblings, start=1) if sibling is current),
+            1,
+        )
         parts.append(f"{current.name}[{position}]")
         current = current.parent if isinstance(current.parent, Tag) else None
     return "/" + "/".join(reversed(parts))
@@ -931,6 +1074,7 @@ class HtmlCanonicalAdapter:
         path = _validate_path(path)
         source = _read_text(path)
         soup = BeautifulSoup(source, "html.parser")
+        _validate_html_nesting_depth(soup, path)
         html_title = soup.title.get_text(" ", strip=True) if soup.title else ""
         for unwanted in soup.find_all(["script", "style", "nav", "noscript", "template"]):
             unwanted.decompose()
@@ -1273,6 +1417,8 @@ class HtmlCanonicalAdapter:
         grid: list[list[str]] = []
         rowspan_until: dict[int, int] = {}
         direct_rows = [row for row in element.find_all("tr") if row.find_parent("table") is element]
+        if len(direct_rows) > MAX_TABLE_ROWS:
+            _raise_table_limit(document, "HTML", "row count")
         row_groups: list[Tag] = []
         for row in direct_rows:
             group = row.find_parent(["thead", "tbody", "tfoot"])
@@ -1283,6 +1429,7 @@ class HtmlCanonicalAdapter:
         for row_index, group in enumerate(row_groups):
             group_last_row[id(group)] = row_index
         header_row = False
+        maximum_width = 0
         for row_index, row in enumerate(direct_rows):
             occupied = {
                 column for column, last_row in rowspan_until.items() if last_row >= row_index
@@ -1310,6 +1457,8 @@ class HtmlCanonicalAdapter:
                 colspan = cls._safe_span_value(
                     document, cell, "colspan"
                 )
+                if colspan > MAX_TABLE_COLUMNS:
+                    _raise_table_limit(document, "HTML", "column count")
                 while any(
                     logical_column in occupied
                     for logical_column in range(column_index, column_index + colspan)
@@ -1318,6 +1467,11 @@ class HtmlCanonicalAdapter:
                 value = HtmlCanonicalAdapter._cell_text(element, cell)
                 is_header = cell.name == "th"
                 required = column_index + colspan
+                if required > MAX_TABLE_COLUMNS:
+                    _raise_table_limit(document, "HTML", "column count")
+                maximum_width = max(maximum_width, required)
+                if len(direct_rows) * maximum_width > MAX_TABLE_GRID_CELLS:
+                    _raise_table_limit(document, "HTML", "grid cell count")
                 if len(row_values) < required:
                     row_values.extend([""] * (required - len(row_values)))
                 row_values[column_index] = value
@@ -1479,13 +1633,15 @@ class HtmlCanonicalAdapter:
         caption = caption_element.get_text(" ", strip=True) if caption_element else None
         src = image.get("src") if image else None
         alt = image.get("alt") if image else None
+        figure_span = span.model_copy(update={"heading_path": builder.heading_path})
+        asset_path = _register_local_figure_asset(document, src, figure_span)
         figure_id = _stable_id("figure", document.document_id, span.xpath, src, caption)
         document.figures.append(
             CanonicalFigure(
                 figure_id=figure_id,
                 caption=caption or alt,
-                asset_path=src,
-                source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
+                asset_path=asset_path,
+                source_spans=[figure_span],
                 metadata={
                     "src": src,
                     "alt": alt,
@@ -1643,13 +1799,15 @@ class HtmlCanonicalAdapter:
         span = cls._context_span(element, context)
         src = element.get("src")
         alt = element.get("alt")
+        figure_span = span.model_copy(update={"heading_path": builder.heading_path})
+        asset_path = _register_local_figure_asset(document, src, figure_span)
         figure_id = _stable_id("figure", document.document_id, span.xpath, src)
         document.figures.append(
             CanonicalFigure(
                 figure_id=figure_id,
                 caption=alt,
-                asset_path=src,
-                source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
+                asset_path=asset_path,
+                source_spans=[figure_span],
                 metadata={
                     "src": src,
                     "alt": alt,
@@ -1740,7 +1898,7 @@ class DocxCanonicalAdapter:
         paragraph_index = 0
         table_index = 0
 
-        for child, locator in self._iter_docx_blocks(docx.element.body, "body"):
+        for child, locator in self._iter_docx_blocks(docx.element.body, "body", path):
             if isinstance(child, CT_P):
                 paragraph = Paragraph(child, docx)
                 paragraph_id = child.get(qn("w14:paraId")) or f"paragraph-{paragraph_index}"
@@ -1759,6 +1917,7 @@ class DocxCanonicalAdapter:
                     docx,
                     Table(child, docx),
                     locator=locator,
+                    nesting_depth=1,
                 )
                 table_index += table_count
 
@@ -1774,13 +1933,30 @@ class DocxCanonicalAdapter:
         return document
 
     @classmethod
-    def _iter_docx_blocks(cls, container, prefix: str):
-        for child_index, child in enumerate(container.iterchildren()):
-            locator = f"{prefix}/{child_index}"
+    def _iter_docx_blocks(cls, container, prefix: str, source_path: Path):
+        stack: list[tuple[object, str, int]] = []
+        children = list(container.iterchildren())
+        for child_index in reversed(range(len(children))):
+            stack.append((children[child_index], f"{prefix}/{child_index}", 1))
+        while stack:
+            child, locator, depth = stack.pop()
+            if depth > MAX_NESTING_DEPTH:
+                raise _parse_error(
+                    source_path,
+                    f"DOCX nesting depth exceeds the {MAX_NESTING_DEPTH} element limit.",
+                )
             if isinstance(child, (CT_P, CT_Tbl)):
                 yield child, locator
                 continue
-            yield from cls._iter_docx_blocks(child, locator)
+            descendants = list(child.iterchildren())
+            for child_index in reversed(range(len(descendants))):
+                stack.append(
+                    (
+                        descendants[child_index],
+                        f"{locator}/{child_index}",
+                        depth + 1,
+                    )
+                )
 
     def _emit_paragraph(
         self,
@@ -1792,7 +1968,9 @@ class DocxCanonicalAdapter:
         *,
         structures_only: bool = False,
     ) -> None:
-        events = list(self._paragraph_events(paragraph))
+        events = list(
+            self._paragraph_events(paragraph, Path(document.source_path or "document.docx"))
+        )
         style_name = paragraph.style.name if paragraph.style is not None else ""
         heading_match = re.match(r"Heading\s+(\d+)", style_name, re.I)
         heading_text = "".join(self._heading_event_text(event) for event in events)
@@ -1863,13 +2041,27 @@ class DocxCanonicalAdapter:
         return ""
 
     @classmethod
-    def _paragraph_events(cls, paragraph: Paragraph):
-        def walk(node):
+    def _paragraph_events(cls, paragraph: Paragraph, source_path: Path):
+        validation_stack = [(paragraph._p, 0)]
+        while validation_stack:
+            node, depth = validation_stack.pop()
+            if depth > MAX_NESTING_DEPTH:
+                raise _parse_error(
+                    source_path,
+                    f"DOCX nesting depth exceeds the {MAX_NESTING_DEPTH} element limit.",
+                )
+            validation_stack.extend(
+                (child, depth + 1) for child in reversed(list(node.iterchildren()))
+            )
+
+        stack = list(reversed(list(paragraph._p.iterchildren())))
+        while stack:
+            node = stack.pop()
             if node.tag in {qn("m:oMath"), qn("m:oMathPara")}:
                 omml = etree.tostring(node, encoding="unicode")
                 text = "".join(item.text or "" for item in node.iter(qn("m:t"))).strip()
                 yield _DocxEvent("formula", text=text, element=node, metadata={"omml": omml})
-                return
+                continue
             if node.tag in {qn("w:drawing"), qn("w:pict"), qn("w:object")}:
                 doc_properties = next(iter(node.iter(qn("wp:docPr"))), None)
                 metadata = {
@@ -1878,27 +2070,28 @@ class DocxCanonicalAdapter:
                     if doc_properties is not None and doc_properties.get(key)
                 }
                 for blip in node.iter(qn("a:blip")):
+                    embedded_id = blip.get(qn("r:embed"))
+                    linked_id = blip.get(qn("r:link"))
                     yield _DocxEvent(
                         "image",
                         element=blip,
-                        relationship_id=blip.get(qn("r:embed")),
-                        metadata=metadata,
+                        relationship_id=embedded_id or linked_id,
+                        metadata={
+                            **metadata,
+                            "relationship_attribute": "embed" if embedded_id else "link",
+                        },
                     )
-                return
+                continue
             if node.tag in {qn("w:t"), qn("w:instrText")}:
                 yield _DocxEvent("text", text=node.text or "")
-                return
+                continue
             if node.tag == qn("w:tab"):
                 yield _DocxEvent("text", text="\t")
-                return
+                continue
             if node.tag in {qn("w:br"), qn("w:cr")}:
                 yield _DocxEvent("text", text="\n")
-                return
-            for child in node.iterchildren():
-                yield from walk(child)
-
-        for child in paragraph._p.iterchildren():
-            yield from walk(child)
+                continue
+            stack.extend(reversed(list(node.iterchildren())))
 
     def _emit_structure_event(
         self,
@@ -1948,20 +2141,21 @@ class DocxCanonicalAdapter:
     ) -> None:
         relationship_id = event.relationship_id
         if not relationship_id or relationship_id not in docx.part.rels:
-            document.warnings.append("DOCX image has no readable relationship target.")
+            document.warnings.append(
+                f"DOCX image relationship {relationship_id or '<missing>'!r} is missing; image skipped."
+            )
             return
         relationship = docx.part.rels[relationship_id]
-        target_part = relationship.target_part
-        blob = target_part.blob
-        asset_sha = hashlib.sha256(blob).hexdigest()
-        target_name = Path(str(target_part.partname)).name
-        safe_name = self._safe_asset_name(target_name, asset_sha)
-        asset_path = f"assets/{safe_name}"
-        source_path = self._materialize_asset(document, safe_name, blob, asset_sha)
-        media_type = getattr(target_part, "content_type", None) or (
-            mimetypes.guess_type(target_name)[0] or "application/octet-stream"
-        )
-        source_target = str(relationship.target_ref).replace("\\", "/")
+        try:
+            source_target = str(relationship.target_ref).replace("\\", "/")
+        except Exception as exc:
+            raise _parse_error(
+                Path(document.source_path or "document.docx"),
+                f"Unable to read DOCX image relationship {relationship_id}: {exc}",
+                exc,
+            )
+        metadata = event.metadata or {}
+        caption = metadata.get("descr") or metadata.get("title") or metadata.get("name")
         heading_link = {
             key: value
             for key, value in {
@@ -1981,6 +2175,74 @@ class DocxCanonicalAdapter:
                 },
             }
         )
+        figure_id = _stable_id(
+            "figure",
+            document.document_id,
+            span.paragraph_id,
+            span.table_id,
+            span.row_index,
+            span.column_index,
+            relationship_id,
+            event_index,
+        )
+        if relationship.is_external:
+            document.warnings.append(
+                f"DOCX image relationship {relationship_id!r} is external and was not materialized."
+            )
+            document.figures.append(
+                CanonicalFigure(
+                    figure_id=figure_id,
+                    caption=caption,
+                    asset_path=None,
+                    source_spans=[image_span],
+                    metadata={
+                        "relationship_id": relationship_id,
+                        "relationship_target": source_target,
+                        "external": True,
+                        **metadata,
+                        **heading_link,
+                    },
+                )
+            )
+            builder.add_content(
+                caption or source_target or "External image",
+                image_span,
+                block_type="figure",
+                figure_id=figure_id,
+                metadata={
+                    "relationship_id": relationship_id,
+                    "relationship_target": source_target,
+                    "external": True,
+                    **metadata,
+                    **heading_link,
+                },
+            )
+            return
+
+        try:
+            target_part = relationship.target_part
+            blob = target_part.blob
+            asset_sha = hashlib.sha256(blob).hexdigest()
+            target_name = Path(str(target_part.partname)).name
+            safe_name = self._safe_asset_name(target_name, asset_sha)
+            asset_path = f"assets/{safe_name}"
+            source_path = self._materialize_asset(
+                document, safe_name, blob, asset_sha
+            )
+            media_type = getattr(target_part, "content_type", None) or (
+                mimetypes.guess_type(target_name)[0] or "application/octet-stream"
+            )
+        except Exception as exc:
+            from app.services.parser import DocumentParseError
+
+            if isinstance(exc, DocumentParseError):
+                raise
+            raise _parse_error(
+                Path(document.source_path or "document.docx"),
+                f"Unable to read embedded DOCX image {relationship_id}: {exc}",
+                exc,
+            )
+
         asset_id = _stable_id("asset", document.document_id, asset_sha)
         if not any(asset.asset_id == asset_id for asset in document.assets):
             document.assets.append(
@@ -1999,18 +2261,6 @@ class DocxCanonicalAdapter:
                     },
                 )
             )
-        metadata = event.metadata or {}
-        caption = metadata.get("descr") or metadata.get("title") or metadata.get("name")
-        figure_id = _stable_id(
-            "figure",
-            document.document_id,
-            span.paragraph_id,
-            span.table_id,
-            span.row_index,
-            span.column_index,
-            relationship_id,
-            event_index,
-        )
         document.figures.append(
             CanonicalFigure(
                 figure_id=figure_id,
@@ -2041,30 +2291,96 @@ class DocxCanonicalAdapter:
         blob: bytes,
         expected_sha: str,
     ) -> Path:
-        root = self.asset_cache_root
-        if root is None:
-            root = get_settings().cache_dir / "canonical_adapter_assets"
-        source_sha = str(document.source_metadata["sha256"])
-        directory = Path(root).expanduser().resolve() / source_sha
-        directory.mkdir(parents=True, exist_ok=True)
-        destination = directory / safe_name
-        if destination.is_file() and self._file_sha256(destination) == expected_sha:
-            return destination
-        temporary = directory / f".{safe_name}.{uuid4().hex}.tmp"
+        source_path = Path(document.source_path or "document.docx")
         try:
+            root = self.asset_cache_root
+            if root is None:
+                root = get_settings().cache_dir / "canonical_adapter_assets"
+            root = Path(root).expanduser()
+            if _is_link_or_reparse_point(root):
+                raise ValueError("asset cache root is a symbolic link or reparse point")
+            root.mkdir(parents=True, exist_ok=True)
+            if _is_link_or_reparse_point(root):
+                raise ValueError("asset cache root is a symbolic link or reparse point")
+            resolved_root = root.resolve(strict=True)
+
+            source_sha = str(document.source_metadata["sha256"])
+            if not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+                raise ValueError("DOCX source sha256 must be lowercase 64-hex")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+                raise ValueError("DOCX asset sha256 must be lowercase 64-hex")
+
+            directory = root / source_sha
+            if _is_link_or_reparse_point(directory):
+                raise ValueError(
+                    "asset cache source directory is a symbolic link or reparse point"
+                )
+            directory.mkdir(exist_ok=True)
+            if _is_link_or_reparse_point(directory):
+                raise ValueError(
+                    "asset cache source directory is a symbolic link or reparse point"
+                )
+            resolved_directory = directory.resolve(strict=True)
+            try:
+                resolved_directory.relative_to(resolved_root)
+            except ValueError as exc:
+                raise ValueError("asset cache source directory escapes cache root") from exc
+            if resolved_directory.parent != resolved_root:
+                raise ValueError("asset cache source directory is not directly under cache root")
+
+            destination = directory / safe_name
+            if _is_link_or_reparse_point(destination):
+                raise ValueError(
+                    "asset cache destination is a symbolic link or reparse point"
+                )
+            if destination.parent.resolve(strict=True) != resolved_directory:
+                raise ValueError("asset cache destination escapes source directory")
+            if destination.is_file() and self._file_sha256(destination) == expected_sha:
+                return destination.resolve(strict=True)
+
+            temporary = directory / f".{safe_name}.{uuid4().hex}.tmp"
+            if _is_link_or_reparse_point(temporary):
+                raise ValueError(
+                    "asset cache temporary path is a symbolic link or reparse point"
+                )
             with temporary.open("xb") as output:
                 output.write(blob)
                 output.flush()
                 os.fsync(output.fileno())
+            if _is_link_or_reparse_point(temporary):
+                raise ValueError(
+                    "asset cache temporary path became a symbolic link or reparse point"
+                )
             if self._file_sha256(temporary) != expected_sha:
                 raise ValueError("materialized DOCX asset hash mismatch")
+            if _is_link_or_reparse_point(destination):
+                raise ValueError(
+                    "asset cache destination is a symbolic link or reparse point"
+                )
             os.replace(temporary, destination)
+            if _is_link_or_reparse_point(destination):
+                raise ValueError(
+                    "asset cache destination became a symbolic link or reparse point"
+                )
+            if self._file_sha256(destination) != expected_sha:
+                raise ValueError("persisted DOCX asset hash mismatch")
+            return destination.resolve(strict=True)
+        except Exception as exc:
+            raise _parse_error(
+                source_path,
+                f"Unable to materialize DOCX asset in cache: {exc}",
+                exc,
+            )
         finally:
-            if temporary.exists():
-                temporary.unlink()
-        if self._file_sha256(destination) != expected_sha:
-            raise ValueError("persisted DOCX asset hash mismatch")
-        return destination
+            temporary_path = locals().get("temporary")
+            if isinstance(temporary_path, Path):
+                try:
+                    if temporary_path.exists() and not _is_link_or_reparse_point(
+                        temporary_path
+                    ):
+                        temporary_path.unlink()
+                except OSError:
+                    pass
 
     @staticmethod
     def _safe_asset_name(target_name: str, asset_sha: str) -> str:
@@ -2147,6 +2463,7 @@ class DocxCanonicalAdapter:
         parent_table_id: str | None = None,
         parent_row_index: int | None = None,
         parent_column_index: int | None = None,
+        nesting_depth: int = 1,
     ) -> int:
         table_id = _stable_id("table", document.document_id, "docx", locator)
         context = {
@@ -2164,10 +2481,18 @@ class DocxCanonicalAdapter:
         active_merges: dict[int, CanonicalCell] = {}
         cell_entries: list[tuple[_Cell, int, int, str]] = []
         raw_rows = list(table._tbl.findall(qn("w:tr")))
+        if len(raw_rows) > MAX_TABLE_ROWS:
+            _raise_table_limit(document, "DOCX", "row count")
 
+        maximum_width = 0
         for row_index, raw_row in enumerate(raw_rows):
             row_values: list[str] = []
             column_index = self._grid_before(raw_row)
+            if column_index > MAX_TABLE_COLUMNS:
+                _raise_table_limit(document, "DOCX", "column count")
+            maximum_width = max(maximum_width, column_index)
+            if len(raw_rows) * maximum_width > MAX_TABLE_GRID_CELLS:
+                _raise_table_limit(document, "DOCX", "grid cell count")
             if column_index:
                 row_values.extend([""] * column_index)
             continued: set[int] = set()
@@ -2175,11 +2500,18 @@ class DocxCanonicalAdapter:
             for raw_cell in raw_row.findall(qn("w:tc")):
                 cell = _Cell(raw_cell, table)
                 colspan = self._docx_grid_span(raw_cell)
+                if colspan > MAX_TABLE_COLUMNS:
+                    _raise_table_limit(document, "DOCX", "column count")
                 vmerge = raw_cell.tcPr.vMerge
                 merge_value = str(vmerge.val).lower() if vmerge is not None else ""
                 is_restart = vmerge is not None and merge_value == "restart"
                 is_continue = vmerge is not None and not is_restart
                 required = column_index + colspan
+                if required > MAX_TABLE_COLUMNS:
+                    _raise_table_limit(document, "DOCX", "column count")
+                maximum_width = max(maximum_width, required)
+                if len(raw_rows) * maximum_width > MAX_TABLE_GRID_CELLS:
+                    _raise_table_limit(document, "DOCX", "grid cell count")
                 if len(row_values) < required:
                     row_values.extend([""] * (required - len(row_values)))
                 cell_locator = f"{locator}/cell-{row_index}-{column_index}"
@@ -2262,6 +2594,7 @@ class DocxCanonicalAdapter:
                 parent_table_id=table_id,
                 parent_row_index=row_index,
                 parent_column_index=column_index,
+                base_depth=nesting_depth,
             )
         return 1 + nested_table_count
 
@@ -2276,48 +2609,65 @@ class DocxCanonicalAdapter:
         parent_table_id: str,
         parent_row_index: int,
         parent_column_index: int,
+        base_depth: int,
     ) -> int:
         nested_table_count = 0
 
-        def walk(container, locator_prefix: str) -> None:
-            nonlocal nested_table_count
-            for child_index, child in enumerate(container.iterchildren()):
-                child_locator = f"{locator_prefix}/{child_index}"
-                if isinstance(child, CT_P):
-                    paragraph = Paragraph(child, cell)
-                    paragraph_id = child.get(qn("w14:paraId")) or child_locator.replace(
-                        "/", "-"
+        stack: list[tuple[object, str, int]] = []
+        children = list(cell._tc.iterchildren())
+        for child_index in reversed(range(len(children))):
+            stack.append(
+                (children[child_index], f"{prefix}/{child_index}", base_depth + 1)
+            )
+        while stack:
+            child, child_locator, depth = stack.pop()
+            if depth > MAX_NESTING_DEPTH:
+                raise _parse_error(
+                    Path(document.source_path or "document.docx"),
+                    f"DOCX nesting depth exceeds the {MAX_NESTING_DEPTH} element limit.",
+                )
+            if isinstance(child, CT_P):
+                paragraph = Paragraph(child, cell)
+                paragraph_id = child.get(qn("w14:paraId")) or child_locator.replace(
+                    "/", "-"
+                )
+                self._emit_paragraph(
+                    document,
+                    builder,
+                    docx,
+                    paragraph,
+                    SourceSpan(
+                        paragraph_id=paragraph_id,
+                        table_id=parent_table_id,
+                        row_index=parent_row_index,
+                        column_index=parent_column_index,
+                        metadata={"locator": child_locator},
+                    ),
+                    structures_only=True,
+                )
+                continue
+            if isinstance(child, CT_Tbl):
+                nested_table_count += self._add_table(
+                    document,
+                    builder,
+                    docx,
+                    Table(child, cell),
+                    locator=child_locator,
+                    parent_table_id=parent_table_id,
+                    parent_row_index=parent_row_index,
+                    parent_column_index=parent_column_index,
+                    nesting_depth=depth,
+                )
+                continue
+            descendants = list(child.iterchildren())
+            for descendant_index in reversed(range(len(descendants))):
+                stack.append(
+                    (
+                        descendants[descendant_index],
+                        f"{child_locator}/{descendant_index}",
+                        depth + 1,
                     )
-                    self._emit_paragraph(
-                        document,
-                        builder,
-                        docx,
-                        paragraph,
-                        SourceSpan(
-                            paragraph_id=paragraph_id,
-                            table_id=parent_table_id,
-                            row_index=parent_row_index,
-                            column_index=parent_column_index,
-                            metadata={"locator": child_locator},
-                        ),
-                        structures_only=True,
-                    )
-                    continue
-                if isinstance(child, CT_Tbl):
-                    nested_table_count += self._add_table(
-                        document,
-                        builder,
-                        docx,
-                        Table(child, cell),
-                        locator=child_locator,
-                        parent_table_id=parent_table_id,
-                        parent_row_index=parent_row_index,
-                        parent_column_index=parent_column_index,
-                    )
-                    continue
-                walk(child, child_locator)
-
-        walk(cell._tc, prefix)
+                )
         return nested_table_count
 
     @staticmethod

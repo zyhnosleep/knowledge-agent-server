@@ -54,7 +54,18 @@ def parse_document(path: Path) -> ParsedDocument:
         return _parse_pdf(path)
     from app.services.canonical_adapters import parse_canonical_document
 
-    return _canonical_to_parsed_document(parse_canonical_document(path))
+    canonical = parse_canonical_document(path)
+    parsed = _canonical_to_parsed_document(canonical)
+    if canonical.parser_source == "text":
+        try:
+            with Path(path).open("r", encoding="utf-8", newline="") as source_file:
+                source_text = source_file.read()
+        except (OSError, UnicodeError) as exc:
+            raise DocumentParseError(Path(path), f"Unable to read text: {exc}") from exc
+        parsed.text = source_text
+        if not parsed.chunks:
+            parsed.chunks = [ParsedChunk(ordinal=0, text=source_text)]
+    return parsed
 
 
 def _canonical_to_parsed_document(document) -> ParsedDocument:
