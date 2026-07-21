@@ -136,6 +136,11 @@ def _register_local_figure_asset(
         split = urlsplit(target)
         scheme = split.scheme.lower()
         windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", target))
+        if split.netloc and scheme != "file":
+            document.warnings.append(
+                f"Figure target {target!r} is a non-local URI and was not materialized."
+            )
+            return None
         if scheme and not windows_absolute and scheme != "file":
             document.warnings.append(
                 f"Figure target {target!r} is a non-local URI and was not materialized."

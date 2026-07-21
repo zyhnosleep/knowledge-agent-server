@@ -1257,11 +1257,60 @@ def test_local_figure_assets_round_trip_and_nonlocal_targets_stay_metadata_only(
     assert loaded.figures[0].asset_path == loaded.assets[0].path
 
 
-def test_absolute_file_uri_figure_target_is_materialized(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix", [".md", ".html"])
+def test_protocol_relative_figure_target_is_never_read_as_local_asset(
+    monkeypatch, tmp_path: Path, suffix: str
+) -> None:
+    trap = (tmp_path / "cdn-trap.png").resolve()
+    _write_png(trap)
+    drive = trap.drive
+    protocol_path = trap.as_posix()[len(drive) :] if drive else trap.as_posix()
+    target = f"//cdn.example{protocol_path}"
+    source = (
+        f"![cdn](<{target}>)\n"
+        if suffix == ".md"
+        else f'<img alt="cdn" src="{target}">'
+    )
+    path = tmp_path / f"protocol-relative{suffix}"
+    path.write_text(source, encoding="utf-8")
+    original_open = Path.open
+
+    def reject_trap_open(candidate: Path, *args, **kwargs):
+        if candidate == trap:
+            raise AssertionError("protocol-relative target was opened as a local file")
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", reject_trap_open)
+
+    document = parse_canonical_document(path)
+
+    assert document.figures[0].asset_path is None
+    assert not document.assets
+    raw_target = document.figures[0].metadata.get("target") or document.figures[0].metadata.get(
+        "src"
+    )
+    assert raw_target == target
+    assert any("non-local" in warning.lower() for warning in document.warnings)
+
+    store = CanonicalArtifactStore(tmp_path / f"artifacts-{suffix.lstrip('.')}")
+    store.write_staging(document.document_id, document.parse_version, document)
+    store.promote(document.document_id, document.parse_version)
+    loaded = store.load(document.document_id, document.parse_version)
+    assert loaded.figures[0].asset_path is None
+    assert not loaded.assets
+
+
+@pytest.mark.parametrize("authority", ["", "localhost"])
+def test_absolute_file_uri_figure_target_is_materialized(
+    tmp_path: Path, authority: str
+) -> None:
     image = tmp_path / "absolute image.png"
     _write_png(image)
     path = tmp_path / "absolute.html"
-    path.write_text(f'<img alt="absolute" src="{image.as_uri()}">', encoding="utf-8")
+    image_uri = image.as_uri()
+    if authority:
+        image_uri = image_uri.replace("file:///", f"file://{authority}/", 1)
+    path.write_text(f'<img alt="absolute" src="{image_uri}">', encoding="utf-8")
 
     document = parse_canonical_document(path)
 
