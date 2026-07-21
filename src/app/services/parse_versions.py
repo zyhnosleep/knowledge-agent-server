@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.orm import Session, object_session
 
 from app.models.records import Document, DocumentParseVersion
@@ -104,14 +104,21 @@ class ParseVersionService:
             )
             if locked_version is None:
                 raise ValueError(f"Parse version {version.id!r} does not exist.")
+            database_pointer = self.db.execute(
+                select(Document.active_parse_version)
+                .where(Document.id == locked_document.id)
+                .with_for_update()
+            ).scalar_one()
+            database_status = self.db.execute(
+                select(DocumentParseVersion.status)
+                .where(DocumentParseVersion.id == locked_version.id)
+                .with_for_update()
+            ).scalar_one()
             if locked_version.document_id != locked_document.id:
                 raise ValueError(
                     "Parse version and document must belong to the same document."
                 )
-            if locked_version.status != "ready_to_activate":
-                raise ValueError(
-                    "Parse version must be in ready_to_activate status before activation."
-                )
+            self._validate_activation_status(locked_version, database_status)
             previous_versions = self.db.scalars(
                 select(DocumentParseVersion)
                 .where(
@@ -123,8 +130,7 @@ class ParseVersionService:
             ).all()
 
         activated_at = datetime.utcnow()
-        previous_pointer = locked_document.active_parse_version
-        previous_statuses = [(previous, previous.status) for previous in previous_versions]
+        previous_statuses = [(previous, "active") for previous in previous_versions]
         version_status = locked_version.status
         version_activated_at = locked_version.activated_at
         for previous in previous_versions:
@@ -135,10 +141,44 @@ class ParseVersionService:
         try:
             self.db.flush()
         except Exception:
-            locked_document.active_parse_version = previous_pointer
+            locked_document.active_parse_version = database_pointer
             for previous, status in previous_statuses:
                 previous.status = status
             locked_version.status = version_status
             locked_version.activated_at = version_activated_at
             raise
         return locked_version
+
+    @staticmethod
+    def _validate_activation_status(
+        version: DocumentParseVersion, database_status: str
+    ) -> None:
+        target = "ready_to_activate"
+        if version.status != target:
+            raise ValueError(
+                "Parse version must be in ready_to_activate status before activation."
+            )
+
+        history = sa_inspect(version).attrs.status.history
+        if not history.has_changes():
+            if database_status != target:
+                raise ValueError(
+                    f"Parse version database status is {database_status!r}, not {target!r}; "
+                    "activation aborted."
+                )
+            return
+
+        sources = list(history.deleted)
+        targets = list(history.added)
+        is_valid_local_transition = (
+            len(sources) == 1
+            and targets == [target]
+            and database_status == sources[0]
+            and target in ALLOWED_TRANSITIONS.get(sources[0], set())
+        )
+        if not is_valid_local_transition:
+            source = sources[0] if len(sources) == 1 else None
+            raise ValueError(
+                "Parse version local transition conflicts with database status "
+                f"{database_status!r} (local source {source!r}); activation aborted."
+            )
