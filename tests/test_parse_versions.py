@@ -240,6 +240,28 @@ def test_activate_accepts_valid_unflushed_transition_from_locked_database_state(
     assert activated is version
 
 
+def test_activate_accepts_unflushed_activation_failure_retry(
+    db: Session, document: Document
+) -> None:
+    service = ParseVersionService(db)
+    version = service.create(document.id, "v1", "parsed/document-1/v1")
+    version.status = "activation_failed"
+    db.commit()
+
+    service.retry_failed_stage(version)
+    activated = service.activate(document, version)
+    db.commit()
+
+    with Session(db.get_bind()) as verification:
+        stored_document = verification.get(Document, document.id)
+        stored_version = verification.get(DocumentParseVersion, version.id)
+        assert stored_document is not None
+        assert stored_version is not None
+        assert stored_document.active_parse_version == "v1"
+        assert stored_version.status == "active"
+    assert activated is version
+
+
 def test_activate_rejects_stale_cached_status_from_another_session(
     tmp_path,
 ) -> None:
@@ -361,6 +383,74 @@ def test_stale_pointer_and_active_version_remain_unchanged_on_status_conflict(
         assert stored_document.active_parse_version == "v1"
         assert stored_previous.status == "active"
         assert stored_version.status == "embedding"
+
+
+def test_activation_refreshes_stale_cached_previous_active_version(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{(tmp_path / 'stale-previous.db').as_posix()}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    with factory() as seed:
+        seed.add(Project(id="p1", slug="research", name="Research"))
+        seed.add(
+            Document(
+                id="d1",
+                project_id="p1",
+                title="Paper",
+                file_name="paper.pdf",
+                sha256="abc",
+                raw_path="raw/paper.pdf",
+            )
+        )
+        seed.add_all(
+            [
+                DocumentParseVersion(
+                    id="v1-id",
+                    document_id="d1",
+                    version_key="v1",
+                    status="superseded",
+                    artifact_dir="parsed/d1/v1",
+                ),
+                DocumentParseVersion(
+                    id="v2-id",
+                    document_id="d1",
+                    version_key="v2",
+                    status="ready_to_activate",
+                    artifact_dir="parsed/d1/v2",
+                ),
+            ]
+        )
+        seed.commit()
+
+    with factory() as first, factory() as second:
+        document = first.get(Document, "d1")
+        cached_previous = first.get(DocumentParseVersion, "v1-id")
+        version = first.get(DocumentParseVersion, "v2-id")
+        assert document is not None
+        assert cached_previous is not None
+        assert version is not None
+        assert cached_previous.status == "superseded"
+        concurrent_document = second.get(Document, "d1")
+        concurrent_previous = second.get(DocumentParseVersion, "v1-id")
+        assert concurrent_document is not None
+        assert concurrent_previous is not None
+        concurrent_document.active_parse_version = "v1"
+        concurrent_previous.status = "active"
+        second.commit()
+
+        activated = ParseVersionService(first).activate(document, version)
+        first.commit()
+        assert activated is version
+
+    with factory() as verification:
+        stored_document = verification.get(Document, "d1")
+        stored_previous = verification.get(DocumentParseVersion, "v1-id")
+        stored_version = verification.get(DocumentParseVersion, "v2-id")
+        assert stored_document is not None
+        assert stored_previous is not None
+        assert stored_version is not None
+        assert stored_document.active_parse_version == "v2"
+        assert stored_previous.status == "superseded"
+        assert stored_version.status == "active"
 
 
 def test_same_session_activation_persists_locked_instances(

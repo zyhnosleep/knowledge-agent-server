@@ -126,11 +126,12 @@ class ParseVersionService:
                     DocumentParseVersion.status == "active",
                     DocumentParseVersion.id != locked_version.id,
                 )
+                .execution_options(populate_existing=True)
                 .with_for_update()
             ).all()
 
         activated_at = datetime.utcnow()
-        previous_statuses = [(previous, "active") for previous in previous_versions]
+        previous_statuses = [(previous, previous.status) for previous in previous_versions]
         version_status = locked_version.status
         version_activated_at = locked_version.activated_at
         for previous in previous_versions:
@@ -170,14 +171,18 @@ class ParseVersionService:
 
         sources = list(history.deleted)
         targets = list(history.added)
+        source = sources[0] if len(sources) == 1 else None
+        is_allowed_edge = source is not None and (
+            target in ALLOWED_TRANSITIONS.get(source, set())
+            or FAILED_STAGE_RETRIES.get(source) == target
+        )
         is_valid_local_transition = (
             len(sources) == 1
             and targets == [target]
-            and database_status == sources[0]
-            and target in ALLOWED_TRANSITIONS.get(sources[0], set())
+            and database_status == source
+            and is_allowed_edge
         )
         if not is_valid_local_transition:
-            source = sources[0] if len(sources) == 1 else None
             raise ValueError(
                 "Parse version local transition conflicts with database status "
                 f"{database_status!r} (local source {source!r}); activation aborted."
