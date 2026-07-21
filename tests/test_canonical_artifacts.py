@@ -1328,6 +1328,100 @@ def test_markdown_percent_encodes_literal_percent_in_asset_path(
     assert (staging / "assets" / "figure%20one.png").is_file()
 
 
+@pytest.mark.parametrize("operation", ["promote", "load"])
+def test_bundle_rejects_noncanonical_absolute_persisted_source_path(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    operation: str,
+) -> None:
+    canonical_document.source_path = "C:\\safe\\paper.pdf"
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    bundle = staging
+    if operation == "load":
+        bundle = store.promote("doc-1", "canonical-v1-abcd")
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    assert manifest["source"]["path"] == "paper.pdf"
+    manifest["source"]["path"] = "C:\\secret\\paper.pdf"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
+        if operation == "promote":
+            store.promote("doc-1", "canonical-v1-abcd")
+        else:
+            store.load("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_rejects_noncanonical_absolute_manifest_metadata(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.metadata["path"] = "paper.pdf"
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["document"]["metadata"]["path"] = "C:\\secret\\paper.pdf"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_bundle_rejects_noncanonical_absolute_structured_metadata(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks[0].metadata["path"] = "paper.pdf"
+    canonical_document.tables[0].metadata["path"] = "table.json"
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    blocks_path = staging / "blocks.jsonl"
+    blocks = [json.loads(line) for line in blocks_path.read_text("utf-8").splitlines()]
+    blocks[0]["metadata"]["path"] = "/secret/paper.pdf"
+    blocks_path.write_text(
+        "\n".join(json.dumps(block) for block in blocks) + "\n",
+        encoding="utf-8",
+    )
+    tables_path = staging / "tables.json"
+    tables = json.loads(tables_path.read_text("utf-8"))
+    tables[0]["metadata"]["path"] = "C:\\secret\\table.json"
+    tables_path.write_text(json.dumps(tables), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
+def test_write_staging_reuses_provided_asset_hash_without_runtime_source(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    first = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    assert canonical_document.assets[0].sha256 is not None
+    Path(canonical_document.assets[0].source_path or "").unlink()
+
+    second = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+
+    assert second == first
+
+
+def test_write_staging_rejects_wrong_provided_hash_without_runtime_source(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    first = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    Path(canonical_document.assets[0].source_path or "").unlink()
+    canonical_document.assets[0].sha256 = "0" * 64
+
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+
+    assert first.is_dir()
+
+
 def test_write_staging_rejects_existing_final_without_orphan(
     tmp_path: Path,
     canonical_document: CanonicalDocument,

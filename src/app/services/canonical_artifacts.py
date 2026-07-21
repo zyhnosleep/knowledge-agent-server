@@ -322,30 +322,24 @@ class CanonicalArtifactStore:
     ) -> dict[str, str]:
         asset_hashes: dict[str, str] = {}
         for asset in assets:
-            if asset.sha256 is not None and not re.fullmatch(
-                r"[0-9a-f]{64}", asset.sha256
-            ):
-                raise ValueError(
-                    f"asset sha256 must be lowercase 64-hex for {asset.asset_id!r}"
-                )
-            if asset.source_path is None:
-                if asset.sha256 is None:
-                    raise FileNotFoundError(
-                        "asset source or persisted sha256 is required for "
-                        f"{asset.asset_id!r}"
+            if asset.sha256 is not None:
+                if not re.fullmatch(r"[0-9a-f]{64}", asset.sha256):
+                    raise ValueError(
+                        f"asset sha256 must be lowercase 64-hex for {asset.asset_id!r}"
                     )
                 asset_hashes[asset.asset_id] = asset.sha256
                 continue
+
+            if asset.source_path is None:
+                raise FileNotFoundError(
+                    "asset source or persisted sha256 is required for "
+                    f"{asset.asset_id!r}"
+                )
 
             source = Path(asset.source_path)
             if not source.is_file():
                 raise FileNotFoundError(f"asset source does not exist: {source}")
             actual_sha256 = self._sha256(source)
-            if asset.sha256 is not None and actual_sha256 != asset.sha256:
-                raise ValueError(
-                    f"asset sha256 mismatch for {asset.asset_id!r}: "
-                    f"expected {asset.sha256}, got {actual_sha256}"
-                )
             asset_hashes[asset.asset_id] = actual_sha256
         return asset_hashes
 
@@ -411,10 +405,17 @@ class CanonicalArtifactStore:
         version: str,
         document: CanonicalDocument,
         asset_hashes: dict[str, str],
+        *,
+        canonicalize: bool = True,
     ) -> dict[str, Any]:
+        def dump_model(model: Any, **kwargs: Any) -> Any:
+            if canonicalize:
+                return cls._bundle_model_dump(model, **kwargs)
+            return model.model_dump(mode="json", **kwargs)
+
         assets = []
         for asset in document.assets:
-            item = cls._bundle_model_dump(
+            item = dump_model(
                 asset,
                 exclude={"source_path"},
             )
@@ -428,7 +429,7 @@ class CanonicalArtifactStore:
                 "abstract": document.abstract,
                 "keywords": document.keywords,
                 "outline": [
-                    cls._bundle_model_dump(section)
+                    dump_model(section)
                     for section in document.outline
                 ],
                 "metadata": document.metadata,
@@ -438,20 +439,26 @@ class CanonicalArtifactStore:
                 "metadata": document.parser_metadata,
             },
             "source": {
-                "path": cls._safe_source_path(document.source_path),
+                "path": (
+                    cls._safe_source_path(document.source_path)
+                    if canonicalize
+                    else document.source_path
+                ),
                 "media_type": document.source_media_type,
                 "metadata": document.source_metadata,
             },
-            "quality": cls._bundle_model_dump(document.quality),
+            "quality": dump_model(document.quality),
             "warnings": document.warnings,
             "assets": assets,
             "status": document.status,
-            "blocks": [cls._bundle_model_dump(block) for block in document.blocks],
-            "tables": [cls._bundle_model_dump(table) for table in document.tables],
-            "figures": [cls._bundle_model_dump(figure) for figure in document.figures],
-            "formulas": [cls._bundle_model_dump(formula) for formula in document.formulas],
+            "blocks": [dump_model(block) for block in document.blocks],
+            "tables": [dump_model(table) for table in document.tables],
+            "figures": [dump_model(figure) for figure in document.figures],
+            "formulas": [dump_model(formula) for formula in document.formulas],
         }
-        return cls._sanitize_metadata_paths(payload)
+        if canonicalize:
+            return cls._sanitize_metadata_paths(payload)
+        return payload
 
     @staticmethod
     def _input_fingerprint(payload: dict[str, Any]) -> str:
@@ -862,13 +869,22 @@ class CanonicalArtifactStore:
         persisted_asset_hashes = {
             asset.asset_id: asset.sha256 for asset in assets if asset.sha256 is not None
         }
-        persisted_payload = self._build_persisted_input_payload(
+        raw_persisted_payload = self._build_persisted_input_payload(
+            document_id,
+            version,
+            persisted_document,
+            persisted_asset_hashes,
+            canonicalize=False,
+        )
+        canonical_persisted_payload = self._build_persisted_input_payload(
             document_id,
             version,
             persisted_document,
             persisted_asset_hashes,
         )
-        if self._input_fingerprint(persisted_payload) != input_fingerprint:
+        if raw_persisted_payload != canonical_persisted_payload:
+            raise ValueError("persisted canonical input is not canonical")
+        if self._input_fingerprint(raw_persisted_payload) != input_fingerprint:
             raise ValueError("canonical input fingerprint mismatch")
 
     @classmethod
