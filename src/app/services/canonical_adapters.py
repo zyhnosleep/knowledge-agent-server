@@ -147,7 +147,22 @@ def _register_local_figure_asset(
             )
             return None
         if scheme == "file":
-            if split.netloc not in {"", "localhost"}:
+            local_authority = not split.netloc
+            if split.netloc:
+                try:
+                    hostname = split.hostname
+                    port = split.port
+                except ValueError:
+                    hostname = None
+                    port = None
+                local_authority = bool(
+                    hostname
+                    and hostname.casefold() == "localhost"
+                    and split.username is None
+                    and split.password is None
+                    and port is None
+                )
+            if not local_authority:
                 document.warnings.append(
                     f"Figure target {target!r} is a non-local file URI and was not materialized."
                 )

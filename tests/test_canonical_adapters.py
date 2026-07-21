@@ -1300,7 +1300,7 @@ def test_protocol_relative_figure_target_is_never_read_as_local_asset(
     assert not loaded.assets
 
 
-@pytest.mark.parametrize("authority", ["", "localhost"])
+@pytest.mark.parametrize("authority", ["", "localhost", "LOCALHOST", "LoCaLhOsT"])
 def test_absolute_file_uri_figure_target_is_materialized(
     tmp_path: Path, authority: str
 ) -> None:
@@ -1316,6 +1316,35 @@ def test_absolute_file_uri_figure_target_is_materialized(
 
     assert document.figures[0].asset_path == document.assets[0].path
     assert Path(document.assets[0].source_path) == image.resolve()
+
+
+@pytest.mark.parametrize(
+    "authority",
+    ["user@localhost", "user:password@localhost", "localhost:80", "localhost:notaport"],
+)
+def test_file_uri_with_credentials_or_port_is_never_read_as_local_asset(
+    monkeypatch, tmp_path: Path, authority: str
+) -> None:
+    trap = (tmp_path / "file-uri-trap.png").resolve()
+    _write_png(trap)
+    uri_path = trap.as_uri().removeprefix("file://")
+    target = f"file://{authority}{uri_path}"
+    path = tmp_path / "unsupported-file-authority.html"
+    path.write_text(f'<img alt="unsupported" src="{target}">', encoding="utf-8")
+    original_open = Path.open
+
+    def reject_trap_open(candidate: Path, *args, **kwargs):
+        if candidate == trap:
+            raise AssertionError("unsupported file authority opened a local file")
+        return original_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", reject_trap_open)
+
+    document = parse_canonical_document(path)
+
+    assert document.figures[0].asset_path is None
+    assert not document.assets
+    assert any("non-local file uri" in warning.lower() for warning in document.warnings)
 
 
 def test_repeated_local_figure_content_uses_one_canonical_asset(tmp_path: Path) -> None:
