@@ -248,6 +248,7 @@ class CanonicalQualityIssue(CanonicalModel):
     message: str
     block_ids: list[str] = Field(default_factory=list)
     repairable: bool = False
+    repair_scope: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

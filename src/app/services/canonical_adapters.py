@@ -2711,47 +2711,843 @@ class DocxCanonicalAdapter:
             return 0
 
 
+def run_mineru(path: Path, page_count: int) -> CanonicalDocument | None:
+    """Run MinerU without entering the canonical PDF dispatcher recursively."""
+    from app.services import parser
+
+    parsed = parser._parse_pdf_with_mineru(path, page_count)
+    if parsed is None:
+        return None
+    return _parsed_pdf_to_canonical(path, parsed, "mineru", page_count)
+
+
+def run_document_intelligence(
+    path: Path,
+    page_count: int,
+    page_texts: list[str],
+    page_indices: set[int] | list[int] | tuple[int, ...] | None = None,
+) -> CanonicalDocument | None:
+    """Run full or page-scoped Document Intelligence and canonicalize its output."""
+    from app.services import parser
+
+    parsed = parser._parse_pdf_with_document_intelligence(
+        path,
+        page_texts,
+        page_count,
+        page_indices=page_indices,
+    )
+    if parsed is None:
+        return None
+    document = _parsed_pdf_to_canonical(
+        path,
+        parsed,
+        "document_intelligence",
+        page_count,
+    )
+    intelligence = parsed.metadata.get("document_intelligence", {})
+    page_outputs = intelligence.get("page_outputs", []) if isinstance(intelligence, dict) else []
+    candidates: list[str] = []
+    if isinstance(page_outputs, list):
+        for output in page_outputs:
+            if not isinstance(output, dict):
+                continue
+            sections = output.get("sections", [])
+            if isinstance(sections, list):
+                candidates.extend(value for value in sections if isinstance(value, str))
+    selected = set(page_indices) if page_indices is not None else {0, 1}
+    candidates.extend(
+        text
+        for index, text in enumerate(page_texts)
+        if index in selected and index < 2 and isinstance(text, str)
+    )
+    document.abstract = _extract_explicit_abstract(candidates)
+    return document
+
+
+def run_text_layer_fallback(
+    path: Path,
+    page_count: int,
+    page_texts: list[str] | None = None,
+    *,
+    text_layer_warnings: list[str] | None = None,
+) -> CanonicalDocument:
+    """Build the final canonical fallback from complete pypdf page text."""
+    from app.services import parser
+
+    warnings = list(text_layer_warnings or [])
+    if page_texts is None:
+        try:
+            page_texts, extracted_count = parser._extract_pdf_text_layer(path)
+            page_count = max(page_count, extracted_count)
+        except Exception as exc:  # noqa: BLE001
+            page_texts = [""] * page_count
+            warnings.append(f"Text layer extraction failed: {exc}")
+    document = _new_document(path, "pypdf_text_layer", "application/pdf")
+    document.parser_source = "pypdf_text_layer"
+    document.parser_metadata.update(
+        {"adapter": "pypdf_text_layer", "format": "pdf", "parser_mode": "pdf_text_layer"}
+    )
+    builder = _DocumentBuilder(document)
+    for page_index in range(page_count):
+        text = page_texts[page_index] if page_index < len(page_texts) else ""
+        if not text.strip():
+            continue
+        builder.add_content(
+            text,
+            SourceSpan(
+                page_index=page_index,
+                page_label=str(page_index + 1),
+                source_block_id=f"pypdf-page-{page_index + 1}",
+            ),
+            metadata={"source": "pypdf_text_layer"},
+        )
+    document.metadata.update(
+        {
+            "expected_page_count": page_count,
+            "parsed_page_indices": list(range(page_count)),
+            "text_layer_pages": list(page_texts),
+            "text_layer_warnings": warnings,
+        }
+    )
+    document.warnings.extend(warnings)
+    return document
+
+
+def _parsed_pdf_to_canonical(
+    path: Path,
+    parsed,
+    parser_source: str,
+    page_count: int,
+) -> CanonicalDocument:
+    document = _new_document(path, parser_source, "application/pdf")
+    document.parser_source = parser_source
+    document.title = parsed.title
+    document.metadata.update(
+        {
+            "expected_page_count": page_count,
+            "legacy_pdf_metadata": parsed.metadata,
+        }
+    )
+    document.parser_metadata.update(
+        {
+            "adapter": parser_source,
+            "format": "pdf",
+            "parser_mode": parsed.metadata.get("parser_mode", parser_source),
+            "source_parser_metadata": parsed.metadata,
+        }
+    )
+    intelligence = parsed.metadata.get("document_intelligence", {})
+    if not isinstance(intelligence, dict):
+        intelligence = {}
+
+    table_entries: list[tuple[str | None, str, CanonicalTable]] = []
+    for index, raw_table in enumerate(intelligence.get("tables", [])):
+        if not isinstance(raw_table, dict):
+            continue
+        page_label = _clean_page_label(raw_table.get("page_label"))
+        table_text = str(raw_table.get("markdown") or raw_table.get("text") or "").strip()
+        caption, headers, rows = _parse_pdf_table_markdown(table_text)
+        span = _pdf_span(page_label, f"{parser_source}-table-{index + 1}")
+        table_id = _stable_id(
+            "table", document.document_id, page_label, index, table_text
+        )
+        table = CanonicalTable(
+            table_id=table_id,
+            caption=caption,
+            headers=headers,
+            rows=rows,
+            cells=[
+                CanonicalCell(
+                    text=value,
+                    row_index=row_index,
+                    column_index=column_index,
+                    is_header=row_index == 0,
+                    source_spans=[span],
+                )
+                for row_index, row in enumerate([headers, *rows])
+                for column_index, value in enumerate(row)
+            ],
+            source_markdown=table_text or None,
+            normalized_markdown=_table_markdown(headers, rows) or table_text or None,
+            source_spans=[span],
+            status="accepted_mineru" if parser_source == "mineru" else "repaired_by_vision",
+            metadata={
+                key: value
+                for key, value in raw_table.items()
+                if key not in {"markdown", "text"}
+            },
+        )
+        document.tables.append(table)
+        table_entries.append((page_label, table_text, table))
+
+    formula_entries: list[tuple[str | None, str, CanonicalFormula]] = []
+    for index, raw_formula in enumerate(intelligence.get("formulas", [])):
+        if not isinstance(raw_formula, dict):
+            continue
+        page_label = _clean_page_label(raw_formula.get("page_label"))
+        formula_text = str(raw_formula.get("text") or raw_formula.get("latex") or "").strip()
+        if not formula_text:
+            continue
+        span = _pdf_span(page_label, f"{parser_source}-formula-{index + 1}")
+        formula = CanonicalFormula(
+            formula_id=_stable_id(
+                "formula", document.document_id, page_label, index, formula_text
+            ),
+            latex=formula_text,
+            source_spans=[span],
+            metadata={
+                key: value
+                for key, value in raw_formula.items()
+                if key not in {"text", "latex"}
+            },
+        )
+        document.formulas.append(formula)
+        formula_entries.append((page_label, formula_text, formula))
+
+    figure_entries: list[tuple[str | None, str, CanonicalFigure]] = []
+    for index, raw_figure in enumerate(intelligence.get("figures", [])):
+        if not isinstance(raw_figure, dict):
+            continue
+        page_label = _clean_page_label(raw_figure.get("page_label"))
+        caption = str(raw_figure.get("caption") or "").strip() or None
+        description = str(raw_figure.get("note") or raw_figure.get("description") or "").strip() or None
+        span = _pdf_span(page_label, f"{parser_source}-figure-{index + 1}")
+        asset_path = _register_pdf_figure_asset(
+            document,
+            raw_figure,
+            intelligence,
+            span,
+        )
+        figure = CanonicalFigure(
+            figure_id=_stable_id(
+                "figure", document.document_id, page_label, index, caption, description
+            ),
+            caption=caption,
+            description=description,
+            asset_path=asset_path,
+            source_spans=[span],
+            metadata=dict(raw_figure),
+        )
+        document.figures.append(figure)
+        figure_text = _pdf_figure_text(raw_figure)
+        figure_entries.append((page_label, figure_text, figure))
+
+    builder = _DocumentBuilder(document)
+    chunks = list(parsed.chunks)
+    if not chunks and parsed.text:
+        from app.services.parser import ParsedChunk
+
+        chunks = [ParsedChunk(ordinal=0, text=parsed.text)]
+
+    used_tables: set[str] = set()
+    used_formulas: set[str] = set()
+    used_figures: set[str] = set()
+    for chunk in chunks:
+        text = str(chunk.text)
+        if not text.strip():
+            continue
+        page_label = _clean_page_label(chunk.page_label)
+        span = _pdf_span(
+            page_label,
+            str(chunk.heading or f"{parser_source}-chunk-{chunk.ordinal}"),
+        )
+        heading = str(chunk.heading or "").lower()
+        table = _match_pdf_structure(
+            table_entries,
+            page_label,
+            text,
+            used_tables,
+            force="table" in heading,
+        )
+        formula = _match_pdf_structure(
+            formula_entries,
+            page_label,
+            text,
+            used_formulas,
+            force="formula" in heading or "equation" in heading,
+        )
+        figure = _match_pdf_structure(
+            figure_entries,
+            page_label,
+            text,
+            used_figures,
+            force="figure" in heading or "image" in heading,
+        )
+        metadata = {
+            "source_chunk_ordinal": chunk.ordinal,
+            "source_heading": chunk.heading,
+        }
+        if table is not None:
+            builder.add_content(
+                text,
+                span,
+                block_type="table",
+                table_id=table.table_id,
+                metadata=metadata,
+            )
+        elif formula is not None:
+            builder.add_content(
+                text,
+                span,
+                block_type="formula",
+                formula_id=formula.formula_id,
+                metadata=metadata,
+            )
+        elif figure is not None:
+            builder.add_content(
+                text,
+                span,
+                block_type="figure",
+                figure_id=figure.figure_id,
+                metadata=metadata,
+            )
+        elif _is_standalone_pdf_heading(text):
+            title = text.lstrip("#").strip()
+            builder.add_heading(title, min(6, max(1, len(text) - len(text.lstrip("#")))), span, **metadata)
+        else:
+            block = builder.add_content(text, span, metadata=metadata)
+            if chunk.heading:
+                block.section_path = [str(chunk.heading)]
+                block.source_spans[0].heading_path = [str(chunk.heading)]
+
+    _append_unmatched_structures(
+        document,
+        builder,
+        table_entries,
+        formula_entries,
+        figure_entries,
+        used_tables,
+        used_formulas,
+        used_figures,
+    )
+    parsed_pages = sorted(
+        {
+            span.page_index
+            for block in document.blocks
+            for span in block.source_spans
+            if span.page_index is not None
+        }
+    )
+    document.metadata["parsed_page_indices"] = parsed_pages
+    explicit_candidates = [chunk.text for chunk in chunks]
+    document.abstract = _extract_explicit_abstract(explicit_candidates)
+    if not document.blocks:
+        document.warnings.append(f"{parser_source} returned no canonical content blocks.")
+    return document
+
+
+def _parse_pdf_table_markdown(text: str) -> tuple[str | None, list[str], list[list[str]]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for header_index in range(max(0, len(lines) - 1)):
+        if "|" not in lines[header_index] or not _is_table_separator(lines[header_index + 1]):
+            continue
+        headers = _split_pipe_row(lines[header_index])
+        rows: list[list[str]] = []
+        for line in lines[header_index + 2 :]:
+            if "|" not in line:
+                break
+            rows.append(_split_pipe_row(line))
+        caption_text = " ".join(lines[:header_index]).strip()
+        return caption_text or None, headers, rows
+    return None, [], []
+
+
+def _clean_page_label(value: object) -> str | None:
+    label = str(value or "").strip()
+    return label if label and label != "?" else None
+
+
+def _pdf_span(page_label: str | None, source_block_id: str) -> SourceSpan:
+    page_index = int(page_label) - 1 if page_label and page_label.isdigit() else None
+    return SourceSpan(
+        page_index=page_index,
+        page_label=page_label,
+        source_block_id=source_block_id,
+    )
+
+
+def _pdf_figure_text(figure: dict) -> str:
+    parts = [
+        str(figure.get(key) or "").strip()
+        for key in ("caption", "note", "description", "image_path", "path")
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _register_pdf_figure_asset(
+    document: CanonicalDocument,
+    figure: dict,
+    intelligence: dict,
+    span: SourceSpan,
+) -> str | None:
+    raw_path = str(figure.get("image_path") or figure.get("path") or "").strip()
+    relative = Path(raw_path)
+    if (
+        not raw_path
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "://" in raw_path
+    ):
+        return None
+
+    roots: list[Path] = []
+    content_list_path = intelligence.get("content_list_path")
+    output_dir = intelligence.get("output_dir")
+    if isinstance(content_list_path, str) and content_list_path:
+        roots.append(Path(content_list_path).expanduser().resolve().parent)
+    if isinstance(output_dir, str) and output_dir:
+        roots.append(Path(output_dir).expanduser().resolve())
+
+    source_path: Path | None = None
+    for root in roots:
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if candidate.is_file() and not _has_link_or_reparse_component(candidate):
+            source_path = candidate
+            break
+    if source_path is None:
+        return None
+
+    try:
+        with source_path.open("rb") as source:
+            asset_sha = hashlib.file_digest(source, "sha256").hexdigest()
+        size_bytes = source_path.stat().st_size
+    except OSError:
+        return None
+    existing = next((asset for asset in document.assets if asset.sha256 == asset_sha), None)
+    if existing is not None:
+        if span not in existing.source_spans:
+            existing.source_spans.append(span)
+        return existing.path
+
+    asset_path = f"assets/{_safe_local_asset_name(source_path, asset_sha)}"
+    document.assets.append(
+        CanonicalAsset(
+            asset_id=_stable_id("asset", document.document_id, asset_sha),
+            path=asset_path,
+            media_type=mimetypes.guess_type(source_path.name)[0] or "application/octet-stream",
+            sha256=asset_sha,
+            source_path=str(source_path),
+            source_spans=[span],
+            metadata={
+                "source_parser": document.parser_source,
+                "mineru_path": raw_path,
+                "size_bytes": size_bytes,
+            },
+        )
+    )
+    return asset_path
+
+
+def _match_pdf_structure(
+    entries,
+    page_label,
+    text: str,
+    used: set[str],
+    *,
+    force: bool = False,
+):
+    normalized_text = text.strip()
+    for entry_page, source_text, structure in entries:
+        identifier = next(
+            getattr(structure, name)
+            for name in ("table_id", "formula_id", "figure_id")
+            if hasattr(structure, name)
+        )
+        if identifier in used or entry_page != page_label:
+            continue
+        normalized_source = source_text.strip()
+        if force or (normalized_source and (
+            normalized_source == normalized_text
+            or normalized_source in normalized_text
+            or normalized_text in normalized_source
+        )):
+            used.add(identifier)
+            return structure
+    return None
+
+
+def _append_unmatched_structures(
+    document: CanonicalDocument,
+    builder: _DocumentBuilder,
+    tables,
+    formulas,
+    figures,
+    used_tables: set[str],
+    used_formulas: set[str],
+    used_figures: set[str],
+) -> None:
+    for page_label, text, table in tables:
+        if table.table_id not in used_tables and text:
+            builder.add_content(
+                text,
+                table.source_spans[0],
+                block_type="table",
+                table_id=table.table_id,
+            )
+    for page_label, text, formula in formulas:
+        if formula.formula_id not in used_formulas:
+            builder.add_content(
+                text,
+                formula.source_spans[0],
+                block_type="formula",
+                formula_id=formula.formula_id,
+            )
+    for page_label, text, figure in figures:
+        if figure.figure_id not in used_figures and text:
+            builder.add_content(
+                text,
+                figure.source_spans[0],
+                block_type="figure",
+                figure_id=figure.figure_id,
+            )
+
+
+def _is_standalone_pdf_heading(text: str) -> bool:
+    stripped = text.strip()
+    return bool(re.fullmatch(r"#{1,6}\s+[^\n]+", stripped))
+
+
+def _extract_explicit_abstract(candidates: list[str]) -> str | None:
+    heading = re.compile(r"(?i)^\s*#{0,6}\s*(?:abstract|摘要)\s*:?[ \t]*$")
+    inline = re.compile(
+        r"(?is)^\s*#{0,6}\s*(?:abstract|摘要)\s*:\s*(?P<body>.+)$"
+    )
+    multiline = re.compile(
+        r"(?is)^\s*#{0,6}\s*(?:abstract|摘要)\s*\n+(?P<body>.+)$"
+    )
+    for index, candidate in enumerate(candidates):
+        value = candidate.strip()
+        match = inline.match(value) or multiline.match(value)
+        if match:
+            body = match.group("body").strip()
+            return body or None
+        if heading.match(value) and index + 1 < len(candidates):
+            body = candidates[index + 1].strip()
+            if body and not heading.match(body):
+                return body
+    return None
+
+
+def _read_text_layer_for_audit(path: Path, page_count: int) -> tuple[list[str], list[str]]:
+    from app.services import parser
+
+    warnings: list[str] = []
+    try:
+        try:
+            page_texts, extracted_count = parser._extract_pdf_text_layer(
+                path,
+                warnings_out=warnings,
+            )
+        except TypeError:
+            # Preserve compatibility with one-argument integrations and monkeypatches.
+            page_texts, extracted_count = parser._extract_pdf_text_layer(path)
+    except Exception as exc:  # noqa: BLE001
+        page_texts = [""] * page_count
+        warnings.append(f"Text layer extraction failed: {exc}")
+    else:
+        if extracted_count != page_count:
+            warnings.append(
+                f"Text layer page count {extracted_count} differs from validated count {page_count}."
+            )
+        if len(page_texts) < page_count:
+            page_texts.extend([""] * (page_count - len(page_texts)))
+        elif len(page_texts) > page_count:
+            page_texts = page_texts[:page_count]
+    return page_texts, warnings
+
+
+def _attach_pdf_audit(
+    document: CanonicalDocument,
+    *,
+    page_count: int,
+    page_texts: list[str],
+    text_layer_warnings: list[str],
+    attempts: list[str],
+    primary_parser: str,
+    repair_scopes: list[str] | None = None,
+) -> None:
+    block_pages = {
+        span.page_index
+        for block in document.blocks
+        for span in block.source_spans
+        if span.page_index is not None
+    }
+    parsed_pages = [
+        index
+        for index in range(page_count)
+        if index in block_pages or index >= len(page_texts) or not page_texts[index].strip()
+    ]
+    scopes = list(dict.fromkeys(repair_scopes or document.metadata.get("repair_scopes", [])))
+    document.metadata.update(
+        {
+            "expected_page_count": page_count,
+            "parsed_page_indices": parsed_pages,
+            "text_layer_pages": list(page_texts),
+            "text_layer_warnings": list(text_layer_warnings),
+            "primary_parser": primary_parser,
+            "parser_attempts": list(attempts),
+            "repair_scopes": scopes,
+        }
+    )
+    document.parser_metadata.update(
+        {
+            "primary_parser": primary_parser,
+            "parser_attempts": list(attempts),
+            "repair_scopes": scopes,
+        }
+    )
+    for warning in text_layer_warnings:
+        if warning not in document.warnings:
+            document.warnings.append(warning)
+
+
+def _finalize_pdf_audit(document: CanonicalDocument) -> CanonicalDocument:
+    page_count = document.metadata.get("expected_page_count")
+    page_count = page_count if isinstance(page_count, int) and page_count > 0 else 0
+    fallback_pages = set(document.quality.fallback_pages)
+    fallback_pages.update(
+        page + 1
+        for page in _repair_page_indices(
+            list(document.metadata.get("repair_scopes", [])),
+            page_count,
+        )
+    )
+    if document.metadata.get("primary_parser") != "mineru":
+        fallback_pages.update(range(1, page_count + 1))
+    quality_dump = document.quality.model_dump(mode="json")
+    document.metadata["fallback_pages"] = sorted(fallback_pages)
+    document.metadata["quality_status"] = document.quality.status
+    document.metadata["quality"] = quality_dump
+    document.parser_metadata["fallback_pages"] = sorted(fallback_pages)
+    document.parser_metadata["quality_status"] = document.quality.status
+    document.parser_metadata["quality"] = quality_dump
+    return document
+
+
+def _repair_page_indices(scopes: list[str], page_count: int) -> set[int]:
+    pages: set[int] = set()
+    for scope in scopes:
+        single = re.fullmatch(r"page:(\d+)", scope)
+        if single:
+            pages.add(int(single.group(1)) - 1)
+            continue
+        page_range = re.fullmatch(r"pages:(\d+)-(\d+)", scope)
+        if page_range:
+            start, end = map(int, page_range.groups())
+            pages.update(range(start - 1, end))
+    return {page for page in pages if 0 <= page < page_count}
+
+
+def _structure_on_pages(structure, page_indices: set[int]) -> bool:
+    return any(
+        span.page_index in page_indices
+        for span in structure.source_spans
+        if span.page_index is not None
+    )
+
+
+def _block_on_pages(block: CanonicalBlock, page_indices: set[int]) -> bool:
+    return any(
+        span.page_index in page_indices
+        for span in block.source_spans
+        if span.page_index is not None
+    )
+
+
+def _merge_pdf_page_repairs(
+    primary: CanonicalDocument,
+    repair: CanonicalDocument,
+    page_indices: set[int],
+) -> CanonicalDocument:
+    primary.blocks = [
+        block for block in primary.blocks if not _block_on_pages(block, page_indices)
+    ] + [block.model_copy(deep=True) for block in repair.blocks]
+    primary.tables = [
+        table for table in primary.tables if not _structure_on_pages(table, page_indices)
+    ] + [table.model_copy(deep=True) for table in repair.tables]
+    primary.figures = [
+        figure for figure in primary.figures if not _structure_on_pages(figure, page_indices)
+    ] + [figure.model_copy(deep=True) for figure in repair.figures]
+    primary.formulas = [
+        formula for formula in primary.formulas if not _structure_on_pages(formula, page_indices)
+    ] + [formula.model_copy(deep=True) for formula in repair.formulas]
+    if repair.abstract and repair.abstract.strip():
+        primary.abstract = repair.abstract
+
+    primary.blocks.sort(
+        key=lambda block: (
+            next(
+                (
+                    span.page_index
+                    for span in block.source_spans
+                    if span.page_index is not None
+                ),
+                10**9,
+            ),
+            block.reading_order,
+            block.block_id,
+        )
+    )
+    seen: set[str] = set()
+    for reading_order, block in enumerate(primary.blocks):
+        if block.block_id in seen:
+            block.block_id = _stable_id(
+                "block", primary.document_id, "repair", reading_order, block.block_id
+            )
+        seen.add(block.block_id)
+        block.reading_order = reading_order
+    return primary
+
+
 class PDFCanonicalAdapter:
-    parser_source = "pdf_legacy"
+    parser_source = "mineru"
 
     def parse(self, path: Path) -> CanonicalDocument:
         path = _validate_path(path)
-        # Task 5 replaces this compatibility bridge with MinerU-first canonical orchestration.
-        from app.services.parser import _parse_pdf
+        from app.services import parser
+        from app.services.canonical_quality import CanonicalQualityGate
 
-        parsed = _parse_pdf(path)
-        document = _new_document(path, self.parser_source, "application/pdf")
-        document.title = parsed.title
-        document.metadata.update(parsed.metadata)
-        document.parser_metadata.update(
-            {"legacy_parser_metadata": parsed.metadata, "compatibility_bridge": True}
+        page_count = parser._validate_pdf_basic(path)
+        attempts: list[str] = []
+
+        mineru_document: CanonicalDocument | None = None
+        if parser.settings.mineru_enabled:
+            try:
+                mineru_document = run_mineru(path, page_count)
+                attempts.append(
+                    "mineru:success" if mineru_document is not None else "mineru:unavailable"
+                )
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"mineru:failed:{type(exc).__name__}:{exc}")
+        else:
+            attempts.append("mineru:disabled")
+
+        page_texts, text_layer_warnings = _read_text_layer_for_audit(path, page_count)
+        gate = CanonicalQualityGate()
+        if mineru_document is not None:
+            _attach_pdf_audit(
+                mineru_document,
+                page_count=page_count,
+                page_texts=page_texts,
+                text_layer_warnings=text_layer_warnings,
+                attempts=attempts,
+                primary_parser="mineru",
+            )
+            report = gate.evaluate(mineru_document)
+            if report.accepted:
+                return _finalize_pdf_audit(mineru_document)
+
+            fatal = any(issue.severity == "fatal" for issue in report.issues)
+            repair_scopes = [
+                issue.repair_scope
+                for issue in report.issues
+                if issue.repairable and issue.repair_scope
+            ]
+            targeted_pages = _repair_page_indices(repair_scopes, page_count)
+            if not fatal and repair_scopes and targeted_pages and parser.settings.document_intelligence_enabled:
+                try:
+                    repair = run_document_intelligence(
+                        path,
+                        page_count,
+                        page_texts,
+                        page_indices=targeted_pages,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    repair = None
+                    attempts.append(
+                        f"document_intelligence:targeted:failed:{type(exc).__name__}:{exc}"
+                    )
+                else:
+                    attempts.append(
+                        "document_intelligence:targeted:success"
+                        if repair is not None
+                        else "document_intelligence:targeted:unavailable"
+                    )
+                if repair is not None:
+                    mineru_document = _merge_pdf_page_repairs(
+                        mineru_document,
+                        repair,
+                        targeted_pages,
+                    )
+                    _attach_pdf_audit(
+                        mineru_document,
+                        page_count=page_count,
+                        page_texts=page_texts,
+                        text_layer_warnings=text_layer_warnings,
+                        attempts=attempts,
+                        primary_parser="mineru",
+                        repair_scopes=repair_scopes,
+                    )
+                    repaired_report = gate.evaluate(mineru_document)
+                    if not any(
+                        issue.severity == "fatal" for issue in repaired_report.issues
+                    ):
+                        return _finalize_pdf_audit(mineru_document)
+                else:
+                    _attach_pdf_audit(
+                        mineru_document,
+                        page_count=page_count,
+                        page_texts=page_texts,
+                        text_layer_warnings=text_layer_warnings,
+                        attempts=attempts,
+                        primary_parser="mineru",
+                    )
+                    return _finalize_pdf_audit(mineru_document)
+            elif not fatal:
+                if repair_scopes and not parser.settings.document_intelligence_enabled:
+                    attempts.append("document_intelligence:targeted:disabled")
+                return _finalize_pdf_audit(mineru_document)
+
+        if parser.settings.document_intelligence_enabled:
+            try:
+                full_di = run_document_intelligence(path, page_count, page_texts)
+            except Exception as exc:  # noqa: BLE001
+                full_di = None
+                attempts.append(
+                    f"document_intelligence:full:failed:{type(exc).__name__}:{exc}"
+                )
+            else:
+                attempts.append(
+                    "document_intelligence:full:success"
+                    if full_di is not None
+                    else "document_intelligence:full:unavailable"
+                )
+            if full_di is not None:
+                _attach_pdf_audit(
+                    full_di,
+                    page_count=page_count,
+                    page_texts=page_texts,
+                    text_layer_warnings=text_layer_warnings,
+                    attempts=attempts,
+                    primary_parser="document_intelligence",
+                )
+                report = gate.evaluate(full_di)
+                if not any(issue.severity == "fatal" for issue in report.issues):
+                    return _finalize_pdf_audit(full_di)
+        else:
+            attempts.append("document_intelligence:full:disabled")
+
+        fallback = run_text_layer_fallback(
+            path,
+            page_count,
+            page_texts,
+            text_layer_warnings=text_layer_warnings,
         )
-        builder = _DocumentBuilder(document)
-        chunks = parsed.chunks
-        if not chunks and parsed.text:
-            from app.services.parser import ParsedChunk
-
-            chunks = [ParsedChunk(ordinal=0, text=parsed.text)]
-        for chunk in chunks:
-            page_index = None
-            if chunk.page_label and str(chunk.page_label).isdigit():
-                page_index = max(0, int(chunk.page_label) - 1)
-            span = SourceSpan(
-                page_index=page_index,
-                page_label=chunk.page_label,
-                source_block_id=f"legacy-chunk-{chunk.ordinal}",
-            )
-            block = builder.add_content(
-                chunk.text,
-                span,
-                metadata={"legacy_ordinal": chunk.ordinal},
-            )
-            if chunk.heading:
-                block.section_path = [chunk.heading]
-                block.source_spans[0].heading_path = [chunk.heading]
-        if not document.blocks:
-            document.warnings.append("PDF parser returned no content blocks.")
-        return document
+        attempts.append("pypdf_text_layer:success")
+        _attach_pdf_audit(
+            fallback,
+            page_count=page_count,
+            page_texts=page_texts,
+            text_layer_warnings=text_layer_warnings,
+            attempts=attempts,
+            primary_parser="pypdf_text_layer",
+        )
+        gate.evaluate(fallback)
+        return _finalize_pdf_audit(fallback)
 
 
 def parse_canonical_document(path: Path) -> CanonicalDocument:

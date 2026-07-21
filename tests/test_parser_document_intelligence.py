@@ -99,6 +99,97 @@ def test_parse_pdf_with_document_intelligence_returns_none_when_rendering_unavai
     assert parsed is None
 
 
+def test_pdf_basic_validation_does_not_extract_page_text(monkeypatch) -> None:
+    class Page:
+        def extract_text(self):
+            raise AssertionError("basic validation must not extract text")
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page(), Page()]
+
+    monkeypatch.setattr(parser, "PdfReader", lambda _path: Reader())
+
+    assert parser._validate_pdf_basic(Path("dummy.pdf")) == 2
+
+
+def test_pdf_text_layer_is_best_effort_per_page(monkeypatch) -> None:
+    class Page:
+        def __init__(self, value=None, error=None):
+            self.value = value
+            self.error = error
+
+        def extract_text(self):
+            if self.error:
+                raise self.error
+            return self.value
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page("First page"), Page(error=RuntimeError("bad stream")), Page("Third page")]
+
+    monkeypatch.setattr(parser, "PdfReader", lambda _path: Reader())
+
+    texts, page_count, warnings = parser._extract_pdf_text_layer_best_effort(Path("dummy.pdf"))
+
+    assert texts == ["First page", "", "Third page"]
+    assert page_count == 3
+    assert warnings == ["Unable to extract text from page 2: bad stream"]
+    assert parser._extract_pdf_text_layer(Path("dummy.pdf")) == (texts, page_count)
+
+
+def test_targeted_document_intelligence_preserves_real_page_labels(monkeypatch) -> None:
+    monkeypatch.setattr(parser, "_render_pdf_pages", lambda path, dpi: [b"one", b"two", b"three"])
+    analyzed_labels = []
+
+    def analyze(**kwargs):
+        analyzed_labels.append(kwargs["page_label"])
+        return DocumentPagePayload(
+            page_label=kwargs["page_label"],
+            page_summary="Target page",
+            sections=["Only selected page"],
+            tables=[],
+            formulas=[],
+            figures=[],
+            evidence_spans=["Only selected page"],
+        )
+
+    monkeypatch.setattr(parser, "_analyze_pdf_page", analyze)
+
+    parsed = parser._parse_pdf_with_document_intelligence(
+        Path("dummy.pdf"), ["one", "two", "three"], 3, page_indices={1}
+    )
+
+    assert parsed is not None
+    assert analyzed_labels == ["2"]
+    assert {chunk.page_label for chunk in parsed.chunks} == {"2"}
+    assert parsed.metadata["pages"] == 3
+    assert parsed.metadata["document_intelligence"]["page_indices"] == [1]
+
+
+def test_document_intelligence_chunk_is_not_truncated(monkeypatch) -> None:
+    long_section = "evidence " * 700
+    monkeypatch.setattr(parser, "_render_pdf_pages", lambda path, dpi: [b"page"])
+    monkeypatch.setattr(
+        parser,
+        "_analyze_pdf_page",
+        lambda **kwargs: DocumentPagePayload(
+            page_label="1",
+            page_summary="Long section",
+            sections=[long_section],
+            tables=[],
+            formulas=[],
+            figures=[],
+            evidence_spans=[],
+        ),
+    )
+
+    parsed = parser._parse_pdf_with_document_intelligence(Path("dummy.pdf"), [""], 1)
+
+    assert parsed is not None
+    assert parsed.chunks[0].text == long_section.strip()
+
+
 def test_mineru_content_to_parsed_doc_maps_structured_blocks(tmp_path) -> None:
     content_list = [
         {"type": "title", "text": "SAC-KG", "page_idx": 0},

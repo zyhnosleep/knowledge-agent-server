@@ -105,33 +105,12 @@ def _canonical_to_parsed_document(document) -> ParsedDocument:
 
 
 def _parse_pdf(path: Path) -> ParsedDocument:
-    page_texts, page_count = _extract_pdf_text_layer(path)
-    if settings.mineru_enabled:
-        enriched = _parse_pdf_with_mineru(path, page_count)
-        if enriched is not None:
-            return enriched
+    from app.services.canonical_adapters import PDFCanonicalAdapter
 
-    if settings.document_intelligence_enabled:
-        enriched = _parse_pdf_with_document_intelligence(path, page_texts, page_count)
-        if enriched is not None:
-            return enriched
-
-    pages = [text for text in page_texts if text.strip()]
-    chunks = [
-        ParsedChunk(ordinal=index, text=text[:4000], page_label=str(index + 1))
-        for index, text in enumerate(page_texts)
-        if text.strip()
-    ]
-    full_text = "\n\n".join(pages)
-    metadata = {
-        "pages": page_count,
-        "parser_mode": "pdf_text_layer",
-        "document_intelligence": {"enabled": False},
-    }
-    return ParsedDocument(title=display_title_from_path(path), text=full_text, chunks=chunks or _fallback_chunks(full_text), metadata=metadata)
+    return _canonical_to_parsed_document(PDFCanonicalAdapter().parse(path))
 
 
-def _extract_pdf_text_layer(path: Path) -> tuple[list[str], int]:
+def _open_pdf_pages(path: Path) -> list[object]:
     try:
         reader = PdfReader(str(path))
         if getattr(reader, "is_encrypted", False):
@@ -141,19 +120,42 @@ def _extract_pdf_text_layer(path: Path) -> tuple[list[str], int]:
                 raise DocumentParseError(path, "Encrypted PDF could not be decrypted.") from exc
             if not decrypted:
                 raise DocumentParseError(path, "Encrypted PDF is not supported.")
-        pages = list(reader.pages)
+        return list(reader.pages)
     except DocumentParseError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise DocumentParseError(path, f"Unable to read PDF: {exc}") from exc
 
+
+def _validate_pdf_basic(path: Path) -> int:
+    """Validate the PDF container and return page count without extracting text."""
+    return len(_open_pdf_pages(path))
+
+
+def _extract_pdf_text_layer_best_effort(path: Path) -> tuple[list[str], int, list[str]]:
+    pages = _open_pdf_pages(path)
+
     page_texts: list[str] = []
+    warnings: list[str] = []
     for index, page in enumerate(pages):
         try:
             page_texts.append((page.extract_text() or "").strip())
         except Exception as exc:  # noqa: BLE001
-            raise DocumentParseError(path, f"Unable to extract text from page {index + 1}: {exc}") from exc
-    return page_texts, len(pages)
+            page_texts.append("")
+            warnings.append(f"Unable to extract text from page {index + 1}: {exc}")
+    return page_texts, len(pages), warnings
+
+
+def _extract_pdf_text_layer(
+    path: Path,
+    *,
+    warnings_out: list[str] | None = None,
+) -> tuple[list[str], int]:
+    """Compatibility API returning best-effort page text and the page count."""
+    page_texts, page_count, warnings = _extract_pdf_text_layer_best_effort(path)
+    if warnings_out is not None:
+        warnings_out.extend(warnings)
+    return page_texts, page_count
 
 
 def _parse_pdf_with_mineru(path: Path, page_count: int) -> ParsedDocument | None:
@@ -453,7 +455,7 @@ def _mineru_content_to_parsed_doc(
         chunks.append(
             ParsedChunk(
                 ordinal=len(chunks),
-                text=block_text[:4000],
+                text=block_text,
                 heading=heading,
                 page_label=page_label,
             )
@@ -574,7 +576,7 @@ def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_pa
             parsed.chunks.append(
                 ParsedChunk(
                     ordinal=len(parsed.chunks),
-                    text=markdown_text[:4000],
+                    text=markdown_text,
                     heading="mineru-markdown-table",
                     page_label=table.get("page_label"),
                 )
@@ -834,7 +836,12 @@ def _summarize_blocks(blocks: list[str]) -> str:
     return "No summary available."
 
 
-def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], page_count: int) -> ParsedDocument | None:
+def _parse_pdf_with_document_intelligence(
+    path: Path,
+    page_texts: list[str],
+    page_count: int,
+    page_indices: set[int] | list[int] | tuple[int, ...] | None = None,
+) -> ParsedDocument | None:
     rendered_pages = _render_pdf_pages(path, dpi=settings.pdf_render_dpi)
     if not rendered_pages:
         logger.info("PDF document intelligence skipped because page rendering was unavailable.")
@@ -848,7 +855,22 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
     figures: list[dict] = []
     client = OllamaClient()
 
+    selected_indices = (
+        None
+        if page_indices is None
+        else sorted(
+            {
+                index
+                for index in page_indices
+                if isinstance(index, int) and 0 <= index < len(rendered_pages)
+            }
+        )
+    )
+    selected_set = None if selected_indices is None else set(selected_indices)
+
     for page_index, image_bytes in enumerate(rendered_pages):
+        if selected_set is not None and page_index not in selected_set:
+            continue
         page_label = str(page_index + 1)
         raw_text = page_texts[page_index] if page_index < len(page_texts) else ""
         quality = _classify_text_layer_quality(raw_text)
@@ -867,6 +889,8 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
                 "page_label": page_label,
                 "text_quality": quality,
                 "page_summary": analysis.page_summary,
+                "sections": list(analysis.sections),
+                "evidence_spans": list(analysis.evidence_spans),
                 "section_count": len(analysis.sections),
                 "table_count": len(analysis.tables),
                 "formula_count": len(analysis.formulas),
@@ -887,7 +911,7 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
             all_chunks.append(
                 ParsedChunk(
                     ordinal=len(all_chunks),
-                    text=chunk_text[:4000],
+                    text=chunk_text,
                     heading=heading,
                     page_label=page_label,
                 )
@@ -902,6 +926,7 @@ def _parse_pdf_with_document_intelligence(path: Path, page_texts: list[str], pag
             "vision_model": settings.ollama_vision_model or settings.ollama_generation_model,
             "render_dpi": settings.pdf_render_dpi,
             "ocr_fallback_enabled": settings.ocr_fallback_enabled,
+            "page_indices": selected_indices,
             "page_outputs": page_outputs,
             "tables": tables,
             "structured_tables": extract_structured_tables(tables),
@@ -986,14 +1011,14 @@ def _fallback_page_analysis(*, page_label: str, raw_text: str, text_quality: str
     return DocumentPagePayload(
         page_label=page_label,
         page_summary=summary[:400],
-        page_markdown="\n\n".join(sections[:6]) if sections else raw_text[:2000],
-        sections=sections[:8],
+        page_markdown="\n\n".join(sections) if sections else raw_text,
+        sections=sections,
         tables=[],
         figures=[],
         formulas=[],
-        key_facts=sections[:5],
+        key_facts=sections,
         entities=[],
-        evidence_spans=sections[:5],
+        evidence_spans=sections,
         coverage_notes=notes,
     )
 
@@ -1018,7 +1043,7 @@ def _fuse_pdf_page_content(*, page_label: str, raw_text: str, text_quality: str,
     if text_quality == "high" and raw_text:
         raw_sections = _split_into_sections(raw_text)
         if raw_sections:
-            sections = _dedupe_preserve_order(raw_sections[:8] + sections)
+            sections = _dedupe_preserve_order(raw_sections + sections)
     tables = [table.strip() for table in analysis.tables if table.strip()]
     formulas = [formula.strip() for formula in analysis.formulas if formula.strip()]
     figures = [figure.strip() for figure in analysis.figures if figure.strip()]
@@ -1031,7 +1056,7 @@ def _fuse_pdf_page_content(*, page_label: str, raw_text: str, text_quality: str,
         "",
         "### Narrative Blocks",
     ]
-    page_markdown_lines.extend(f"- {section}" for section in sections[:8] or ["No narrative blocks identified."])#取前8个章节，超过部分省略
+    page_markdown_lines.extend(f"- {section}" for section in sections or ["No narrative blocks identified."])
     if tables:
         page_markdown_lines.extend(["", "### Tables", *tables])#用生成器表达式把所有公式转换为markdown列表项，先换行，再添加标题，最后添加表格内容
     if formulas:
@@ -1039,19 +1064,19 @@ def _fuse_pdf_page_content(*, page_label: str, raw_text: str, text_quality: str,
     if figures:
         page_markdown_lines.extend(["", "### Figures", *(f"- {item}" for item in figures)])
     if evidence:
-        page_markdown_lines.extend(["", "### Evidence Spans", *(f"- {item}" for item in evidence[:8])])
+        page_markdown_lines.extend(["", "### Evidence Spans", *(f"- {item}" for item in evidence)])
 
     chunk_blocks: list[tuple[str, str | None]] = []#章节，表格，公式，图片
-    for index, section in enumerate(sections[:8]):
+    for index, section in enumerate(sections):
         chunk_blocks.append((section, f"page-{page_label}-section-{index + 1}"))
-    for index, table in enumerate(tables[:4]):
+    for index, table in enumerate(tables):
         chunk_blocks.append((table, f"page-{page_label}-table-{index + 1}"))
-    for index, formula in enumerate(formulas[:4]):
+    for index, formula in enumerate(formulas):
         chunk_blocks.append((formula, f"page-{page_label}-formula-{index + 1}"))
-    for index, figure in enumerate(figures[:4]):
+    for index, figure in enumerate(figures):
         chunk_blocks.append((figure, f"page-{page_label}-figure-{index + 1}"))
     if not chunk_blocks:#如果文本没有这些分块，就给markdowm或原文
-        fallback_text = analysis.page_markdown.strip() or raw_text[:2000].strip()
+        fallback_text = analysis.page_markdown.strip() or raw_text.strip()
         if fallback_text:
             chunk_blocks.append((fallback_text, f"page-{page_label}-content"))
 
