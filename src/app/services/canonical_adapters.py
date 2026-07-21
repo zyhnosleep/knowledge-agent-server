@@ -47,6 +47,16 @@ class _Line:
     text: str
 
 
+@dataclass(frozen=True)
+class _MarkdownImage:
+    start: int
+    end: int
+    alt: str
+    target: str
+    title: str | None = None
+    reference_label: str | None = None
+
+
 def _parse_error(path: Path, message: str, exc: Exception | None = None) -> Exception:
     # Lazy import keeps parser.parse_document() free to import the dispatcher lazily.
     from app.services.parser import DocumentParseError
@@ -146,12 +156,14 @@ class _DocumentBuilder:
         self._headings.append((level, title))
 
         normalized = title.strip().lower().rstrip(":")
-        if normalized in {"references", "reference", "bibliography"}:
+        if (
+            normalized in {"references", "reference", "bibliography"}
+            and self._reference_level is None
+        ):
             self._reference_level = level
             self._appendix_level = None
-        elif normalized.startswith("appendix"):
+        elif normalized.startswith("appendix") and self._reference_level is None:
             self._appendix_level = level
-            self._reference_level = None
 
         updated_span = self._span(span)
         block = self._append_block(
@@ -183,7 +195,9 @@ class _DocumentBuilder:
         formula_id: str | None = None,
     ) -> CanonicalBlock:
         if block_type == "narrative":
-            if self._appendix_level is not None:
+            if self._reference_level is not None:
+                block_type = "reference"
+            elif self._appendix_level is not None:
                 block_type = "appendix"
         return self._append_block(
             block_type=block_type,
@@ -336,13 +350,15 @@ class TextCanonicalAdapter:
 
 class MarkdownCanonicalAdapter:
     parser_source = "markdown"
-    _heading_re = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
+    _heading_re = re.compile(r"^(#{1,6})[ \t]+(?P<title>.*?)[ \t]*$")
     _fence_re = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
-    _image_re = re.compile(
-        r"!\[(?P<alt>[^]]*)\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<bare>[^\s)]+))"
-        r"(?:\s+(?:\"(?P<double_title>[^\"]*)\"|'(?P<single_title>[^']*)'))?\s*\)"
-    )
     _setext_re = re.compile(r"^[ \t]*(?P<underline>=+|-+)[ \t]*$")
+    _definition_re = re.compile(
+        r"^[ ]{0,3}\[(?P<label>[^]]+)\]:[ \t]*"
+        r"(?:<(?P<angle>[^>]+)>|(?P<bare>\S+))"
+        r"(?:[ \t]+(?:\"(?P<double_title>[^\"]*)\"|'(?P<single_title>[^']*)'|"
+        r"\((?P<paren_title>[^)]*)\)))?[ \t]*$"
+    )
 
     def parse(self, path: Path) -> CanonicalDocument:
         path = _validate_path(path)
@@ -350,16 +366,23 @@ class MarkdownCanonicalAdapter:
         document = _new_document(path, self.parser_source, "text/markdown")
         builder = _DocumentBuilder(document)
         lines = _lines(source)
+        definitions, definition_lines = self._definitions(lines)
         index = 0
 
         while index < len(lines):
+            if index in definition_lines:
+                index += 1
+                continue
             if not lines[index].text.strip():
                 index += 1
                 continue
 
             heading_match = self._heading_re.match(lines[index].text)
             if heading_match:
-                title = heading_match.group(2).strip()
+                title = heading_match.group("title").strip()
+                closing = re.fullmatch(r"(?P<title>.*?)[ \t]+#+[ \t]*", title)
+                if closing is not None:
+                    title = closing.group("title")
                 builder.add_heading(title, len(heading_match.group(1)), _text_span(lines, index, index))
                 if not document.title or document.title == display_title_from_path(path):
                     if len(heading_match.group(1)) == 1:
@@ -391,12 +414,14 @@ class MarkdownCanonicalAdapter:
                 code_span = _text_span(lines, index, last)
                 if not closed:
                     code_span = code_span.model_copy(update={"char_end": len(source)})
+                info = fence_match.group(2).strip()
                 builder.add_content(
                     body,
                     code_span,
                     metadata={
                         "kind": "code",
-                        "language": fence_match.group(2).strip(),
+                        "language": info.split(maxsplit=1)[0] if info else "",
+                        "info": info,
                         "fence": fence,
                         "closed": closed,
                     },
@@ -468,22 +493,21 @@ class MarkdownCanonicalAdapter:
                 index = end
                 continue
 
-            image_match = self._image_re.fullmatch(lines[index].text.strip())
-            if image_match:
-                span = _text_span(lines, index, index)
-                raw = source[span.char_start : span.char_end]
-                self._add_image(document, builder, span, raw, image_match)
-                index += 1
-                continue
-
             start = index
             index += 1
-            while index < len(lines) and lines[index].text.strip() and not self._is_special(lines, index):
+            while (
+                index < len(lines)
+                and index not in definition_lines
+                and lines[index].text.strip()
+                and not self._is_special(lines, index)
+            ):
                 index += 1
             end = index - 1
             span = _text_span(lines, start, end)
             text = source[span.char_start : span.char_end]
-            blocks = self._add_paragraph(document, builder, lines, text, span)
+            blocks = self._add_paragraph(
+                document, builder, lines, text, span, definitions
+            )
             if builder.heading_path and builder.heading_path[-1].strip().lower().rstrip(":") == "abstract":
                 abstract_text = "".join(
                     block.text for block in blocks if block.block_type == "narrative"
@@ -499,7 +523,6 @@ class MarkdownCanonicalAdapter:
         return bool(
             self._heading_re.match(value)
             or self._fence_re.match(value)
-            or self._image_re.fullmatch(value.strip())
             or self._setext_level(lines, index) is not None
             or value.strip().startswith(("$$", "\\["))
             or (
@@ -524,33 +547,36 @@ class MarkdownCanonicalAdapter:
         lines: list[_Line],
         text: str,
         span: SourceSpan,
+        definitions: dict[str, tuple[str, str | None]],
     ) -> list[CanonicalBlock]:
         blocks: list[CanonicalBlock] = []
         absolute_start = span.char_start or 0
         cursor = 0
-        for match in self._image_re.finditer(text):
-            if match.start() > cursor:
-                before = text[cursor : match.start()]
+        for image in self._scan_images(text, definitions):
+            if image.start > cursor:
+                before = text[cursor : image.start]
                 if before.strip():
                     before_start = absolute_start + cursor
                     blocks.append(
                         builder.add_content(
                             before,
-                            _span_for_chars(lines, before_start, absolute_start + match.start()),
+                            _span_for_chars(
+                                lines, before_start, absolute_start + image.start
+                            ),
                         )
                     )
-            raw = match.group(0)
-            image_start = absolute_start + match.start()
+            raw = text[image.start : image.end]
+            image_start = absolute_start + image.start
             blocks.append(
                 self._add_image(
                     document,
                     builder,
                     _span_for_chars(lines, image_start, image_start + len(raw)),
                     raw,
-                    match,
+                    image,
                 )
             )
-            cursor = match.end()
+            cursor = image.end
         if cursor < len(text):
             after = text[cursor:]
             if after.strip():
@@ -571,11 +597,11 @@ class MarkdownCanonicalAdapter:
         builder: _DocumentBuilder,
         span: SourceSpan,
         raw: str,
-        match: re.Match[str],
+        image: _MarkdownImage,
     ) -> CanonicalBlock:
-        target = match.group("angle") or match.group("bare")
-        title = match.group("double_title") or match.group("single_title")
-        caption = match.group("alt") or title or None
+        target = image.target
+        title = image.title
+        caption = image.alt or title or None
         figure_id = _stable_id(
             "figure", document.document_id, span.char_start, target, caption
         )
@@ -587,8 +613,9 @@ class MarkdownCanonicalAdapter:
                 source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
                 metadata={
                     "target": target,
-                    "alt": match.group("alt"),
+                    "alt": image.alt,
                     "title": title,
+                    "reference_label": image.reference_label,
                     "source_markdown": raw,
                 },
             )
@@ -600,6 +627,207 @@ class MarkdownCanonicalAdapter:
             figure_id=figure_id,
             metadata={"source_markdown": raw, "target": target, "title": title},
         )
+
+    @classmethod
+    def _definitions(
+        cls, lines: list[_Line]
+    ) -> tuple[dict[str, tuple[str, str | None]], set[int]]:
+        definitions: dict[str, tuple[str, str | None]] = {}
+        definition_lines: set[int] = set()
+        for index, line in enumerate(lines):
+            match = cls._definition_re.fullmatch(line.text)
+            if match is None:
+                continue
+            label = cls._normalize_reference_label(match.group("label"))
+            target = match.group("angle") or match.group("bare")
+            title = (
+                match.group("double_title")
+                or match.group("single_title")
+                or match.group("paren_title")
+            )
+            definitions.setdefault(
+                label, (cls._unescape_markdown(target), title)
+            )
+            definition_lines.add(index)
+        return definitions, definition_lines
+
+    @classmethod
+    def _scan_images(
+        cls,
+        text: str,
+        definitions: dict[str, tuple[str, str | None]],
+    ) -> list[_MarkdownImage]:
+        images: list[_MarkdownImage] = []
+        index = 0
+        while index < len(text):
+            if text[index] == "`":
+                run_length = len(text[index:]) - len(text[index:].lstrip("`"))
+                closing = cls._find_backtick_closing(
+                    text, index + run_length, run_length
+                )
+                index = closing + run_length if closing >= 0 else index + run_length
+                continue
+            if (
+                text[index] != "!"
+                or cls._is_escaped(text, index)
+                or index + 1 >= len(text)
+                or text[index + 1] != "["
+            ):
+                index += 1
+                continue
+            alt_end = cls._find_closing_bracket(text, index + 2)
+            if alt_end < 0:
+                index += 1
+                continue
+            alt = cls._unescape_markdown(text[index + 2 : alt_end])
+            cursor = alt_end + 1
+            parsed: tuple[int, str, str | None, str | None] | None = None
+            if cursor < len(text) and text[cursor] == "(":
+                direct = cls._parse_direct_image(text, cursor)
+                if direct is not None:
+                    end, target, title = direct
+                    parsed = (end, target, title, None)
+            elif cursor < len(text) and text[cursor] == "[":
+                label_end = cls._find_closing_bracket(text, cursor + 1)
+                if label_end >= 0:
+                    raw_label = text[cursor + 1 : label_end] or alt
+                    label = cls._normalize_reference_label(raw_label)
+                    if label in definitions:
+                        target, title = definitions[label]
+                        parsed = (label_end + 1, target, title, label)
+            else:
+                label = cls._normalize_reference_label(alt)
+                if label in definitions:
+                    target, title = definitions[label]
+                    parsed = (cursor, target, title, label)
+            if parsed is None:
+                index += 1
+                continue
+            end, target, title, reference_label = parsed
+            images.append(
+                _MarkdownImage(
+                    start=index,
+                    end=end,
+                    alt=alt,
+                    target=target,
+                    title=title,
+                    reference_label=reference_label,
+                )
+            )
+            index = end
+        return images
+
+    @classmethod
+    def _parse_direct_image(
+        cls, text: str, opening: int
+    ) -> tuple[int, str, str | None] | None:
+        cursor = opening + 1
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+        if cursor >= len(text):
+            return None
+        if text[cursor] == "<":
+            target_end = cls._find_unescaped(text, ">", cursor + 1)
+            if target_end < 0:
+                return None
+            target = text[cursor + 1 : target_end]
+            cursor = target_end + 1
+        else:
+            target_start = cursor
+            depth = 0
+            while cursor < len(text):
+                character = text[cursor]
+                if character == "\\" and cursor + 1 < len(text):
+                    cursor += 2
+                    continue
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif character in " \t\r\n" and depth == 0:
+                    break
+                cursor += 1
+            target = text[target_start:cursor]
+            if not target:
+                return None
+        target = cls._unescape_markdown(target)
+        while cursor < len(text) and text[cursor] in " \t\r\n":
+            cursor += 1
+        title: str | None = None
+        if cursor < len(text) and text[cursor] in {'"', "'", "("}:
+            opener = text[cursor]
+            closer = ")" if opener == "(" else opener
+            title_end = cls._find_unescaped(text, closer, cursor + 1)
+            if title_end < 0:
+                return None
+            title = cls._unescape_markdown(text[cursor + 1 : title_end])
+            cursor = title_end + 1
+            while cursor < len(text) and text[cursor] in " \t\r\n":
+                cursor += 1
+        if cursor >= len(text) or text[cursor] != ")":
+            return None
+        return cursor + 1, target, title
+
+    @staticmethod
+    def _find_unescaped(text: str, character: str, start: int) -> int:
+        index = start
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == character:
+                return index
+            index += 1
+        return -1
+
+    @staticmethod
+    def _find_closing_bracket(text: str, start: int) -> int:
+        depth = 0
+        index = start
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == "[":
+                depth += 1
+            elif text[index] == "]":
+                if depth == 0:
+                    return index
+                depth -= 1
+            index += 1
+        return -1
+
+    @staticmethod
+    def _find_backtick_closing(text: str, start: int, run_length: int) -> int:
+        index = start
+        while index < len(text):
+            if text[index] != "`":
+                index += 1
+                continue
+            candidate_length = len(text[index:]) - len(text[index:].lstrip("`"))
+            if candidate_length == run_length:
+                return index
+            index += candidate_length
+        return -1
+
+    @staticmethod
+    def _is_escaped(text: str, index: int) -> bool:
+        slash_count = 0
+        cursor = index - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            slash_count += 1
+            cursor -= 1
+        return slash_count % 2 == 1
+
+    @staticmethod
+    def _normalize_reference_label(label: str) -> str:
+        return re.sub(r"\s+", " ", label.strip()).casefold()
+
+    @staticmethod
+    def _unescape_markdown(value: str) -> str:
+        return re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])", r"\1", value)
 
     @staticmethod
     def _formula_at(source: str, lines: list[_Line], index: int) -> tuple[str, int, str] | None:
@@ -746,11 +974,132 @@ class HtmlCanonicalAdapter:
         document: CanonicalDocument,
         builder: _DocumentBuilder,
         table: Tag,
+        *,
+        parent_table_id: str | None = None,
+        parent_row_index: int | None = None,
+        parent_column_index: int | None = None,
+        parent_figure_id: str | None = None,
     ) -> None:
-        self._add_table(document, builder, table)
-        for nested in table.find_all("table"):
-            if nested.find_parent("table") is table:
-                self._walk_table_tree(document, builder, nested)
+        table_id, cell_positions = self._add_table(
+            document,
+            builder,
+            table,
+            parent_table_id=parent_table_id,
+            parent_row_index=parent_row_index,
+            parent_column_index=parent_column_index,
+            parent_figure_id=parent_figure_id,
+        )
+        for cell, row_index, column_index in cell_positions:
+            self._walk_structured_children(
+                document,
+                builder,
+                cell,
+                parent_table_id=table_id,
+                parent_row_index=row_index,
+                parent_column_index=column_index,
+                parent_figure_id=parent_figure_id,
+            )
+
+    def _walk_structured_children(
+        self,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        container: Tag,
+        *,
+        parent_table_id: str | None = None,
+        parent_row_index: int | None = None,
+        parent_column_index: int | None = None,
+        parent_figure_id: str | None = None,
+        skip_image: Tag | None = None,
+    ) -> None:
+        context = self._context_metadata(
+            parent_table_id,
+            parent_row_index,
+            parent_column_index,
+            parent_figure_id,
+        )
+
+        def visit(node: Tag | NavigableString) -> None:
+            if not isinstance(node, Tag):
+                return
+            span = self._context_span(node, context)
+            if node.name == "pre":
+                builder.add_content(
+                    node.get_text("", strip=False).strip("\r\n"),
+                    span,
+                    metadata={
+                        "kind": "code",
+                        "language": self._code_language(node.find("code")),
+                        **context,
+                    },
+                )
+                return
+            if node.name == "code":
+                builder.add_content(
+                    node.get_text("", strip=False),
+                    span,
+                    metadata={
+                        "kind": "code",
+                        "language": self._code_language(node),
+                        **context,
+                    },
+                )
+                return
+            if _is_math_element(node):
+                self._add_formula(document, builder, node, context=context)
+                return
+            if node.name == "img":
+                if node is not skip_image:
+                    self._add_image(document, builder, node, context=context)
+                return
+            if node.name == "table":
+                self._walk_table_tree(
+                    document,
+                    builder,
+                    node,
+                    parent_table_id=parent_table_id,
+                    parent_row_index=parent_row_index,
+                    parent_column_index=parent_column_index,
+                    parent_figure_id=parent_figure_id,
+                )
+                return
+            if node.name == "figure":
+                self._add_figure(document, builder, node, context=context)
+                return
+            if node.name == "figcaption":
+                return
+            for child in list(node.children):
+                visit(child)
+
+        for child in list(container.children):
+            visit(child)
+
+    @staticmethod
+    def _context_metadata(
+        parent_table_id: str | None,
+        parent_row_index: int | None,
+        parent_column_index: int | None,
+        parent_figure_id: str | None,
+    ) -> dict[str, object]:
+        values = {
+            "parent_table_id": parent_table_id,
+            "parent_row_index": parent_row_index,
+            "parent_column_index": parent_column_index,
+            "parent_figure_id": parent_figure_id,
+        }
+        return {key: value for key, value in values.items() if value is not None}
+
+    @staticmethod
+    def _context_span(element: Tag, context: dict[str, object]) -> SourceSpan:
+        span = _html_span(element)
+        return span.model_copy(
+            update={
+                "table_id": context.get("parent_table_id"),
+                "row_index": context.get("parent_row_index"),
+                "column_index": context.get("parent_column_index"),
+                "metadata": dict(context),
+            }
+        )
 
     def _walk_inline_container(
         self,
@@ -767,17 +1116,16 @@ class HtmlCanonicalAdapter:
             buffer.clear()
             if not text.strip():
                 return
-            text_index += 1
             parent_span = _html_span(container)
             builder.add_content(
                 text,
                 parent_span.model_copy(
                     update={
-                        "xpath": f"{parent_span.xpath}/text()[{text_index}]",
-                        "metadata": {"text_segment_index": text_index},
+                        "metadata": {"segment_index": text_index},
                     }
                 ),
             )
+            text_index += 1
 
         def visit(node: Tag | NavigableString) -> None:
             if isinstance(node, NavigableString):
@@ -820,14 +1168,45 @@ class HtmlCanonicalAdapter:
                 return class_name.removeprefix("language-")
         return ""
 
-    @staticmethod
-    def _add_table(document: CanonicalDocument, builder: _DocumentBuilder, element: Tag) -> None:
-        span = _html_span(element)
-        table_id = _stable_id("table", document.document_id, span.xpath, str(element))
+    @classmethod
+    def _add_table(
+        cls,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        element: Tag,
+        *,
+        parent_table_id: str | None = None,
+        parent_row_index: int | None = None,
+        parent_column_index: int | None = None,
+        parent_figure_id: str | None = None,
+    ) -> tuple[str, list[tuple[Tag, int, int]]]:
+        base_span = _html_span(element)
+        table_id = _stable_id(
+            "table", document.document_id, base_span.xpath, str(element)
+        )
+        context = cls._context_metadata(
+            parent_table_id,
+            parent_row_index,
+            parent_column_index,
+            parent_figure_id,
+        )
+        span = base_span.model_copy(
+            update={"table_id": table_id, "metadata": dict(context)}
+        )
         cells: list[CanonicalCell] = []
+        cell_positions: list[tuple[Tag, int, int]] = []
         grid: list[list[str]] = []
         rowspan_until: dict[int, int] = {}
         direct_rows = [row for row in element.find_all("tr") if row.find_parent("table") is element]
+        row_groups: list[Tag] = []
+        for row in direct_rows:
+            group = row.find_parent(["thead", "tbody", "tfoot"])
+            if group is None or group.find_parent("table") is not element:
+                group = element
+            row_groups.append(group)
+        group_last_row: dict[int, int] = {}
+        for row_index, group in enumerate(row_groups):
+            group_last_row[id(group)] = row_index
         header_row = False
         for row_index, row in enumerate(direct_rows):
             occupied = {
@@ -843,10 +1222,13 @@ class HtmlCanonicalAdapter:
             if row_index == 0:
                 header_row = any(cell.name == "th" for cell in direct_cells)
             for cell in direct_cells:
-                rowspan = HtmlCanonicalAdapter._safe_span_value(
-                    document, cell, "rowspan"
+                rowspan = cls._safe_span_value(
+                    document,
+                    cell,
+                    "rowspan",
+                    zero_value=group_last_row[id(row_groups[row_index])] - row_index + 1,
                 )
-                colspan = HtmlCanonicalAdapter._safe_span_value(
+                colspan = cls._safe_span_value(
                     document, cell, "colspan"
                 )
                 while any(
@@ -877,10 +1259,12 @@ class HtmlCanonicalAdapter:
                                 row_index=row_index,
                                 column_index=column_index,
                                 heading_path=builder.heading_path,
+                                metadata=dict(context),
                             )
                         ],
                     )
                 )
+                cell_positions.append((cell, row_index, column_index))
                 for occupied_column in range(column_index, column_index + colspan):
                     occupied.add(occupied_column)
                     if rowspan > 1:
@@ -905,19 +1289,34 @@ class HtmlCanonicalAdapter:
             source_html=str(element),
             normalized_markdown=normalized,
             source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
+            metadata=dict(context),
         )
         document.tables.append(table)
         if caption_element is not None and caption:
             builder.add_content(
                 caption,
-                _html_span(caption_element),
+                cls._context_span(caption_element, context),
                 block_type="caption",
                 table_id=table_id,
+                metadata=dict(context),
             )
-        builder.add_content(normalized, span, block_type="table", table_id=table_id)
+        builder.add_content(
+            normalized,
+            span,
+            block_type="table",
+            table_id=table_id,
+            metadata=dict(context),
+        )
+        return table_id, cell_positions
 
     @staticmethod
-    def _safe_span_value(document: CanonicalDocument, cell: Tag, attribute: str) -> int:
+    def _safe_span_value(
+        document: CanonicalDocument,
+        cell: Tag,
+        attribute: str,
+        *,
+        zero_value: int | None = None,
+    ) -> int:
         raw = cell.get(attribute, 1)
         try:
             value = int(raw)
@@ -926,6 +1325,8 @@ class HtmlCanonicalAdapter:
                 f"Invalid HTML {attribute}={raw!r}; using 1 at {_html_xpath(cell)}."
             )
             return 1
+        if value == 0 and zero_value is not None:
+            return max(1, zero_value)
         if value < 1:
             document.warnings.append(
                 f"Invalid HTML {attribute}={raw!r}; using 1 at {_html_xpath(cell)}."
@@ -942,11 +1343,32 @@ class HtmlCanonicalAdapter:
         ]
         return " ".join(pieces)
 
-    @staticmethod
-    def _add_figure(document: CanonicalDocument, builder: _DocumentBuilder, element: Tag) -> None:
-        span = _html_span(element)
-        image = element.find("img")
-        caption_element = element.find("figcaption")
+    def _add_figure(
+        self,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        element: Tag,
+        *,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        context = dict(context or {})
+        span = self._context_span(element, context)
+        image = next(
+            (
+                candidate
+                for candidate in element.find_all("img")
+                if candidate.find_parent("figure") is element
+            ),
+            None,
+        )
+        caption_element = next(
+            (
+                candidate
+                for candidate in element.find_all("figcaption")
+                if candidate.find_parent("figure") is element
+            ),
+            None,
+        )
         caption = caption_element.get_text(" ", strip=True) if caption_element else None
         src = image.get("src") if image else None
         alt = image.get("alt") if image else None
@@ -957,21 +1379,109 @@ class HtmlCanonicalAdapter:
                 caption=caption or alt,
                 asset_path=src,
                 source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
-                metadata={"src": src, "alt": alt, "source_html": str(element)},
+                metadata={
+                    "src": src,
+                    "alt": alt,
+                    "source_html": str(element),
+                    **context,
+                },
             )
         )
-        builder.add_content(caption or alt or src or "Figure", span, block_type="figure", figure_id=figure_id)
-        if caption_element is not None and caption:
-            builder.add_content(
-                caption,
-                _html_span(caption_element),
-                block_type="caption",
-                figure_id=figure_id,
-            )
+        child_context = {**context, "parent_figure_id": figure_id}
+        emitted_figure = False
 
-    @staticmethod
-    def _add_image(document: CanonicalDocument, builder: _DocumentBuilder, element: Tag) -> None:
-        span = _html_span(element)
+        def emit_figure() -> None:
+            nonlocal emitted_figure
+            if emitted_figure:
+                return
+            builder.add_content(
+                alt or src or "Figure",
+                span,
+                block_type="figure",
+                figure_id=figure_id,
+                metadata=dict(context),
+            )
+            emitted_figure = True
+
+        if image is None:
+            emit_figure()
+
+        def visit(node: Tag | NavigableString) -> None:
+            if not isinstance(node, Tag):
+                return
+            if node is image:
+                emit_figure()
+                return
+            if node is caption_element:
+                if caption:
+                    builder.add_content(
+                        caption,
+                        self._context_span(node, context),
+                        block_type="caption",
+                        figure_id=figure_id,
+                        metadata=dict(context),
+                    )
+                return
+            if node.name == "pre":
+                builder.add_content(
+                    node.get_text("", strip=False).strip("\r\n"),
+                    self._context_span(node, child_context),
+                    metadata={
+                        "kind": "code",
+                        "language": self._code_language(node.find("code")),
+                        **child_context,
+                    },
+                )
+                return
+            if node.name == "code":
+                builder.add_content(
+                    node.get_text("", strip=False),
+                    self._context_span(node, child_context),
+                    metadata={
+                        "kind": "code",
+                        "language": self._code_language(node),
+                        **child_context,
+                    },
+                )
+                return
+            if _is_math_element(node):
+                self._add_formula(document, builder, node, context=child_context)
+                return
+            if node.name == "img":
+                self._add_image(document, builder, node, context=child_context)
+                return
+            if node.name == "table":
+                self._walk_table_tree(
+                    document,
+                    builder,
+                    node,
+                    parent_table_id=context.get("parent_table_id"),
+                    parent_row_index=context.get("parent_row_index"),
+                    parent_column_index=context.get("parent_column_index"),
+                    parent_figure_id=figure_id,
+                )
+                return
+            if node.name == "figure":
+                self._add_figure(document, builder, node, context=child_context)
+                return
+            for child in list(node.children):
+                visit(child)
+
+        for child in list(element.children):
+            visit(child)
+        emit_figure()
+
+    @classmethod
+    def _add_image(
+        cls,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        element: Tag,
+        *,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        context = dict(context or {})
+        span = cls._context_span(element, context)
         src = element.get("src")
         alt = element.get("alt")
         figure_id = _stable_id("figure", document.document_id, span.xpath, src)
@@ -981,14 +1491,33 @@ class HtmlCanonicalAdapter:
                 caption=alt,
                 asset_path=src,
                 source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
-                metadata={"src": src, "alt": alt, "source_html": str(element)},
+                metadata={
+                    "src": src,
+                    "alt": alt,
+                    "source_html": str(element),
+                    **context,
+                },
             )
         )
-        builder.add_content(alt or src or "Image", span, block_type="figure", figure_id=figure_id)
+        builder.add_content(
+            alt or src or "Image",
+            span,
+            block_type="figure",
+            figure_id=figure_id,
+            metadata=dict(context),
+        )
 
-    @staticmethod
-    def _add_formula(document: CanonicalDocument, builder: _DocumentBuilder, element: Tag) -> None:
-        span = _html_span(element)
+    @classmethod
+    def _add_formula(
+        cls,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        element: Tag,
+        *,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        context = dict(context or {})
+        span = cls._context_span(element, context)
         annotation = element.find("annotation", attrs={"encoding": re.compile("tex", re.I)})
         latex = element.get("data-latex") or (
             annotation.get_text("", strip=True) if annotation else element.get_text(" ", strip=True)
@@ -999,10 +1528,20 @@ class HtmlCanonicalAdapter:
                 formula_id=formula_id,
                 latex=latex,
                 source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
-                metadata={"source_format": "html", "source_html": str(element)},
+                metadata={
+                    "source_format": "html",
+                    "source_html": str(element),
+                    **context,
+                },
             )
         )
-        builder.add_content(latex, span, block_type="formula", formula_id=formula_id)
+        builder.add_content(
+            latex,
+            span,
+            block_type="formula",
+            formula_id=formula_id,
+            metadata=dict(context),
+        )
 
 
 @dataclass(frozen=True)
@@ -1036,7 +1575,7 @@ class DocxCanonicalAdapter:
         paragraph_index = 0
         table_index = 0
 
-        for child in docx.element.body.iterchildren():
+        for child, locator in self._iter_docx_blocks(docx.element.body, "body"):
             if isinstance(child, CT_P):
                 paragraph = Paragraph(child, docx)
                 paragraph_id = child.get(qn("w14:paraId")) or f"paragraph-{paragraph_index}"
@@ -1049,10 +1588,14 @@ class DocxCanonicalAdapter:
                 )
                 paragraph_index += 1
             elif isinstance(child, CT_Tbl):
-                self._add_table(
-                    document, builder, docx, Table(child, docx), table_index
+                table_count = self._add_table(
+                    document,
+                    builder,
+                    docx,
+                    Table(child, docx),
+                    locator=locator,
                 )
-                table_index += 1
+                table_index += table_count
 
         document.parser_metadata.update(
             {
@@ -1064,6 +1607,15 @@ class DocxCanonicalAdapter:
         if not document.blocks:
             document.warnings.append("DOCX contains no supported content blocks.")
         return document
+
+    @classmethod
+    def _iter_docx_blocks(cls, container, prefix: str):
+        for child_index, child in enumerate(container.iterchildren()):
+            locator = f"{prefix}/{child_index}"
+            if isinstance(child, (CT_P, CT_Tbl)):
+                yield child, locator
+                continue
+            yield from cls._iter_docx_blocks(child, locator)
 
     def _emit_paragraph(
         self,
@@ -1196,7 +1748,10 @@ class DocxCanonicalAdapter:
             update={
                 "image_relationship_id": relationship_id,
                 "heading_path": builder.heading_path,
-                "metadata": {"relationship_target": source_target},
+                "metadata": {
+                    **span.metadata,
+                    "relationship_target": source_target,
+                },
             }
         )
         asset_id = _stable_id("asset", document.document_id, asset_sha)
@@ -1318,7 +1873,10 @@ class DocxCanonicalAdapter:
         formula_span = span.model_copy(
             update={
                 "heading_path": builder.heading_path,
-                "metadata": {"formula_event_index": event_index},
+                "metadata": {
+                    **span.metadata,
+                    "formula_event_index": event_index,
+                },
             }
         )
         document.formulas.append(
@@ -1344,13 +1902,27 @@ class DocxCanonicalAdapter:
         builder: _DocumentBuilder,
         docx,
         table: Table,
-        table_index: int,
-    ) -> None:
-        table_id = _stable_id("table", document.document_id, "docx", table_index)
+        *,
+        locator: str,
+        parent_table_id: str | None = None,
+        parent_row_index: int | None = None,
+        parent_column_index: int | None = None,
+    ) -> int:
+        table_id = _stable_id("table", document.document_id, "docx", locator)
+        context = {
+            key: value
+            for key, value in {
+                "locator": locator,
+                "parent_table_id": parent_table_id,
+                "parent_row_index": parent_row_index,
+                "parent_column_index": parent_column_index,
+            }.items()
+            if value is not None
+        }
         cells: list[CanonicalCell] = []
         grid: list[list[str]] = []
         active_merges: dict[int, CanonicalCell] = {}
-        cell_paragraphs: list[tuple[Paragraph, int, int, int]] = []
+        cell_entries: list[tuple[_Cell, int, int, str]] = []
         raw_rows = list(table._tbl.findall(qn("w:tr")))
 
         for row_index, raw_row in enumerate(raw_rows):
@@ -1370,6 +1942,10 @@ class DocxCanonicalAdapter:
                 required = column_index + colspan
                 if len(row_values) < required:
                     row_values.extend([""] * (required - len(row_values)))
+                cell_locator = f"{locator}/cell-{row_index}-{column_index}"
+                cell_entries.append(
+                    (cell, row_index, column_index, cell_locator)
+                )
 
                 if is_continue and column_index in active_merges:
                     origin = active_merges[column_index]
@@ -1386,6 +1962,7 @@ class DocxCanonicalAdapter:
                     row_index=row_index,
                     column_index=column_index,
                     heading_path=builder.heading_path,
+                    metadata={"locator": cell_locator, **context},
                 )
                 canonical_cell = CanonicalCell(
                     text=text,
@@ -1401,10 +1978,6 @@ class DocxCanonicalAdapter:
                     if is_restart:
                         active_merges[logical_column] = canonical_cell
                         restarted.add(logical_column)
-                for paragraph_index, paragraph in enumerate(cell.paragraphs):
-                    cell_paragraphs.append(
-                        (paragraph, row_index, column_index, paragraph_index)
-                    )
                 column_index += colspan
             active_merges = {
                 column: origin
@@ -1417,7 +1990,7 @@ class DocxCanonicalAdapter:
         grid = [(row + [""] * width)[:width] for row in grid]
         headers = grid[0] if grid else []
         rows = grid[1:] if grid else []
-        span = SourceSpan(table_id=table_id)
+        span = SourceSpan(table_id=table_id, metadata=dict(context))
         normalized = _table_markdown(headers, rows)
         document.tables.append(
             CanonicalTable(
@@ -1427,28 +2000,85 @@ class DocxCanonicalAdapter:
                 cells=cells,
                 normalized_markdown=normalized,
                 source_spans=[span.model_copy(update={"heading_path": builder.heading_path})],
-                metadata={"body_table_index": table_index},
+                metadata=dict(context),
             )
         )
-        builder.add_content(normalized, span, block_type="table", table_id=table_id)
+        builder.add_content(
+            normalized,
+            span,
+            block_type="table",
+            table_id=table_id,
+            metadata=dict(context),
+        )
 
-        for paragraph, row_index, column_index, paragraph_index in cell_paragraphs:
-            paragraph_id = paragraph._p.get(qn("w14:paraId")) or (
-                f"table-{table_index}-r{row_index}-c{column_index}-p{paragraph_index}"
-            )
-            self._emit_paragraph(
+        nested_table_count = 0
+        for cell, row_index, column_index, cell_locator in cell_entries:
+            nested_table_count += self._walk_docx_cell_contents(
                 document,
                 builder,
                 docx,
-                paragraph,
-                SourceSpan(
-                    paragraph_id=paragraph_id,
-                    table_id=table_id,
-                    row_index=row_index,
-                    column_index=column_index,
-                ),
-                structures_only=True,
+                cell,
+                prefix=cell_locator,
+                parent_table_id=table_id,
+                parent_row_index=row_index,
+                parent_column_index=column_index,
             )
+        return 1 + nested_table_count
+
+    def _walk_docx_cell_contents(
+        self,
+        document: CanonicalDocument,
+        builder: _DocumentBuilder,
+        docx,
+        cell: _Cell,
+        *,
+        prefix: str,
+        parent_table_id: str,
+        parent_row_index: int,
+        parent_column_index: int,
+    ) -> int:
+        nested_table_count = 0
+
+        def walk(container, locator_prefix: str) -> None:
+            nonlocal nested_table_count
+            for child_index, child in enumerate(container.iterchildren()):
+                child_locator = f"{locator_prefix}/{child_index}"
+                if isinstance(child, CT_P):
+                    paragraph = Paragraph(child, cell)
+                    paragraph_id = child.get(qn("w14:paraId")) or child_locator.replace(
+                        "/", "-"
+                    )
+                    self._emit_paragraph(
+                        document,
+                        builder,
+                        docx,
+                        paragraph,
+                        SourceSpan(
+                            paragraph_id=paragraph_id,
+                            table_id=parent_table_id,
+                            row_index=parent_row_index,
+                            column_index=parent_column_index,
+                            metadata={"locator": child_locator},
+                        ),
+                        structures_only=True,
+                    )
+                    continue
+                if isinstance(child, CT_Tbl):
+                    nested_table_count += self._add_table(
+                        document,
+                        builder,
+                        docx,
+                        Table(child, cell),
+                        locator=child_locator,
+                        parent_table_id=parent_table_id,
+                        parent_row_index=parent_row_index,
+                        parent_column_index=parent_column_index,
+                    )
+                    continue
+                walk(child, child_locator)
+
+        walk(cell._tc, prefix)
+        return nested_table_count
 
     @staticmethod
     def _docx_grid_span(raw_cell) -> int:
