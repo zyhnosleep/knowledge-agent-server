@@ -405,17 +405,10 @@ class CanonicalArtifactStore:
         version: str,
         document: CanonicalDocument,
         asset_hashes: dict[str, str],
-        *,
-        canonicalize: bool = True,
     ) -> dict[str, Any]:
-        def dump_model(model: Any, **kwargs: Any) -> Any:
-            if canonicalize:
-                return cls._bundle_model_dump(model, **kwargs)
-            return model.model_dump(mode="json", **kwargs)
-
         assets = []
         for asset in document.assets:
-            item = dump_model(
+            item = cls._bundle_model_dump(
                 asset,
                 exclude={"source_path"},
             )
@@ -429,7 +422,7 @@ class CanonicalArtifactStore:
                 "abstract": document.abstract,
                 "keywords": document.keywords,
                 "outline": [
-                    dump_model(section)
+                    cls._bundle_model_dump(section)
                     for section in document.outline
                 ],
                 "metadata": document.metadata,
@@ -439,36 +432,57 @@ class CanonicalArtifactStore:
                 "metadata": document.parser_metadata,
             },
             "source": {
-                "path": (
-                    cls._safe_source_path(document.source_path)
-                    if canonicalize
-                    else document.source_path
-                ),
+                "path": cls._safe_source_path(document.source_path),
                 "media_type": document.source_media_type,
                 "metadata": document.source_metadata,
             },
-            "quality": dump_model(document.quality),
+            "quality": cls._bundle_model_dump(document.quality),
             "warnings": document.warnings,
             "assets": assets,
             "status": document.status,
-            "blocks": [dump_model(block) for block in document.blocks],
-            "tables": [dump_model(table) for table in document.tables],
-            "figures": [dump_model(figure) for figure in document.figures],
-            "formulas": [dump_model(formula) for formula in document.formulas],
+            "blocks": [cls._bundle_model_dump(block) for block in document.blocks],
+            "tables": [cls._bundle_model_dump(table) for table in document.tables],
+            "figures": [cls._bundle_model_dump(figure) for figure in document.figures],
+            "formulas": [cls._bundle_model_dump(formula) for formula in document.formulas],
         }
-        if canonicalize:
-            return cls._sanitize_metadata_paths(payload)
-        return payload
+        return cls._sanitize_metadata_paths(payload)
 
     @staticmethod
-    def _input_fingerprint(payload: dict[str, Any]) -> str:
-        serialized = json.dumps(
+    def _build_raw_persisted_input_payload(
+        manifest: dict[str, Any],
+        raw_blocks: list[Any],
+        raw_tables: list[Any],
+        raw_figures: list[Any],
+        raw_formulas: list[Any],
+    ) -> dict[str, Any]:
+        return {
+            "document_id": manifest["document_id"],
+            "version": manifest["version"],
+            "document": manifest["document"],
+            "parser": manifest["parser"],
+            "source": manifest["source"],
+            "quality": manifest["quality"],
+            "warnings": manifest["warnings"],
+            "assets": manifest["assets"],
+            "status": manifest["status"],
+            "blocks": raw_blocks,
+            "tables": raw_tables,
+            "figures": raw_figures,
+            "formulas": raw_formulas,
+        }
+
+    @staticmethod
+    def _serialize_input_payload(payload: dict[str, Any]) -> bytes:
+        return json.dumps(
             payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        return hashlib.sha256(serialized).hexdigest()
+
+    @classmethod
+    def _input_fingerprint(cls, payload: dict[str, Any]) -> str:
+        return hashlib.sha256(cls._serialize_input_payload(payload)).hexdigest()
 
     @staticmethod
     def _render_markdown(
@@ -794,16 +808,22 @@ class CanonicalArtifactStore:
         if self._sha256(bundle / "canonical.md") != markdown_sha256:
             raise ValueError("canonical.md sha256 mismatch")
 
-        blocks: list[CanonicalBlock] = []
-        with (bundle / "blocks.jsonl").open("r", encoding="utf-8") as block_file:
-            for line_number, line in enumerate(block_file, start=1):
-                if not line.strip():
-                    raise ValueError(f"empty blocks.jsonl line at {line_number}")
-                blocks.append(CanonicalBlock.model_validate_json(line))
-
-        tables = self._read_model_list(bundle / "tables.json", CanonicalTable)
-        figures = self._read_model_list(bundle / "figures.json", CanonicalFigure)
-        formulas = self._read_model_list(bundle / "formulas.json", CanonicalFormula)
+        raw_blocks, blocks = self._read_jsonl_model_list(
+            bundle / "blocks.jsonl",
+            CanonicalBlock,
+        )
+        raw_tables, tables = self._read_model_list_with_raw(
+            bundle / "tables.json",
+            CanonicalTable,
+        )
+        raw_figures, figures = self._read_model_list_with_raw(
+            bundle / "figures.json",
+            CanonicalFigure,
+        )
+        raw_formulas, formulas = self._read_model_list_with_raw(
+            bundle / "formulas.json",
+            CanonicalFormula,
+        )
 
         asset_inventory = manifest.get("assets")
         if not isinstance(asset_inventory, list):
@@ -869,12 +889,12 @@ class CanonicalArtifactStore:
         persisted_asset_hashes = {
             asset.asset_id: asset.sha256 for asset in assets if asset.sha256 is not None
         }
-        raw_persisted_payload = self._build_persisted_input_payload(
-            document_id,
-            version,
-            persisted_document,
-            persisted_asset_hashes,
-            canonicalize=False,
+        raw_persisted_payload = self._build_raw_persisted_input_payload(
+            manifest,
+            raw_blocks,
+            raw_tables,
+            raw_figures,
+            raw_formulas,
         )
         canonical_persisted_payload = self._build_persisted_input_payload(
             document_id,
@@ -882,7 +902,9 @@ class CanonicalArtifactStore:
             persisted_document,
             persisted_asset_hashes,
         )
-        if raw_persisted_payload != canonical_persisted_payload:
+        if self._serialize_input_payload(
+            raw_persisted_payload
+        ) != self._serialize_input_payload(canonical_persisted_payload):
             raise ValueError("persisted canonical input is not canonical")
         if self._input_fingerprint(raw_persisted_payload) != input_fingerprint:
             raise ValueError("canonical input fingerprint mismatch")
@@ -1093,12 +1115,39 @@ class CanonicalArtifactStore:
             raise ValueError("canonical manifest assets must be a JSON array")
         if not isinstance(manifest["status"], str):
             raise ValueError("canonical manifest status must be a string")
+
     @classmethod
-    def _read_model_list(cls, path: Path, model: type[Any]) -> list[Any]:
+    def _read_jsonl_model_list(
+        cls,
+        path: Path,
+        model: type[Any],
+    ) -> tuple[list[Any], list[Any]]:
+        raw_items: list[Any] = []
+        models: list[Any] = []
+        with path.open("r", encoding="utf-8") as input_file:
+            for line_number, line in enumerate(input_file, start=1):
+                if not line.strip():
+                    raise ValueError(f"empty {path.name} line at {line_number}")
+                raw_item = json.loads(line)
+                raw_items.append(raw_item)
+                models.append(model.model_validate(raw_item))
+        return raw_items, models
+
+    @classmethod
+    def _read_model_list_with_raw(
+        cls,
+        path: Path,
+        model: type[Any],
+    ) -> tuple[list[Any], list[Any]]:
         value = cls._read_json(path)
         if not isinstance(value, list):
             raise ValueError(f"canonical artifact must contain a JSON array: {path.name}")
-        return [model.model_validate(item) for item in value]
+        return value, [model.model_validate(item) for item in value]
+
+    @classmethod
+    def _read_model_list(cls, path: Path, model: type[Any]) -> list[Any]:
+        _, models = cls._read_model_list_with_raw(path, model)
+        return models
 
     @classmethod
     def _validate_model_list(cls, path: Path, model: type[Any]) -> None:

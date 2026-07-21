@@ -1422,6 +1422,53 @@ def test_write_staging_rejects_wrong_provided_hash_without_runtime_source(
     assert first.is_dir()
 
 
+@pytest.mark.parametrize("operation", ["promote", "load"])
+def test_bundle_rejects_block_with_omitted_persisted_default(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    operation: str,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    bundle = staging
+    if operation == "load":
+        bundle = store.promote("doc-1", "canonical-v1-abcd")
+    blocks_path = bundle / "blocks.jsonl"
+    blocks = [json.loads(line) for line in blocks_path.read_text("utf-8").splitlines()]
+    del blocks[0]["retrievable"]
+    blocks_path.write_text(
+        "\n".join(json.dumps(block) for block in blocks) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
+        if operation == "promote":
+            store.promote("doc-1", "canonical-v1-abcd")
+        else:
+            store.load("doc-1", "canonical-v1-abcd")
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "field"),
+    [("tables.json", "status"), ("figures.json", "warnings")],
+)
+def test_bundle_rejects_structured_record_with_omitted_persisted_default(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    artifact_name: str,
+    field: str,
+) -> None:
+    store = CanonicalArtifactStore(tmp_path)
+    staging = store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    artifact_path = staging / artifact_name
+    records = json.loads(artifact_path.read_text("utf-8"))
+    del records[0][field]
+    artifact_path.write_text(json.dumps(records), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="persisted canonical input is not canonical"):
+        store.promote("doc-1", "canonical-v1-abcd")
+
+
 def test_write_staging_rejects_existing_final_without_orphan(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
