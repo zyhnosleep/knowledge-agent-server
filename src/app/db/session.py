@@ -5,11 +5,21 @@ import uuid
 from collections.abc import Generator
 from datetime import datetime
 
-from sqlalchemy import create_engine, inspect, text
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.core.config import get_settings
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 
 settings = get_settings()
 
@@ -19,8 +29,27 @@ connect_args = (
     else {}
 )
 engine = create_engine(settings.database_url, future=True, connect_args=connect_args)
+if settings.database_url.startswith("sqlite"):
+    event.listen(engine, "connect", _enable_sqlite_foreign_keys)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
+
+
+_REQUIRED_CHUNK_COLUMNS = {
+    "parse_version",
+    "chunk_role",
+    "block_type",
+    "section_path",
+    "source_block_ids",
+    "source_spans",
+    "embedding_text",
+    "token_count",
+}
+_CHUNK_SELF_FOREIGN_KEYS = {
+    "parent_chunk_id": ("fk_document_chunks_parent_chunk_id", "CASCADE"),
+    "previous_chunk_id": ("fk_document_chunks_previous_chunk_id", "SET NULL"),
+    "next_chunk_id": ("fk_document_chunks_next_chunk_id", "SET NULL"),
+}
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -34,9 +63,19 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     from app.models import records  # noqa: F401
 
+    if settings.database_url.startswith("sqlite"):
+        _configure_sqlite_engine(engine)
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_columns()
     _ensure_sqlite_unique_indexes()
+
+
+def _configure_sqlite_engine(target_engine: Engine) -> None:
+    if not event.contains(target_engine, "connect", _enable_sqlite_foreign_keys):
+        event.listen(target_engine, "connect", _enable_sqlite_foreign_keys)
+    with target_engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        connection.commit()
 
 
 def _ensure_sqlite_columns() -> None:
@@ -86,7 +125,86 @@ def _ensure_sqlite_columns() -> None:
                 if "duplicate column" not in str(exc).lower():
                     raise
     _backfill_sqlite_parse_versions()
+    _ensure_sqlite_chunk_schema()
     _ensure_sqlite_indexes()
+
+
+def _ensure_sqlite_chunk_schema() -> None:
+    if not settings.database_url.startswith("sqlite"):
+        return
+    with engine.connect() as connection:
+        schema = inspect(connection)
+        if "document_chunks" not in schema.get_table_names():
+            return
+        columns = {column["name"]: column for column in schema.get_columns("document_chunks")}
+        foreign_keys = {
+            foreign_key["constrained_columns"][0]: foreign_key
+            for foreign_key in schema.get_foreign_keys("document_chunks")
+            if foreign_key["referred_table"] == "document_chunks"
+        }
+        nullable_mismatch = any(
+            columns[column_name]["nullable"]
+            for column_name in _REQUIRED_CHUNK_COLUMNS
+        )
+        missing_foreign_keys = {
+            column_name
+            for column_name, (_constraint_name, ondelete) in _CHUNK_SELF_FOREIGN_KEYS.items()
+            if column_name not in foreign_keys
+            or foreign_keys[column_name].get("options", {}).get("ondelete", "").upper()
+            != ondelete
+        }
+        if not nullable_mismatch and not missing_foreign_keys:
+            return
+        conflicting_foreign_keys = missing_foreign_keys & set(foreign_keys)
+        if conflicting_foreign_keys:
+            names = ", ".join(sorted(conflicting_foreign_keys))
+            raise RuntimeError(
+                f"SQLite document_chunks has incompatible foreign keys: {names}."
+            )
+
+    _rebuild_sqlite_chunk_schema(columns, missing_foreign_keys)
+
+
+def _rebuild_sqlite_chunk_schema(
+    columns: dict[str, dict], missing_foreign_keys: set[str]
+) -> None:
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.commit()
+        try:
+            with connection.begin():
+                context = MigrationContext.configure(connection)
+                operations = Operations(context)
+                with operations.batch_alter_table(
+                    "document_chunks", recreate="always"
+                ) as batch_op:
+                    for column_name in sorted(_REQUIRED_CHUNK_COLUMNS):
+                        if columns[column_name]["nullable"]:
+                            batch_op.alter_column(
+                                column_name,
+                                existing_type=columns[column_name]["type"],
+                                nullable=False,
+                            )
+                    for column_name in sorted(missing_foreign_keys):
+                        constraint_name, ondelete = _CHUNK_SELF_FOREIGN_KEYS[column_name]
+                        batch_op.create_foreign_key(
+                            constraint_name,
+                            "document_chunks",
+                            [column_name],
+                            ["id"],
+                            ondelete=ondelete,
+                        )
+        finally:
+            if connection.in_transaction():
+                connection.rollback()
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
+
+        violations = connection.exec_driver_sql("PRAGMA foreign_key_check").all()
+        if violations:
+            raise RuntimeError(
+                "SQLite document_chunks rebuild produced foreign-key violations."
+            )
 
 
 def _backfill_sqlite_parse_versions() -> None:
@@ -149,6 +267,11 @@ def _ensure_sqlite_indexes() -> None:
             "conversation_sessions",
             "CREATE INDEX IF NOT EXISTS ix_conversation_sessions_document_id "
             "ON conversation_sessions (document_id)",
+        ),
+        (
+            "document_chunks",
+            "CREATE INDEX IF NOT EXISTS ix_document_chunks_document_id "
+            "ON document_chunks (document_id)",
         ),
         (
             "document_chunks",

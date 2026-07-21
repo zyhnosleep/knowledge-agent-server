@@ -83,14 +83,8 @@ class ParseVersionService:
     ) -> DocumentParseVersion:
         if self.db is None:
             raise RuntimeError("A database session is required to activate a parse version.")
-        if object_session(document) is not self.db:
-            raise ValueError(
-                "Document must be attached to the current session before activation."
-            )
-        if object_session(version) is not self.db:
-            raise ValueError(
-                "Parse version must be attached to the current session before activation."
-            )
+        self._require_persistent_current_session(document, "Document")
+        self._require_persistent_current_session(version, "Parse version")
 
         with self.db.no_autoflush:
             locked_document = self.db.scalar(
@@ -134,22 +128,31 @@ class ParseVersionService:
             set_committed_value(
                 locked_version, "version_key", database_version_key
             )
-            previous_versions = self.db.scalars(
-                select(DocumentParseVersion)
+            previous_rows = self.db.execute(
+                select(DocumentParseVersion.id, DocumentParseVersion.status)
                 .where(
                     DocumentParseVersion.document_id == locked_document.id,
                     DocumentParseVersion.status == "active",
                     DocumentParseVersion.id != locked_version.id,
                 )
-                .execution_options(populate_existing=True)
                 .with_for_update()
             ).all()
+            previous_statuses: list[tuple[DocumentParseVersion, str]] = []
+            for previous_id, previous_database_status in previous_rows:
+                previous = self.db.get(DocumentParseVersion, previous_id)
+                if previous is None:
+                    raise ValueError(
+                        f"Active parse version {previous_id!r} no longer exists."
+                    )
+                set_committed_value(
+                    previous, "status", previous_database_status
+                )
+                previous_statuses.append((previous, previous_database_status))
 
         activated_at = datetime.utcnow()
-        previous_statuses = [(previous, previous.status) for previous in previous_versions]
         version_status = locked_version.status
         version_activated_at = locked_version.activated_at
-        for previous in previous_versions:
+        for previous, _database_status in previous_statuses:
             previous.status = "superseded"
         locked_document.active_parse_version = database_version_key
         locked_version.status = "active"
@@ -164,6 +167,18 @@ class ParseVersionService:
             locked_version.activated_at = version_activated_at
             raise
         return locked_version
+
+    def _require_persistent_current_session(self, instance: object, label: str) -> None:
+        state = sa_inspect(instance)
+        if (
+            object_session(instance) is not self.db
+            or not state.persistent
+            or state.deleted
+            or instance in self.db.deleted
+        ):
+            raise ValueError(
+                f"{label} must be persistent in the current session and not pending deletion."
+            )
 
     @staticmethod
     def _validate_activation_status(

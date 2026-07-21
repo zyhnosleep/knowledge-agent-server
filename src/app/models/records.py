@@ -202,6 +202,7 @@ class DocumentChunk(Base, TimestampMixin):
     children: Mapped[list["DocumentChunk"]] = relationship(
         foreign_keys=[parent_chunk_id],
         back_populates="parent",
+        cascade="all, delete-orphan",
         passive_deletes=True,
     )
     previous_chunk: Mapped["DocumentChunk | None"] = relationship(

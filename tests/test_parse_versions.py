@@ -611,6 +611,28 @@ def test_activate_supersedes_previous_active_version(
     assert document.active_parse_version == "v2"
 
 
+def test_activate_preserves_unflushed_previous_version_metadata(
+    db: Session, document: Document
+) -> None:
+    service = ParseVersionService(db)
+    previous = service.create(document.id, "v1", "parsed/document-1/v1")
+    previous.status = "active"
+    current = service.create(document.id, "v2", "parsed/document-1/v2")
+    current.status = "ready_to_activate"
+    document.active_parse_version = "v1"
+    db.commit()
+    previous.artifact_dir = "parsed/document-1/v1-relocated"
+
+    service.activate(document, current)
+    db.commit()
+
+    with Session(db.get_bind()) as verification:
+        stored_previous = verification.get(DocumentParseVersion, previous.id)
+        assert stored_previous is not None
+        assert stored_previous.status == "superseded"
+        assert stored_previous.artifact_dir == "parsed/document-1/v1-relocated"
+
+
 def test_activate_rejects_cross_document_without_partial_changes(
     db: Session, document: Document
 ) -> None:
@@ -733,6 +755,56 @@ def test_activate_rejects_version_from_another_session_before_database_changes(
     )
 
 
+def test_activate_rejects_document_pending_deletion(
+    db: Session, document: Document
+) -> None:
+    version = ParseVersionService(db).create(
+        document.id, "v1", "parsed/document-1/v1"
+    )
+    version.status = "ready_to_activate"
+    db.flush()
+    version_id = version.id
+    document_id = document.id
+    db.commit()
+    db.delete(document)
+
+    with pytest.raises(ValueError, match="persistent.*current session"):
+        ParseVersionService(db).activate(document, version)
+    db.rollback()
+
+    stored_document = db.get(Document, document_id)
+    stored_version = db.get(DocumentParseVersion, version_id)
+    assert stored_document is not None
+    assert stored_version is not None
+    assert stored_document.active_parse_version is None
+    assert stored_version.status == "ready_to_activate"
+
+
+def test_activate_rejects_version_pending_deletion(
+    db: Session, document: Document
+) -> None:
+    version = ParseVersionService(db).create(
+        document.id, "v1", "parsed/document-1/v1"
+    )
+    version.status = "ready_to_activate"
+    db.flush()
+    version_id = version.id
+    document_id = document.id
+    db.commit()
+    db.delete(version)
+
+    with pytest.raises(ValueError, match="persistent.*current session"):
+        ParseVersionService(db).activate(document, version)
+    db.rollback()
+
+    stored_document = db.get(Document, document_id)
+    stored_version = db.get(DocumentParseVersion, version_id)
+    assert stored_document is not None
+    assert stored_version is not None
+    assert stored_document.active_parse_version is None
+    assert stored_version.status == "ready_to_activate"
+
+
 def test_activate_restores_in_memory_state_when_flush_fails(
     db: Session, document: Document, monkeypatch
 ) -> None:
@@ -833,6 +905,78 @@ def test_parent_foreign_key_cascades_at_database_level(
     assert db.get(DocumentChunk, "child") is None
 
 
+def test_orm_delete_parent_removes_loaded_children(
+    db: Session, document: Document
+) -> None:
+    parent = DocumentChunk(
+        id="loaded-parent",
+        document_id=document.id,
+        parse_version="v1",
+        ordinal=0,
+        chunk_role="parent",
+        block_type="narrative",
+        text="Parent",
+        embedding_text="Parent",
+    )
+    child = DocumentChunk(
+        id="loaded-child",
+        document_id=document.id,
+        parse_version="v1",
+        parent=parent,
+        ordinal=1,
+        chunk_role="child",
+        block_type="narrative",
+        text="Child",
+        embedding_text="Child",
+    )
+    db.add_all([parent, child])
+    db.commit()
+    assert parent.children == [child]
+
+    db.delete(parent)
+    db.commit()
+
+    assert db.get(DocumentChunk, child.id) is None
+
+
+def test_orm_delete_parent_removes_unloaded_children(
+    db: Session, document: Document
+) -> None:
+    parent = DocumentChunk(
+        id="unloaded-parent",
+        document_id=document.id,
+        parse_version="v1",
+        ordinal=0,
+        chunk_role="parent",
+        block_type="narrative",
+        text="Parent",
+        embedding_text="Parent",
+    )
+    child = DocumentChunk(
+        id="unloaded-child",
+        document_id=document.id,
+        parse_version="v1",
+        parent=parent,
+        ordinal=1,
+        chunk_role="child",
+        block_type="narrative",
+        text="Child",
+        embedding_text="Child",
+    )
+    db.add_all([parent, child])
+    db.commit()
+    parent_id = parent.id
+    child_id = child.id
+    db.expunge_all()
+    unloaded_parent = db.get(DocumentChunk, parent_id)
+    assert unloaded_parent is not None
+
+    db.delete(unloaded_parent)
+    db.commit()
+
+    assert db.get(DocumentChunk, child_id) is None
+
+
 def test_chunk_schema_has_version_role_index_and_self_foreign_key() -> None:
     table = DocumentChunk.__table__
     index_columns = {tuple(column.name for column in index.columns) for index in table.indexes}
@@ -926,12 +1070,31 @@ def test_init_db_upgrades_legacy_sqlite_chunk_columns_and_indexes(
     monkeypatch.setattr(session_module.settings, "database_url", database_url)
 
     session_module.init_db()
+    session_module.init_db()
 
     inspector = inspect(engine)
     document_columns = {column["name"] for column in inspector.get_columns("documents")}
     chunk_columns = {column["name"] for column in inspector.get_columns("document_chunks")}
     chunk_indexes = {
         index["name"] for index in inspector.get_indexes("document_chunks")
+    }
+    required_columns = {
+        "parse_version",
+        "chunk_role",
+        "block_type",
+        "section_path",
+        "source_block_ids",
+        "source_spans",
+        "embedding_text",
+        "token_count",
+    }
+    column_details = {
+        column["name"]: column for column in inspector.get_columns("document_chunks")
+    }
+    self_foreign_keys = {
+        foreign_key["constrained_columns"][0]: foreign_key
+        for foreign_key in inspector.get_foreign_keys("document_chunks")
+        if foreign_key["referred_table"] == "document_chunks"
     }
     with engine.connect() as connection:
         chunk = connection.execute(
@@ -949,6 +1112,15 @@ def test_init_db_upgrades_legacy_sqlite_chunk_columns_and_indexes(
 
     assert "active_parse_version" in document_columns
     assert set(CHUNK_SCHEMA_COLUMNS) <= chunk_columns
+    assert all(not column_details[name]["nullable"] for name in required_columns)
+    assert set(self_foreign_keys) == {
+        "parent_chunk_id",
+        "previous_chunk_id",
+        "next_chunk_id",
+    }
+    assert self_foreign_keys["parent_chunk_id"]["options"]["ondelete"] == "CASCADE"
+    assert self_foreign_keys["previous_chunk_id"]["options"]["ondelete"] == "SET NULL"
+    assert self_foreign_keys["next_chunk_id"]["options"]["ondelete"] == "SET NULL"
     assert "ix_document_chunks_document_parse_version_role" in chunk_indexes
     assert dict(chunk) == {
         "parse_version": "legacy",
@@ -958,6 +1130,53 @@ def test_init_db_upgrades_legacy_sqlite_chunk_columns_and_indexes(
         "token_count": 4,
     }
     assert dict(version) == {"version_key": "legacy", "status": "quarantined"}
+
+    with engine.connect() as connection:
+        assert connection.scalar(text("PRAGMA foreign_keys")) == 1
+    with Session(engine) as legacy_db:
+        legacy_db.add_all(
+            [
+                DocumentChunk(
+                    id="legacy-parent",
+                    document_id="d1",
+                    ordinal=1,
+                    text="Parent",
+                ),
+                DocumentChunk(
+                    id="legacy-child",
+                    document_id="d1",
+                    parent_chunk_id="legacy-parent",
+                    ordinal=2,
+                    text="Child",
+                ),
+                DocumentChunk(
+                    id="legacy-previous-ref",
+                    document_id="d1",
+                    previous_chunk_id="legacy-parent",
+                    ordinal=3,
+                    text="Previous ref",
+                ),
+                DocumentChunk(
+                    id="legacy-next-ref",
+                    document_id="d1",
+                    next_chunk_id="legacy-parent",
+                    ordinal=4,
+                    text="Next ref",
+                ),
+            ]
+        )
+        legacy_db.commit()
+        legacy_db.execute(
+            text("DELETE FROM document_chunks WHERE id = 'legacy-parent'")
+        )
+        legacy_db.commit()
+        assert legacy_db.get(DocumentChunk, "legacy-child") is None
+        previous_ref = legacy_db.get(DocumentChunk, "legacy-previous-ref")
+        next_ref = legacy_db.get(DocumentChunk, "legacy-next-ref")
+        assert previous_ref is not None
+        assert next_ref is not None
+        assert previous_ref.previous_chunk_id is None
+        assert next_ref.next_chunk_id is None
 
 
 CHUNK_SCHEMA_COLUMNS = {
