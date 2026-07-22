@@ -637,6 +637,50 @@ def test_generated_analysis_and_contextual_prefix_are_excluded_from_markdown(
     assert "DO NOT RENDER GENERATED FORMULA EXPLANATION" not in markdown
 
 
+def test_generated_blocks_are_excluded_from_canonical_markdown_but_analysis_stays_json(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks.append(
+        CanonicalBlock(
+            block_id="generated-analysis",
+            block_type="narrative",
+            text="DO NOT RENDER GENERATED BLOCK ANALYSIS",
+            reading_order=30,
+            parser_source="vision-model",
+            metadata={"generated": True, "provenance": "ai_analysis"},
+        )
+    )
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    markdown = (staging / "canonical.md").read_text("utf-8")
+    blocks = (staging / "blocks.jsonl").read_text("utf-8")
+    figures = json.loads((staging / "figures.json").read_text("utf-8"))
+
+    assert "DO NOT RENDER GENERATED BLOCK ANALYSIS" not in markdown
+    assert "DO NOT RENDER GENERATED BLOCK ANALYSIS" not in blocks
+    assert "DO NOT RENDER GENERATED FIGURE SUMMARY" not in markdown
+    assert figures[0]["generated_summary"] == "DO NOT RENDER GENERATED FIGURE SUMMARY"
+    assert figures[0]["analysis_model"] == "vision-model"
+
+
+def test_staged_figure_asset_survives_mineru_temporary_directory_cleanup(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    source_path = Path(canonical_document.assets[0].source_path or "")
+    expected = source_path.read_bytes()
+
+    staging = CanonicalArtifactStore(tmp_path / "store").write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+    source_path.unlink()
+
+    assert (staging / "assets" / "figures" / "figure-1.png").read_bytes() == expected
+
+
 def test_markdown_includes_unreferenced_structured_source_evidence(
     tmp_path: Path,
     canonical_document: CanonicalDocument,

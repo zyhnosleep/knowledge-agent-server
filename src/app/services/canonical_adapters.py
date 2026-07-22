@@ -2894,17 +2894,23 @@ def _parsed_pdf_to_canonical(
         formula_text = str(raw_formula.get("text") or raw_formula.get("latex") or "").strip()
         if not formula_text:
             continue
+        caption = str(raw_formula.get("caption") or "").strip() or None
+        description = str(
+            raw_formula.get("description") or raw_formula.get("note") or ""
+        ).strip() or None
         span = _pdf_span(page_label, f"{parser_source}-formula-{index + 1}")
         formula = CanonicalFormula(
             formula_id=_stable_id(
                 "formula", document.document_id, page_label, index, formula_text
             ),
             latex=formula_text,
+            caption=caption,
+            description=description,
             source_spans=[span],
             metadata={
                 key: value
                 for key, value in raw_formula.items()
-                if key not in {"text", "latex"}
+                if key not in {"text", "latex", "caption", "description", "note"}
             },
         )
         document.formulas.append(formula)
@@ -4021,4 +4027,82 @@ def parse_canonical_document(path: Path) -> CanonicalDocument:
         ".markdown": MarkdownCanonicalAdapter(),
         ".txt": TextCanonicalAdapter(),
     }.get(path.suffix.lower(), TextCanonicalAdapter())
-    return adapter.parse(path)
+    document = adapter.parse(path)
+    if isinstance(document, CanonicalDocument):
+        _link_nearby_structured_source_blocks(document)
+    return document
+
+
+def _link_nearby_structured_source_blocks(document: CanonicalDocument) -> None:
+    """Attach nearby source prose without manufacturing descriptions.
+
+    The links are format-neutral: every adapter already emits canonical blocks,
+    so Figure/Formula retrieval can use the same provenance rule for PDF, DOCX,
+    HTML, Markdown, and plain text.
+    """
+
+    ordered = sorted(document.blocks, key=lambda block: (block.reading_order, block.block_id))
+    positions = {block.block_id: index for index, block in enumerate(ordered)}
+
+    def block_pages(block: CanonicalBlock) -> set[int]:
+        return {
+            span.page_index
+            for span in block.source_spans
+            if span.page_index is not None
+        }
+
+    def nearby_ids(
+        owner_id: str,
+        owner_pages: set[int],
+        existing: list[str],
+        attribute: str,
+    ) -> list[str]:
+        anchors = [
+            positions[block.block_id]
+            for block in ordered
+            if getattr(block, attribute) == owner_id
+        ]
+        if not anchors:
+            return existing
+        candidates: list[tuple[int, int, str]] = []
+        for block in ordered:
+            if (
+                block.block_type not in {"narrative", "appendix"}
+                or not block.text.strip()
+                or block.metadata.get("generated")
+            ):
+                continue
+            pages = block_pages(block)
+            if owner_pages and pages and owner_pages.isdisjoint(pages):
+                continue
+            position = positions[block.block_id]
+            distance = min(abs(position - anchor) for anchor in anchors)
+            if distance <= 2:
+                candidates.append((distance, position, block.block_id))
+        discovered = [item[2] for item in sorted(candidates)[:2]]
+        return list(dict.fromkeys([*existing, *discovered]))
+
+    for figure in document.figures:
+        pages = {
+            span.page_index
+            for span in figure.source_spans
+            if span.page_index is not None
+        }
+        figure.nearby_block_ids = nearby_ids(
+            figure.figure_id,
+            pages,
+            figure.nearby_block_ids,
+            "figure_id",
+        )
+    for formula in document.formulas:
+        pages = {
+            span.page_index
+            for span in formula.source_spans
+            if span.page_index is not None
+        }
+        formula.nearby_block_ids = nearby_ids(
+            formula.formula_id,
+            pages,
+            formula.nearby_block_ids,
+            "formula_id",
+        )

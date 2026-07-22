@@ -448,7 +448,11 @@ class CanonicalArtifactStore:
             "warnings": document.warnings,
             "assets": assets,
             "status": document.status,
-            "blocks": [cls._bundle_model_dump(block) for block in document.blocks],
+            "blocks": [
+                cls._bundle_model_dump(block)
+                for block in document.blocks
+                if not cls._is_generated_block(block)
+            ],
             "tables": [cls._bundle_model_dump(table) for table in document.tables],
             "figures": [cls._bundle_model_dump(figure) for figure in document.figures],
             "formulas": [cls._bundle_model_dump(formula) for formula in document.formulas],
@@ -524,6 +528,8 @@ class CanonicalArtifactStore:
             document.blocks,
             key=lambda item: (item.reading_order, item.block_id),
         ):
+            if CanonicalArtifactStore._is_generated_block(block):
+                continue
             anchor = html.escape(f"block-{block.block_id}", quote=True)
             lines.append(f'<a id="{anchor}"></a>')
             if block.block_type == "heading":
@@ -786,8 +792,20 @@ class CanonicalArtifactStore:
                 separators=(",", ":"),
             )
             for block in blocks
+            if not cls._is_generated_block(block)
         ]
         cls._write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+    @staticmethod
+    def _is_generated_block(block: CanonicalBlock) -> bool:
+        provenance = block.metadata.get("provenance")
+        return bool(
+            block.metadata.get("generated") is True
+            or (
+                isinstance(provenance, dict)
+                and provenance.get("generated") is True
+            )
+        )
 
     @classmethod
     def _bundle_model_dump(cls, model: Any, **kwargs: Any) -> Any:
