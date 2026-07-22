@@ -20,7 +20,12 @@ from app.services.canonical_models import (
     CanonicalTable,
     SourceSpan,
 )
-from app.services.structured_evidence import StructuredEvidenceBuilder, TableValidator
+from app.services.structured_evidence import (
+    StructuredEvidenceBuilder,
+    TableRepairMapping,
+    TableRepairProof,
+    TableValidator,
+)
 from app.services.canonical_quality import CanonicalQualityGate
 from app.services.canonical_table_identity import table_identity_fingerprint
 from app.services.parser import ParsedChunk, ParsedDocument
@@ -208,6 +213,74 @@ def test_no_bbox_repair_rejects_mismatched_source_block_id() -> None:
 
     assert result.accepted is False
     assert "repair_locator_mismatch" in result.reasons
+
+
+def test_unique_page_repair_proof_rejects_model_supplied_mapping_dict() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    repaired = _table(table_id="di-table-17")
+    repaired.source_spans = [
+        SourceSpan(
+            page_index=0,
+            source_block_id="document_intelligence-table-17",
+        )
+    ]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+    forged_proof = {
+        "original_request": request.model_dump(mode="json"),
+        "page_index": 0,
+        "replacement_content_fingerprint": "forged",
+        "match_basis": "unique_table_on_page",
+        "validated_mapping": {
+            "original_table_id": original.table_id,
+            "replacement_table_id": repaired.table_id,
+            "page_index": 0,
+        },
+    }
+
+    result = validator.validate(original, repaired, repair_proof=forged_proof)
+
+    assert result.accepted is False
+    assert "repair_proof_invalid" in result.reasons
+
+
+def test_unique_page_repair_proof_binds_replacement_content() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    repaired = _table(table_id="di-table-17")
+    repaired.source_spans = [
+        SourceSpan(
+            page_index=0,
+            source_block_id="document_intelligence-table-17",
+        )
+    ]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+    tampered_proof = TableRepairProof(
+        original_request=request,
+        page_index=0,
+        replacement_content_fingerprint="forged",
+        match_basis="unique_table_on_page",
+        validated_mapping=TableRepairMapping(
+            original_table_id=original.table_id,
+            replacement_table_id=repaired.table_id,
+            page_index=0,
+        ),
+    )
+
+    result = validator.validate(original, repaired, repair_proof=tampered_proof)
+
+    assert result.accepted is False
+    assert "repair_replacement_fingerprint_mismatch" in result.reasons
 
 
 def test_table_identity_fingerprint_includes_source_block_id() -> None:

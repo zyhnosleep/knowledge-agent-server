@@ -25,6 +25,7 @@ from app.core.config import get_settings
 from app.services.canonical_abstract import extract_explicit_abstract
 from app.services.canonical_provenance import block_is_generated
 from app.services.canonical_table_identity import (
+    table_content_fingerprint,
     table_has_precise_locator,
     table_identity_fingerprint,
 )
@@ -3512,6 +3513,14 @@ def _structure_bbox(structure) -> tuple[float, float, float, float] | None:
     return None
 
 
+def _table_source_region_id(table: CanonicalTable) -> str | None:
+    for span in table.source_spans:
+        value = span.metadata.get("source_region_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _bboxes_overlap(
     left: tuple[float, float, float, float],
     right: tuple[float, float, float, float],
@@ -3532,11 +3541,24 @@ def _table_replacements_match_issues(
 ) -> bool:
     originals = {table.table_id: table for table in primary.tables}
     original_page_tables = _structures_on_pages(primary.tables, {page_index})
+    if len(replacements) != len(original_page_tables) or any(
+        not _structure_on_pages(table, {page_index}) for table in replacements
+    ):
+        return False
     if len(original_page_tables) > 1 and any(
         not table_has_precise_locator(table)
         for table in [*original_page_tables, *replacements]
     ):
-        return False
+        original_regions = [
+            _table_source_region_id(table) for table in original_page_tables
+        ]
+        replacement_regions = [_table_source_region_id(table) for table in replacements]
+        if (
+            any(region is None for region in [*original_regions, *replacement_regions])
+            or len(set(original_regions)) != len(original_regions)
+            or sorted(original_regions) != sorted(replacement_regions)
+        ):
+            return False
     page_issues = [
         issue
         for issue in issues
@@ -3550,6 +3572,7 @@ def _table_replacements_match_issues(
         if original is None:
             return False
         original_bbox = _structure_bbox(original)
+        original_region = _table_source_region_id(original)
         available = [table for table in replacements if table.table_id not in used_ids]
         if original_bbox is not None:
             located = [table for table in available if _structure_bbox(table) is not None]
@@ -3559,6 +3582,12 @@ def _table_replacements_match_issues(
                     for table in located
                     if _bboxes_overlap(original_bbox, _structure_bbox(table))
                 ]
+        elif original_region is not None:
+            available = [
+                table
+                for table in available
+                if _table_source_region_id(table) == original_region
+            ]
         if not available:
             return False
 
@@ -3573,16 +3602,45 @@ def _table_replacements_match_issues(
 
         available.sort(key=replacement_key)
         replacement = available[0]
-        from app.services.structured_evidence import TableValidator
+        from app.services.structured_evidence import (
+            TableRepairMapping,
+            TableRepairProof,
+            TableRepairRequest,
+            TableValidator,
+        )
 
         validator = TableValidator()
         request = validator.validate(original).repair_request
         if request is None:
             return False
+        proof: TableRepairRequest | TableRepairProof
+        if (
+            original_bbox is None
+            and original_region is None
+            and TableValidator._stable_locator(original)
+            != TableValidator._stable_locator(replacement)
+        ):
+            if len(original_page_tables) != 1 or len(replacements) != 1:
+                return False
+            proof = TableRepairProof(
+                original_request=request,
+                page_index=page_index,
+                replacement_content_fingerprint=table_content_fingerprint(
+                    replacement
+                ),
+                match_basis="unique_table_on_page",
+                validated_mapping=TableRepairMapping(
+                    original_table_id=original.table_id,
+                    replacement_table_id=replacement.table_id,
+                    page_index=page_index,
+                ),
+            )
+        else:
+            proof = request
         validation = validator.validate(
             original,
             repaired_table=replacement,
-            repair_proof=request,
+            repair_proof=proof,
         )
         if not validation.accepted:
             return False
@@ -3590,7 +3648,7 @@ def _table_replacements_match_issues(
         replacement.metadata = {
             **replacement.metadata,
             "repair_original_table_id": original.table_id,
-            "repair_proof": request.model_dump(mode="json"),
+            "repair_proof": proof.model_dump(mode="json"),
             "repair_proof_validated": True,
         }
         used_ids.add(replacement.table_id)

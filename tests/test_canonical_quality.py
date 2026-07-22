@@ -861,7 +861,7 @@ def test_table_repair_with_valid_replacement_is_accepted(
             SourceSpan(
                 page_index=0,
                 page_label="1",
-                source_block_id="source-table-1",
+                source_block_id="mineru-table-1",
             )
         ],
     )
@@ -882,7 +882,7 @@ def test_table_repair_with_valid_replacement_is_accepted(
             SourceSpan(
                 page_index=0,
                 page_label="1",
-                source_block_id="source-table-1",
+                source_block_id="document_intelligence-table-1",
             )
         ],
     )
@@ -909,6 +909,14 @@ def test_table_repair_with_valid_replacement_is_accepted(
     assert result.tables[0].status == "repaired_by_vision"
     assert result.tables[0].metadata["repair_original_table_id"] == "mineru-invalid"
     assert result.tables[0].metadata["repair_proof_validated"] is True
+    proof = result.tables[0].metadata["repair_proof"]
+    assert proof["match_basis"] == "unique_table_on_page"
+    assert proof["original_request"]["table_id"] == "mineru-invalid"
+    assert proof["validated_mapping"] == {
+        "original_table_id": "mineru-invalid",
+        "replacement_table_id": "di-valid",
+        "page_index": 0,
+    }
 
 
 def test_table_repair_requires_replacement_inventory_on_each_target_page() -> None:
@@ -1105,7 +1113,17 @@ def test_targeted_table_repair_rejects_same_content_with_different_ids() -> None
                 if valid
                 else []
             ),
-            source_spans=[SourceSpan(page_index=0, page_label="1")],
+            source_spans=[
+                SourceSpan(
+                    page_index=0,
+                    page_label="1",
+                    source_block_id=(
+                        f"document_intelligence-{table_id}"
+                        if valid
+                        else f"mineru-{table_id}"
+                    ),
+                )
+            ],
         )
 
     primary = _document(_block("Page body"))

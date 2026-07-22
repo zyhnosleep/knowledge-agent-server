@@ -20,7 +20,10 @@ from app.services.canonical_models import (
     TableStatus,
 )
 from app.services.canonical_quality import CanonicalQualityGate
-from app.services.canonical_table_identity import table_identity_fingerprint
+from app.services.canonical_table_identity import (
+    table_content_fingerprint,
+    table_identity_fingerprint,
+)
 
 
 class TableRepairRequest(BaseModel):
@@ -33,6 +36,28 @@ class TableRepairRequest(BaseModel):
     locator: dict[str, Any]
     source_fingerprint: str
     instructions: str
+
+
+class TableRepairMapping(BaseModel):
+    """Orchestrator-validated mapping between parser-specific table objects."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    original_table_id: str
+    replacement_table_id: str
+    page_index: int = Field(ge=0)
+
+
+class TableRepairProof(BaseModel):
+    """Parser-independent proof emitted only after inventory-level matching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    original_request: TableRepairRequest
+    page_index: int = Field(ge=0)
+    replacement_content_fingerprint: str
+    match_basis: Literal["unique_table_on_page"]
+    validated_mapping: TableRepairMapping
 
 
 class TableValidationResult(BaseModel):
@@ -73,7 +98,9 @@ class TableValidator:
         self,
         table: CanonicalTable,
         repaired_table: CanonicalTable | None = None,
-        repair_proof: TableRepairRequest | dict[str, Any] | None = None,
+        repair_proof: (
+            TableRepairRequest | TableRepairProof | dict[str, Any] | None
+        ) = None,
     ) -> TableValidationResult:
         candidate = (repaired_table or table).model_copy(deep=True)
         reasons = self._reasons(candidate)
@@ -116,7 +143,7 @@ class TableValidator:
     def _validate_repair_proof(
         original: CanonicalTable,
         repaired: CanonicalTable,
-        proof: TableRepairRequest | dict[str, Any] | None,
+        proof: TableRepairRequest | TableRepairProof | dict[str, Any] | None,
         reasons: list[str],
     ) -> None:
         def add(reason: str) -> None:
@@ -126,10 +153,21 @@ class TableValidator:
         if proof is None:
             add("repair_proof_missing")
             return
+        if isinstance(proof, TableRepairProof):
+            TableValidator._validate_inventory_proof(
+                original,
+                repaired,
+                proof,
+                reasons,
+            )
+            return
         if isinstance(proof, TableRepairRequest):
             fingerprint = proof.source_fingerprint
             locator = proof.locator
         elif isinstance(proof, dict):
+            if "original_request" in proof:
+                add("repair_proof_invalid")
+                return
             fingerprint = proof.get("source_fingerprint")
             locator = proof.get("locator")
         else:
@@ -149,10 +187,83 @@ class TableValidator:
             add("repair_locator_mismatch")
 
     @staticmethod
+    def _validate_inventory_proof(
+        original: CanonicalTable,
+        repaired: CanonicalTable,
+        proof: TableRepairProof,
+        reasons: list[str],
+    ) -> None:
+        def add(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        request = proof.original_request
+        expected_fingerprint = table_identity_fingerprint(original)
+        expected_locator = TableValidator._stable_locator(original)
+        request_locator = TableValidator._stable_locator_value(request.locator)
+        repaired_locator = TableValidator._stable_locator(repaired)
+        original_pages = TableValidator._table_pages(original)
+        repaired_pages = TableValidator._table_pages(repaired)
+        mapping = proof.validated_mapping
+
+        if request.table_id != original.table_id:
+            add("repair_original_table_mismatch")
+        if request.source_fingerprint != expected_fingerprint:
+            add("repair_source_fingerprint_mismatch")
+        if not expected_locator or request_locator != expected_locator:
+            add("repair_proof_locator_mismatch")
+        if not repaired_locator:
+            add("repair_replacement_locator_missing")
+        if TableValidator._table_bbox(original) is not None:
+            add("repair_match_basis_invalid")
+        if TableValidator._source_region_id(original) is not None:
+            add("repair_match_basis_invalid")
+        if original_pages != {proof.page_index} or repaired_pages != {
+            proof.page_index
+        }:
+            add("repair_page_mismatch")
+        if proof.replacement_content_fingerprint != table_content_fingerprint(
+            repaired
+        ):
+            add("repair_replacement_fingerprint_mismatch")
+        if (
+            mapping.original_table_id != original.table_id
+            or mapping.replacement_table_id != repaired.table_id
+            or mapping.page_index != proof.page_index
+        ):
+            add("repair_validated_mapping_mismatch")
+
+    @staticmethod
+    def _table_pages(table: CanonicalTable) -> set[int]:
+        return {
+            span.page_index
+            for span in table.source_spans
+            if span.page_index is not None
+        }
+
+    @staticmethod
+    def _table_bbox(table: CanonicalTable) -> tuple[float, float, float, float] | None:
+        for span in table.source_spans:
+            box = span.normalized_bbox or span.bbox
+            if box is not None:
+                return box
+        return None
+
+    @staticmethod
+    def _source_region_id(table: CanonicalTable) -> str | None:
+        for span in table.source_spans:
+            value = span.metadata.get("source_region_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
     def _stable_locator(table: CanonicalTable) -> dict[str, Any]:
-        return TableValidator._stable_locator_value(
-            CanonicalQualityGate._table_locator(table)
-        )
+        locator = CanonicalQualityGate._table_locator(table)
+        source_region_id = TableValidator._source_region_id(table)
+        if source_region_id is not None:
+            locator["source_region_id"] = source_region_id
+        return TableValidator._stable_locator_value(locator)
 
     @staticmethod
     def _stable_locator_value(value: object) -> dict[str, Any]:
@@ -160,11 +271,21 @@ class TableValidator:
             return {}
         page_index = value.get("page_index")
         bbox = value.get("bbox")
+        source_region_id = value.get("source_region_id")
         source_block_id = value.get("source_block_id")
         if bbox is not None:
             return {
                 key: item
                 for key, item in {"page_index": page_index, "bbox": bbox}.items()
+                if item is not None
+            }
+        if source_region_id is not None:
+            return {
+                key: item
+                for key, item in {
+                    "page_index": page_index,
+                    "source_region_id": source_region_id,
+                }.items()
                 if item is not None
             }
         if source_block_id is not None:

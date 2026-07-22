@@ -232,11 +232,17 @@ class CanonicalQualityGate:
         if span is None:
             return {}
         box = span.normalized_bbox or span.bbox
+        source_region_id = span.metadata.get("source_region_id")
         return {
             key: value
             for key, value in {
                 "page_index": span.page_index,
                 "bbox": list(box) if box is not None else None,
+                "source_region_id": (
+                    source_region_id
+                    if isinstance(source_region_id, str) and source_region_id.strip()
+                    else None
+                ),
                 "source_block_id": span.source_block_id,
             }.items()
             if value is not None
