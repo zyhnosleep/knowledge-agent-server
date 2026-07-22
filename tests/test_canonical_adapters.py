@@ -718,6 +718,27 @@ def test_html_captions_nested_tables_and_spans_have_structural_coordinates(
     assert len([block for block in document.blocks if block.table_id == outer.table_id]) == 2
 
 
+def test_nested_html_tables_round_trip_through_final_quality_gate(tmp_path: Path) -> None:
+    path = tmp_path / "nested-quality.html"
+    path.write_text(
+        """<html><body><table id="outer">
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Accuracy</td><td>91<table id="inner">
+<tr><th>Fold</th><th>Score</th></tr><tr><td>A</td><td>0.91</td></tr>
+</table></td></tr></table></body></html>""",
+        encoding="utf-8",
+    )
+
+    document = parse_canonical_document(path)
+
+    outer, inner = document.tables
+    assert outer.rows == [["Accuracy", "91"]]
+    assert inner.rows == [["A", "0.91"]]
+    assert all(table.status == "accepted_mineru" for table in document.tables)
+    assert document.quality.accepted is True
+    assert document.quality.status in {"accepted", "accepted_with_warnings"}
+
+
 def test_html_colspan_moves_past_every_active_rowspan_column(tmp_path: Path) -> None:
     path = tmp_path / "overlap.html"
     path.write_text(

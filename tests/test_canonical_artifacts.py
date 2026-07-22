@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services import canonical_artifacts
 from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.canonical_models import (
     CanonicalAsset,
@@ -73,22 +74,23 @@ def canonical_document(source_asset: Path) -> CanonicalDocument:
         ],
         blocks=[
             CanonicalBlock(
-                block_id="later",
-                block_type="narrative",
-                text="Second source paragraph.",
-                section_path=["Results"],
-                reading_order=20,
-                parser_source="mineru",
-                source_spans=[SourceSpan(page_index=3, source_block_id="pdf-20")],
-            ),
-            CanonicalBlock(
                 block_id="first",
                 block_type="heading",
                 text="Introduction",
                 section_path=["Introduction"],
+                reading_order=0,
+                parser_source="mineru",
+                source_spans=[SourceSpan(page_index=3, source_block_id="pdf-heading")],
+                metadata={"contextual_prefix": "DO NOT RENDER CONTEXT PREFIX"},
+            ),
+            CanonicalBlock(
+                block_id="later",
+                block_type="narrative",
+                text="Second source paragraph.",
+                section_path=["Results"],
                 reading_order=1,
                 parser_source="mineru",
-                metadata={"contextual_prefix": "DO NOT RENDER CONTEXT PREFIX"},
+                source_spans=[SourceSpan(page_index=3, source_block_id="pdf-20")],
             ),
         ],
         tables=[
@@ -97,7 +99,14 @@ def canonical_document(source_asset: Path) -> CanonicalDocument:
                 caption="Source table caption",
                 headers=["Model", "F1"],
                 rows=[["SAC-KG", "74.7"]],
-                normalized_markdown="| Model | F1 |\n|---|---|\n| SAC-KG | 74.7 |",
+                cells=[
+                    CanonicalCell(text="Model", row_index=0, column_index=0, is_header=True),
+                    CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+                    CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
+                    CanonicalCell(text="74.7", row_index=1, column_index=1),
+                ],
+                normalized_markdown="| Model | F1 |\n| --- | --- |\n| SAC-KG | 74.7 |",
+                source_spans=[SourceSpan(page_index=3, source_block_id="table-source")],
             )
         ],
         figures=[
@@ -170,6 +179,38 @@ def test_artifact_store_writes_self_contained_bundle(
 
     assert final.exists()
     assert not staging.exists()
+
+
+def test_artifact_store_revalidates_stale_accepted_table_before_writing(
+    tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    canonical_document.tables[0].rows = [["SAC-KG"]]
+    canonical_document.tables[0].status = "accepted_mineru"
+    canonical_document.quality = CanonicalQualityReport(
+        accepted=True, status="accepted", score=1.0
+    )
+    canonical_document.metadata["table_activation_allowed"] = True
+
+    with pytest.raises(ValueError, match="activation-safe|validation"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+def test_artifact_store_rejects_stale_fatal_quality_before_writing(
+    tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    canonical_document.metadata.update(
+        {"expected_page_count": 2, "parsed_page_indices": [0]}
+    )
+    canonical_document.quality = CanonicalQualityReport(
+        accepted=True, status="accepted", score=1.0
+    )
+
+    with pytest.raises(ValueError, match="quality|activation-safe"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
 
 
 def test_staging_contains_all_required_artifacts(
@@ -712,6 +753,38 @@ def test_staged_figure_asset_survives_mineru_temporary_directory_cleanup(
     source_path.unlink()
 
     assert (staging / "assets" / "figures" / "figure-1.png").read_bytes() == expected
+
+
+def test_artifact_store_rejects_single_asset_over_configured_limit(
+    monkeypatch, tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    monkeypatch.setattr(canonical_artifacts, "_MAX_SINGLE_ASSET_BYTES", 4)
+
+    with pytest.raises(ValueError, match="asset size limit"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+def test_artifact_store_hashes_assets_during_streaming_copy(
+    monkeypatch, tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    original_sha256 = CanonicalArtifactStore._sha256
+
+    def reject_second_asset_read(path: Path) -> str:
+        if "assets" in path.parts:
+            raise AssertionError("asset must be hashed during its streaming copy")
+        return original_sha256(path)
+
+    monkeypatch.setattr(CanonicalArtifactStore, "_sha256", staticmethod(reject_second_asset_read))
+
+    staging = tmp_path / "staging"
+    (staging / "assets").mkdir(parents=True)
+    CanonicalArtifactStore(tmp_path / "store")._copy_assets(
+        staging, canonical_document.assets
+    )
+
+    assert (staging / canonical_document.assets[0].path).is_file()
 
 
 def test_markdown_includes_unreferenced_structured_source_evidence(

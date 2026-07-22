@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from app.services.canonical_models import (
     CanonicalAsset,
@@ -63,6 +63,9 @@ _REMOTE_URI_SCHEMES = {"http", "https", "s3", "gs", "minio"}
 _MAX_TABLE_ROWS = 10_000
 _MAX_TABLE_COLUMNS = 1_000
 _MAX_TABLE_GRID_CELLS = 1_000_000
+_MAX_SINGLE_ASSET_BYTES = 64 * 1024 * 1024
+_MAX_DOCUMENT_ASSET_BYTES = 256 * 1024 * 1024
+_ASSET_COPY_CHUNK_BYTES = 1024 * 1024
 
 
 class CanonicalArtifactStore:
@@ -123,16 +126,6 @@ class CanonicalArtifactStore:
             )
         document = source_only_document(document)
         document.ensure_json_compatible()
-        failed_tables = [
-            table.table_id
-            for table in document.tables
-            if table.status == "validation_failed"
-        ]
-        if failed_tables or document.metadata.get("table_activation_allowed") is False:
-            raise ValueError(
-                "canonical table validation failed; staging is not activation-safe: "
-                f"{failed_tables}"
-            )
         self._validate_record_contract(
             document.blocks,
             document.tables,
@@ -142,6 +135,47 @@ class CanonicalArtifactStore:
             document.outline,
             document.quality,
         )
+        failed_table_ids = [
+            table.table_id
+            for table in document.tables
+            if table.status == "validation_failed"
+        ]
+        if failed_table_ids or document.metadata.get("table_activation_allowed") is False:
+            raise ValueError(
+                f"canonical table validation failed: {failed_table_ids}"
+            )
+        if document.quality.accepted is True or document.quality.status in {
+            "accepted",
+            "accepted_with_warnings",
+        }:
+            from app.services.canonical_adapters import _finalize_structured_evidence
+
+            revalidated = document.model_copy(deep=True)
+            _finalize_structured_evidence(revalidated)
+            claimed_accepted_table_ids = {
+                table.table_id
+                for table in document.tables
+                if table.status
+                in {"accepted_mineru", "repaired_by_vision", "cross_page_merged"}
+            }
+            stale_accepted_tables = [
+                table.table_id
+                for table in revalidated.tables
+                if table.table_id in claimed_accepted_table_ids
+                and table.status == "validation_failed"
+            ]
+            fatal_boundary_codes = {
+                issue.code
+                for issue in revalidated.quality.issues
+                if issue.severity == "fatal"
+                and issue.code in {"page_missing", "asset_invalid"}
+            }
+            if stale_accepted_tables or fatal_boundary_codes:
+                raise ValueError(
+                    "canonical quality/table validation failed; staging is not "
+                    "activation-safe: "
+                    f"tables={stale_accepted_tables}, fatal={sorted(fatal_boundary_codes)}"
+                )
         document_root = self._prepare_document_root(document_id, create=True)
         final = document_root / version
         if final.exists():
@@ -304,6 +338,30 @@ class CanonicalArtifactStore:
         assets: list[CanonicalAsset],
     ) -> dict[str, str]:
         asset_hashes: dict[str, str] = {}
+        source_stats: dict[str, os.stat_result] = {}
+        total_size = 0
+        for asset in assets:
+            if asset.source_path is None:
+                raise FileNotFoundError(
+                    f"asset source is required for declared asset {asset.asset_id!r}"
+                )
+            source = Path(asset.source_path)
+            if self._is_link_or_reparse_point(source):
+                raise ValueError(f"asset source cannot be a symbolic link: {source}")
+            try:
+                source_stat = source.stat()
+            except OSError as exc:
+                raise FileNotFoundError(f"asset source does not exist: {source}") from exc
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise FileNotFoundError(f"asset source is not a regular file: {source}")
+            if source_stat.st_size > _MAX_SINGLE_ASSET_BYTES:
+                raise ValueError(
+                    f"asset size limit exceeded for {asset.asset_id!r}: {source_stat.st_size}"
+                )
+            total_size += source_stat.st_size
+            if total_size > _MAX_DOCUMENT_ASSET_BYTES:
+                raise ValueError("document asset size limit exceeded")
+            source_stats[asset.asset_id] = source_stat
         for asset in assets:
             if asset.sha256 is not None and not re.fullmatch(
                 r"[0-9a-f]{64}", asset.sha256
@@ -312,22 +370,50 @@ class CanonicalArtifactStore:
                     f"asset sha256 must be lowercase 64-hex for {asset.asset_id!r}"
                 )
             destination = self._asset_destination(staging, asset.path)
-            if asset.source_path is None:
-                raise FileNotFoundError(
-                    f"asset source is required for declared asset {asset.asset_id!r}"
-                )
-
             source = Path(asset.source_path)
-            if not source.is_file():
-                raise FileNotFoundError(f"asset source does not exist: {source}")
-
+            initial_stat = source_stats[asset.asset_id]
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with source.open("rb") as source_file, destination.open("xb") as output_file:
-                shutil.copyfileobj(source_file, output_file)
-                output_file.flush()
-                os.fsync(output_file.fileno())
+            temporary = destination.with_name(
+                f".{destination.name}.{uuid4().hex}.tmp"
+            )
+            digest = hashlib.sha256()
+            copied_size = 0
+            try:
+                with source.open("rb") as source_file, temporary.open("xb") as output_file:
+                    opened_stat = os.fstat(source_file.fileno())
+                    if (
+                        opened_stat.st_size != initial_stat.st_size
+                        or opened_stat.st_mtime_ns != initial_stat.st_mtime_ns
+                    ):
+                        raise ValueError("asset source changed before streaming copy")
+                    while chunk := source_file.read(_ASSET_COPY_CHUNK_BYTES):
+                        copied_size += len(chunk)
+                        if copied_size > initial_stat.st_size:
+                            raise ValueError("asset source size changed during streaming copy")
+                        digest.update(chunk)
+                        output_file.write(chunk)
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+                    closed_stat = os.fstat(source_file.fileno())
+                final_stat = source.stat()
+                if (
+                    copied_size != initial_stat.st_size
+                    or closed_stat.st_size != initial_stat.st_size
+                    or final_stat.st_size != initial_stat.st_size
+                    or final_stat.st_mtime_ns != initial_stat.st_mtime_ns
+                    or self._is_link_or_reparse_point(source)
+                ):
+                    raise ValueError("asset source changed during streaming copy")
+                if self._is_link_or_reparse_point(destination):
+                    raise ValueError("asset destination became a symbolic link")
+                os.replace(temporary, destination)
+                if self._is_link_or_reparse_point(destination):
+                    raise ValueError("asset destination became a symbolic link")
+            finally:
+                if temporary.exists() and not self._is_link_or_reparse_point(temporary):
+                    temporary.unlink()
 
-            actual_sha256 = self._sha256(destination)
+            actual_sha256 = digest.hexdigest()
             if asset.sha256 is not None and actual_sha256 != asset.sha256:
                 raise ValueError(
                     f"asset sha256 mismatch for {asset.asset_id!r}: "
@@ -721,7 +807,7 @@ class CanonicalArtifactStore:
                 )
                 cells.append(
                     CanonicalCell(
-                        text=element.get_text(" ", strip=True),
+                        text=cls._html_cell_text(table, element),
                         row_index=row_index,
                         column_index=column_index,
                         rowspan=rowspan,
@@ -740,6 +826,46 @@ class CanonicalArtifactStore:
                         occupied.add((span_row, span_column))
                 column_index += colspan
         return cells
+
+    @staticmethod
+    def _html_cell_text(table: Tag, cell: Tag) -> str:
+        pieces: list[str] = []
+
+        def visit(node: Tag | NavigableString) -> None:
+            if isinstance(node, NavigableString):
+                if node.find_parent("table") is table and str(node).strip():
+                    pieces.append(str(node).strip())
+                return
+            if not isinstance(node, Tag) or node.name == "table":
+                return
+            if node.name == "img":
+                value = node.get("alt") or node.get("src")
+                if value:
+                    pieces.append(str(value).strip())
+                return
+            classes = {str(value).casefold() for value in node.get("class", [])}
+            if (
+                node.name == "math"
+                or "math" in classes
+                or node.get("data-latex") is not None
+            ):
+                annotation = node.find(
+                    "annotation", attrs={"encoding": re.compile("tex", re.I)}
+                )
+                value = node.get("data-latex") or (
+                    annotation.get_text("", strip=True)
+                    if annotation is not None
+                    else node.get_text(" ", strip=True)
+                )
+                if value:
+                    pieces.append(str(value).strip())
+                return
+            for child in list(node.children):
+                visit(child)
+
+        for child in list(cell.children):
+            visit(child)
+        return " ".join(pieces)
 
     @staticmethod
     def _validate_table_dimensions(row_count: int, column_count: int) -> None:

@@ -25,8 +25,6 @@ from app.core.config import get_settings
 from app.services.canonical_abstract import extract_explicit_abstract
 from app.services.canonical_provenance import block_is_generated
 from app.services.canonical_table_identity import (
-    table_content_fingerprint,
-    table_has_precise_locator,
     table_identity_fingerprint,
 )
 from app.services.canonical_models import (
@@ -47,6 +45,13 @@ from app.services.filesystem import display_title_from_path
 MAX_TABLE_ROWS = 10_000
 MAX_TABLE_COLUMNS = 1_000
 MAX_TABLE_GRID_CELLS = 1_000_000
+MAX_SINGLE_ASSET_BYTES = 64 * 1024 * 1024
+MAX_DOCUMENT_ASSET_BYTES = 256 * 1024 * 1024
+ASSET_COPY_CHUNK_BYTES = 1024 * 1024
+ADAPTER_ASSET_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
+ADAPTER_ASSET_CACHE_CLEANUP_POLICY = (
+    "evict source-sha directories by oldest mtime, then lexical sha"
+)
 MAX_NESTING_DEPTH = 256
 
 
@@ -133,7 +138,7 @@ def _safe_local_asset_name(path: Path, asset_sha: str) -> str:
 def _materialize_adapter_asset(
     document: CanonicalDocument,
     safe_name: str,
-    blob: bytes,
+    blob: bytes | Path,
     expected_sha: str,
     *,
     source_kind: str,
@@ -161,7 +166,20 @@ def _materialize_adapter_asset(
             raise ValueError("canonical source sha256 must be lowercase 64-hex")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
             raise ValueError("canonical asset sha256 must be lowercase 64-hex")
-        if hashlib.sha256(blob).hexdigest() != expected_sha:
+        source_stat: os.stat_result | None = None
+        if isinstance(blob, Path):
+            if _has_link_or_reparse_component(blob):
+                raise ValueError("extracted asset source contains a link or reparse point")
+            source_stat = blob.stat()
+            if source_stat.st_size > MAX_SINGLE_ASSET_BYTES:
+                raise ValueError("extracted asset size limit exceeded")
+            with blob.open("rb") as source:
+                source_digest = hashlib.file_digest(source, "sha256").hexdigest()
+        else:
+            if len(blob) > MAX_SINGLE_ASSET_BYTES:
+                raise ValueError("extracted asset size limit exceeded")
+            source_digest = hashlib.sha256(blob).hexdigest()
+        if source_digest != expected_sha:
             raise ValueError("extracted asset hash mismatch")
 
         directory = root / source_sha
@@ -201,9 +219,36 @@ def _materialize_adapter_asset(
                 "asset cache temporary path is a symbolic link or reparse point"
             )
         with temporary.open("xb") as output:
-            output.write(blob)
+            copied_digest = hashlib.sha256()
+            copied_size = 0
+            if isinstance(blob, Path):
+                with blob.open("rb") as source:
+                    opened_stat = os.fstat(source.fileno())
+                    if source_stat is None or (
+                        opened_stat.st_size != source_stat.st_size
+                        or opened_stat.st_mtime_ns != source_stat.st_mtime_ns
+                    ):
+                        raise ValueError("extracted asset changed before copy")
+                    while chunk := source.read(ASSET_COPY_CHUNK_BYTES):
+                        copied_size += len(chunk)
+                        copied_digest.update(chunk)
+                        output.write(chunk)
+                    final_stat = os.fstat(source.fileno())
+                if (
+                    copied_size != source_stat.st_size
+                    or final_stat.st_size != source_stat.st_size
+                    or blob.stat().st_mtime_ns != source_stat.st_mtime_ns
+                    or _has_link_or_reparse_component(blob)
+                ):
+                    raise ValueError("extracted asset changed during copy")
+            else:
+                copied_size = len(blob)
+                copied_digest.update(blob)
+                output.write(blob)
             output.flush()
             os.fsync(output.fileno())
+        if copied_digest.hexdigest() != expected_sha:
+            raise ValueError("materialized asset hash mismatch")
         if _is_link_or_reparse_point(temporary):
             raise ValueError(
                 "asset cache temporary path became a symbolic link or reparse point"
@@ -311,9 +356,17 @@ def _register_local_figure_asset(
             )
             return None
         resolved = candidate.resolve(strict=True)
+        size_bytes = resolved.stat().st_size
+        existing_total = sum(
+            int(asset.metadata.get("size_bytes") or 0) for asset in document.assets
+        )
+        if (
+            size_bytes > MAX_SINGLE_ASSET_BYTES
+            or existing_total + size_bytes > MAX_DOCUMENT_ASSET_BYTES
+        ):
+            raise ValueError("canonical asset size limit exceeded")
         with resolved.open("rb") as source:
             asset_sha = hashlib.file_digest(source, "sha256").hexdigest()
-        size_bytes = resolved.stat().st_size
     except (OSError, ValueError) as exc:
         document.warnings.append(
             f"Figure target {target!r} could not be read and was not materialized: {exc}."
@@ -2400,6 +2453,8 @@ class DocxCanonicalAdapter:
                         "relationship_target": source_target,
                         "embedded": True,
                         "size_bytes": len(blob),
+                        "cache_limit_bytes": ADAPTER_ASSET_CACHE_MAX_BYTES,
+                        "cache_cleanup_policy": ADAPTER_ASSET_CACHE_CLEANUP_POLICY,
                     },
                 )
             )
@@ -3153,9 +3208,18 @@ def _register_pdf_figure_asset(
         return None
 
     try:
-        blob = source_path.read_bytes()
-        asset_sha = hashlib.sha256(blob).hexdigest()
-        size_bytes = len(blob)
+        source_stat = source_path.stat()
+        existing_total = sum(
+            int(asset.metadata.get("size_bytes") or 0) for asset in document.assets
+        )
+        if (
+            source_stat.st_size > MAX_SINGLE_ASSET_BYTES
+            or existing_total + source_stat.st_size > MAX_DOCUMENT_ASSET_BYTES
+        ):
+            return None
+        with source_path.open("rb") as source:
+            asset_sha = hashlib.file_digest(source, "sha256").hexdigest()
+        size_bytes = source_stat.st_size
     except OSError:
         return None
     existing = next((asset for asset in document.assets if asset.sha256 == asset_sha), None)
@@ -3168,7 +3232,7 @@ def _register_pdf_figure_asset(
     durable_source = _materialize_adapter_asset(
         document,
         safe_name,
-        blob,
+        source_path,
         asset_sha,
         source_kind="PDF/MinerU",
     )
@@ -3185,6 +3249,8 @@ def _register_pdf_figure_asset(
                 "source_parser": document.parser_source,
                 "mineru_path": raw_path,
                 "size_bytes": size_bytes,
+                "cache_limit_bytes": ADAPTER_ASSET_CACHE_MAX_BYTES,
+                "cache_cleanup_policy": ADAPTER_ASSET_CACHE_CLEANUP_POLICY,
             },
         )
     )
@@ -3513,52 +3579,13 @@ def _structure_bbox(structure) -> tuple[float, float, float, float] | None:
     return None
 
 
-def _table_source_region_id(table: CanonicalTable) -> str | None:
-    for span in table.source_spans:
-        value = span.metadata.get("source_region_id")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _bboxes_overlap(
-    left: tuple[float, float, float, float],
-    right: tuple[float, float, float, float],
-) -> bool:
-    return not (
-        left[2] < right[0]
-        or right[2] < left[0]
-        or left[3] < right[1]
-        or right[3] < left[1]
-    )
-
-
 def _table_replacements_match_issues(
     primary: CanonicalDocument,
     replacements: list[CanonicalTable],
     issues: list[CanonicalQualityIssue],
     page_index: int,
 ) -> bool:
-    originals = {table.table_id: table for table in primary.tables}
     original_page_tables = _structures_on_pages(primary.tables, {page_index})
-    if len(replacements) != len(original_page_tables) or any(
-        not _structure_on_pages(table, {page_index}) for table in replacements
-    ):
-        return False
-    if len(original_page_tables) > 1 and any(
-        not table_has_precise_locator(table)
-        for table in [*original_page_tables, *replacements]
-    ):
-        original_regions = [
-            _table_source_region_id(table) for table in original_page_tables
-        ]
-        replacement_regions = [_table_source_region_id(table) for table in replacements]
-        if (
-            any(region is None for region in [*original_regions, *replacement_regions])
-            or len(set(original_regions)) != len(original_regions)
-            or sorted(original_regions) != sorted(replacement_regions)
-        ):
-            return False
     page_issues = [
         issue
         for issue in issues
@@ -3566,84 +3593,22 @@ def _table_replacements_match_issues(
         and issue.repair_scope
         and page_index in _repair_scope_page_indices(issue.repair_scope)
     ]
-    used_ids: set[str] = set()
-    for issue in page_issues:
-        original = originals.get(str(issue.metadata.get("table_id") or ""))
-        if original is None:
-            return False
-        original_bbox = _structure_bbox(original)
-        original_region = _table_source_region_id(original)
-        available = [table for table in replacements if table.table_id not in used_ids]
-        if original_bbox is not None:
-            located = [table for table in available if _structure_bbox(table) is not None]
-            if located:
-                available = [
-                    table
-                    for table in located
-                    if _bboxes_overlap(original_bbox, _structure_bbox(table))
-                ]
-        elif original_region is not None:
-            available = [
-                table
-                for table in available
-                if _table_source_region_id(table) == original_region
-            ]
-        if not available:
-            return False
+    repair_table_ids = {
+        str(issue.metadata.get("table_id"))
+        for issue in page_issues
+        if issue.metadata.get("table_id") is not None
+    }
+    from app.services.structured_evidence import TableValidator
 
-        def replacement_key(table: CanonicalTable) -> tuple[float, str]:
-            replacement_bbox = _structure_bbox(table)
-            distance = (
-                abs(replacement_bbox[1] - original_bbox[1])
-                if replacement_bbox is not None and original_bbox is not None
-                else 0.0
-            )
-            return distance, table.table_id
-
-        available.sort(key=replacement_key)
-        replacement = available[0]
-        from app.services.structured_evidence import (
-            TableRepairMapping,
-            TableRepairProof,
-            TableRepairRequest,
-            TableValidator,
-        )
-
-        validator = TableValidator()
-        request = validator.validate(original).repair_request
-        if request is None:
-            return False
-        proof: TableRepairRequest | TableRepairProof
-        if (
-            original_bbox is None
-            and original_region is None
-            and TableValidator._stable_locator(original)
-            != TableValidator._stable_locator(replacement)
-        ):
-            if len(original_page_tables) != 1 or len(replacements) != 1:
-                return False
-            proof = TableRepairProof(
-                original_request=request,
-                page_index=page_index,
-                replacement_content_fingerprint=table_content_fingerprint(
-                    replacement
-                ),
-                match_basis="unique_table_on_page",
-                validated_mapping=TableRepairMapping(
-                    original_table_id=original.table_id,
-                    replacement_table_id=replacement.table_id,
-                    page_index=page_index,
-                ),
-            )
-        else:
-            proof = request
-        validation = validator.validate(
-            original,
-            repaired_table=replacement,
-            repair_proof=proof,
-        )
-        if not validation.accepted:
-            return False
+    bindings = TableValidator().validate_repair_inventory(
+        original_page_tables,
+        replacements,
+        repair_table_ids,
+        page_index,
+    )
+    if bindings is None:
+        return False
+    for original, replacement, validation, proof in bindings:
         replacement.status = "repaired_by_vision"
         replacement.metadata = {
             **replacement.metadata,
@@ -3651,7 +3616,6 @@ def _table_replacements_match_issues(
             "repair_proof": proof.model_dump(mode="json"),
             "repair_proof_validated": True,
         }
-        used_ids.add(replacement.table_id)
     return True
 
 
@@ -4181,6 +4145,43 @@ def _finalize_structured_evidence(document: CanonicalDocument) -> None:
     # keeps adapter finalization independent from model-cache availability.
     builder = StructuredEvidenceBuilder(token_counter=lambda _text: 0)
     document.tables = builder.merge_cross_page_tables(document.tables)
+    aliases = dict(builder.table_aliases)
+    if aliases:
+        document.metadata["table_aliases"] = aliases
+
+        def remap_metadata(value):
+            if isinstance(value, list):
+                return [remap_metadata(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            remapped = {}
+            for key, item in value.items():
+                if (
+                    key
+                    in {
+                        "table_id",
+                        "parent_table_id",
+                        "continuation_of",
+                        "original_table_id",
+                        "retrieval_covered_by_table_id",
+                    }
+                    and isinstance(item, str)
+                ):
+                    remapped[key] = aliases.get(item, item)
+                else:
+                    remapped[key] = remap_metadata(item)
+            return remapped
+
+        for block in document.blocks:
+            if block.table_id is not None:
+                block.table_id = aliases.get(block.table_id, block.table_id)
+            block.metadata = remap_metadata(block.metadata)
+            for span in block.source_spans:
+                if span.table_id is not None:
+                    span.table_id = aliases.get(span.table_id, span.table_id)
+                span.metadata = remap_metadata(span.metadata)
+        for issue in document.quality.issues:
+            issue.metadata = remap_metadata(issue.metadata)
     validator = TableValidator()
     requests: list[dict[str, object]] = []
     validated_tables: list[CanonicalTable] = []

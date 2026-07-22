@@ -3,6 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from app.services import canonical_adapters
 from app.services.canonical_adapters import (
     MarkdownCanonicalAdapter,
@@ -27,7 +29,10 @@ from app.services.structured_evidence import (
     TableValidator,
 )
 from app.services.canonical_quality import CanonicalQualityGate
-from app.services.canonical_table_identity import table_identity_fingerprint
+from app.services.canonical_table_identity import (
+    table_content_fingerprint,
+    table_identity_fingerprint,
+)
 from app.services.parser import ParsedChunk, ParsedDocument
 
 
@@ -147,14 +152,14 @@ def test_valid_repair_is_marked_repaired_by_vision() -> None:
     assert request is not None
 
     missing_proof = validator.validate(original, repaired_table=repaired)
-    result = validator.validate(
-        original,
-        repaired_table=repaired,
-        repair_proof=request,
+    bindings = validator.validate_repair_inventory(
+        [original], [repaired], {original.table_id}, 0
     )
 
     assert missing_proof.accepted is False
     assert "repair_proof_missing" in missing_proof.reasons
+    assert bindings is not None
+    result = bindings[0][2]
     assert result.accepted is True
     assert result.status == "repaired_by_vision"
     assert result.table.status == "repaired_by_vision"
@@ -190,9 +195,12 @@ def test_no_bbox_repair_accepts_matching_source_block_id() -> None:
     request = validator.validate(original).repair_request
     assert request is not None
 
-    result = validator.validate(original, repaired, repair_proof=request)
+    bindings = validator.validate_repair_inventory(
+        [original], [repaired], {original.table_id}, 0
+    )
 
-    assert result.accepted is True
+    assert bindings is not None
+    assert bindings[0][2].accepted is True
 
 
 def test_no_bbox_repair_rejects_mismatched_source_block_id() -> None:
@@ -281,6 +289,37 @@ def test_unique_page_repair_proof_binds_replacement_content() -> None:
 
     assert result.accepted is False
     assert "repair_replacement_fingerprint_mismatch" in result.reasons
+
+
+def test_public_typed_repair_proof_is_not_an_authorization_capability() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    repaired = _table(table_id="di-table-17")
+    repaired.source_spans = [
+        SourceSpan(page_index=0, source_block_id="di-table-17")
+    ]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+    public_proof = TableRepairProof(
+        original_request=request,
+        page_index=0,
+        replacement_content_fingerprint=table_content_fingerprint(repaired),
+        match_basis="unique_table_on_page",
+        validated_mapping=TableRepairMapping(
+            original_table_id=original.table_id,
+            replacement_table_id=repaired.table_id,
+            page_index=0,
+        ),
+    )
+
+    result = validator.validate(original, repaired, repair_proof=public_proof)
+
+    assert result.accepted is False
+    assert "repair_inventory_missing" in result.reasons
 
 
 def test_table_identity_fingerprint_includes_source_block_id() -> None:
@@ -386,11 +425,48 @@ def test_table_validator_rejects_caption_number_and_extraction_anomalies() -> No
 
 def test_table_validator_detects_percentage_split_across_cells() -> None:
     table = _table(rows=[["News", "84.9", "%"]])
+    table.metadata["fragmented_numeric_tokens"] = ["84.9", "%"]
 
     result = TableValidator().validate(table)
 
     assert result.accepted is False
     assert "numeric_token_fragmented" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "headers,row",
+    [
+        (["Value", "Measure"], ["10", "kg"]),
+        (["Magnitude", "Symbol"], ["10", "kg"]),
+        (["Value", "Punctuation"], ["10", "."]),
+    ],
+)
+def test_table_validator_does_not_infer_fragmentation_from_adjacent_text_cells(
+    headers: list[str], row: list[str]
+) -> None:
+    markdown = (
+        f"| {headers[0]} | {headers[1]} |\n| --- | --- |\n"
+        f"| {row[0]} | {row[1]} |"
+    )
+    span = SourceSpan(page_index=0, source_block_id="table-source")
+    table = CanonicalTable(
+        table_id="legitimate-columns",
+        headers=headers,
+        rows=[row],
+        cells=[
+            CanonicalCell(text=headers[0], row_index=0, column_index=0, is_header=True),
+            CanonicalCell(text=headers[1], row_index=0, column_index=1, is_header=True),
+            CanonicalCell(text=row[0], row_index=1, column_index=0),
+            CanonicalCell(text=row[1], row_index=1, column_index=1),
+        ],
+        source_markdown=markdown,
+        normalized_markdown=markdown,
+        source_spans=[span],
+    )
+
+    result = TableValidator().validate(table)
+
+    assert result.accepted is True
 
 
 def test_table_validator_rejects_source_html_that_disagrees_with_structure() -> None:
@@ -570,6 +646,80 @@ def test_configured_tokenizer_loader_drives_real_token_boundaries() -> None:
     assert children[0].metadata["tokenizer_name"] == "configured-local-tokenizer"
 
 
+def test_tokenizer_loader_is_cached_per_process_and_model_name() -> None:
+    loaded: list[str] = []
+
+    class FakeTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return list(text.encode("utf-8"))
+
+    def load(name: str) -> FakeTokenizer:
+        loaded.append(name)
+        return FakeTokenizer()
+
+    name = "cache-test-tokenizer-unique"
+    first = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=load)
+    second = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=load)
+
+    assert first.estimate_tokens("abc") == second.estimate_tokens("abc") == 3
+    assert loaded == [name]
+
+
+def test_token_limited_row_splitting_counts_each_row_once() -> None:
+    calls: list[str] = []
+
+    def count(text: str) -> int:
+        calls.append(text)
+        return len(text)
+
+    rows = [[f"row-{index}", "value"] for index in range(20)]
+    table = _table(rows=rows)
+    builder = StructuredEvidenceBuilder(token_counter=count)
+    one_row_limit = len(builder._table_text(table, [0]))
+
+    groups = builder._split_group_by_token_limit(
+        table,
+        list(range(len(rows))),
+        one_row_limit,
+    )
+
+    assert groups == [[index] for index in range(len(rows))]
+    assert len(calls) <= len(rows) + 2
+
+
+def test_child_provenance_uses_only_selected_row_and_rowspan_cell_pages() -> None:
+    table = _table(rows=[["A", "Base", "1"], ["B", "Proposed", "2"]])
+    table.source_spans = [
+        SourceSpan(page_index=0),
+        SourceSpan(page_index=1),
+        SourceSpan(page_index=2),
+    ]
+    for cell in table.cells:
+        cell.source_spans = []
+        if cell.row_index == 1:
+            cell.source_spans = [SourceSpan(page_index=0)]
+        elif cell.row_index == 2:
+            cell.metadata["original_page_index"] = 1
+    spanning = next(cell for cell in table.cells if cell.row_index == 1)
+    spanning.rowspan = 2
+
+    spans = StructuredEvidenceBuilder._row_source_spans(table, [1])
+
+    assert {span.page_index for span in spans} == {0, 1}
+
+
+def test_child_provenance_falls_back_to_table_pages_only_without_cell_provenance() -> None:
+    table = _table(rows=[["A", "Base", "1"]])
+    table.source_spans = [SourceSpan(page_index=3)]
+    for cell in table.cells:
+        cell.source_spans = []
+        cell.metadata.pop("original_page_index", None)
+
+    spans = StructuredEvidenceBuilder._row_source_spans(table, [0])
+
+    assert {span.page_index for span in spans} == {3}
+
+
 def test_explicit_cross_page_continuation_merges_before_chunking() -> None:
     first = _table(
         table_id="table-page-1",
@@ -625,6 +775,58 @@ def test_explicit_cross_page_continuation_merges_before_chunking() -> None:
     assert parent.metadata["status"] == "cross_page_merged"
     assert parent.metadata["source_markdowns"] == table.metadata["source_markdowns"]
     assert parent.metadata["source_htmls"] == table.metadata["source_htmls"]
+
+
+def test_continuation_graph_accepts_unordered_input_and_records_aliases() -> None:
+    root = _table(table_id="root", rows=[["News", "Base", "81.2%"]], page_index=0)
+    continuation = _table(
+        table_id="continued",
+        rows=[["News", "Proposed", "84.9%"]],
+        page_index=1,
+        metadata={"continuation_of": "root"},
+    )
+    builder = StructuredEvidenceBuilder(token_counter=lambda _text: 0)
+
+    merged = builder.merge_cross_page_tables([continuation, root])
+
+    assert [table.table_id for table in merged] == ["root"]
+    assert builder.table_aliases == {"continued": "root"}
+
+
+@pytest.mark.parametrize(
+    "tables,error",
+    [
+        ([_table(table_id="dup", page_index=0), _table(table_id="dup", page_index=1)], "duplicate"),
+        ([_table(table_id="orphan", page_index=1, metadata={"continuation_of": "missing"})], "unknown"),
+        ([
+            _table(table_id="a", page_index=0, metadata={"continuation_of": "b"}),
+            _table(table_id="b", page_index=1, metadata={"continuation_of": "a"}),
+        ], "cycle"),
+        ([
+            _table(table_id="root", page_index=0),
+            _table(table_id="child-1", page_index=1, metadata={"continuation_of": "root"}),
+            _table(table_id="child-2", page_index=1, metadata={"continuation_of": "root"}),
+        ], "branch"),
+        ([
+            _table(table_id="root", page_index=1),
+            _table(table_id="child", page_index=0, metadata={"continuation_of": "root"}),
+        ], "page order"),
+        ([
+            _table(table_id="root", page_index=0),
+            _table(table_id="child", page_index=2, metadata={"continuation_of": "root"}),
+        ], "adjacent"),
+        ([
+            _table(table_id="root", page_index=0),
+            _table(table_id="child", page_index=1, metadata={"continuation_of": "root"}),
+        ], "source page"),
+    ],
+)
+def test_continuation_graph_rejects_invalid_topologies(tables, error: str) -> None:
+    if error == "source page":
+        tables[1].source_spans = []
+
+    with pytest.raises(ValueError, match=error):
+        StructuredEvidenceBuilder(token_counter=lambda _text: 0).merge_cross_page_tables(tables)
 
 
 def test_quality_gate_accepts_consistent_cross_page_source_segments() -> None:
@@ -760,7 +962,28 @@ def test_adapter_completion_merges_explicit_continuations_and_validates_tables(
         source_path=str(source),
         parser_source="mineru",
         parse_version="canonical-v1",
-        tables=[first, second],
+        blocks=[
+            CanonicalBlock(
+                block_id="first-table-block",
+                block_type="table",
+                text=first.normalized_markdown or "table",
+                reading_order=0,
+                parser_source="mineru",
+                table_id=first.table_id,
+                source_spans=first.source_spans,
+            ),
+            CanonicalBlock(
+                block_id="continuation-table-block",
+                block_type="table",
+                text=second.normalized_markdown or "table",
+                reading_order=1,
+                parser_source="mineru",
+                table_id=second.table_id,
+                source_spans=second.source_spans,
+                metadata={"parent_table_id": second.table_id},
+            ),
+        ],
+        tables=[second, first],
     )
     monkeypatch.setattr(
         MarkdownCanonicalAdapter,
@@ -772,6 +995,9 @@ def test_adapter_completion_merges_explicit_continuations_and_validates_tables(
 
     assert len(result.tables) == 1
     assert result.tables[0].status == "cross_page_merged"
+    assert result.metadata["table_aliases"] == {second.table_id: first.table_id}
+    assert {block.table_id for block in result.blocks} == {first.table_id}
+    assert result.blocks[1].metadata["parent_table_id"] == first.table_id
     assert result.metadata["table_repair_requests"] == []
 
 

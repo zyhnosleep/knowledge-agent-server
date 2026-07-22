@@ -1491,7 +1491,6 @@ def test_mineru_long_table_conversion_is_not_truncated(monkeypatch: pytest.Monke
         page_count=1,
     )
     monkeypatch.setattr(parser, "_parse_pdf_with_mineru", lambda *_args: parsed)
-
     document = canonical_adapters.run_mineru(pdf_path, 1)
 
     assert document is not None
@@ -1561,6 +1560,14 @@ def test_mineru_existing_figure_file_is_registered_as_canonical_asset(
         content_list_path=content_list_path,
     )
     monkeypatch.setattr(parser, "_parse_pdf_with_mineru", lambda *_args: parsed)
+    original_read_bytes = Path.read_bytes
+
+    def reject_bulk_image_read(candidate: Path) -> bytes:
+        if candidate.resolve() == image_path.resolve():
+            raise OSError("MinerU assets must use streaming I/O")
+        return original_read_bytes(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_bulk_image_read)
 
     document = canonical_adapters.run_mineru(pdf_path, 1)
 
@@ -1569,7 +1576,8 @@ def test_mineru_existing_figure_file_is_registered_as_canonical_asset(
     assert document.assets[0].path.startswith("assets/")
     durable_source = Path(document.assets[0].source_path or "")
     assert durable_source.is_file()
-    assert durable_source.read_bytes() == image_path.read_bytes()
+    with durable_source.open("rb") as durable, image_path.open("rb") as source:
+        assert durable.read() == source.read()
     assert output_dir not in durable_source.parents
     assert tmp_path / "adapter-cache" in durable_source.parents
     assert document.figures[0].asset_path == document.assets[0].path

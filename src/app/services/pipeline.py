@@ -200,15 +200,29 @@ class IngestionPipeline:
             canonical_metadata = parsed.metadata.get("canonical", {})
             canonical_quality = canonical_metadata.get("quality", {})
             canonical_quality_status = canonical_quality.get("status")
+            canonical_quality_accepted = canonical_quality.get("accepted") is True
             activation_allowed = canonical_metadata.get(
                 "table_activation_allowed", True
             )
-            quality_rejected = (
-                canonical_quality_status == "validation_failed"
-                or activation_allowed is False
+            quality_accepted = (
+                canonical_quality_accepted
+                and canonical_quality_status
+                in {"accepted", "accepted_with_warnings"}
+                and activation_allowed is not False
             )
+            quality_rejected = not quality_accepted
+            if quality_accepted:
+                quality_report_status = "ok"
+            elif canonical_quality_status not in {
+                "accepted",
+                "accepted_with_warnings",
+                None,
+            }:
+                quality_report_status = canonical_quality_status
+            else:
+                quality_report_status = "validation_failed"
             quality_report = {
-                "status": "validation_failed" if quality_rejected else "ok",
+                "status": quality_report_status,
                 "document_id": document.id,
                 "canonical_status": canonical_metadata.get("status"),
                 "canonical_quality": canonical_quality,

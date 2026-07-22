@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterable
 from typing import Any, Callable, Literal
 
@@ -111,6 +112,8 @@ class TableValidator:
                 repair_proof,
                 reasons,
             )
+            if "repair_inventory_missing" not in reasons:
+                reasons.append("repair_inventory_missing")
         if reasons:
             candidate.status = "validation_failed"
             return TableValidationResult(
@@ -138,6 +141,114 @@ class TableValidator:
             status=status,
             table=candidate,
         )
+
+    def validate_repair_inventory(
+        self,
+        original_tables: list[CanonicalTable],
+        replacement_tables: list[CanonicalTable],
+        repair_table_ids: set[str],
+        page_index: int,
+    ) -> list[
+        tuple[
+            CanonicalTable,
+            CanonicalTable,
+            TableValidationResult,
+            TableRepairRequest | TableRepairProof,
+        ]
+    ] | None:
+        """Atomically validate a complete page inventory and issue audit proofs."""
+
+        if (
+            not original_tables
+            or len(original_tables) != len(replacement_tables)
+            or len({table.table_id for table in original_tables}) != len(original_tables)
+            or len({table.table_id for table in replacement_tables})
+            != len(replacement_tables)
+            or len(
+                {table_content_fingerprint(table) for table in replacement_tables}
+            )
+            != len(replacement_tables)
+        ):
+            return None
+        if any(
+            self._table_pages(table) != {page_index}
+            for table in [*original_tables, *replacement_tables]
+        ):
+            return None
+        originals_by_id = {table.table_id: table for table in original_tables}
+        if not repair_table_ids or not repair_table_ids.issubset(originals_by_id):
+            return None
+
+        pairs: list[tuple[CanonicalTable, CanonicalTable]] = []
+        if len(original_tables) == 1:
+            pairs = [(original_tables[0], replacement_tables[0])]
+        elif all(self._table_bbox(table) is not None for table in [*original_tables, *replacement_tables]):
+            replacements_by_bbox = {
+                self._table_bbox(table): table for table in replacement_tables
+            }
+            if len(replacements_by_bbox) != len(replacement_tables):
+                return None
+            for original in original_tables:
+                replacement = replacements_by_bbox.get(self._table_bbox(original))
+                if replacement is None:
+                    return None
+                pairs.append((original, replacement))
+        elif all(self._source_region_id(table) is not None for table in [*original_tables, *replacement_tables]):
+            replacements_by_region = {
+                self._source_region_id(table): table for table in replacement_tables
+            }
+            if len(replacements_by_region) != len(replacement_tables):
+                return None
+            for original in original_tables:
+                replacement = replacements_by_region.get(self._source_region_id(original))
+                if replacement is None:
+                    return None
+                pairs.append((original, replacement))
+        else:
+            return None
+
+        bindings = []
+        for original, replacement in pairs:
+            replacement_reasons = self._reasons(replacement)
+            if replacement_reasons:
+                return None
+            if original.table_id not in repair_table_ids:
+                continue
+            request = self.validate(original).repair_request
+            if request is None:
+                return None
+            if self._stable_locator(original) == self._stable_locator(replacement):
+                proof: TableRepairRequest | TableRepairProof = request
+            else:
+                if len(original_tables) != 1:
+                    return None
+                if not self._stable_locator(original) or not self._stable_locator(replacement):
+                    return None
+                proof = TableRepairProof(
+                    original_request=request,
+                    page_index=page_index,
+                    replacement_content_fingerprint=table_content_fingerprint(replacement),
+                    match_basis="unique_table_on_page",
+                    validated_mapping=TableRepairMapping(
+                        original_table_id=original.table_id,
+                        replacement_table_id=replacement.table_id,
+                        page_index=page_index,
+                    ),
+                )
+            reasons: list[str] = []
+            self._validate_repair_proof(original, replacement, proof, reasons)
+            if reasons:
+                return None
+            candidate = replacement.model_copy(deep=True)
+            candidate.status = "repaired_by_vision"
+            result = TableValidationResult(
+                accepted=True,
+                activation_allowed=True,
+                status="repaired_by_vision",
+                table=candidate,
+            )
+            bindings.append((original, replacement, result, proof))
+        return bindings
 
     @staticmethod
     def _validate_repair_proof(
@@ -329,8 +440,6 @@ class TableValidator:
             add("numeric_token_fragmented")
         if table.metadata.get("fragmented_unit_tokens"):
             add("unit_token_fragmented")
-        if cls._has_split_numeric_or_unit(table):
-            add("numeric_token_fragmented")
         if table.metadata.get("continuation_expected") and not table.metadata.get(
             "continuation_recovered"
         ):
@@ -499,6 +608,9 @@ class TableValidator:
 class StructuredEvidenceBuilder:
     """Build table Parent/Child chunks and source-faithful visual evidence."""
 
+    _tokenizer_cache: dict[str, Any] = {}
+    _tokenizer_cache_lock = threading.Lock()
+
     def __init__(
         self,
         *,
@@ -508,6 +620,7 @@ class StructuredEvidenceBuilder:
         tokenizer_loader: Callable[[str], Any] | None = None,
     ) -> None:
         self.tokenizer_name = tokenizer_name or get_settings().semantic_tokenizer_name
+        self.table_aliases: dict[str, str] = {}
         self._tokenizer = tokenizer
         self._token_counter = token_counter
         self._tokenizer_fallback_reason: str | None = None
@@ -519,7 +632,12 @@ class StructuredEvidenceBuilder:
             return
         loader = tokenizer_loader or self._load_local_tokenizer
         try:
-            self._tokenizer = loader(self.tokenizer_name)
+            with self._tokenizer_cache_lock:
+                cached = self._tokenizer_cache.get(self.tokenizer_name)
+                if cached is None:
+                    cached = loader(self.tokenizer_name)
+                    self._tokenizer_cache[self.tokenizer_name] = cached
+                self._tokenizer = cached
         except Exception as exc:  # noqa: BLE001 - fallback is an explicit contract
             self._tokenizer = None
             self._tokenizer_fallback_reason = type(exc).__name__
@@ -625,18 +743,87 @@ class StructuredEvidenceBuilder:
         self,
         tables: Iterable[CanonicalTable],
     ) -> list[CanonicalTable]:
-        merged: list[CanonicalTable] = []
-        roots: dict[str, CanonicalTable] = {}
-        for source_table in tables:
-            table = source_table.model_copy(deep=True)
-            continuation_of = str(table.metadata.get("continuation_of") or "").strip()
-            root = roots.get(continuation_of)
-            if not continuation_of or root is None:
-                merged.append(table)
-                roots[table.table_id] = table
+        source_tables = [table.model_copy(deep=True) for table in tables]
+        self.table_aliases = {}
+        by_id: dict[str, CanonicalTable] = {}
+        input_order: dict[str, int] = {}
+        for index, table in enumerate(source_tables):
+            if table.table_id in by_id:
+                raise ValueError(f"duplicate continuation table ID: {table.table_id!r}")
+            by_id[table.table_id] = table
+            input_order[table.table_id] = index
+
+        parent_by_id: dict[str, str] = {}
+        children: dict[str, list[str]] = {}
+        for table in source_tables:
+            parent_id = str(table.metadata.get("continuation_of") or "").strip()
+            if not parent_id:
                 continue
-            self._merge_continuation(root, table)
-            roots[table.table_id] = root
+            if parent_id not in by_id:
+                raise ValueError(
+                    f"unknown continuation parent {parent_id!r} for {table.table_id!r}"
+                )
+            parent_by_id[table.table_id] = parent_id
+            children.setdefault(parent_id, []).append(table.table_id)
+        if any(len(child_ids) > 1 for child_ids in children.values()):
+            raise ValueError("continuation graph contains a branch conflict")
+
+        for table_id in by_id:
+            seen: set[str] = set()
+            cursor = table_id
+            while cursor in parent_by_id:
+                if cursor in seen:
+                    raise ValueError("continuation graph contains a cycle")
+                seen.add(cursor)
+                cursor = parent_by_id[cursor]
+
+        def source_page(table: CanonicalTable) -> int:
+            pages = {
+                span.page_index
+                for span in table.source_spans
+                if span.page_index is not None
+            }
+            if len(pages) != 1:
+                raise ValueError(
+                    f"continuation table {table.table_id!r} requires one source page"
+                )
+            return next(iter(pages))
+
+        root_ids = [table_id for table_id in by_id if table_id not in parent_by_id]
+        root_ids.sort(
+            key=lambda table_id: (
+                min(
+                    (
+                        span.page_index
+                        for span in by_id[table_id].source_spans
+                        if span.page_index is not None
+                    ),
+                    default=10**9,
+                ),
+                input_order[table_id],
+                table_id,
+            )
+        )
+        merged: list[CanonicalTable] = []
+        for root_id in root_ids:
+            root = by_id[root_id]
+            merged.append(root)
+            cursor = root_id
+            previous_page: int | None = None
+            while cursor in children:
+                child_id = children[cursor][0]
+                parent_page = source_page(by_id[cursor])
+                child_page = source_page(by_id[child_id])
+                if child_page <= parent_page:
+                    raise ValueError("continuation graph has invalid page order")
+                if child_page != parent_page + 1:
+                    raise ValueError("continuation pages must be adjacent")
+                if previous_page is not None and parent_page != previous_page:
+                    raise ValueError("continuation graph has invalid page order")
+                self._merge_continuation(root, by_id[child_id])
+                self.table_aliases[child_id] = root_id
+                previous_page = child_page
+                cursor = child_id
         return merged
 
     def figure_chunk(
@@ -737,20 +924,29 @@ class StructuredEvidenceBuilder:
         indices: list[int],
         max_tokens: int,
     ) -> list[list[int]]:
+        base_cost = self.estimate_tokens(self._table_text(table, []))
+        row_costs = {
+            index: self.estimate_tokens(
+                "\n" + self._markdown_grid(table.headers, [table.rows[index]])[-1]
+            )
+            for index in indices
+        }
         groups: list[list[int]] = []
         current: list[int] = []
+        current_cost = base_cost
         for index in indices:
-            proposed = [*current, index]
-            if current and self.estimate_tokens(self._table_text(table, proposed)) > max_tokens:
+            row_cost = row_costs[index]
+            if current and current_cost + row_cost > max_tokens:
                 groups.append(current)
                 current = [index]
+                current_cost = base_cost + row_cost
             else:
-                current = proposed
-            if len(current) == 1 and self.estimate_tokens(
-                self._table_text(table, current)
-            ) > max_tokens:
+                current.append(index)
+                current_cost += row_cost
+            if len(current) == 1 and current_cost > max_tokens:
                 groups.append(current)
                 current = []
+                current_cost = base_cost
         if current:
             groups.append(current)
         return groups
@@ -866,13 +1062,20 @@ class StructuredEvidenceBuilder:
     @staticmethod
     def _row_source_spans(table: CanonicalTable, row_indices: list[int]) -> list[SourceSpan]:
         selected = {index + 1 for index in row_indices}
-        spans = list(table.source_spans)
+        spans: list[SourceSpan] = []
         for cell in table.cells:
-            if cell.row_index == 0 or any(
+            if any(
                 cell.row_index <= row_index < cell.row_index + cell.rowspan
                 for row_index in selected
             ):
                 spans.extend(cell.source_spans)
+                original_page = cell.metadata.get("original_page_index")
+                if isinstance(original_page, int) and not any(
+                    span.page_index == original_page for span in cell.source_spans
+                ):
+                    spans.append(SourceSpan(page_index=original_page))
+        if not spans:
+            spans = list(table.source_spans)
         return StructuredEvidenceBuilder._deduplicate_spans(spans)
 
     @staticmethod

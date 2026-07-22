@@ -189,7 +189,12 @@ def test_process_document_rolls_back_partial_changes_before_marking_failed(monke
             title="Parsed",
             text="Parsed text",
             chunks=[ParsedChunk(ordinal=0, text="Parsed text")],
-            metadata={},
+            metadata={
+                "canonical": {
+                    "quality": {"accepted": True, "status": "accepted"},
+                    "table_activation_allowed": True,
+                }
+            },
         ),
     )
 
@@ -226,7 +231,12 @@ def test_process_document_cleans_chunks_when_later_extraction_fails(monkeypatch)
             title="Case",
             text="Parsed text",
             chunks=[ParsedChunk(ordinal=0, text="Parsed chunk", page_label="1")],
-            metadata={},
+            metadata={
+                "canonical": {
+                    "quality": {"accepted": True, "status": "accepted"},
+                    "table_activation_allowed": True,
+                }
+            },
         ),
     )
     monkeypatch.setattr(IngestionPipeline, "_extract_document", lambda self, failed_document, full_text: (_ for _ in ()).throw(RuntimeError("extract failure")))
@@ -261,7 +271,12 @@ def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch
             title="Parsed",
             text="Parsed text",
             chunks=[ParsedChunk(ordinal=0, text="Parsed text", page_label="1")],
-            metadata={},
+            metadata={
+                "canonical": {
+                    "quality": {"accepted": True, "status": "accepted"},
+                    "table_activation_allowed": True,
+                }
+            },
         ),
     )
 
@@ -285,12 +300,23 @@ def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "canonical_status,activation_allowed",
-    [("validation_failed", True), ("accepted", False)],
+    "canonical_status,quality_accepted,activation_allowed,issue_code",
+    [
+        ("validation_failed", False, True, "table_invalid"),
+        ("accepted", True, False, "table_invalid"),
+        ("rejected", False, True, "page_missing"),
+        ("rejected", False, True, "content_empty"),
+        ("rejected", False, True, "asset_invalid"),
+    ],
 )
 @pytest.mark.parametrize("suffix", ["pdf", "md"])
 def test_process_document_fails_closed_before_chunks_for_canonical_table_failure(
-    monkeypatch, canonical_status: str, activation_allowed: bool, suffix: str
+    monkeypatch,
+    canonical_status: str,
+    quality_accepted: bool,
+    activation_allowed: bool,
+    issue_code: str,
+    suffix: str,
 ) -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -325,10 +351,10 @@ def test_process_document_fails_closed_before_chunks_for_canonical_table_failure
             metadata={
                 "canonical": {
                     "quality": {
-                        "accepted": canonical_status == "accepted",
+                        "accepted": quality_accepted,
                         "status": canonical_status,
                         "score": 0.5,
-                        "issues": [{"code": "table_invalid"}],
+                        "issues": [{"code": issue_code}],
                     },
                     "status": "ready",
                     "table_activation_allowed": activation_allowed,
@@ -353,9 +379,14 @@ def test_process_document_fails_closed_before_chunks_for_canonical_table_failure
     assert failed.status == RunStatus.failed.value
     assert stored_document.status == DocumentStatus.failed.value
     assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 0
-    assert stored_document.metadata_json["ingest_quality"]["status"] == "validation_failed"
+    expected_ingest_status = (
+        "validation_failed"
+        if canonical_status == "validation_failed" or activation_allowed is False
+        else "rejected"
+    )
+    assert stored_document.metadata_json["ingest_quality"]["status"] == expected_ingest_status
     assert stored_document.metadata_json["ingest_error"]
-    assert stored_run.provider_report["ingest_quality"]["status"] == "validation_failed"
+    assert stored_run.provider_report["ingest_quality"]["status"] == expected_ingest_status
     assert stored_run.provider_report["error"]
 
 
