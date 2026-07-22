@@ -1488,7 +1488,8 @@ def test_identical_html_siblings_have_distinct_identity_locators_and_ids(
     path = tmp_path / "identical.html"
     path.write_text(
         "<html><body>"
-        "<table><tr><td>same</td></tr></table><table><tr><td>same</td></tr></table>"
+        "<table><tr><th>value</th></tr><tr><td>same</td></tr></table>"
+        "<table><tr><th>value</th></tr><tr><td>same</td></tr></table>"
         '<img src="https://example.test/same.png" alt="same">'
         '<img src="https://example.test/same.png" alt="same">'
         '<math><mi>x</mi></math><math><mi>x</mi></math>'

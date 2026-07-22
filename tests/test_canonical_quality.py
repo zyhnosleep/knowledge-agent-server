@@ -894,6 +894,9 @@ def test_table_repair_with_valid_replacement_is_accepted(
     assert [table.table_id for table in result.tables] == ["di-valid"]
     assert result.quality.accepted is True
     assert all(issue.code != "table_invalid" for issue in result.quality.issues)
+    assert result.tables[0].status == "repaired_by_vision"
+    assert result.tables[0].metadata["repair_original_table_id"] == "mineru-invalid"
+    assert result.tables[0].metadata["repair_proof_validated"] is True
 
 
 def test_table_repair_requires_replacement_inventory_on_each_target_page() -> None:
@@ -1501,6 +1504,10 @@ def test_mineru_figure_metadata_is_linked_to_a_figure_block(
 def test_mineru_existing_figure_file_is_registered_as_canonical_asset(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    class TestSettings:
+        cache_dir = tmp_path / "adapter-cache"
+
+    monkeypatch.setattr(canonical_adapters, "get_settings", lambda: TestSettings())
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF fixture")
     output_dir = tmp_path / "mineru-output"
@@ -1530,7 +1537,11 @@ def test_mineru_existing_figure_file_is_registered_as_canonical_asset(
     assert document is not None
     assert len(document.assets) == 1
     assert document.assets[0].path.startswith("assets/")
-    assert document.assets[0].source_path == str(image_path.resolve())
+    durable_source = Path(document.assets[0].source_path or "")
+    assert durable_source.is_file()
+    assert durable_source.read_bytes() == image_path.read_bytes()
+    assert output_dir not in durable_source.parents
+    assert tmp_path / "adapter-cache" in durable_source.parents
     assert document.figures[0].asset_path == document.assets[0].path
 
 

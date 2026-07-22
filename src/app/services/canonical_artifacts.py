@@ -25,6 +25,7 @@ from app.services.canonical_models import (
     CanonicalTable,
     SectionNode,
 )
+from app.services.canonical_provenance import block_is_generated, source_only_document
 
 
 _REQUIRED_FILES = {
@@ -120,7 +121,18 @@ class CanonicalArtifactStore:
             raise ValueError(
                 f"parse_version {document.parse_version!r} does not match {version!r}"
             )
+        document = source_only_document(document)
         document.ensure_json_compatible()
+        failed_tables = [
+            table.table_id
+            for table in document.tables
+            if table.status == "validation_failed"
+        ]
+        if failed_tables or document.metadata.get("table_activation_allowed") is False:
+            raise ValueError(
+                "canonical table validation failed; staging is not activation-safe: "
+                f"{failed_tables}"
+            )
         self._validate_record_contract(
             document.blocks,
             document.tables,
@@ -798,14 +810,7 @@ class CanonicalArtifactStore:
 
     @staticmethod
     def _is_generated_block(block: CanonicalBlock) -> bool:
-        provenance = block.metadata.get("provenance")
-        return bool(
-            block.metadata.get("generated") is True
-            or (
-                isinstance(provenance, dict)
-                and provenance.get("generated") is True
-            )
-        )
+        return block_is_generated(block)
 
     @classmethod
     def _bundle_model_dump(cls, model: Any, **kwargs: Any) -> Any:

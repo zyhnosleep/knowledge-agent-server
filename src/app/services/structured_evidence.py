@@ -4,10 +4,12 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.config import get_settings
+from app.services.canonical_provenance import block_is_generated
 from app.services.canonical_models import (
     CanonicalBlock,
     CanonicalCell,
@@ -71,11 +73,17 @@ class TableValidator:
         self,
         table: CanonicalTable,
         repaired_table: CanonicalTable | None = None,
+        repair_proof: TableRepairRequest | dict[str, Any] | None = None,
     ) -> TableValidationResult:
         candidate = (repaired_table or table).model_copy(deep=True)
         reasons = self._reasons(candidate)
-        if repaired_table is not None and repaired_table.table_id != table.table_id:
-            reasons.append("repair_identity_mismatch")
+        if repaired_table is not None:
+            self._validate_repair_proof(
+                table,
+                repaired_table,
+                repair_proof,
+                reasons,
+            )
         if reasons:
             candidate.status = "validation_failed"
             return TableValidationResult(
@@ -84,7 +92,10 @@ class TableValidator:
                 status="validation_failed",
                 reasons=reasons,
                 table=candidate,
-                repair_request=self._repair_request(candidate, reasons),
+                repair_request=self._repair_request(
+                    table if repaired_table is not None else candidate,
+                    reasons,
+                ),
             )
 
         if repaired_table is not None:
@@ -100,6 +111,56 @@ class TableValidator:
             status=status,
             table=candidate,
         )
+
+    @staticmethod
+    def _validate_repair_proof(
+        original: CanonicalTable,
+        repaired: CanonicalTable,
+        proof: TableRepairRequest | dict[str, Any] | None,
+        reasons: list[str],
+    ) -> None:
+        def add(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        if proof is None:
+            add("repair_proof_missing")
+            return
+        if isinstance(proof, TableRepairRequest):
+            fingerprint = proof.source_fingerprint
+            locator = proof.locator
+        elif isinstance(proof, dict):
+            fingerprint = proof.get("source_fingerprint")
+            locator = proof.get("locator")
+        else:
+            add("repair_proof_invalid")
+            return
+        expected_fingerprint = table_identity_fingerprint(original)
+        if fingerprint != expected_fingerprint:
+            add("repair_source_fingerprint_mismatch")
+        expected_locator = TableValidator._stable_locator(original)
+        proof_locator = TableValidator._stable_locator_value(locator)
+        repaired_locator = TableValidator._stable_locator(repaired)
+        if not expected_locator or proof_locator != expected_locator:
+            add("repair_proof_locator_mismatch")
+        if repaired_locator != expected_locator:
+            add("repair_locator_mismatch")
+
+    @staticmethod
+    def _stable_locator(table: CanonicalTable) -> dict[str, Any]:
+        return TableValidator._stable_locator_value(
+            CanonicalQualityGate._table_locator(table)
+        )
+
+    @staticmethod
+    def _stable_locator_value(value: object) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: value[key]
+            for key in ("page_index", "bbox")
+            if value.get(key) is not None
+        }
 
     @classmethod
     def _reasons(cls, table: CanonicalTable) -> list[str]:
@@ -137,7 +198,118 @@ class TableValidator:
             "continuation_recovered"
         ):
             add("cross_page_continuation_missing")
+        source_markdowns = table.metadata.get("source_markdowns")
+        if table.status == "cross_page_merged" and isinstance(source_markdowns, list):
+            if cls._source_markdown_segments_match(table, source_markdowns):
+                reasons = [
+                    reason
+                    for reason in reasons
+                    if reason
+                    not in {"source_markdown_invalid", "source_markdown_mismatch"}
+                ]
+            else:
+                add("cross_page_source_markdown_mismatch")
+
+        source_htmls = table.metadata.get("source_htmls")
+        if (
+            table.status == "cross_page_merged"
+            and isinstance(source_htmls, list)
+            and source_htmls
+        ):
+            if not cls._source_html_segments_match(table, source_htmls):
+                add("cross_page_source_html_mismatch")
+        elif table.source_html is not None:
+            try:
+                from app.services.canonical_artifacts import CanonicalArtifactStore
+
+                html_cells = CanonicalArtifactStore._table_cells_from_html(
+                    table.source_html
+                )
+                html_headers, html_rows = CanonicalArtifactStore._table_grid_from_cells(
+                    html_cells
+                )
+            except (TypeError, ValueError):
+                add("source_html_invalid")
+            else:
+                if (html_headers, html_rows) != (table.headers, table.rows):
+                    add("source_html_mismatch")
+                html_signatures = sorted(cls._cell_signature(cell) for cell in html_cells)
+                cell_signatures = sorted(cls._cell_signature(cell) for cell in table.cells)
+                if html_signatures != cell_signatures:
+                    add("source_html_cell_mismatch")
         return reasons
+
+    @classmethod
+    def _source_markdown_segments_match(
+        cls,
+        table: CanonicalTable,
+        markdowns: list[object],
+    ) -> bool:
+        grids: list[tuple[list[str], list[list[str]]]] = []
+        for markdown in markdowns:
+            if not isinstance(markdown, str):
+                return False
+            parsed = CanonicalQualityGate._markdown_table_data(markdown)
+            if parsed is None:
+                return False
+            grids.append(parsed)
+        return cls._combined_segment_rows(table.headers, grids) == table.rows
+
+    @classmethod
+    def _source_html_segments_match(
+        cls,
+        table: CanonicalTable,
+        htmls: list[object],
+    ) -> bool:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        grids: list[tuple[list[str], list[list[str]]]] = []
+        cell_segments = table.metadata.get("source_cell_segments")
+        if not isinstance(cell_segments, list) or len(cell_segments) != len(htmls):
+            return False
+        for index, source_html in enumerate(htmls):
+            if not isinstance(source_html, str):
+                return False
+            try:
+                cells = CanonicalArtifactStore._table_cells_from_html(source_html)
+                grids.append(CanonicalArtifactStore._table_grid_from_cells(cells))
+                expected_cells = [
+                    CanonicalCell.model_validate(item)
+                    for item in cell_segments[index]
+                ]
+            except (TypeError, ValueError):
+                return False
+            if sorted(cls._cell_signature(cell) for cell in cells) != sorted(
+                cls._cell_signature(cell) for cell in expected_cells
+            ):
+                return False
+        return cls._combined_segment_rows(table.headers, grids) == table.rows
+
+    @staticmethod
+    def _combined_segment_rows(
+        headers: list[str],
+        grids: list[tuple[list[str], list[list[str]]]],
+    ) -> list[list[str]] | None:
+        combined: list[list[str]] = []
+        for segment_headers, segment_rows in grids:
+            if segment_headers != headers:
+                return None
+            rows = list(segment_rows)
+            if rows and rows[0] == headers:
+                rows = rows[1:]
+            combined.extend(rows)
+        return combined
+
+    @staticmethod
+    def _cell_signature(cell: CanonicalCell) -> tuple[object, ...]:
+        return (
+            cell.row_index,
+            cell.column_index,
+            cell.rowspan,
+            cell.colspan,
+            cell.is_header,
+            cell.text,
+        )
 
     @staticmethod
     def _has_split_numeric_or_unit(table: CanonicalTable) -> bool:
@@ -190,17 +362,59 @@ class TableValidator:
 class StructuredEvidenceBuilder:
     """Build table Parent/Child chunks and source-faithful visual evidence."""
 
+    def __init__(
+        self,
+        *,
+        token_counter: Callable[[str], int] | None = None,
+        tokenizer: Any | None = None,
+        tokenizer_name: str | None = None,
+        tokenizer_loader: Callable[[str], Any] | None = None,
+    ) -> None:
+        self.tokenizer_name = tokenizer_name or get_settings().semantic_tokenizer_name
+        self._tokenizer = tokenizer
+        self._token_counter = token_counter
+        self._tokenizer_fallback_reason: str | None = None
+        if token_counter is not None:
+            self.token_count_mode = "injected_counter"
+            return
+        if tokenizer is not None:
+            self.token_count_mode = "transformers"
+            return
+        loader = tokenizer_loader or self._load_local_tokenizer
+        try:
+            self._tokenizer = loader(self.tokenizer_name)
+        except Exception as exc:  # noqa: BLE001 - fallback is an explicit contract
+            self._tokenizer = None
+            self._tokenizer_fallback_reason = type(exc).__name__
+            self.token_count_mode = "utf8_bytes_fallback"
+        else:
+            self.token_count_mode = "transformers"
+
     @staticmethod
-    def estimate_tokens(text: str) -> int:
-        # A deterministic conservative boundary without coupling this layer to a
-        # model-specific tokenizer. Every non-whitespace unit is indivisible.
-        return len(re.findall(r"\S+", text))
+    def _load_local_tokenizer(name: str) -> Any:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(name, local_files_only=True)
+
+    def estimate_tokens(self, text: str) -> int:
+        if self._token_counter is not None:
+            count = self._token_counter(text)
+        elif self._tokenizer is not None:
+            count = len(self._tokenizer.encode(text, add_special_tokens=False))
+        else:
+            # A tokenizer token cannot encode less than one source byte. Counting
+            # UTF-8 bytes therefore deliberately overestimates CJK, formulas,
+            # punctuation, and long identifiers instead of silently undercounting.
+            count = len(text.encode("utf-8"))
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("token counter must return a non-negative integer")
+        return count
 
     def table_chunks(
         self,
         table: CanonicalTable,
         max_tokens: int,
-    ) -> list[StructuredEvidenceChunk]:
+    ) -> tuple[StructuredEvidenceChunk, list[StructuredEvidenceChunk]]:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         validation = TableValidator().validate(table)
@@ -268,7 +482,7 @@ class StructuredEvidenceBuilder:
                         ),
                     )
                 )
-        return [parent, *children]
+        return parent, children
 
     def merge_cross_page_tables(
         self,
@@ -462,8 +676,8 @@ class StructuredEvidenceBuilder:
         lines.extend("| " + " | ".join(escape(value) for value in row) + " |" for row in rows)
         return lines
 
-    @staticmethod
     def _table_metadata(
+        self,
         table: CanonicalTable,
         row_indices: list[int],
         *,
@@ -473,7 +687,11 @@ class StructuredEvidenceBuilder:
         cells = [
             cell.model_dump(mode="json")
             for cell in table.cells
-            if cell.row_index == 0 or cell.row_index in selected_grid_rows
+            if cell.row_index == 0
+            or any(
+                cell.row_index <= row_index < cell.row_index + cell.rowspan
+                for row_index in selected_grid_rows
+            )
         ]
         return {
             "table_id": table.table_id,
@@ -486,10 +704,17 @@ class StructuredEvidenceBuilder:
             "cells": cells,
             "footnotes": table.footnotes,
             "source_markdown": table.source_markdown,
+            "source_html": table.source_html,
+            "source_markdowns": table.metadata.get("source_markdowns", []),
+            "source_htmls": table.metadata.get("source_htmls", []),
+            "source_cell_segments": table.metadata.get("source_cell_segments", []),
             "normalized_markdown": StructuredEvidenceBuilder._table_text_without_caption(
                 table, row_indices
             ),
             "overflow": overflow,
+            "token_count_mode": self.token_count_mode,
+            "tokenizer_name": self.tokenizer_name,
+            "tokenizer_fallback_reason": self._tokenizer_fallback_reason,
         }
 
     @staticmethod
@@ -506,7 +731,10 @@ class StructuredEvidenceBuilder:
         selected = {index + 1 for index in row_indices}
         spans = list(table.source_spans)
         for cell in table.cells:
-            if cell.row_index == 0 or cell.row_index in selected:
+            if cell.row_index == 0 or any(
+                cell.row_index <= row_index < cell.row_index + cell.rowspan
+                for row_index in selected
+            ):
                 spans.extend(cell.source_spans)
         return StructuredEvidenceBuilder._deduplicate_spans(spans)
 
@@ -532,6 +760,19 @@ class StructuredEvidenceBuilder:
             source_markdowns.append(root.source_markdown)
         if continuation.source_markdown:
             source_markdowns.append(continuation.source_markdown)
+        source_htmls = list(root.metadata.get("source_htmls") or [])
+        if not source_htmls and root.source_html:
+            source_htmls.append(root.source_html)
+        if continuation.source_html:
+            source_htmls.append(continuation.source_html)
+        source_cell_segments = list(root.metadata.get("source_cell_segments") or [])
+        if not source_cell_segments:
+            source_cell_segments.append(
+                [cell.model_dump(mode="json") for cell in root.cells]
+            )
+        source_cell_segments.append(
+            [cell.model_dump(mode="json") for cell in continuation.cells]
+        )
 
         repeated_data_header = bool(
             continuation.rows and continuation.rows[0] == root.headers
@@ -585,6 +826,8 @@ class StructuredEvidenceBuilder:
                     continuation.table_id,
                 ],
                 "source_markdowns": source_markdowns,
+                "source_htmls": source_htmls,
+                "source_cell_segments": source_cell_segments,
                 "merged_repeated_header_cells": repeated_cells,
             }
         )
@@ -592,7 +835,6 @@ class StructuredEvidenceBuilder:
             StructuredEvidenceBuilder._markdown_grid(root.headers, root.rows)
         )
         root.normalized_markdown = normalized
-        root.source_markdown = normalized
 
     @staticmethod
     def _nearby_source_text(
@@ -605,7 +847,7 @@ class StructuredEvidenceBuilder:
             for block in blocks
             if block.block_id in wanted
             and block.block_type in {"narrative", "appendix"}
-            and not block.metadata.get("generated")
+            and not block_is_generated(block)
             and block.text.strip()
         ]
 

@@ -23,6 +23,7 @@ from lxml import etree
 
 from app.core.config import get_settings
 from app.services.canonical_abstract import extract_explicit_abstract
+from app.services.canonical_provenance import block_is_generated
 from app.services.canonical_table_identity import (
     table_has_precise_locator,
     table_identity_fingerprint,
@@ -126,6 +127,120 @@ def _safe_local_asset_name(path: Path, asset_sha: str) -> str:
         suffix = ""
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip(". -") or "asset"
     return f"{asset_sha[:24]}-{stem[:80]}{suffix}"
+
+
+def _materialize_adapter_asset(
+    document: CanonicalDocument,
+    safe_name: str,
+    blob: bytes,
+    expected_sha: str,
+    *,
+    source_kind: str,
+    asset_cache_root: Path | None = None,
+) -> Path:
+    """Atomically persist an extracted asset outside parser temporary output."""
+
+    source_path = Path(document.source_path or "document")
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", safe_name):
+            raise ValueError("asset cache filename is not portable")
+        root = asset_cache_root
+        if root is None:
+            root = get_settings().cache_dir / "canonical_adapter_assets"
+        root = Path(root).expanduser()
+        if _is_link_or_reparse_point(root):
+            raise ValueError("asset cache root is a symbolic link or reparse point")
+        root.mkdir(parents=True, exist_ok=True)
+        if _is_link_or_reparse_point(root):
+            raise ValueError("asset cache root is a symbolic link or reparse point")
+        resolved_root = root.resolve(strict=True)
+
+        source_sha = str(document.source_metadata["sha256"])
+        if not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+            raise ValueError("canonical source sha256 must be lowercase 64-hex")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            raise ValueError("canonical asset sha256 must be lowercase 64-hex")
+        if hashlib.sha256(blob).hexdigest() != expected_sha:
+            raise ValueError("extracted asset hash mismatch")
+
+        directory = root / source_sha
+        if _is_link_or_reparse_point(directory):
+            raise ValueError(
+                "asset cache source directory is a symbolic link or reparse point"
+            )
+        directory.mkdir(exist_ok=True)
+        if _is_link_or_reparse_point(directory):
+            raise ValueError(
+                "asset cache source directory is a symbolic link or reparse point"
+            )
+        resolved_directory = directory.resolve(strict=True)
+        try:
+            resolved_directory.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError("asset cache source directory escapes cache root") from exc
+        if resolved_directory.parent != resolved_root:
+            raise ValueError("asset cache source directory is not directly under cache root")
+
+        destination = directory / safe_name
+        if _is_link_or_reparse_point(destination):
+            raise ValueError(
+                "asset cache destination is a symbolic link or reparse point"
+            )
+        if destination.parent.resolve(strict=True) != resolved_directory:
+            raise ValueError("asset cache destination escapes source directory")
+        if destination.is_file():
+            with destination.open("rb") as persisted:
+                persisted_sha = hashlib.file_digest(persisted, "sha256").hexdigest()
+            if persisted_sha == expected_sha:
+                return destination.resolve(strict=True)
+
+        temporary = directory / f".{safe_name}.{uuid4().hex}.tmp"
+        if _is_link_or_reparse_point(temporary):
+            raise ValueError(
+                "asset cache temporary path is a symbolic link or reparse point"
+            )
+        with temporary.open("xb") as output:
+            output.write(blob)
+            output.flush()
+            os.fsync(output.fileno())
+        if _is_link_or_reparse_point(temporary):
+            raise ValueError(
+                "asset cache temporary path became a symbolic link or reparse point"
+            )
+        with temporary.open("rb") as persisted:
+            temporary_sha = hashlib.file_digest(persisted, "sha256").hexdigest()
+        if temporary_sha != expected_sha:
+            raise ValueError("materialized asset hash mismatch")
+        if _is_link_or_reparse_point(destination):
+            raise ValueError(
+                "asset cache destination is a symbolic link or reparse point"
+            )
+        os.replace(temporary, destination)
+        if _is_link_or_reparse_point(destination):
+            raise ValueError(
+                "asset cache destination became a symbolic link or reparse point"
+            )
+        with destination.open("rb") as persisted:
+            destination_sha = hashlib.file_digest(persisted, "sha256").hexdigest()
+        if destination_sha != expected_sha:
+            raise ValueError("persisted asset hash mismatch")
+        return destination.resolve(strict=True)
+    except Exception as exc:
+        raise _parse_error(
+            source_path,
+            f"Unable to materialize {source_kind} asset in cache: {exc}",
+            exc,
+        )
+    finally:
+        temporary_path = locals().get("temporary")
+        if isinstance(temporary_path, Path):
+            try:
+                if temporary_path.exists() and not _is_link_or_reparse_point(
+                    temporary_path
+                ):
+                    temporary_path.unlink()
+            except OSError:
+                pass
 
 
 def _register_local_figure_asset(
@@ -2317,96 +2432,14 @@ class DocxCanonicalAdapter:
         blob: bytes,
         expected_sha: str,
     ) -> Path:
-        source_path = Path(document.source_path or "document.docx")
-        try:
-            root = self.asset_cache_root
-            if root is None:
-                root = get_settings().cache_dir / "canonical_adapter_assets"
-            root = Path(root).expanduser()
-            if _is_link_or_reparse_point(root):
-                raise ValueError("asset cache root is a symbolic link or reparse point")
-            root.mkdir(parents=True, exist_ok=True)
-            if _is_link_or_reparse_point(root):
-                raise ValueError("asset cache root is a symbolic link or reparse point")
-            resolved_root = root.resolve(strict=True)
-
-            source_sha = str(document.source_metadata["sha256"])
-            if not re.fullmatch(r"[0-9a-f]{64}", source_sha):
-                raise ValueError("DOCX source sha256 must be lowercase 64-hex")
-            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-                raise ValueError("DOCX asset sha256 must be lowercase 64-hex")
-
-            directory = root / source_sha
-            if _is_link_or_reparse_point(directory):
-                raise ValueError(
-                    "asset cache source directory is a symbolic link or reparse point"
-                )
-            directory.mkdir(exist_ok=True)
-            if _is_link_or_reparse_point(directory):
-                raise ValueError(
-                    "asset cache source directory is a symbolic link or reparse point"
-                )
-            resolved_directory = directory.resolve(strict=True)
-            try:
-                resolved_directory.relative_to(resolved_root)
-            except ValueError as exc:
-                raise ValueError("asset cache source directory escapes cache root") from exc
-            if resolved_directory.parent != resolved_root:
-                raise ValueError("asset cache source directory is not directly under cache root")
-
-            destination = directory / safe_name
-            if _is_link_or_reparse_point(destination):
-                raise ValueError(
-                    "asset cache destination is a symbolic link or reparse point"
-                )
-            if destination.parent.resolve(strict=True) != resolved_directory:
-                raise ValueError("asset cache destination escapes source directory")
-            if destination.is_file() and self._file_sha256(destination) == expected_sha:
-                return destination.resolve(strict=True)
-
-            temporary = directory / f".{safe_name}.{uuid4().hex}.tmp"
-            if _is_link_or_reparse_point(temporary):
-                raise ValueError(
-                    "asset cache temporary path is a symbolic link or reparse point"
-                )
-            with temporary.open("xb") as output:
-                output.write(blob)
-                output.flush()
-                os.fsync(output.fileno())
-            if _is_link_or_reparse_point(temporary):
-                raise ValueError(
-                    "asset cache temporary path became a symbolic link or reparse point"
-                )
-            if self._file_sha256(temporary) != expected_sha:
-                raise ValueError("materialized DOCX asset hash mismatch")
-            if _is_link_or_reparse_point(destination):
-                raise ValueError(
-                    "asset cache destination is a symbolic link or reparse point"
-                )
-            os.replace(temporary, destination)
-            if _is_link_or_reparse_point(destination):
-                raise ValueError(
-                    "asset cache destination became a symbolic link or reparse point"
-                )
-            if self._file_sha256(destination) != expected_sha:
-                raise ValueError("persisted DOCX asset hash mismatch")
-            return destination.resolve(strict=True)
-        except Exception as exc:
-            raise _parse_error(
-                source_path,
-                f"Unable to materialize DOCX asset in cache: {exc}",
-                exc,
-            )
-        finally:
-            temporary_path = locals().get("temporary")
-            if isinstance(temporary_path, Path):
-                try:
-                    if temporary_path.exists() and not _is_link_or_reparse_point(
-                        temporary_path
-                    ):
-                        temporary_path.unlink()
-                except OSError:
-                    pass
+        return _materialize_adapter_asset(
+            document,
+            safe_name,
+            blob,
+            expected_sha,
+            source_kind="DOCX",
+            asset_cache_root=self.asset_cache_root,
+        )
 
     @staticmethod
     def _safe_asset_name(target_name: str, asset_sha: str) -> str:
@@ -2414,11 +2447,6 @@ class DocxCanonicalAdapter:
         if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
             suffix = ""
         return f"image-{asset_sha[:24]}{suffix}"
-
-    @staticmethod
-    def _file_sha256(path: Path) -> str:
-        with path.open("rb") as source:
-            return hashlib.file_digest(source, "sha256").hexdigest()
 
     @staticmethod
     def _add_formula(
@@ -3124,9 +3152,9 @@ def _register_pdf_figure_asset(
         return None
 
     try:
-        with source_path.open("rb") as source:
-            asset_sha = hashlib.file_digest(source, "sha256").hexdigest()
-        size_bytes = source_path.stat().st_size
+        blob = source_path.read_bytes()
+        asset_sha = hashlib.sha256(blob).hexdigest()
+        size_bytes = len(blob)
     except OSError:
         return None
     existing = next((asset for asset in document.assets if asset.sha256 == asset_sha), None)
@@ -3135,14 +3163,22 @@ def _register_pdf_figure_asset(
             existing.source_spans.append(span)
         return existing.path
 
-    asset_path = f"assets/{_safe_local_asset_name(source_path, asset_sha)}"
+    safe_name = _safe_local_asset_name(source_path, asset_sha)
+    durable_source = _materialize_adapter_asset(
+        document,
+        safe_name,
+        blob,
+        asset_sha,
+        source_kind="PDF/MinerU",
+    )
+    asset_path = f"assets/{safe_name}"
     document.assets.append(
         CanonicalAsset(
             asset_id=_stable_id("asset", document.document_id, asset_sha),
             path=asset_path,
             media_type=mimetypes.guess_type(source_path.name)[0] or "application/octet-stream",
             sha256=asset_sha,
-            source_path=str(source_path),
+            source_path=str(durable_source),
             source_spans=[span],
             metadata={
                 "source_parser": document.parser_source,
@@ -3304,6 +3340,7 @@ def _attach_pdf_audit(
 
 
 def _finalize_pdf_audit(document: CanonicalDocument) -> CanonicalDocument:
+    _finalize_structured_evidence(document)
     page_count = document.metadata.get("expected_page_count")
     page_count = page_count if isinstance(page_count, int) and page_count > 0 else 0
     fallback_pages = set(document.quality.fallback_pages)
@@ -3535,7 +3572,28 @@ def _table_replacements_match_issues(
             return distance, table.table_id
 
         available.sort(key=replacement_key)
-        used_ids.add(available[0].table_id)
+        replacement = available[0]
+        from app.services.structured_evidence import TableValidator
+
+        validator = TableValidator()
+        request = validator.validate(original).repair_request
+        if request is None:
+            return False
+        validation = validator.validate(
+            original,
+            repaired_table=replacement,
+            repair_proof=request,
+        )
+        if not validation.accepted:
+            return False
+        replacement.status = "repaired_by_vision"
+        replacement.metadata = {
+            **replacement.metadata,
+            "repair_original_table_id": original.table_id,
+            "repair_proof": request.model_dump(mode="json"),
+            "repair_proof_validated": True,
+        }
+        used_ids.add(replacement.table_id)
     return True
 
 
@@ -3868,6 +3926,8 @@ class PDFCanonicalAdapter:
                 primary_parser="mineru",
             )
             report = gate.evaluate(mineru_document)
+            _finalize_structured_evidence(mineru_document)
+            report = mineru_document.quality
             if report.accepted:
                 return _finalize_pdf_audit(mineru_document)
 
@@ -3904,6 +3964,25 @@ class PDFCanonicalAdapter:
                         targeted_pages,
                     ):
                         attempts.append("document_intelligence:targeted:partial")
+                        _attach_pdf_audit(
+                            mineru_document,
+                            page_count=page_count,
+                            page_texts=page_texts,
+                            text_layer_warnings=text_layer_warnings,
+                            attempts=attempts,
+                            primary_parser="mineru",
+                        )
+                        return _finalize_pdf_audit(mineru_document)
+                    if "table" in _issue_replacement_types(repair_issues) and any(
+                        not _table_replacements_match_issues(
+                            mineru_document,
+                            _structures_on_pages(repair.tables, {page_index}),
+                            repair_issues,
+                            page_index,
+                        )
+                        for page_index in sorted(targeted_pages)
+                    ):
+                        attempts.append("document_intelligence:targeted:incomplete")
                         _attach_pdf_audit(
                             mineru_document,
                             page_count=page_count,
@@ -4029,8 +4108,84 @@ def parse_canonical_document(path: Path) -> CanonicalDocument:
     }.get(path.suffix.lower(), TextCanonicalAdapter())
     document = adapter.parse(path)
     if isinstance(document, CanonicalDocument):
+        _finalize_structured_evidence(document)
         _link_nearby_structured_source_blocks(document)
     return document
+
+
+def _finalize_structured_evidence(document: CanonicalDocument) -> None:
+    """Merge and validate tables at the canonical adapter boundary."""
+
+    from app.services.structured_evidence import StructuredEvidenceBuilder, TableValidator
+
+    # Tokenization is not used by continuation merging. Injecting this counter
+    # keeps adapter finalization independent from model-cache availability.
+    builder = StructuredEvidenceBuilder(token_counter=lambda _text: 0)
+    document.tables = builder.merge_cross_page_tables(document.tables)
+    validator = TableValidator()
+    requests: list[dict[str, object]] = []
+    validated_tables: list[CanonicalTable] = []
+    failed_results = []
+    for table in document.tables:
+        result = validator.validate(table)
+        validated_tables.append(result.table)
+        if not result.accepted:
+            failed_results.append(result)
+            if result.repair_request is not None:
+                requests.append(result.repair_request.model_dump(mode="json"))
+    document.tables = validated_tables
+    document.metadata["table_repair_requests"] = requests
+    document.metadata["table_activation_allowed"] = not failed_results
+
+    document.quality.issues = [
+        issue
+        for issue in document.quality.issues
+        if issue.code != "structured_table_validation_failed"
+    ]
+    existing_invalid_ids = {
+        str(issue.metadata.get("table_id"))
+        for issue in document.quality.issues
+        if issue.code == "table_invalid" and issue.metadata.get("table_id") is not None
+    }
+    for result in failed_results:
+        if result.table.table_id in existing_invalid_ids:
+            continue
+        repair_request = result.repair_request
+        locator = repair_request.locator if repair_request is not None else {}
+        page_index = locator.get("page_index")
+        document.quality.issues.append(
+            CanonicalQualityIssue(
+                code="table_invalid",
+                severity="error",
+                message=(
+                    f"Table {result.table.table_id} failed structured validation."
+                ),
+                block_ids=[
+                    block.block_id
+                    for block in document.blocks
+                    if block.table_id == result.table.table_id
+                ],
+                repairable=True,
+                repair_scope=(
+                    f"page:{page_index + 1}"
+                    if isinstance(page_index, int)
+                    else "document"
+                ),
+                metadata={
+                    "table_id": result.table.table_id,
+                    "reasons": result.reasons,
+                    "locator": locator,
+                    "repair_request": (
+                        repair_request.model_dump(mode="json")
+                        if repair_request is not None
+                        else None
+                    ),
+                },
+            )
+        )
+    if failed_results:
+        document.quality.accepted = False
+        document.quality.status = "validation_failed"
 
 
 def _link_nearby_structured_source_blocks(document: CanonicalDocument) -> None:
@@ -4069,7 +4224,7 @@ def _link_nearby_structured_source_blocks(document: CanonicalDocument) -> None:
             if (
                 block.block_type not in {"narrative", "appendix"}
                 or not block.text.strip()
-                or block.metadata.get("generated")
+                or block_is_generated(block)
             ):
                 continue
             pages = block_pages(block)

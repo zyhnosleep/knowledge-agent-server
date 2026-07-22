@@ -666,6 +666,39 @@ def test_generated_blocks_are_excluded_from_canonical_markdown_but_analysis_stay
     assert figures[0]["analysis_model"] == "vision-model"
 
 
+def test_nested_generated_provenance_is_filtered_and_dangling_references_are_cleaned(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.blocks.append(
+        CanonicalBlock(
+            block_id="nested-generated",
+            block_type="narrative",
+            text="DO NOT PERSIST NESTED GENERATED TEXT",
+            reading_order=30,
+            parser_source="vision-model",
+            metadata={"provenance": {"generated": True, "model": "vision-model"}},
+        )
+    )
+    canonical_document.figures[0].nearby_block_ids = ["nested-generated"]
+    canonical_document.formulas[0].nearby_block_ids = ["nested-generated"]
+    canonical_document.outline.append(
+        SectionNode(title="Generated", block_id="nested-generated")
+    )
+
+    store = CanonicalArtifactStore(tmp_path)
+    store.write_staging("doc-1", "canonical-v1-abcd", canonical_document)
+    store.promote("doc-1", "canonical-v1-abcd")
+    restored = store.load("doc-1", "canonical-v1-abcd")
+
+    assert "nested-generated" not in {block.block_id for block in restored.blocks}
+    assert restored.figures[0].nearby_block_ids == []
+    assert restored.formulas[0].nearby_block_ids == []
+    assert "nested-generated" not in {
+        node.block_id for node in restored.outline if node.block_id
+    }
+
+
 def test_staged_figure_asset_survives_mineru_temporary_directory_cleanup(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
@@ -1594,6 +1627,19 @@ def test_write_rejects_nonempty_table_without_renderable_rows(
     canonical_document.quality.issues[0].block_ids = []
 
     with pytest.raises(ValueError, match="no renderable table evidence"):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
+def test_write_staging_fails_closed_for_validation_failed_table(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+) -> None:
+    canonical_document.tables[0].status = "validation_failed"
+    canonical_document.metadata["table_activation_allowed"] = False
+
+    with pytest.raises(ValueError, match="table validation failed"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1", "canonical-v1-abcd", canonical_document
         )
