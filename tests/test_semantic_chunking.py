@@ -34,6 +34,10 @@ class RecordingEmbedder:
         return [[1.0, float(index % 2)] for index, _text in enumerate(texts)]
 
 
+class NamedEmbedder(RecordingEmbedder):
+    model_name = "test/semantic-embedder"
+
+
 def span(block_id: str, page: int = 0, start: int = 0, end: int = 10) -> SourceSpan:
     return SourceSpan(
         page_index=page,
@@ -116,8 +120,57 @@ def test_chunk_draft_is_serializable_and_defaults_come_from_settings() -> None:
         source_spans=[span("b1")],
         section_path=["Methods"],
         ordinal=0,
+        splitter_name="section_aware_semantic",
+        splitter_version="semantic-v1",
+        splitting_model="test/model",
+        semantic_boundary_score=None,
     )
     assert draft.model_dump(mode="json")["source_spans"][0]["source_block_id"] == "b1"
+
+
+def test_every_draft_has_roundtrippable_splitter_audit_and_boundary_reason() -> None:
+    vectors = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+    embedder = NamedEmbedder(vectors)
+    chunks = make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=4,
+        parent_max_tokens=4,
+        child_min_tokens=1,
+        child_target_tokens=4,
+        child_max_tokens=4,
+        overlap_tokens=0,
+    ).build(
+        document(
+            block(
+                "audit",
+                "S1 evidence. S2 evidence. S3 evidence. S4 evidence.",
+                0,
+            )
+        )
+    )
+
+    assert chunks
+    assert all(item.splitter_name == "section_aware_semantic" for item in chunks)
+    assert all(item.splitter_version == "semantic-v1" for item in chunks)
+    assert all(item.splitting_model == "test/semantic-embedder" for item in chunks)
+    assert all(
+        ChunkDraft.model_validate(item.model_dump(mode="json")) == item
+        for item in chunks
+    )
+    semantic_parent = next(
+        item
+        for item in chunks
+        if item.chunk_role == "parent"
+        and item.metadata["boundary_reason"] == "semantic_percentile"
+    )
+    assert semantic_parent.semantic_boundary_score == pytest.approx(
+        semantic_parent.metadata["semantic_boundary_score"]
+    )
+    assert any(
+        item.metadata["boundary_reason"] in {"max_tokens", "section_end"}
+        for item in chunks
+    )
 
 
 def test_embeddings_are_batched_once_and_low_cosine_boundary_is_preferred() -> None:
@@ -144,9 +197,67 @@ def test_embeddings_are_batched_once_and_low_cosine_boundary_is_preferred() -> N
 
     parents = [item for item in chunks if item.chunk_role == "parent"]
     assert len(embedder.calls) == 1
-    assert embedder.calls[0] == [f"S{index} evidence." for index in range(1, 7)]
+    assert embedder.calls[0] == [
+        *(f"S{index} evidence. " for index in range(1, 6)),
+        "S6 evidence.",
+    ]
     assert len(parents) == 2
-    assert parents[0].text == "S1 evidence. S2 evidence. S3 evidence."
+    assert parents[0].text == "S1 evidence. S2 evidence. S3 evidence. "
+
+
+def test_parent_semantic_percentile_is_recomputed_for_each_current_chunk() -> None:
+    angles = [0.0, 0.1, 1.6, 1.7, 2.7, 2.8]
+    vectors = [[math.cos(angle), math.sin(angle)] for angle in angles]
+    chunks = make_chunker(
+        RecordingEmbedder(vectors),
+        parent_min_tokens=1,
+        parent_target_tokens=4,
+        parent_max_tokens=6,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+        break_percentile=10,
+    ).build(
+        document(
+            block(
+                "local-percentile",
+                " ".join(f"S{index} evidence." for index in range(1, 7)),
+                0,
+            )
+        )
+    )
+    parents = [item for item in chunks if item.chunk_role == "parent"]
+
+    assert [item.token_count for item in parents] == [4, 4, 4]
+    assert len({item.parent_local_id for item in chunks if item.chunk_role == "child"}) == 3
+
+
+def test_children_use_semantic_boundary_after_target_instead_of_cutting_at_target() -> None:
+    angles = [0.0, 0.1, 0.2, 1.7, 1.8, 2.8]
+    vectors = [[math.cos(angle), math.sin(angle)] for angle in angles]
+    chunks = make_chunker(
+        RecordingEmbedder(vectors),
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=4,
+        child_max_tokens=6,
+        overlap_tokens=0,
+        break_percentile=20,
+    ).build(
+        document(
+            block(
+                "child-semantic",
+                " ".join(f"S{index} evidence." for index in range(1, 7)),
+                0,
+            )
+        )
+    )
+    children = [item for item in chunks if item.chunk_role == "child"]
+
+    assert children[0].token_count == 6
 
 
 def test_english_and_cjk_sentence_boundaries_and_section_boundary_are_hard() -> None:
@@ -161,7 +272,113 @@ def test_english_and_cjk_sentence_boundaries_and_section_boundary_are_hard() -> 
     assert len(parents) == 2
     assert parents[0].section_path == ["Intro"]
     assert parents[1].section_path == ["方法"]
-    assert parents[1].text == "第一句。 第二句！ 第三句？"
+    assert parents[1].text == "第一句。第二句！第三句？"
+
+
+def test_sentence_units_preserve_exact_source_and_do_not_split_abbreviations_decimals_or_urls() -> None:
+    source = (
+        "Dr. Smith measured 3.14 units.  "
+        "Visit https://example.com/a.b?q=1.\n\n"
+        "Next line。中文句！"
+    )
+    source_block = block("fidelity", source, 0)
+    source_block.source_spans = [
+        SourceSpan(
+            page_index=0,
+            source_block_id="fidelity",
+            char_start=100,
+            char_end=100 + len(source),
+        )
+    ]
+    embedder = RecordingEmbedder()
+    chunks = make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(source_block))
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+    child = next(item for item in chunks if item.chunk_role == "child")
+
+    assert parent.text == source
+    assert child.text == source
+    assert embedder.calls == [
+        [
+            "Dr. Smith measured 3.14 units.  ",
+            "Visit https://example.com/a.b?q=1.\n\n",
+            "Next line。",
+            "中文句！",
+        ]
+    ]
+
+
+def test_narrative_merge_does_not_invent_separator_between_source_blocks() -> None:
+    first = block("first-source", "Alpha source.  \n", 0)
+    second = block("second-source", "\nBeta source.", 1)
+    chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(first, second))
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+
+    assert parent.text == first.text + second.text
+
+
+def test_quoted_question_and_exclamation_marks_are_sentence_boundaries() -> None:
+    source = 'He asked "Ready?"  She shouted (Go!)\nDone.'
+    embedder = RecordingEmbedder()
+    chunks = make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(block("quoted", source, 0)))
+
+    assert embedder.calls == [
+        ['He asked "Ready?"  ', "She shouted (Go!)\n", "Done."]
+    ]
+    assert next(item for item in chunks if item.chunk_role == "parent").text == source
+
+
+def test_academic_abbreviations_and_initialisms_do_not_create_false_boundaries() -> None:
+    source = (
+        "Fig. 2 shows Eq. 3 in Sec. 4. "
+        "Smith et al. agree. "
+        "A Ph.D. study in the U.S. confirms it."
+    )
+    embedder = RecordingEmbedder()
+    chunks = make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(block("academic-abbrev", source, 0)))
+
+    assert embedder.calls == [
+        [
+            "Fig. 2 shows Eq. 3 in Sec. 4. ",
+            "Smith et al. agree. ",
+            "A Ph.D. study in the U.S. confirms it.",
+        ]
+    ]
+    assert next(item for item in chunks if item.chunk_role == "parent").text == source
 
 
 def test_parent_max_is_hard_and_overlong_sentence_uses_lossless_token_windows() -> None:
@@ -226,7 +443,7 @@ def test_children_use_whole_sentence_overlap_and_do_not_lose_source() -> None:
     assert recovered == re.findall(r"Sentence\d+ has evidence\.", parent.text)
 
 
-def test_child_tail_is_merged_when_it_fits_and_single_sentence_overflow_is_marked() -> None:
+def test_child_tail_is_merged_and_splittable_long_sentence_respects_child_max() -> None:
     source = sentence_sequence(5)
     chunks = make_chunker(
         parent_min_tokens=1,
@@ -251,13 +468,80 @@ def test_child_tail_is_merged_when_it_fits_and_single_sentence_overflow_is_marke
         child_max_tokens=6,
         overlap_tokens=0,
     ).build(document(block("overflow", long_sentence, 0)))
-    overflow_child = next(item for item in overflow_chunks if item.chunk_role == "child")
-    assert overflow_child.token_count == 11
-    assert overflow_child.metadata["single_sentence_overflow"] is True
-    assert overflow_child.text == long_sentence
+    overflow_children = [
+        item for item in overflow_chunks if item.chunk_role == "child"
+    ]
+    assert all(item.token_count <= 6 for item in overflow_children)
+    assert "".join(item.text for item in overflow_children) == long_sentence
+    assert all(
+        item.metadata["single_sentence_overflow"] is False
+        for item in overflow_children
+    )
 
 
-def test_child_neighbors_are_scoped_to_their_parent() -> None:
+def test_parent_tail_rebalances_complete_units_when_direct_merge_would_exceed_max() -> None:
+    source = " ".join(f"P{index} unit." for index in range(1, 6))
+    chunks = make_chunker(
+        parent_min_tokens=4,
+        parent_target_tokens=8,
+        parent_max_tokens=8,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(block("parent-rebalance", source, 0)))
+    parents = [item for item in chunks if item.chunk_role == "parent"]
+
+    assert [item.token_count for item in parents] == [6, 4]
+    assert all(item.metadata.get("undersized_reason") is None for item in parents)
+    assert "".join(item.text for item in parents) == source
+
+
+def test_child_tail_rebalances_complete_units_without_loss_or_reordering() -> None:
+    source = " ".join(f"C{index} unit." for index in range(1, 6))
+    chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=4,
+        child_target_tokens=8,
+        child_max_tokens=8,
+        overlap_tokens=0,
+    ).build(document(block("child-rebalance", source, 0)))
+    children = [item for item in chunks if item.chunk_role == "child"]
+
+    assert [item.token_count for item in children] == [6, 4]
+    assert all(item.metadata.get("undersized_reason") is None for item in children)
+    assert "".join(item.text for item in children) == source
+
+
+def test_only_indivisible_source_character_may_overflow_with_explicit_metadata() -> None:
+    def indivisible_counter(text: str) -> int:
+        return len(text) * 10
+
+    chunks = SemanticChunker(
+        RecordingEmbedder(),
+        indivisible_counter,
+        parent_min_tokens=1,
+        parent_target_tokens=4,
+        parent_max_tokens=6,
+        child_min_tokens=1,
+        child_target_tokens=4,
+        child_max_tokens=6,
+        overlap_tokens=0,
+        break_percentile=20,
+    ).build(document(block("one-char", "界", 0)))
+
+    assert {item.text for item in chunks} == {"界"}
+    assert all(item.token_count == 10 for item in chunks)
+    assert all(item.metadata["unavoidable_token_overflow"] is True for item in chunks)
+    assert all(
+        item.metadata["overflow_reason"] == "single_source_character_exceeds_max"
+        for item in chunks
+    )
+
+
+def test_child_neighbors_cross_parent_within_structure_but_stop_at_section_boundary() -> None:
     chunks = make_chunker(
         parent_min_tokens=2,
         parent_target_tokens=6,
@@ -270,20 +554,47 @@ def test_child_neighbors_are_scoped_to_their_parent() -> None:
     parents = [item for item in chunks if item.chunk_role == "parent"]
     assert len(parents) == 3
 
-    for parent in parents:
-        children = [item for item in chunks if item.parent_local_id == parent.local_id]
-        assert children
-        assert children[0].previous_child_local_id is None
-        assert children[-1].next_child_local_id is None
-        allowed = {item.local_id for item in children}
-        assert all(
-            item.previous_child_local_id is None or item.previous_child_local_id in allowed
-            for item in children
+    children = [item for item in chunks if item.chunk_role == "child"]
+    for index, child in enumerate(children):
+        assert child.previous_child_local_id == (
+            children[index - 1].local_id if index else None
         )
-        assert all(
-            item.next_child_local_id is None or item.next_child_local_id in allowed
-            for item in children
+        assert child.next_child_local_id == (
+            children[index + 1].local_id if index + 1 < len(children) else None
         )
+    parent_by_child = {item.local_id: item.parent_local_id for item in children}
+    assert any(
+        child.next_child_local_id is not None
+        and parent_by_child[child.next_child_local_id] != child.parent_local_id
+        for child in children
+    )
+
+    section_chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=3,
+        child_max_tokens=6,
+        overlap_tokens=0,
+    ).build(
+        document(
+            block("section-a", sentence_sequence(3, "A"), 0, section_path=["A"]),
+            block("section-b", sentence_sequence(3, "B"), 1, section_path=["B"]),
+        )
+    )
+    section_a = [
+        item
+        for item in section_chunks
+        if item.chunk_role == "child" and item.section_path == ["A"]
+    ]
+    section_b = [
+        item
+        for item in section_chunks
+        if item.chunk_role == "child" and item.section_path == ["B"]
+    ]
+    assert section_a[-1].next_child_local_id is None
+    assert section_b[0].previous_child_local_id is None
 
 
 def test_references_are_excluded_but_appendix_and_caption_are_searchable() -> None:
@@ -347,6 +658,60 @@ def test_reference_structures_are_excluded_but_appendix_structures_are_searchabl
 
     assert all(item.source_block_ids != ["reference-table-block"] for item in chunks)
     assert any(item.source_block_ids == ["appendix-table-block"] for item in chunks)
+
+
+@pytest.mark.parametrize(
+    "section_title",
+    [
+        "Literature Cited",
+        "Sources",
+        "Cited Literature",
+        "8. Literature Cited",
+        "文献",
+        "参考资料",
+        "引用资料",
+    ],
+)
+def test_common_reference_section_variants_are_excluded(section_title: str) -> None:
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(
+        document(
+            block(
+                "variant-reference",
+                "This citation must stay out of ordinary RAG.",
+                0,
+                section_path=[section_title],
+            ),
+            block(
+                "appendix-kept",
+                "Appendix source remains searchable.",
+                1,
+                block_type="appendix",
+                section_path=["Appendix B"],
+            ),
+        )
+    )
+    combined = "".join(item.text for item in chunks)
+
+    assert "citation must stay out" not in combined
+    assert "Appendix source remains searchable" in combined
+
+
+def test_numbered_cited_literature_structured_block_is_excluded() -> None:
+    table = valid_table().model_copy(deep=True)
+    table.table_id = "cited-table"
+    doc = document(
+        block(
+            "cited-table-block",
+            "",
+            0,
+            block_type="table",
+            section_path=["4. Cited Literature"],
+            table_id=table.table_id,
+        )
+    )
+    doc.tables = [table]
+
+    assert make_chunker().build(doc) == []
 
 
 @pytest.mark.parametrize("format_kind", ["code", "pre"])
@@ -428,6 +793,58 @@ def test_ids_and_spans_are_stable_deduplicated_and_source_sensitive() -> None:
     assert [item.local_id for item in first] != [item.local_id for item in changed]
     assert all(len(item.source_spans) == 1 for item in first)
     assert all(item.embedding_text == item.text for item in first)
+
+
+def test_child_spans_use_precise_block_relative_character_ranges() -> None:
+    source = " ".join(f"S{index} evidence." for index in range(1, 7))
+    source_block = block("precise", source, 0)
+    source_block.source_spans = [
+        SourceSpan(
+            page_index=3,
+            source_block_id="precise",
+            char_start=100,
+            char_end=100 + len(source),
+        )
+    ]
+    chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=2,
+        child_max_tokens=2,
+        overlap_tokens=0,
+    ).build(document(source_block))
+    children = [item for item in chunks if item.chunk_role == "child"]
+    ranges = [
+        (item.source_spans[0].char_start, item.source_spans[0].char_end)
+        for item in children
+    ]
+
+    assert len(children) == 6
+    assert len(set(ranges)) == 6
+    assert ranges[0][0] == 100
+    assert ranges[-1][1] == 100 + len(source)
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+    assert "".join(item.text for item in children) == source
+    assert all(item.metadata["source_span_mapping"] == "exact" for item in children)
+
+
+def test_locator_without_character_range_is_preserved_and_marked_approximate() -> None:
+    source_block = block("locator", "First sentence. Second sentence.", 0)
+    source_block.source_spans = [
+        SourceSpan(
+            page_index=4,
+            source_block_id="locator",
+            bbox=(1.0, 2.0, 3.0, 4.0),
+        )
+    ]
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(
+        document(source_block)
+    )
+
+    assert all(item.source_spans[0].bbox == (1.0, 2.0, 3.0, 4.0) for item in chunks)
+    assert all(item.metadata["source_span_mapping"] == "approximate" for item in chunks)
 
 
 @pytest.mark.parametrize(
@@ -516,6 +933,12 @@ def test_structured_blocks_are_isolated_and_table_children_keep_precise_spans() 
     assert all(item.source_block_ids == ["table-block"] for item in table_children)
     assert all(item.source_spans for item in table_children)
     assert [item.metadata["row_indices"] for item in table_children] == [[0], [1]]
+    assert table_parent.metadata["boundary_reason"] == "structured_boundary"
+    assert all(
+        item.metadata["boundary_reason"] == "structured_boundary"
+        for item in table_children
+    )
+    assert table_parent.semantic_boundary_score is None
     assert {item.source_block_id for item in table_parent.source_spans} == {
         "source-table",
         "table-block",
@@ -588,6 +1011,8 @@ def test_figure_and_formula_have_source_faithful_children_and_generated_provenan
         assert child.text == parent.text
         assert child.source_spans == parent.source_spans
         assert child.metadata["source_faithful_single_child"] is True
+        assert parent.metadata["boundary_reason"] == "structured_boundary"
+        assert child.metadata["boundary_reason"] == "structured_boundary"
         assert nearby_id in parent.source_block_ids
         assert nearby_id in child.source_block_ids
         assert nearby_page in {item.page_index for item in parent.source_spans}

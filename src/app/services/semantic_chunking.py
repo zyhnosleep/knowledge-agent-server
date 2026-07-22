@@ -38,6 +38,10 @@ class ChunkDraft(BaseModel):
     source_spans: list[SourceSpan] = Field(default_factory=list)
     section_path: list[str] = Field(default_factory=list)
     ordinal: int = Field(ge=0)
+    splitter_name: str
+    splitter_version: str
+    splitting_model: str
+    semantic_boundary_score: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -55,6 +59,9 @@ class SemanticChunker:
         child_max_tokens: int | None = None,
         overlap_tokens: int | None = None,
         break_percentile: int | None = None,
+        splitter_name: str = "section_aware_semantic",
+        splitter_version: str = "semantic-v1",
+        splitting_model: str | None = None,
     ) -> None:
         settings = get_settings()
         self.embedder = embedder
@@ -90,6 +97,25 @@ class SemanticChunker:
             settings.semantic_break_percentile
             if break_percentile is None
             else break_percentile
+        )
+        self.splitter_name = splitter_name
+        self.splitter_version = splitter_version
+        embedder_model = next(
+            (
+                value
+                for value in (
+                    getattr(embedder, "model_name", None),
+                    getattr(embedder, "model", None),
+                    getattr(embedder, "name", None),
+                )
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
+        self.splitting_model = (
+            splitting_model
+            or embedder_model
+            or settings.semantic_splitting_model
         )
         self._validate_configuration()
         self._structured_builder = StructuredEvidenceBuilder(token_counter=self._count_tokens)
@@ -194,11 +220,11 @@ class SemanticChunker:
                     section_path=section_path,
                 )
             raw_texts = (
-                [block.text]
+                [(0, len(block.text), block.text)]
                 if preformatted and block.text
-                else self._sentences(block.text)
+                else self._sentence_ranges(block.text)
             )
-            for sentence_index, sentence in enumerate(raw_texts):
+            for sentence_index, (start, end, sentence) in enumerate(raw_texts):
                 current.units.append(
                     _RawUnit(
                         text=sentence,
@@ -209,6 +235,8 @@ class SemanticChunker:
                         source_spans=list(block.source_spans),
                         sentence_id=f"{block.block_id}:{sentence_index}",
                         preformatted=preformatted,
+                        block_char_start=start,
+                        block_char_end=end,
                     )
                 )
         flush()
@@ -229,12 +257,18 @@ class SemanticChunker:
             "references",
             "bibliography",
             "works cited",
+            "literature cited",
+            "cited literature",
+            "sources",
             "参考文献",
             "引用文献",
+            "文献",
+            "参考资料",
+            "引用资料",
         }
         for part in section_path:
             normalized = re.sub(
-                r"^\s*(?:(?:\d+(?:\.\d+)*)|(?:[ivxlcdm]+)|(?:[一二三四五六七八九十]+))[.、)]?\s*",
+                r"^\s*(?:(?:\d+(?:\.\d+)*|[ivxlcdm]+|[一二三四五六七八九十]+)(?:[.、)]|\s+))\s*",
                 "",
                 part.strip().casefold(),
             ).rstrip(":：")
@@ -243,16 +277,69 @@ class SemanticChunker:
         return False
 
     @staticmethod
-    def _sentences(text: str) -> list[str]:
-        normalized = text.strip()
-        if not normalized:
+    def _sentence_ranges(text: str) -> list[tuple[int, int, str]]:
+        if not text:
             return []
-        pattern = re.compile(r".+?(?:[.!?。！？]+[\"'”’）)\]]*|$)", re.DOTALL)
-        return [
-            match.group(0).strip()
-            for match in pattern.finditer(normalized)
-            if match.group(0).strip()
-        ]
+        abbreviations = {
+            "dr",
+            "mr",
+            "mrs",
+            "ms",
+            "prof",
+            "sr",
+            "jr",
+            "st",
+            "vs",
+            "etc",
+            "e.g",
+            "i.e",
+            "fig",
+            "eq",
+            "sec",
+            "ref",
+            "al",
+        }
+        closers = {'"', "'", "”", "’", "）", ")", "]"}
+        ranges: list[tuple[int, int, str]] = []
+        start = 0
+        index = 0
+        while index < len(text):
+            character = text[index]
+            boundary = character in "。！？"
+            if character in "!?":
+                probe = index + 1
+                while probe < len(text) and text[probe] in closers:
+                    probe += 1
+                boundary = probe == len(text) or text[probe].isspace()
+            elif character == ".":
+                next_character = text[index + 1] if index + 1 < len(text) else ""
+                previous_character = text[index - 1] if index else ""
+                decimal = previous_character.isdigit() and next_character.isdigit()
+                token_match = re.search(r"([A-Za-z]+(?:\.[A-Za-z]+)*)\.$", text[start : index + 1])
+                token = token_match.group(1).casefold() if token_match else ""
+                initialism = "." in token and all(
+                    1 <= len(part) <= 2 for part in token.split(".")
+                )
+                abbreviation = token in abbreviations or initialism
+                boundary = (
+                    not decimal
+                    and not abbreviation
+                    and (not next_character or next_character.isspace() or next_character in closers)
+                )
+            if not boundary:
+                index += 1
+                continue
+            end = index + 1
+            while end < len(text) and text[end] in closers:
+                end += 1
+            while end < len(text) and text[end].isspace():
+                end += 1
+            ranges.append((start, end, text[start:end]))
+            start = end
+            index = end
+        if start < len(text):
+            ranges.append((start, len(text), text[start:]))
+        return ranges
 
     def _attach_embeddings(self, units: list[_RawUnit]) -> None:
         texts = [unit.text for unit in units]
@@ -300,30 +387,32 @@ class SemanticChunker:
         expanded: list[_RawUnit] = []
         parent_max = self.parent_token_limits[2]
         for unit in segment.units:
-            window_max = (
-                min(parent_max, self.child_token_limits[2])
-                if unit.preformatted
-                else parent_max
-            )
+            window_max = min(parent_max, self.child_token_limits[2])
             if unit.token_count <= window_max:
                 expanded.append(unit)
                 continue
-            windows = (
-                self._lossless_token_windows(unit.text, window_max)
-                if unit.preformatted
-                else self._safe_token_windows(unit.text, window_max)
-            )
+            windows = self._lossless_token_windows(unit.text, window_max)
             for window_index, text in enumerate(windows):
+                relative_start = sum(len(item) for item in windows[:window_index])
+                token_count = self._count_tokens(text)
                 expanded.append(
                     unit.copy_with(
                         text=text,
-                        token_count=self._count_tokens(text),
+                        token_count=token_count,
                         token_window_split=True,
                         window_index=window_index,
+                        block_char_start=unit.block_char_start + relative_start,
+                        block_char_end=unit.block_char_start + relative_start + len(text),
+                        unavoidable_overflow=token_count > window_max,
+                        overflow_reason=(
+                            "single_source_character_exceeds_max"
+                            if token_count > window_max
+                            else None
+                        ),
                     )
                 )
 
-        parent_groups = self._parent_groups(expanded)
+        parent_groups = self._semantic_groups(expanded, *self.parent_token_limits)
         structure_id = "narrative:" + hashlib.sha256(
             json.dumps(
                 [segment.block_type, segment.section_path, self._source_ids(expanded)],
@@ -331,7 +420,9 @@ class SemanticChunker:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()[:20]
-        for parent_index, units in enumerate(parent_groups):
+        structure_children: list[ChunkDraft] = []
+        for parent_index, parent_group in enumerate(parent_groups):
+            units = parent_group.units
             parent_text = self._join_units(units)
             parent_id = self._local_id(
                 parse_version,
@@ -355,9 +446,28 @@ class SemanticChunker:
                 metadata={
                     "semantic_zero_vector_fallback": any(unit.zero_vector for unit in units),
                     "token_window_split": any(unit.token_window_split for unit in units),
+                    "unavoidable_token_overflow": any(
+                        unit.unavoidable_overflow for unit in units
+                    ),
+                    "overflow_reason": next(
+                        (
+                            unit.overflow_reason
+                            for unit in units
+                            if unit.overflow_reason is not None
+                        ),
+                        None,
+                    ),
                     "parent_min_underflow": self._count_tokens(parent_text)
                     < self.parent_token_limits[0],
+                    "undersized_reason": (
+                        "section_too_short_or_max_prevents_rebalance"
+                        if self._count_tokens(parent_text) < self.parent_token_limits[0]
+                        else None
+                    ),
                     "source_unit_ids": [unit.unit_id for unit in units],
+                    "semantic_boundary_score": parent_group.boundary_score,
+                    "boundary_reason": parent_group.boundary_reason,
+                    "source_span_mapping": self._source_span_mapping(units),
                 },
             )
             drafts.append(parent)
@@ -368,53 +478,88 @@ class SemanticChunker:
                 start_ordinal=len(drafts),
             )
             drafts.extend(children)
+            structure_children.extend(children)
+        self._link_neighbors(structure_children)
 
-    def _parent_groups(self, units: list[_RawUnit]) -> list[list[_RawUnit]]:
+    def _semantic_groups(
+        self,
+        units: list[_RawUnit],
+        minimum: int,
+        target: int,
+        maximum: int,
+    ) -> list[_ChunkGroup]:
         if not units:
             return []
-        minimum, target, maximum = self.parent_token_limits
-        semantic_boundaries = self._low_similarity_boundaries(units)
         groups: list[list[_RawUnit]] = []
-        current: list[_RawUnit] = []
-        current_tokens = 0
-        for index, unit in enumerate(units):
-            if current and self._group_tokens([*current, unit]) > maximum:
-                groups.append(current)
-                current = []
-            current.append(unit)
-            current_tokens = self._group_tokens(current)
-            if (
-                index < len(units) - 1
-                and current_tokens >= minimum
-                and current_tokens >= target
-                and index in semantic_boundaries
-            ):
-                groups.append(current)
-                current = []
-                current_tokens = 0
-        if current:
-            groups.append(current)
-        if (
-            len(groups) > 1
-            and self._group_tokens(groups[-1]) < minimum
-            and self._group_tokens([*groups[-2], *groups[-1]]) <= maximum
-        ):
-            groups[-2].extend(groups.pop())
-        return groups
+        boundary_audit: dict[str, tuple[float | None, str]] = {}
+        start = 0
+        while start < len(units):
+            max_end = start
+            while max_end < len(units):
+                candidate = units[start : max_end + 1]
+                if max_end > start and self._group_tokens(candidate) > maximum:
+                    break
+                max_end += 1
+                if self._group_tokens(candidate) > maximum:
+                    break
+            max_end = max(start + 1, max_end)
 
-    def _low_similarity_boundaries(self, units: list[_RawUnit]) -> set[int]:
-        scored: list[tuple[float, int]] = []
-        for index in range(len(units) - 1):
-            left = units[index]
-            right = units[index + 1]
-            if left.embedding is None or right.embedding is None:
-                raise RuntimeError("raw unit embedding missing")
-            scored.append((self._cosine(left.embedding, right.embedding), index))
-        if not scored:
-            return set()
-        count = max(1, math.ceil(len(scored) * self.break_percentile / 100))
-        ranked = sorted(scored, key=lambda item: (item[0], item[1]))[:count]
-        return {index for _score, index in ranked}
+            candidates: list[tuple[float, int]] = []
+            for end in range(start + 1, max_end + 1):
+                if end >= len(units):
+                    continue
+                candidate = units[start:end]
+                if self._group_tokens(candidate) < max(minimum, target):
+                    continue
+                left = units[end - 1].embedding
+                right = units[end].embedding
+                if left is None or right is None:
+                    raise RuntimeError("raw unit embedding missing")
+                candidates.append((self._cosine(left, right), end))
+
+            if candidates:
+                percentile_count = max(
+                    1,
+                    math.ceil(len(candidates) * self.break_percentile / 100),
+                )
+                bottom = sorted(candidates, key=lambda item: (item[0], item[1]))[
+                    :percentile_count
+                ]
+                score, chosen_end = min(bottom, key=lambda item: item[1])
+                reason = "semantic_percentile"
+            else:
+                chosen_end = max_end
+                score = None
+                reason = "section_end" if chosen_end >= len(units) else "max_tokens"
+            group = units[start:chosen_end]
+            groups.append(group)
+            boundary_audit[group[-1].unit_id] = (score, reason)
+            start = chosen_end
+
+        groups = self._rebalance_tail(groups, minimum, maximum)
+        result: list[_ChunkGroup] = []
+        for index, group in enumerate(groups):
+            if index + 1 == len(groups):
+                score, reason = None, "section_end"
+            elif group[-1].unit_id in boundary_audit:
+                score, reason = boundary_audit[group[-1].unit_id]
+            else:
+                left = group[-1].embedding
+                right = groups[index + 1][0].embedding
+                score = (
+                    self._cosine(left, right)
+                    if left is not None and right is not None
+                    else None
+                )
+                reason = "min_rebalance"
+            result.append(
+                _ChunkGroup(
+                    units=group,
+                    boundary_score=score,
+                    boundary_reason=reason,
+                )
+            )
+        return result
 
     @staticmethod
     def _cosine(left: list[float], right: list[float]) -> float:
@@ -462,7 +607,9 @@ class SemanticChunker:
                 else:
                     high = middle - 1
             if best == 0:
-                raise ValueError("token counter reports one source character above parent max")
+                windows.append(remaining[0])
+                remaining = remaining[1:]
+                continue
             windows.append(remaining[:best])
             remaining = remaining[best:]
         return windows
@@ -484,7 +631,9 @@ class SemanticChunker:
                 else:
                     high = middle - 1
             if best == 0:
-                raise ValueError("token counter reports one source character above parent max")
+                windows.append(remaining[0])
+                remaining = remaining[1:]
+                continue
             windows.append(remaining[:best])
             remaining = remaining[best:]
         return windows
@@ -498,27 +647,8 @@ class SemanticChunker:
         start_ordinal: int,
     ) -> list[ChunkDraft]:
         minimum, target, maximum = self.child_token_limits
-        base_groups: list[list[_RawUnit]] = []
-        current: list[_RawUnit] = []
-        current_tokens = 0
-        for unit in units:
-            if current and self._group_tokens([*current, unit]) > maximum:
-                base_groups.append(current)
-                current = []
-            current.append(unit)
-            current_tokens = self._group_tokens(current)
-            if current_tokens >= target:
-                base_groups.append(current)
-                current = []
-                current_tokens = 0
-        if current:
-            base_groups.append(current)
-        if (
-            len(base_groups) > 1
-            and self._group_tokens(base_groups[-1]) < minimum
-            and self._group_tokens([*base_groups[-2], *base_groups[-1]]) <= maximum
-        ):
-            base_groups[-2].extend(base_groups.pop())
+        base_chunk_groups = self._semantic_groups(units, minimum, target, maximum)
+        base_groups = [item.units for item in base_chunk_groups]
 
         child_groups: list[tuple[list[_RawUnit], int]] = []
         for index, group in enumerate(base_groups):
@@ -561,16 +691,70 @@ class SemanticChunker:
                         "overlap_tokens": self._group_tokens(group[:overlap_count]),
                         "single_sentence_overflow": len(base_group) == 1
                         and base_group[0].token_count > maximum,
+                        "unavoidable_token_overflow": any(
+                            item.unavoidable_overflow for item in base_group
+                        ),
+                        "overflow_reason": next(
+                            (
+                                item.overflow_reason
+                                for item in base_group
+                                if item.overflow_reason is not None
+                            ),
+                            None,
+                        ),
                         "source_sentence_token_window": any(
                             item.token_window_split for item in group
                         ),
                         "child_min_underflow": self._count_tokens(text) < minimum,
+                        "undersized_reason": (
+                            "structure_too_short_or_max_prevents_rebalance"
+                            if self._count_tokens(text) < minimum
+                            else None
+                        ),
                         "source_unit_ids": [item.unit_id for item in group],
+                        "semantic_boundary_score": base_chunk_groups[
+                            child_index
+                        ].boundary_score,
+                        "boundary_reason": base_chunk_groups[
+                            child_index
+                        ].boundary_reason,
+                        "source_span_mapping": self._source_span_mapping(group),
                     },
                 )
             )
         self._link_neighbors(children)
         return children
+
+    def _rebalance_tail(
+        self,
+        groups: list[list[_RawUnit]],
+        minimum: int,
+        maximum: int,
+    ) -> list[list[_RawUnit]]:
+        if len(groups) < 2 or self._group_tokens(groups[-1]) >= minimum:
+            return groups
+        previous = groups[-2]
+        tail = groups[-1]
+        if self._group_tokens([*previous, *tail]) <= maximum:
+            previous.extend(groups.pop())
+            return groups
+
+        candidate_previous = list(previous)
+        candidate_tail = list(tail)
+        while self._group_tokens(candidate_tail) < minimum and len(candidate_previous) > 1:
+            candidate_tail.insert(0, candidate_previous.pop())
+            if (
+                self._group_tokens(candidate_previous) > maximum
+                or self._group_tokens(candidate_tail) > maximum
+            ):
+                return groups
+        if (
+            self._group_tokens(candidate_previous) >= minimum
+            and self._group_tokens(candidate_tail) >= minimum
+        ):
+            groups[-2] = candidate_previous
+            groups[-1] = candidate_tail
+        return groups
 
     def _whole_sentence_overlap(
         self,
@@ -679,6 +863,8 @@ class SemanticChunker:
             metadata={
                 **source_parent.metadata,
                 "structured_chunk_id": source_parent.chunk_id,
+                "semantic_boundary_score": None,
+                "boundary_reason": "structured_boundary",
             },
         )
         drafts.append(parent)
@@ -696,6 +882,8 @@ class SemanticChunker:
             metadata = {
                 **source_child.metadata,
                 "structured_chunk_id": source_child.chunk_id,
+                "semantic_boundary_score": None,
+                "boundary_reason": "structured_boundary",
             }
             if block.block_type in {"figure", "formula"}:
                 metadata["source_faithful_single_child"] = True
@@ -781,6 +969,10 @@ class SemanticChunker:
             source_spans=self._deduplicate_spans(source_spans),
             section_path=section_path,
             ordinal=ordinal,
+            splitter_name=self.splitter_name,
+            splitter_version=self.splitter_version,
+            splitting_model=self.splitting_model,
+            semantic_boundary_score=metadata.get("semantic_boundary_score"),
             metadata=metadata,
         )
 
@@ -795,9 +987,12 @@ class SemanticChunker:
     @staticmethod
     def _join_units(units: Iterable[_RawUnit]) -> str:
         values = list(units)
-        if values and all(unit.preformatted for unit in values):
-            return "".join(unit.text for unit in values)
-        return " ".join(unit.text.strip() for unit in values if unit.text.strip())
+        if not values:
+            return ""
+        parts = [values[0].text]
+        for _previous, current in zip(values, values[1:]):
+            parts.append(current.text)
+        return "".join(parts)
 
     def _group_tokens(self, units: Iterable[_RawUnit]) -> int:
         return self._count_tokens(self._join_units(units))
@@ -814,9 +1009,56 @@ class SemanticChunker:
 
     @classmethod
     def _source_spans(cls, units: Iterable[_RawUnit]) -> list[SourceSpan]:
-        return cls._deduplicate_spans(
-            span for unit in units for span in unit.source_spans
-        )
+        mapped: list[SourceSpan] = []
+        for unit in units:
+            for span in unit.source_spans:
+                if (
+                    span.char_start is not None
+                    and span.char_end is not None
+                    and span.char_end - span.char_start >= unit.block_char_end
+                ):
+                    mapped.append(
+                        span.model_copy(
+                            update={
+                                "char_start": span.char_start + unit.block_char_start,
+                                "char_end": span.char_start + unit.block_char_end,
+                            }
+                        )
+                    )
+                else:
+                    mapped.append(span)
+        deduplicated = cls._deduplicate_spans(mapped)
+        merged: list[SourceSpan] = []
+        for span in deduplicated:
+            if merged and cls._spans_are_adjacent(merged[-1], span):
+                merged[-1] = merged[-1].model_copy(update={"char_end": span.char_end})
+            else:
+                merged.append(span)
+        return merged
+
+    @staticmethod
+    def _source_span_mapping(units: Iterable[_RawUnit]) -> str:
+        for unit in units:
+            for span in unit.source_spans:
+                if (
+                    span.char_start is None
+                    or span.char_end is None
+                    or span.char_end - span.char_start < unit.block_char_end
+                ):
+                    return "approximate"
+        return "exact"
+
+    @staticmethod
+    def _spans_are_adjacent(left: SourceSpan, right: SourceSpan) -> bool:
+        if left.char_end is None or right.char_start is None:
+            return False
+        left_locator = left.model_dump(mode="json")
+        right_locator = right.model_dump(mode="json")
+        left_locator.pop("char_start", None)
+        left_locator.pop("char_end", None)
+        right_locator.pop("char_start", None)
+        right_locator.pop("char_end", None)
+        return left_locator == right_locator and left.char_end == right.char_start
 
     @staticmethod
     def _deduplicate_spans(spans: Iterable[SourceSpan]) -> list[SourceSpan]:
@@ -871,6 +1113,10 @@ class _RawUnit:
     token_window_split: bool = False
     window_index: int | None = None
     preformatted: bool = False
+    block_char_start: int = 0
+    block_char_end: int = 0
+    unavoidable_overflow: bool = False
+    overflow_reason: str | None = None
 
     @property
     def unit_id(self) -> str:
@@ -891,9 +1137,20 @@ class _RawUnit:
             "token_window_split": self.token_window_split,
             "window_index": self.window_index,
             "preformatted": self.preformatted,
+            "block_char_start": self.block_char_start,
+            "block_char_end": self.block_char_end,
+            "unavoidable_overflow": self.unavoidable_overflow,
+            "overflow_reason": self.overflow_reason,
         }
         values.update(changes)
         return _RawUnit(**values)
+
+
+@dataclass
+class _ChunkGroup:
+    units: list[_RawUnit]
+    boundary_score: float | None
+    boundary_reason: str
 
 
 @dataclass
