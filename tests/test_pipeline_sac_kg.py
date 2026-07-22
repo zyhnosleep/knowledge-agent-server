@@ -284,6 +284,81 @@ def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch
     assert report["progress"]["stage"] == "completed"
 
 
+@pytest.mark.parametrize(
+    "canonical_status,activation_allowed",
+    [("validation_failed", True), ("accepted", False)],
+)
+@pytest.mark.parametrize("suffix", ["pdf", "md"])
+def test_process_document_fails_closed_before_chunks_for_canonical_table_failure(
+    monkeypatch, canonical_status: str, activation_allowed: bool, suffix: str
+) -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Case",
+        file_name=f"case.{suffix}",
+        sha256="abc",
+        raw_path=f"raw/case.{suffix}",
+    )
+    run = PipelineRun(
+        id="r1",
+        project_id="p1",
+        document_id="d1",
+        run_type=RunType.ingest.value,
+        status=RunStatus.queued.value,
+        provider_report={},
+    )
+    db.add_all([project, document, run])
+    db.commit()
+
+    from app.services import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "parse_document",
+        lambda _path: ParsedDocument(
+            title="Parsed",
+            text="Unsafe table evidence",
+            chunks=[ParsedChunk(ordinal=0, text="Unsafe table evidence")],
+            metadata={
+                "canonical": {
+                    "quality": {
+                        "accepted": canonical_status == "accepted",
+                        "status": canonical_status,
+                        "score": 0.5,
+                        "issues": [{"code": "table_invalid"}],
+                    },
+                    "status": "ready",
+                    "table_activation_allowed": activation_allowed,
+                    "table_repair_requests": [{"table_id": "table-1"}],
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        IngestionPipeline,
+        "_replace_chunks",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rejected canonical evidence must not be persisted")
+        ),
+    )
+
+    failed = IngestionPipeline(db).process_document("d1")
+
+    db.expire_all()
+    stored_document = db.get(Document, "d1")
+    stored_run = db.get(PipelineRun, "r1")
+    assert failed.status == RunStatus.failed.value
+    assert stored_document.status == DocumentStatus.failed.value
+    assert db.query(DocumentChunk).filter(DocumentChunk.document_id == "d1").count() == 0
+    assert stored_document.metadata_json["ingest_quality"]["status"] == "validation_failed"
+    assert stored_document.metadata_json["ingest_error"]
+    assert stored_run.provider_report["ingest_quality"]["status"] == "validation_failed"
+    assert stored_run.provider_report["error"]
+
+
 def test_ensure_growing_entities_reuses_existing_tail_entity() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")

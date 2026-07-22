@@ -857,7 +857,13 @@ def test_table_repair_with_valid_replacement_is_accepted(
             CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
             CanonicalCell(text="SAC-KG", row_index=1, column_index=0),
         ],
-        source_spans=[SourceSpan(page_index=0, page_label="1")],
+        source_spans=[
+            SourceSpan(
+                page_index=0,
+                page_label="1",
+                source_block_id="source-table-1",
+            )
+        ],
     )
     replacement = CanonicalTable(
         table_id="di-valid",
@@ -872,7 +878,13 @@ def test_table_repair_with_valid_replacement_is_accepted(
         normalized_markdown=(
             "| Model | F1 |\n| --- | --- |\n| SAC-KG | 74.7 |"
         ),
-        source_spans=[SourceSpan(page_index=0, page_label="1")],
+        source_spans=[
+            SourceSpan(
+                page_index=0,
+                page_label="1",
+                source_block_id="source-table-1",
+            )
+        ],
     )
     mineru = _table_document(invalid, parser_source="mineru")
     repaired = _table_document(replacement, parser_source="document_intelligence")

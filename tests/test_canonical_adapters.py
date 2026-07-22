@@ -24,6 +24,14 @@ from app.services.canonical_adapters import (
     parse_canonical_document,
 )
 from app.services.parser import DocumentParseError, parse_document
+from app.services.canonical_models import (
+    CanonicalBlock,
+    CanonicalDocument,
+    CanonicalFigure,
+    CanonicalFormula,
+    CanonicalQualityReport,
+    SectionNode,
+)
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "canonical"
@@ -1696,3 +1704,124 @@ def test_compatibility_text_parse_keeps_raw_text_and_emits_fallback_chunk(
     assert parsed.text == content
     assert len(parsed.chunks) == 1
     assert parsed.chunks[0].text == content
+
+
+@pytest.mark.parametrize("suffix", [".pdf", ".md"])
+def test_parse_document_routes_every_format_through_canonical_finalization(
+    monkeypatch, tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / f"source{suffix}"
+    path.write_bytes(b"placeholder")
+    canonical = CanonicalDocument(
+        document_id="canonical-1",
+        source_path=str(path),
+        source_media_type="application/pdf" if suffix == ".pdf" else "text/markdown",
+        parser_source="fixture",
+        parse_version="1",
+        title="Canonical title",
+        blocks=[
+            CanonicalBlock(
+                block_id="source-block",
+                block_type="narrative",
+                text="Canonical source text",
+                reading_order=0,
+                parser_source="fixture",
+            )
+        ],
+        quality=CanonicalQualityReport(accepted=True, status="accepted", score=1.0),
+        status="ready",
+        metadata={"table_activation_allowed": True, "table_repair_requests": []},
+    )
+    calls: list[Path] = []
+
+    def fake_parse_canonical(candidate: Path) -> CanonicalDocument:
+        calls.append(candidate)
+        return canonical
+
+    monkeypatch.setattr(
+        canonical_adapters, "parse_canonical_document", fake_parse_canonical
+    )
+    monkeypatch.setattr(
+        "app.services.parser._parse_pdf",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("PDF must use the public canonical boundary")
+        ),
+    )
+
+    parsed = parse_document(path)
+
+    assert calls == [path]
+    assert parsed.text == "Canonical source text"
+    assert parsed.metadata["canonical"]["quality"]["status"] == "accepted"
+    assert parsed.metadata["canonical"]["status"] == "ready"
+    assert parsed.metadata["canonical"]["table_activation_allowed"] is True
+    assert parsed.metadata["canonical"]["table_repair_requests"] == []
+
+
+def test_canonical_conversion_excludes_nested_generated_provenance_and_cleans_links(
+    monkeypatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "source.md"
+    path.write_text("placeholder", encoding="utf-8")
+    canonical = CanonicalDocument(
+        document_id="canonical-generated",
+        source_path=str(path),
+        source_media_type="text/markdown",
+        parser_source="fixture",
+        parse_version="1",
+        title="Source",
+        blocks=[
+            CanonicalBlock(
+                block_id="original",
+                block_type="narrative",
+                text="Original evidence",
+                reading_order=0,
+                parser_source="fixture",
+            ),
+            CanonicalBlock(
+                block_id="generated",
+                block_type="narrative",
+                text="Generated interpretation",
+                reading_order=1,
+                parser_source="vision",
+                metadata={"provenance": {"generated": True}},
+            ),
+        ],
+        outline=[
+            SectionNode(title="Original", block_id="original"),
+            SectionNode(title="Generated", block_id="generated"),
+        ],
+        figures=[
+            CanonicalFigure(
+                figure_id="figure-1",
+                nearby_block_ids=["original", "generated"],
+            )
+        ],
+        formulas=[
+            CanonicalFormula(
+                formula_id="formula-1",
+                latex="x=1",
+                nearby_block_ids=["original", "generated"],
+            )
+        ],
+        quality=CanonicalQualityReport(accepted=True, status="accepted", score=1.0),
+        status="ready",
+        metadata={"table_activation_allowed": True, "table_repair_requests": []},
+    )
+    monkeypatch.setattr(
+        canonical_adapters, "parse_canonical_document", lambda _path: canonical
+    )
+
+    parsed = parse_document(path)
+
+    assert [chunk.text for chunk in parsed.chunks] == ["Original evidence"]
+    assert parsed.text == "Original evidence"
+    assert [node["block_id"] for node in parsed.metadata["canonical"]["outline"]] == [
+        "original"
+    ]
+    assert parsed.metadata["canonical"]["figures"][0]["nearby_block_ids"] == [
+        "original"
+    ]
+    assert parsed.metadata["canonical"]["formulas"][0]["nearby_block_ids"] == [
+        "original"
+    ]

@@ -49,9 +49,6 @@ class ParsedDocument:
 
 
 def parse_document(path: Path) -> ParsedDocument:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return _parse_pdf(path)
     from app.services.canonical_adapters import parse_canonical_document
 
     canonical = parse_canonical_document(path)
@@ -69,6 +66,12 @@ def parse_document(path: Path) -> ParsedDocument:
 
 
 def _canonical_to_parsed_document(document) -> ParsedDocument:
+    from app.services.canonical_provenance import block_is_generated, source_only_document
+
+    document = source_only_document(document)
+    source_blocks = [
+        block for block in document.blocks if not block_is_generated(block)
+    ]
     chunks = [
         ParsedChunk(
             ordinal=block.reading_order,
@@ -79,7 +82,7 @@ def _canonical_to_parsed_document(document) -> ParsedDocument:
                 None,
             ),
         )
-        for block in document.blocks
+        for block in source_blocks
     ]
     metadata = dict(document.parser_metadata)
     metadata.update(
@@ -91,6 +94,21 @@ def _canonical_to_parsed_document(document) -> ParsedDocument:
                 "source_path": document.source_path,
                 "source_media_type": document.source_media_type,
                 "warnings": list(document.warnings),
+                "quality": document.quality.model_dump(mode="json"),
+                "status": document.status,
+                "table_activation_allowed": document.metadata.get(
+                    "table_activation_allowed", True
+                ),
+                "table_repair_requests": list(
+                    document.metadata.get("table_repair_requests", [])
+                ),
+                "outline": [node.model_dump(mode="json") for node in document.outline],
+                "figures": [
+                    figure.model_dump(mode="json") for figure in document.figures
+                ],
+                "formulas": [
+                    formula.model_dump(mode="json") for formula in document.formulas
+                ],
             },
             "parser_metadata": dict(document.parser_metadata),
             "source_metadata": dict(document.source_metadata),
@@ -98,7 +116,7 @@ def _canonical_to_parsed_document(document) -> ParsedDocument:
     )
     return ParsedDocument(
         title=document.title,
-        text="\n\n".join(block.text for block in document.blocks),
+        text="\n\n".join(block.text for block in source_blocks),
         chunks=chunks,
         metadata=metadata,
     )

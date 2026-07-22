@@ -4116,6 +4116,7 @@ def parse_canonical_document(path: Path) -> CanonicalDocument:
 def _finalize_structured_evidence(document: CanonicalDocument) -> None:
     """Merge and validate tables at the canonical adapter boundary."""
 
+    from app.services.canonical_quality import CanonicalQualityGate
     from app.services.structured_evidence import StructuredEvidenceBuilder, TableValidator
 
     # Tokenization is not used by continuation merging. Injecting this counter
@@ -4128,6 +4129,12 @@ def _finalize_structured_evidence(document: CanonicalDocument) -> None:
     failed_results = []
     for table in document.tables:
         result = validator.validate(table)
+        if result.accepted:
+            result.table.metadata.pop("structured_validation_reasons", None)
+        else:
+            result.table.metadata["structured_validation_reasons"] = list(
+                result.reasons
+            )
         validated_tables.append(result.table)
         if not result.accepted:
             failed_results.append(result)
@@ -4137,55 +4144,21 @@ def _finalize_structured_evidence(document: CanonicalDocument) -> None:
     document.metadata["table_repair_requests"] = requests
     document.metadata["table_activation_allowed"] = not failed_results
 
-    document.quality.issues = [
-        issue
-        for issue in document.quality.issues
-        if issue.code != "structured_table_validation_failed"
-    ]
-    existing_invalid_ids = {
-        str(issue.metadata.get("table_id"))
-        for issue in document.quality.issues
-        if issue.code == "table_invalid" and issue.metadata.get("table_id") is not None
-    }
-    for result in failed_results:
-        if result.table.table_id in existing_invalid_ids:
+    CanonicalQualityGate().evaluate(document)
+    failed_by_id = {result.table.table_id: result for result in failed_results}
+    for issue in document.quality.issues:
+        if issue.code != "table_invalid":
+            continue
+        result = failed_by_id.get(str(issue.metadata.get("table_id")))
+        if result is None:
             continue
         repair_request = result.repair_request
-        locator = repair_request.locator if repair_request is not None else {}
-        page_index = locator.get("page_index")
-        document.quality.issues.append(
-            CanonicalQualityIssue(
-                code="table_invalid",
-                severity="error",
-                message=(
-                    f"Table {result.table.table_id} failed structured validation."
-                ),
-                block_ids=[
-                    block.block_id
-                    for block in document.blocks
-                    if block.table_id == result.table.table_id
-                ],
-                repairable=True,
-                repair_scope=(
-                    f"page:{page_index + 1}"
-                    if isinstance(page_index, int)
-                    else "document"
-                ),
-                metadata={
-                    "table_id": result.table.table_id,
-                    "reasons": result.reasons,
-                    "locator": locator,
-                    "repair_request": (
-                        repair_request.model_dump(mode="json")
-                        if repair_request is not None
-                        else None
-                    ),
-                },
-            )
+        issue.metadata["reasons"] = list(result.reasons)
+        issue.metadata["repair_request"] = (
+            repair_request.model_dump(mode="json")
+            if repair_request is not None
+            else None
         )
-    if failed_results:
-        document.quality.accepted = False
-        document.quality.status = "validation_failed"
 
 
 def _link_nearby_structured_source_blocks(document: CanonicalDocument) -> None:

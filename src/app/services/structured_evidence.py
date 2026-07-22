@@ -141,9 +141,11 @@ class TableValidator:
         expected_locator = TableValidator._stable_locator(original)
         proof_locator = TableValidator._stable_locator_value(locator)
         repaired_locator = TableValidator._stable_locator(repaired)
-        if not expected_locator or proof_locator != expected_locator:
+        if not expected_locator:
+            add("repair_stable_locator_missing")
+        elif proof_locator != expected_locator:
             add("repair_proof_locator_mismatch")
-        if repaired_locator != expected_locator:
+        if expected_locator and repaired_locator != expected_locator:
             add("repair_locator_mismatch")
 
     @staticmethod
@@ -156,11 +158,25 @@ class TableValidator:
     def _stable_locator_value(value: object) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
-        return {
-            key: value[key]
-            for key in ("page_index", "bbox")
-            if value.get(key) is not None
-        }
+        page_index = value.get("page_index")
+        bbox = value.get("bbox")
+        source_block_id = value.get("source_block_id")
+        if bbox is not None:
+            return {
+                key: item
+                for key, item in {"page_index": page_index, "bbox": bbox}.items()
+                if item is not None
+            }
+        if source_block_id is not None:
+            return {
+                key: item
+                for key, item in {
+                    "page_index": page_index,
+                    "source_block_id": source_block_id,
+                }.items()
+                if item is not None
+            }
+        return {}
 
     @classmethod
     def _reasons(cls, table: CanonicalTable) -> list[str]:

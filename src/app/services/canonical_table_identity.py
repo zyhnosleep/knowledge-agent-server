@@ -55,12 +55,14 @@ def table_identity_fingerprint(table: CanonicalTable) -> str:
             {
                 "page_index": span.page_index,
                 "bbox": [round(value, 6) for value in box] if box is not None else None,
+                "source_block_id": span.source_block_id,
             }
         )
     locators.sort(
         key=lambda item: (
             item["page_index"] if item["page_index"] is not None else 10**9,
             item["bbox"] or [],
+            item["source_block_id"] or "",
         )
     )
     payload = {

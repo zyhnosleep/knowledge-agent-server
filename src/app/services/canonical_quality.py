@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 from app.services.canonical_abstract import has_explicit_abstract
 from app.services.canonical_table_identity import table_identity_fingerprint
 from app.services.canonical_models import (
+    CanonicalCell,
     CanonicalDocument,
     CanonicalQualityIssue,
     CanonicalQualityReport,
@@ -192,6 +193,13 @@ class CanonicalQualityGate:
         issues: list[CanonicalQualityIssue] = []
         for table in document.tables:
             reasons = cls._invalid_table_reasons(table)
+            structured_reasons = table.metadata.get("structured_validation_reasons")
+            if isinstance(structured_reasons, list):
+                reasons.extend(
+                    reason
+                    for reason in structured_reasons
+                    if isinstance(reason, str) and reason not in reasons
+                )
             if not reasons:
                 continue
             page = next(
@@ -399,7 +407,15 @@ class CanonicalQualityGate:
             table.normalized_markdown.strip() != expected_markdown
         ):
             add("normalized_markdown_mismatch")
-        if table.source_markdown is not None:
+        source_markdowns = table.metadata.get("source_markdowns")
+        if table.status == "cross_page_merged" and isinstance(
+            source_markdowns, list
+        ):
+            if not CanonicalQualityGate._source_markdown_segments_match(
+                table, source_markdowns
+            ):
+                add("cross_page_source_markdown_mismatch")
+        elif table.source_markdown is not None:
             source_data = CanonicalQualityGate._markdown_table_data(
                 table.source_markdown
             )
@@ -407,7 +423,108 @@ class CanonicalQualityGate:
                 add("source_markdown_invalid")
             elif source_data != (table.headers, table.rows):
                 add("source_markdown_mismatch")
+
+        source_htmls = table.metadata.get("source_htmls")
+        if (
+            table.status == "cross_page_merged"
+            and isinstance(source_htmls, list)
+            and source_htmls
+        ):
+            if not CanonicalQualityGate._source_html_segments_match(
+                table, source_htmls
+            ):
+                add("cross_page_source_html_mismatch")
+        elif table.source_html is not None:
+            try:
+                from app.services.canonical_artifacts import CanonicalArtifactStore
+
+                html_cells = CanonicalArtifactStore._table_cells_from_html(
+                    table.source_html
+                )
+                html_headers, html_rows = CanonicalArtifactStore._table_grid_from_cells(
+                    html_cells
+                )
+            except (TypeError, ValueError):
+                add("source_html_invalid")
+            else:
+                if (html_headers, html_rows) != (table.headers, table.rows):
+                    add("source_html_mismatch")
+                html_signatures = sorted(
+                    CanonicalQualityGate._cell_signature(cell) for cell in html_cells
+                )
+                cell_signatures = sorted(
+                    CanonicalQualityGate._cell_signature(cell) for cell in table.cells
+                )
+                if html_signatures != cell_signatures:
+                    add("source_html_cell_mismatch")
         return reasons
+
+    @classmethod
+    def _source_markdown_segments_match(
+        cls, table: CanonicalTable, markdowns: list[object]
+    ) -> bool:
+        grids: list[tuple[list[str], list[list[str]]]] = []
+        for markdown in markdowns:
+            if not isinstance(markdown, str):
+                return False
+            parsed = cls._markdown_table_data(markdown)
+            if parsed is None:
+                return False
+            grids.append(parsed)
+        return cls._combined_segment_rows(table.headers, grids) == table.rows
+
+    @classmethod
+    def _source_html_segments_match(
+        cls, table: CanonicalTable, htmls: list[object]
+    ) -> bool:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        cell_segments = table.metadata.get("source_cell_segments")
+        if not isinstance(cell_segments, list) or len(cell_segments) != len(htmls):
+            return False
+        grids: list[tuple[list[str], list[list[str]]]] = []
+        for index, source_html in enumerate(htmls):
+            if not isinstance(source_html, str):
+                return False
+            try:
+                cells = CanonicalArtifactStore._table_cells_from_html(source_html)
+                grids.append(CanonicalArtifactStore._table_grid_from_cells(cells))
+                expected_cells = [
+                    CanonicalCell.model_validate(item) for item in cell_segments[index]
+                ]
+            except (TypeError, ValueError):
+                return False
+            if sorted(cls._cell_signature(cell) for cell in cells) != sorted(
+                cls._cell_signature(cell) for cell in expected_cells
+            ):
+                return False
+        return cls._combined_segment_rows(table.headers, grids) == table.rows
+
+    @staticmethod
+    def _combined_segment_rows(
+        headers: list[str],
+        grids: list[tuple[list[str], list[list[str]]]],
+    ) -> list[list[str]] | None:
+        combined: list[list[str]] = []
+        for segment_headers, segment_rows in grids:
+            if segment_headers != headers:
+                return None
+            rows = list(segment_rows)
+            if rows and rows[0] == headers:
+                rows = rows[1:]
+            combined.extend(rows)
+        return combined
+
+    @staticmethod
+    def _cell_signature(cell: CanonicalCell) -> tuple[object, ...]:
+        return (
+            cell.row_index,
+            cell.column_index,
+            cell.rowspan,
+            cell.colspan,
+            cell.is_header,
+            cell.text,
+        )
 
     @staticmethod
     def _table_markdown(headers: list[str], rows: list[list[str]]) -> str:

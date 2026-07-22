@@ -6,6 +6,7 @@ from pathlib import Path
 from app.services import canonical_adapters
 from app.services.canonical_adapters import (
     MarkdownCanonicalAdapter,
+    _finalize_structured_evidence,
     _parsed_pdf_to_canonical,
     parse_canonical_document,
 )
@@ -20,6 +21,8 @@ from app.services.canonical_models import (
     SourceSpan,
 )
 from app.services.structured_evidence import StructuredEvidenceBuilder, TableValidator
+from app.services.canonical_quality import CanonicalQualityGate
+from app.services.canonical_table_identity import table_identity_fingerprint
 from app.services.parser import ParsedChunk, ParsedDocument
 
 
@@ -150,6 +153,70 @@ def test_valid_repair_is_marked_repaired_by_vision() -> None:
     assert result.accepted is True
     assert result.status == "repaired_by_vision"
     assert result.table.status == "repaired_by_vision"
+
+
+def test_page_only_repair_proof_is_rejected_without_stable_block_locator() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [SourceSpan(page_index=0)]
+    repaired = _table(table_id=original.table_id)
+    repaired.source_spans = [SourceSpan(page_index=0)]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+
+    result = validator.validate(original, repaired, repair_proof=request)
+
+    assert result.accepted is False
+    assert "repair_stable_locator_missing" in result.reasons
+
+
+def test_no_bbox_repair_accepts_matching_source_block_id() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    repaired = _table(table_id=original.table_id)
+    repaired.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+
+    result = validator.validate(original, repaired, repair_proof=request)
+
+    assert result.accepted is True
+
+
+def test_no_bbox_repair_rejects_mismatched_source_block_id() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    original.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-17")
+    ]
+    repaired = _table(table_id=original.table_id)
+    repaired.source_spans = [
+        SourceSpan(page_index=0, source_block_id="mineru-table-99")
+    ]
+    validator = TableValidator()
+    request = validator.validate(original).repair_request
+    assert request is not None
+
+    result = validator.validate(original, repaired, repair_proof=request)
+
+    assert result.accepted is False
+    assert "repair_locator_mismatch" in result.reasons
+
+
+def test_table_identity_fingerprint_includes_source_block_id() -> None:
+    first = _table()
+    second = first.model_copy(deep=True)
+    assert first.source_spans[0].bbox is not None
+    second.source_spans[0].source_block_id = "different-source-block"
+
+    assert table_identity_fingerprint(first) != table_identity_fingerprint(second)
 
 
 def test_repair_with_same_table_id_but_wrong_source_region_is_rejected() -> None:
@@ -485,6 +552,106 @@ def test_explicit_cross_page_continuation_merges_before_chunking() -> None:
     assert parent.metadata["status"] == "cross_page_merged"
     assert parent.metadata["source_markdowns"] == table.metadata["source_markdowns"]
     assert parent.metadata["source_htmls"] == table.metadata["source_htmls"]
+
+
+def test_quality_gate_accepts_consistent_cross_page_source_segments() -> None:
+    first = _table(
+        table_id="table-page-1",
+        rows=[["News", "Base", "81.2%"]],
+        page_index=0,
+    )
+    continuation = _table(
+        table_id="table-page-2",
+        rows=[["News", "Proposed", "84.9%"]],
+        page_index=1,
+        metadata={"continuation_of": first.table_id},
+    )
+    merged = StructuredEvidenceBuilder(
+        token_counter=lambda _text: 0
+    ).merge_cross_page_tables([first, continuation])[0]
+    document = CanonicalDocument(
+        document_id="cross-page",
+        parser_source="mineru",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="source-prose",
+                block_type="narrative",
+                text="Source evidence",
+                reading_order=0,
+                parser_source="mineru",
+            )
+        ],
+        tables=[merged],
+    )
+
+    report = CanonicalQualityGate().evaluate(document)
+
+    assert report.accepted is True
+    assert not any(issue.code == "table_invalid" for issue in report.issues)
+
+
+def test_structured_finalization_recomputes_quality_score_and_fallback_for_bad_html() -> None:
+    table = _table(page_index=0)
+    table.source_html = (
+        "<table><tr><th>Dataset</th><th>Method</th><th>Accuracy</th></tr>"
+        "<tr><td>News</td><td>Wrong</td><td>0%</td></tr></table>"
+    )
+    document = CanonicalDocument(
+        document_id="invalid-html",
+        parser_source="mineru",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="table-block",
+                block_type="table",
+                text=table.normalized_markdown or "table",
+                reading_order=0,
+                parser_source="mineru",
+                table_id=table.table_id,
+                source_spans=table.source_spans,
+            )
+        ],
+        tables=[table],
+    )
+
+    _finalize_structured_evidence(document)
+
+    issue = next(item for item in document.quality.issues if item.code == "table_invalid")
+    assert document.quality.status == "validation_failed"
+    assert document.quality.accepted is False
+    assert document.quality.score == 0.85
+    assert document.quality.fallback_pages == [1]
+    assert issue.repair_scope == "page:1"
+    assert "source_html_mismatch" in issue.metadata["reasons"]
+
+
+def test_structured_finalization_preserves_strict_only_reasons_in_quality_report() -> None:
+    table = _table(page_index=2, metadata={"truncated": True})
+    document = CanonicalDocument(
+        document_id="silent-truncation",
+        parser_source="mineru",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="table-block",
+                block_type="table",
+                text=table.normalized_markdown or "table",
+                reading_order=0,
+                parser_source="mineru",
+                table_id=table.table_id,
+                source_spans=table.source_spans,
+            )
+        ],
+        tables=[table],
+    )
+
+    _finalize_structured_evidence(document)
+
+    issue = next(item for item in document.quality.issues if item.code == "table_invalid")
+    assert document.quality.score == 0.85
+    assert document.quality.fallback_pages == [3]
+    assert "silent_truncation" in issue.metadata["reasons"]
 
 
 def test_same_headers_without_continuation_are_not_merged() -> None:

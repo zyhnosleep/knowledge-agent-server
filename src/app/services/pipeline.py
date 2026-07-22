@@ -197,8 +197,45 @@ class IngestionPipeline:
             ensure_source_identity(document, document.title)
             ensure_paper_profile(document)
             merged_metadata = dict(document.metadata_json or {})
-            quality_report = {"status": "ok", "document_id": document.id}
+            canonical_metadata = parsed.metadata.get("canonical", {})
+            canonical_quality = canonical_metadata.get("quality", {})
+            canonical_quality_status = canonical_quality.get("status")
+            activation_allowed = canonical_metadata.get(
+                "table_activation_allowed", True
+            )
+            quality_rejected = (
+                canonical_quality_status == "validation_failed"
+                or activation_allowed is False
+            )
+            quality_report = {
+                "status": "validation_failed" if quality_rejected else "ok",
+                "document_id": document.id,
+                "canonical_status": canonical_metadata.get("status"),
+                "canonical_quality": canonical_quality,
+                "table_activation_allowed": activation_allowed,
+                "table_repair_requests": canonical_metadata.get(
+                    "table_repair_requests", []
+                ),
+            }
             merged_metadata["ingest_quality"] = quality_report
+            if quality_rejected:
+                error = (
+                    "Canonical structured evidence validation failed; "
+                    "document activation was blocked before chunk persistence."
+                )
+                merged_metadata["ingest_error"] = error
+                document.metadata_json = merged_metadata
+                document.status = DocumentStatus.failed.value
+                run.status = RunStatus.failed.value
+                run.notes = error
+                run.provider_report = {
+                    **dict(run.provider_report or {}),
+                    "ingest_quality": quality_report,
+                    "error": error,
+                }
+                self._set_progress(run, 100, "failed", error)
+                self.db.commit()
+                return run
             document.metadata_json = merged_metadata
             self._set_progress(run, 30, "chunking", "Replacing document chunks and preparing embeddings.")
             self._replace_chunks(document, parsed.chunks)
