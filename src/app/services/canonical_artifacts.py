@@ -125,57 +125,52 @@ class CanonicalArtifactStore:
                 f"parse_version {document.parse_version!r} does not match {version!r}"
             )
         document = source_only_document(document)
+        from app.services.canonical_adapters import _finalize_structured_evidence
+
+        _finalize_structured_evidence(document)
         document.ensure_json_compatible()
-        self._validate_record_contract(
-            document.blocks,
-            document.tables,
-            document.figures,
-            document.formulas,
-            document.assets,
-            document.outline,
-            document.quality,
-        )
+        record_error: ValueError | None = None
+        try:
+            self._validate_record_contract(
+                document.blocks,
+                document.tables,
+                document.figures,
+                document.formulas,
+                document.assets,
+                document.outline,
+                document.quality,
+            )
+        except ValueError as exc:
+            record_error = exc
         failed_table_ids = [
             table.table_id
             for table in document.tables
             if table.status == "validation_failed"
         ]
-        if failed_table_ids or document.metadata.get("table_activation_allowed") is False:
+        quality_allowed = (
+            document.quality.accepted is True
+            and document.quality.status in {"accepted", "accepted_with_warnings"}
+        )
+        tables_allowed = all(
+            table.status
+            in {"accepted_mineru", "repaired_by_vision", "cross_page_merged"}
+            for table in document.tables
+        )
+        activation_allowed = document.metadata.get("table_activation_allowed") is True
+        if (
+            record_error is not None
+            or failed_table_ids
+            or not quality_allowed
+            or not tables_allowed
+            or not activation_allowed
+        ):
+            issue_codes = sorted({issue.code for issue in document.quality.issues})
+            detail = f"; record={record_error}" if record_error is not None else ""
             raise ValueError(
-                f"canonical table validation failed: {failed_table_ids}"
+                "canonical activation validation failed: "
+                f"quality={document.quality.status}, issues={issue_codes}, "
+                f"tables={failed_table_ids}{detail}"
             )
-        if document.quality.accepted is True or document.quality.status in {
-            "accepted",
-            "accepted_with_warnings",
-        }:
-            from app.services.canonical_adapters import _finalize_structured_evidence
-
-            revalidated = document.model_copy(deep=True)
-            _finalize_structured_evidence(revalidated)
-            claimed_accepted_table_ids = {
-                table.table_id
-                for table in document.tables
-                if table.status
-                in {"accepted_mineru", "repaired_by_vision", "cross_page_merged"}
-            }
-            stale_accepted_tables = [
-                table.table_id
-                for table in revalidated.tables
-                if table.table_id in claimed_accepted_table_ids
-                and table.status == "validation_failed"
-            ]
-            fatal_boundary_codes = {
-                issue.code
-                for issue in revalidated.quality.issues
-                if issue.severity == "fatal"
-                and issue.code in {"page_missing", "asset_invalid"}
-            }
-            if stale_accepted_tables or fatal_boundary_codes:
-                raise ValueError(
-                    "canonical quality/table validation failed; staging is not "
-                    "activation-safe: "
-                    f"tables={stale_accepted_tables}, fatal={sorted(fatal_boundary_codes)}"
-                )
         document_root = self._prepare_document_root(document_id, create=True)
         final = document_root / version
         if final.exists():

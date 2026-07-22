@@ -57,7 +57,12 @@ class TableRepairProof(BaseModel):
     original_request: TableRepairRequest
     page_index: int = Field(ge=0)
     replacement_content_fingerprint: str
-    match_basis: Literal["unique_table_on_page"]
+    match_basis: Literal[
+        "source_region_id",
+        "normalized_bbox",
+        "source_block_id",
+        "unique_table_on_page",
+    ]
     validated_mapping: TableRepairMapping
 
 
@@ -179,36 +184,12 @@ class TableValidator:
         if not repair_table_ids or not repair_table_ids.issubset(originals_by_id):
             return None
 
-        pairs: list[tuple[CanonicalTable, CanonicalTable]] = []
-        if len(original_tables) == 1:
-            pairs = [(original_tables[0], replacement_tables[0])]
-        elif all(self._table_bbox(table) is not None for table in [*original_tables, *replacement_tables]):
-            replacements_by_bbox = {
-                self._table_bbox(table): table for table in replacement_tables
-            }
-            if len(replacements_by_bbox) != len(replacement_tables):
-                return None
-            for original in original_tables:
-                replacement = replacements_by_bbox.get(self._table_bbox(original))
-                if replacement is None:
-                    return None
-                pairs.append((original, replacement))
-        elif all(self._source_region_id(table) is not None for table in [*original_tables, *replacement_tables]):
-            replacements_by_region = {
-                self._source_region_id(table): table for table in replacement_tables
-            }
-            if len(replacements_by_region) != len(replacement_tables):
-                return None
-            for original in original_tables:
-                replacement = replacements_by_region.get(self._source_region_id(original))
-                if replacement is None:
-                    return None
-                pairs.append((original, replacement))
-        else:
+        matched = self._unique_inventory_matching(original_tables, replacement_tables)
+        if matched is None:
             return None
 
         bindings = []
-        for original, replacement in pairs:
+        for original, replacement, match_basis in matched:
             replacement_reasons = self._reasons(replacement)
             if replacement_reasons:
                 return None
@@ -217,24 +198,17 @@ class TableValidator:
             request = self.validate(original).repair_request
             if request is None:
                 return None
-            if self._stable_locator(original) == self._stable_locator(replacement):
-                proof: TableRepairRequest | TableRepairProof = request
-            else:
-                if len(original_tables) != 1:
-                    return None
-                if not self._stable_locator(original) or not self._stable_locator(replacement):
-                    return None
-                proof = TableRepairProof(
-                    original_request=request,
+            proof: TableRepairRequest | TableRepairProof = TableRepairProof(
+                original_request=request,
+                page_index=page_index,
+                replacement_content_fingerprint=table_content_fingerprint(replacement),
+                match_basis=match_basis,
+                validated_mapping=TableRepairMapping(
+                    original_table_id=original.table_id,
+                    replacement_table_id=replacement.table_id,
                     page_index=page_index,
-                    replacement_content_fingerprint=table_content_fingerprint(replacement),
-                    match_basis="unique_table_on_page",
-                    validated_mapping=TableRepairMapping(
-                        original_table_id=original.table_id,
-                        replacement_table_id=replacement.table_id,
-                        page_index=page_index,
-                    ),
-                )
+                ),
+            )
             reasons: list[str] = []
             self._validate_repair_proof(original, replacement, proof, reasons)
             if reasons:
@@ -249,6 +223,99 @@ class TableValidator:
             )
             bindings.append((original, replacement, result, proof))
         return bindings
+
+    @classmethod
+    def _unique_inventory_matching(
+        cls,
+        originals: list[CanonicalTable],
+        replacements: list[CanonicalTable],
+    ) -> list[tuple[CanonicalTable, CanonicalTable, str]] | None:
+        candidates: dict[int, list[tuple[int, str]]] = {}
+        for original_index, original in enumerate(originals):
+            exact_regions = [
+                (replacement_index, "source_region_id")
+                for replacement_index, replacement in enumerate(replacements)
+                if cls._source_region_id(original) is not None
+                and cls._source_region_id(original)
+                == cls._source_region_id(replacement)
+            ]
+            if exact_regions:
+                candidates[original_index] = exact_regions
+                continue
+            spatial = [
+                (replacement_index, "normalized_bbox")
+                for replacement_index, replacement in enumerate(replacements)
+                if cls._bbox_locators_match(original, replacement)
+            ]
+            if spatial:
+                candidates[original_index] = spatial
+                continue
+            source_block_id = cls._source_block_id(original)
+            candidates[original_index] = [
+                (replacement_index, "source_block_id")
+                for replacement_index, replacement in enumerate(replacements)
+                if source_block_id is not None
+                and source_block_id == cls._source_block_id(replacement)
+            ]
+        if any(not edges for edges in candidates.values()):
+            return None
+
+        matched_right: dict[int, int] = {}
+
+        def augment(left: int, seen: set[int]) -> bool:
+            for right, _ in candidates[left]:
+                if right in seen:
+                    continue
+                seen.add(right)
+                previous = matched_right.get(right)
+                if previous is None or augment(previous, seen):
+                    matched_right[right] = left
+                    return True
+            return False
+
+        for left in sorted(candidates, key=lambda item: len(candidates[item])):
+            if not augment(left, set()):
+                return None
+        if len(matched_right) != len(originals):
+            return None
+        matched_left = {left: right for right, left in matched_right.items()}
+
+        graph: dict[int, list[int]] = {
+            node: [] for node in range(len(originals) + len(replacements))
+        }
+        offset = len(originals)
+        for left, edges in candidates.items():
+            for right, _ in edges:
+                if matched_left[left] == right:
+                    graph[offset + right].append(left)
+                else:
+                    graph[left].append(offset + right)
+        colors: dict[int, int] = {}
+
+        def has_cycle(node: int) -> bool:
+            colors[node] = 1
+            for neighbor in graph[node]:
+                if colors.get(neighbor) == 1:
+                    return True
+                if colors.get(neighbor, 0) == 0 and has_cycle(neighbor):
+                    return True
+            colors[node] = 2
+            return False
+
+        if any(
+            colors.get(node, 0) == 0 and has_cycle(node)
+            for node in graph
+        ):
+            return None
+
+        result = []
+        for left, original in enumerate(originals):
+            right = matched_left[left]
+            basis = next(
+                basis for candidate, basis in candidates[left] if candidate == right
+            )
+            result.append((original, replacements[right], basis))
+        return result
 
     @staticmethod
     def _validate_repair_proof(
@@ -325,9 +392,23 @@ class TableValidator:
             add("repair_proof_locator_mismatch")
         if not repaired_locator:
             add("repair_replacement_locator_missing")
-        if TableValidator._table_bbox(original) is not None:
+        if proof.match_basis == "source_region_id" and (
+            TableValidator._source_region_id(original) is None
+            or TableValidator._source_region_id(original)
+            != TableValidator._source_region_id(repaired)
+        ):
             add("repair_match_basis_invalid")
-        if TableValidator._source_region_id(original) is not None:
+        elif proof.match_basis == "normalized_bbox" and not (
+            TableValidator._bbox_locators_match(original, repaired)
+        ):
+            add("repair_match_basis_invalid")
+        elif proof.match_basis == "source_block_id" and (
+            TableValidator._source_block_id(original) is None
+            or TableValidator._source_block_id(original)
+            != TableValidator._source_block_id(repaired)
+        ):
+            add("repair_match_basis_invalid")
+        elif proof.match_basis == "unique_table_on_page":
             add("repair_match_basis_invalid")
         if original_pages != {proof.page_index} or repaired_pages != {
             proof.page_index
@@ -358,6 +439,66 @@ class TableValidator:
             box = span.normalized_bbox or span.bbox
             if box is not None:
                 return box
+        return None
+
+    @staticmethod
+    def _normalized_table_bbox(
+        table: CanonicalTable,
+    ) -> tuple[float, float, float, float] | None:
+        return next(
+            (
+                span.normalized_bbox
+                for span in table.source_spans
+                if span.normalized_bbox is not None
+            ),
+            None,
+        )
+
+    @classmethod
+    def _bbox_locators_match(
+        cls,
+        original: CanonicalTable,
+        replacement: CanonicalTable,
+    ) -> bool:
+        original_normalized = cls._normalized_table_bbox(original)
+        replacement_normalized = cls._normalized_table_bbox(replacement)
+        if original_normalized is None or replacement_normalized is None:
+            original_bbox = cls._table_bbox(original)
+            replacement_bbox = cls._table_bbox(replacement)
+            return original_bbox is not None and original_bbox == replacement_bbox
+
+        left, top, right, bottom = original_normalized
+        other_left, other_top, other_right, other_bottom = replacement_normalized
+        intersection_width = max(0.0, min(right, other_right) - max(left, other_left))
+        intersection_height = max(
+            0.0, min(bottom, other_bottom) - max(top, other_top)
+        )
+        intersection = intersection_width * intersection_height
+        original_area = max(0.0, right - left) * max(0.0, bottom - top)
+        replacement_area = max(0.0, other_right - other_left) * max(
+            0.0, other_bottom - other_top
+        )
+        union = original_area + replacement_area - intersection
+        if union <= 0:
+            return False
+        iou = intersection / union
+        center_delta = max(
+            abs((left + right) / 2 - (other_left + other_right) / 2),
+            abs((top + bottom) / 2 - (other_top + other_bottom) / 2),
+        )
+        boundary_delta = max(
+            abs(left - other_left),
+            abs(top - other_top),
+            abs(right - other_right),
+            abs(bottom - other_bottom),
+        )
+        return iou >= 0.8 and center_delta <= 0.02 and boundary_delta <= 0.02
+
+    @staticmethod
+    def _source_block_id(table: CanonicalTable) -> str | None:
+        for span in table.source_spans:
+            if span.source_block_id and span.source_block_id.strip():
+                return span.source_block_id.strip()
         return None
 
     @staticmethod
@@ -558,34 +699,6 @@ class TableValidator:
         )
 
     @staticmethod
-    def _has_split_numeric_or_unit(table: CanonicalTable) -> bool:
-        numeric = re.compile(r"^[+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)$")
-        unit = re.compile(
-            r"^(?:%|‰|°[CFK]|kg|mg|g|km|cm|mm|m|ms|μs|ns|s|Hz|kHz|MHz|GHz|"
-            r"KB|MB|GB|TB|bps|kbps|Mbps|Gbps)$",
-            re.I,
-        )
-        explicit_unit_headers = {"unit", "units", "单位", "量纲"}
-        for row in table.rows:
-            for column_index in range(1, len(row)):
-                left = row[column_index - 1].strip()
-                right = row[column_index].strip()
-                header = (
-                    table.headers[column_index].strip().casefold()
-                    if column_index < len(table.headers)
-                    else ""
-                )
-                if (
-                    numeric.fullmatch(left)
-                    and unit.fullmatch(right)
-                    and header not in explicit_unit_headers
-                ):
-                    return True
-                if left and right in {".", ","}:
-                    return True
-        return False
-
-    @staticmethod
     def _repair_request(
         table: CanonicalTable,
         reasons: list[str],
@@ -608,7 +721,10 @@ class TableValidator:
 class StructuredEvidenceBuilder:
     """Build table Parent/Child chunks and source-faithful visual evidence."""
 
-    _tokenizer_cache: dict[str, Any] = {}
+    _tokenizer_cache: dict[tuple[str, tuple[str, int | None]], Any] = {}
+    _tokenizer_key_locks: dict[
+        tuple[str, tuple[str, int | None]], threading.Lock
+    ] = {}
     _tokenizer_cache_lock = threading.Lock()
 
     def __init__(
@@ -623,6 +739,8 @@ class StructuredEvidenceBuilder:
         self.table_aliases: dict[str, str] = {}
         self._tokenizer = tokenizer
         self._token_counter = token_counter
+        self._tokenizer_loader: Callable[[str], Any] | None = None
+        self._tokenizer_cache_key: tuple[str, tuple[str, int | None]] | None = None
         self._tokenizer_fallback_reason: str | None = None
         if token_counter is not None:
             self.token_count_mode = "injected_counter"
@@ -631,19 +749,14 @@ class StructuredEvidenceBuilder:
             self.token_count_mode = "transformers"
             return
         loader = tokenizer_loader or self._load_local_tokenizer
-        try:
-            with self._tokenizer_cache_lock:
-                cached = self._tokenizer_cache.get(self.tokenizer_name)
-                if cached is None:
-                    cached = loader(self.tokenizer_name)
-                    self._tokenizer_cache[self.tokenizer_name] = cached
-                self._tokenizer = cached
-        except Exception as exc:  # noqa: BLE001 - fallback is an explicit contract
-            self._tokenizer = None
-            self._tokenizer_fallback_reason = type(exc).__name__
-            self.token_count_mode = "utf8_bytes_fallback"
-        else:
-            self.token_count_mode = "transformers"
+        loader_identity = (
+            ("default", None)
+            if tokenizer_loader is None
+            else ("custom", id(tokenizer_loader))
+        )
+        self._tokenizer_loader = loader
+        self._tokenizer_cache_key = (self.tokenizer_name, loader_identity)
+        self.token_count_mode = "transformers"
 
     @staticmethod
     def _load_local_tokenizer(name: str) -> Any:
@@ -654,16 +767,49 @@ class StructuredEvidenceBuilder:
     def estimate_tokens(self, text: str) -> int:
         if self._token_counter is not None:
             count = self._token_counter(text)
-        elif self._tokenizer is not None:
-            count = len(self._tokenizer.encode(text, add_special_tokens=False))
         else:
-            # A tokenizer token cannot encode less than one source byte. Counting
-            # UTF-8 bytes therefore deliberately overestimates CJK, formulas,
-            # punctuation, and long identifiers instead of silently undercounting.
-            count = len(text.encode("utf-8"))
+            self._ensure_tokenizer_loaded()
+            if self._tokenizer is not None:
+                count = len(self._tokenizer.encode(text, add_special_tokens=False))
+            else:
+                # A tokenizer token cannot encode less than one source byte. Counting
+                # UTF-8 bytes therefore deliberately overestimates CJK, formulas,
+                # punctuation, and long identifiers instead of silently undercounting.
+                count = len(text.encode("utf-8"))
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError("token counter must return a non-negative integer")
         return count
+
+    def _ensure_tokenizer_loaded(self) -> None:
+        if self._tokenizer is not None or self._tokenizer_loader is None:
+            return
+        key = self._tokenizer_cache_key
+        if key is None:
+            return
+        cached = self._tokenizer_cache.get(key)
+        if cached is not None:
+            self._tokenizer = cached
+            return
+        with self._tokenizer_cache_lock:
+            cached = self._tokenizer_cache.get(key)
+            if cached is not None:
+                self._tokenizer = cached
+                return
+            key_lock = self._tokenizer_key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            cached = self._tokenizer_cache.get(key)
+            if cached is None:
+                try:
+                    cached = self._tokenizer_loader(self.tokenizer_name)
+                except Exception as exc:  # noqa: BLE001 - explicit fallback contract
+                    self._tokenizer_loader = None
+                    self._tokenizer_fallback_reason = type(exc).__name__
+                    self.token_count_mode = "utf8_bytes_fallback"
+                    return
+                with self._tokenizer_cache_lock:
+                    self._tokenizer_cache[key] = cached
+                    self._tokenizer_key_locks.pop(key, None)
+            self._tokenizer = cached
 
     def table_chunks(
         self,

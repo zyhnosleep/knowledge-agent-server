@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.services import canonical_artifacts
+from app.services.canonical_adapters import _finalize_structured_evidence
 from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.canonical_models import (
     CanonicalAsset,
@@ -24,6 +25,19 @@ from app.services.canonical_models import (
     SectionNode,
     SourceSpan,
 )
+from app.services.canonical_provenance import source_only_document
+
+
+def _activation_document(document: CanonicalDocument) -> CanonicalDocument:
+    activated = source_only_document(document)
+    _finalize_structured_evidence(activated)
+    return activated
+
+
+def _render_test_markdown(document: CanonicalDocument) -> str:
+    return CanonicalArtifactStore._render_markdown(
+        "doc-1", "canonical-v1-abcd", document
+    )
 
 
 def _create_directory_link(link: Path, target: Path) -> None:
@@ -213,6 +227,57 @@ def test_artifact_store_rejects_stale_fatal_quality_before_writing(
         )
 
 
+def test_artifact_store_recomputes_stale_rejected_quality_without_mutating_caller(
+    tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    canonical_document.quality = CanonicalQualityReport(
+        accepted=False, status="rejected", score=0.0
+    )
+    canonical_document.tables[0].status = "validation_failed"
+    canonical_document.metadata["table_activation_allowed"] = False
+    original = canonical_document.model_copy(deep=True)
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+
+    assert staging.is_dir()
+    assert canonical_document == original
+
+
+@pytest.mark.parametrize(
+    "invalid_kind,expected_code",
+    [
+        ("content", "content_empty"),
+        ("reading_order", "reading_order_invalid"),
+        ("asset", "asset_invalid"),
+    ],
+)
+def test_artifact_store_rejects_recomputed_fatal_quality_even_if_marked_accepted(
+    tmp_path: Path,
+    canonical_document: CanonicalDocument,
+    invalid_kind: str,
+    expected_code: str,
+) -> None:
+    if invalid_kind == "content":
+        for block in canonical_document.blocks:
+            block.retrievable = False
+    elif invalid_kind == "reading_order":
+        canonical_document.blocks[1].reading_order = 3
+    else:
+        canonical_document.figures[0].asset_path = "assets/missing.png"
+    canonical_document.quality = CanonicalQualityReport(
+        accepted=True, status="accepted", score=1.0
+    )
+    canonical_document.tables[0].status = "accepted_mineru"
+    canonical_document.metadata["table_activation_allowed"] = True
+
+    with pytest.raises(ValueError, match=expected_code):
+        CanonicalArtifactStore(tmp_path).write_staging(
+            "doc-1", "canonical-v1-abcd", canonical_document
+        )
+
+
 def test_staging_contains_all_required_artifacts(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
@@ -272,8 +337,9 @@ def test_bundle_json_round_trips_canonical_models(
     assert manifest["canonical_markdown_sha256"] == hashlib.sha256(
         (staging / "canonical.md").read_bytes()
     ).hexdigest()
-    assert blocks == canonical_document.blocks
-    assert tables == canonical_document.tables
+    activated = _activation_document(canonical_document)
+    assert blocks == activated.blocks
+    assert tables == activated.tables
     assert figures == canonical_document.figures
     assert formulas == canonical_document.formulas
 
@@ -287,7 +353,7 @@ def test_promoted_bundle_loads_complete_canonical_document(
     store.promote("doc-1", "canonical-v1-abcd")
 
     restored = store.load("doc-1", "canonical-v1-abcd")
-    expected = canonical_document.model_copy(deep=True)
+    expected = _activation_document(canonical_document)
     for asset in expected.assets:
         asset.source_path = None
 
@@ -308,12 +374,13 @@ def test_manifest_document_section_persists_non_transient_fields(
 
     manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
 
+    activated = _activation_document(canonical_document)
     assert manifest["document"] == {
         "title": canonical_document.title,
         "abstract": canonical_document.abstract,
         "keywords": canonical_document.keywords,
         "outline": [item.model_dump(mode="json") for item in canonical_document.outline],
-        "metadata": canonical_document.metadata,
+        "metadata": activated.metadata,
     }
 
 
@@ -343,7 +410,18 @@ def test_write_rejects_document_identity_conflicts(
 
 
 def test_empty_document_identity_is_filled_by_bundle_identity(tmp_path: Path) -> None:
-    document = CanonicalDocument(title="Untitled source")
+    document = CanonicalDocument(
+        title="Untitled source",
+        blocks=[
+            CanonicalBlock(
+                block_id="source-1",
+                block_type="narrative",
+                text="Source content.",
+                reading_order=0,
+                parser_source="fixture",
+            )
+        ],
+    )
     store = CanonicalArtifactStore(tmp_path)
     store.write_staging("doc-empty", "canonical-v2", document)
     store.promote("doc-empty", "canonical-v2")
@@ -791,17 +869,8 @@ def test_markdown_includes_unreferenced_structured_source_evidence(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
 ) -> None:
-    canonical_document.blocks = []
-    canonical_document.outline[0].block_id = None
-    canonical_document.quality.issues[0].block_ids = []
     canonical_document.tables[0].footnotes = ["Source table footnote."]
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1",
-        "canonical-v1-abcd",
-        canonical_document,
-    )
-
-    markdown = (staging / "canonical.md").read_text("utf-8")
+    markdown = _render_test_markdown(canonical_document)
 
     assert "Source table caption" in markdown
     assert "| SAC-KG | 74.7 |" in markdown
@@ -832,13 +901,7 @@ def test_markdown_uses_faithful_table_fallbacks(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1",
-        "canonical-v1-abcd",
-        canonical_document,
-    )
-
-    assert expected in (staging / "canonical.md").read_text("utf-8")
+    assert expected in _render_test_markdown(canonical_document)
 
 
 def test_markdown_keeps_linked_block_text_and_formats_heading_blocks(
@@ -851,7 +914,7 @@ def test_markdown_keeps_linked_block_text_and_formats_heading_blocks(
             block_type="table",
             text="RAW TABLE BLOCK SHOULD BE REPLACED",
             section_path=["Results"],
-            reading_order=10,
+            reading_order=2,
             parser_source="mineru",
             table_id="table-1",
         )
@@ -986,7 +1049,7 @@ def test_markdown_keeps_block_text_and_renders_multiple_references_in_order(
             block_type="narrative",
             text="Narrative source text.",
             section_path=["Results"],
-            reading_order=1,
+            reading_order=0,
             parser_source="mineru",
             table_id="table-1",
             figure_id="figure-1",
@@ -995,10 +1058,7 @@ def test_markdown_keeps_block_text_and_renders_multiple_references_in_order(
     ]
     canonical_document.outline = [SectionNode(title="Results", level=1, block_id="multi")]
     canonical_document.quality.issues[0].block_ids = ["multi"]
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1", "canonical-v1-abcd", canonical_document
-    )
-    markdown = (staging / "canonical.md").read_text("utf-8")
+    markdown = _render_test_markdown(canonical_document)
     text_index = markdown.index("Narrative source text.")
     assert text_index < markdown.index("Source table caption", text_index)
     assert markdown.index("Source table caption", text_index) < markdown.index(
@@ -1026,10 +1086,7 @@ def test_fallback_table_and_figure_markdown_escape_special_characters(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1", "canonical-v1-abcd", canonical_document
-    )
-    markdown = (staging / "canonical.md").read_text("utf-8")
+    markdown = _render_test_markdown(canonical_document)
     assert "H\\|1" in markdown
     assert "H\\\\2" in markdown
     assert "a\\|b" in markdown
@@ -1051,9 +1108,7 @@ def test_fallback_table_rejects_rows_with_wrong_width(
     canonical_document.quality.issues[0].block_ids = []
 
     with pytest.raises(ValueError, match="table row width"):
-        CanonicalArtifactStore(tmp_path).write_staging(
-            "doc-1", "canonical-v1-abcd", canonical_document
-        )
+        _render_test_markdown(canonical_document)
 
 
 def test_promote_rejects_incomplete_bundle(
@@ -1312,7 +1367,7 @@ def test_write_rejects_broken_block_references(
 
 @pytest.mark.parametrize(
     "reference_kind",
-    ["outline", "figure_nearby", "formula_nearby", "quality_issue"],
+    ["outline", "figure_nearby", "formula_nearby"],
 )
 def test_write_rejects_dangling_canonical_block_references(
     tmp_path: Path,
@@ -1325,15 +1380,28 @@ def test_write_rejects_dangling_canonical_block_references(
         canonical_document.figures[0].nearby_block_ids = ["missing-block"]
     elif reference_kind == "formula_nearby":
         canonical_document.formulas[0].nearby_block_ids = ["missing-block"]
-    else:
-        canonical_document.quality.issues[0].block_ids = ["missing-block"]
-
     with pytest.raises(ValueError, match="canonical block reference"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1",
             "canonical-v1-abcd",
             canonical_document,
         )
+
+
+def test_write_discards_stale_quality_issue_block_references(
+    tmp_path: Path, canonical_document: CanonicalDocument
+) -> None:
+    canonical_document.quality.issues[0].block_ids = ["missing-block"]
+
+    staging = CanonicalArtifactStore(tmp_path).write_staging(
+        "doc-1", "canonical-v1-abcd", canonical_document
+    )
+
+    manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
+    assert all(
+        "missing-block" not in issue["block_ids"]
+        for issue in manifest["quality"]["issues"]
+    )
 
 
 def test_promote_rejects_tampered_outline_block_reference(
@@ -1643,10 +1711,7 @@ def test_markdown_renders_cells_only_table_evidence(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1", "canonical-v1-abcd", canonical_document
-    )
-    markdown = (staging / "canonical.md").read_text("utf-8")
+    markdown = _render_test_markdown(canonical_document)
 
     assert "| Model | Score |" in markdown
     assert "| SAC\\|KG | 74.7 |" in markdown
@@ -1673,10 +1738,7 @@ def test_markdown_renders_source_html_table_without_unsafe_content(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    staging = CanonicalArtifactStore(tmp_path).write_staging(
-        "doc-1", "canonical-v1-abcd", canonical_document
-    )
-    markdown = (staging / "canonical.md").read_text("utf-8")
+    markdown = _render_test_markdown(canonical_document)
 
     assert "| Model | Score |" in markdown
     assert "| SAC-KG | 74.7 |" in markdown
@@ -1700,19 +1762,18 @@ def test_write_rejects_nonempty_table_without_renderable_rows(
     canonical_document.quality.issues[0].block_ids = []
 
     with pytest.raises(ValueError, match="no renderable table evidence"):
-        CanonicalArtifactStore(tmp_path).write_staging(
-            "doc-1", "canonical-v1-abcd", canonical_document
-        )
+        _render_test_markdown(canonical_document)
 
 
 def test_write_staging_fails_closed_for_validation_failed_table(
     tmp_path: Path,
     canonical_document: CanonicalDocument,
 ) -> None:
+    canonical_document.tables[0].rows = [["SAC-KG"]]
     canonical_document.tables[0].status = "validation_failed"
     canonical_document.metadata["table_activation_allowed"] = False
 
-    with pytest.raises(ValueError, match="table validation failed"):
+    with pytest.raises(ValueError, match="table_invalid"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1", "canonical-v1-abcd", canonical_document
         )
@@ -1814,9 +1875,7 @@ def test_source_html_rejects_oversized_span_before_matrix_allocation(
     canonical_document.quality.issues[0].block_ids = []
 
     with pytest.raises(ValueError, match="table matrix exceeds canonical limits"):
-        CanonicalArtifactStore(tmp_path).write_staging(
-            "doc-1", "canonical-v1-abcd", canonical_document
-        )
+        _render_test_markdown(canonical_document)
 
 
 @pytest.mark.parametrize(
@@ -1850,7 +1909,7 @@ def test_write_rejects_table_without_actual_table_evidence(
     canonical_document.outline[0].block_id = None
     canonical_document.quality.issues[0].block_ids = []
 
-    with pytest.raises(ValueError, match="no renderable table evidence"):
+    with pytest.raises(ValueError, match="table_invalid|content_empty"):
         CanonicalArtifactStore(tmp_path).write_staging(
             "doc-1", "canonical-v1-abcd", canonical_document
         )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -163,6 +165,133 @@ def test_valid_repair_is_marked_repaired_by_vision() -> None:
     assert result.accepted is True
     assert result.status == "repaired_by_vision"
     assert result.table.status == "repaired_by_vision"
+
+
+def _set_normalized_table_locator(
+    table: CanonicalTable,
+    bbox: tuple[float, float, float, float],
+    *,
+    source_region_id: str | None = None,
+) -> None:
+    table.source_spans = [
+        SourceSpan(
+            page_index=0,
+            normalized_bbox=bbox,
+            metadata=(
+                {"source_region_id": source_region_id}
+                if source_region_id is not None
+                else {}
+            ),
+        )
+    ]
+
+
+def test_single_repair_inventory_accepts_small_normalized_bbox_shift() -> None:
+    original = _table()
+    original.metadata["truncated"] = True
+    replacement = _table(table_id="vision-table-1")
+    _set_normalized_table_locator(original, (0.100, 0.200, 0.400, 0.600))
+    _set_normalized_table_locator(replacement, (0.101, 0.199, 0.401, 0.601))
+
+    bindings = TableValidator().validate_repair_inventory(
+        [original], [replacement], {original.table_id}, 0
+    )
+
+    assert bindings is not None
+    assert bindings[0][1].table_id == replacement.table_id
+
+
+def test_multi_repair_inventory_uniquely_matches_shifted_normalized_bboxes() -> None:
+    first = _table(table_id="original-1", rows=[["A", "Base", "1"]])
+    second = _table(table_id="original-2", rows=[["B", "Base", "2"]])
+    first.metadata["truncated"] = True
+    second.metadata["truncated"] = True
+    first_repair = _table(table_id="repair-1", rows=[["A", "Fixed", "10"]])
+    second_repair = _table(table_id="repair-2", rows=[["B", "Fixed", "20"]])
+    _set_normalized_table_locator(first, (0.100, 0.100, 0.400, 0.300))
+    _set_normalized_table_locator(second, (0.550, 0.500, 0.850, 0.800))
+    _set_normalized_table_locator(first_repair, (0.101, 0.099, 0.401, 0.301))
+    _set_normalized_table_locator(second_repair, (0.549, 0.501, 0.851, 0.799))
+
+    bindings = TableValidator().validate_repair_inventory(
+        [first, second],
+        [second_repair, first_repair],
+        {first.table_id, second.table_id},
+        0,
+    )
+
+    assert bindings is not None
+    assert {
+        original.table_id: replacement.table_id
+        for original, replacement, _, _ in bindings
+    } == {"original-1": "repair-1", "original-2": "repair-2"}
+
+
+def test_repair_inventory_prioritizes_exact_source_region_over_ambiguous_bbox() -> None:
+    first = _table(table_id="original-region-a", rows=[["A", "Base", "1"]])
+    second = _table(table_id="original-region-b", rows=[["B", "Base", "2"]])
+    first.metadata["truncated"] = True
+    second.metadata["truncated"] = True
+    repair_a = _table(table_id="repair-region-a", rows=[["A", "Fixed", "10"]])
+    repair_b = _table(table_id="repair-region-b", rows=[["B", "Fixed", "20"]])
+    shared_bbox = (0.100, 0.100, 0.400, 0.400)
+    _set_normalized_table_locator(first, shared_bbox, source_region_id="region-a")
+    _set_normalized_table_locator(second, shared_bbox, source_region_id="region-b")
+    _set_normalized_table_locator(repair_a, shared_bbox, source_region_id="region-a")
+    _set_normalized_table_locator(repair_b, shared_bbox, source_region_id="region-b")
+
+    bindings = TableValidator().validate_repair_inventory(
+        [first, second],
+        [repair_b, repair_a],
+        {first.table_id, second.table_id},
+        0,
+    )
+
+    assert bindings is not None
+    assert {
+        original.table_id: replacement.table_id
+        for original, replacement, _, _ in bindings
+    } == {
+        "original-region-a": "repair-region-a",
+        "original-region-b": "repair-region-b",
+    }
+
+
+def test_repair_inventory_rejects_low_iou_and_ambiguous_bbox_graphs() -> None:
+    original = _table(table_id="original-low")
+    original.metadata["truncated"] = True
+    far_repair = _table(table_id="repair-far")
+    _set_normalized_table_locator(original, (0.100, 0.100, 0.300, 0.300))
+    _set_normalized_table_locator(far_repair, (0.600, 0.600, 0.800, 0.800))
+    validator = TableValidator()
+
+    assert (
+        validator.validate_repair_inventory(
+            [original], [far_repair], {original.table_id}, 0
+        )
+        is None
+    )
+
+    first = _table(table_id="original-a", rows=[["A", "Base", "1"]])
+    second = _table(table_id="original-b", rows=[["B", "Base", "2"]])
+    first.metadata["truncated"] = True
+    second.metadata["truncated"] = True
+    repair_a = _table(table_id="repair-a", rows=[["A", "Fixed", "10"]])
+    repair_b = _table(table_id="repair-b", rows=[["B", "Fixed", "20"]])
+    _set_normalized_table_locator(first, (0.100, 0.100, 0.400, 0.400))
+    _set_normalized_table_locator(second, (0.105, 0.100, 0.405, 0.400))
+    _set_normalized_table_locator(repair_a, (0.102, 0.100, 0.402, 0.400))
+    _set_normalized_table_locator(repair_b, (0.103, 0.100, 0.403, 0.400))
+
+    assert (
+        validator.validate_repair_inventory(
+            [first, second],
+            [repair_a, repair_b],
+            {first.table_id, second.table_id},
+            0,
+        )
+        is None
+    )
 
 
 def test_page_only_repair_proof_is_rejected_without_stable_block_locator() -> None:
@@ -661,7 +790,61 @@ def test_tokenizer_loader_is_cached_per_process_and_model_name() -> None:
     first = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=load)
     second = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=load)
 
+    assert loaded == []
     assert first.estimate_tokens("abc") == second.estimate_tokens("abc") == 3
+    assert loaded == [name]
+
+
+def test_tokenizer_cache_key_includes_loader_identity() -> None:
+    loaded: list[str] = []
+
+    class FakeTokenizer:
+        def __init__(self, width: int) -> None:
+            self.width = width
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return [self.width] * self.width
+
+    def first_loader(name: str) -> FakeTokenizer:
+        loaded.append(f"first:{name}")
+        return FakeTokenizer(1)
+
+    def second_loader(name: str) -> FakeTokenizer:
+        loaded.append(f"second:{name}")
+        return FakeTokenizer(2)
+
+    name = "same-model-different-loader"
+    first = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=first_loader)
+    second = StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=second_loader)
+
+    assert first.estimate_tokens("x") == 1
+    assert second.estimate_tokens("x") == 2
+    assert loaded == [f"first:{name}", f"second:{name}"]
+
+
+def test_lazy_tokenizer_load_is_singleton_across_concurrent_builders() -> None:
+    loaded: list[str] = []
+
+    class FakeTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            return list(text.encode("utf-8"))
+
+    def load(name: str) -> FakeTokenizer:
+        loaded.append(name)
+        time.sleep(0.02)
+        return FakeTokenizer()
+
+    name = "concurrent-lazy-tokenizer"
+    builders = [
+        StructuredEvidenceBuilder(tokenizer_name=name, tokenizer_loader=load)
+        for _ in range(8)
+    ]
+    assert loaded == []
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        counts = list(executor.map(lambda builder: builder.estimate_tokens("abc"), builders))
+
+    assert counts == [3] * len(builders)
     assert loaded == [name]
 
 

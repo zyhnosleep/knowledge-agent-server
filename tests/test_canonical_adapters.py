@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 from base64 import b64decode
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -1538,10 +1539,8 @@ def test_identical_html_siblings_have_distinct_identity_locators_and_ids(
     assert len({formula.formula_id for formula in document.formulas}) == 2
 
     store = CanonicalArtifactStore(tmp_path / "artifacts")
-    store.write_staging(document.document_id, document.parse_version, document)
-    store.promote(document.document_id, document.parse_version)
-    loaded = store.load(document.document_id, document.parse_version)
-    assert len(loaded.tables) == len(loaded.figures) == len(loaded.formulas) == 2
+    with pytest.raises(ValueError, match="table_content_duplicate"):
+        store.write_staging(document.document_id, document.parse_version, document)
 
 
 def test_docx_external_linked_image_is_metadata_only_and_never_reads_target_part(
@@ -1593,6 +1592,104 @@ def test_docx_asset_cache_io_failure_is_wrapped_with_source_and_cause(
     with pytest.raises(DocumentParseError, match=r"cache-failure\.docx:.*cache") as raised:
         DocxCanonicalAdapter(asset_cache_root=tmp_path / "cache").parse(path)
     assert isinstance(raised.value.__cause__, PermissionError)
+
+
+def _adapter_cache_document(source_sha: str, source_path: Path) -> CanonicalDocument:
+    return CanonicalDocument(
+        document_id=f"doc-{source_sha[:8]}",
+        source_path=str(source_path),
+        source_metadata={"sha256": source_sha},
+    )
+
+
+def test_adapter_asset_cache_rejects_write_that_would_exceed_total_limit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(canonical_adapters, "ADAPTER_ASSET_CACHE_MAX_BYTES", 6)
+    first_blob = b"1234"
+    second_blob = b"5678"
+    first_sha = hashlib.sha256(first_blob).hexdigest()
+    second_sha = hashlib.sha256(second_blob).hexdigest()
+    first_document = _adapter_cache_document("a" * 64, tmp_path / "first.docx")
+    second_document = _adapter_cache_document("b" * 64, tmp_path / "second.docx")
+
+    canonical_adapters._materialize_adapter_asset(
+        first_document,
+        "first.png",
+        first_blob,
+        first_sha,
+        source_kind="test",
+        asset_cache_root=cache_root,
+    )
+    with pytest.raises(DocumentParseError, match="cache size limit"):
+        canonical_adapters._materialize_adapter_asset(
+            second_document,
+            "second.png",
+            second_blob,
+            second_sha,
+            source_kind="test",
+            asset_cache_root=cache_root,
+        )
+
+    assert sum(path.stat().st_size for path in cache_root.rglob("*") if path.is_file()) <= 6
+
+
+def test_adapter_asset_cache_limit_is_atomic_across_threads(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(canonical_adapters, "ADAPTER_ASSET_CACHE_MAX_BYTES", 6)
+    blobs = [b"1234", b"5678"]
+    documents = [
+        _adapter_cache_document(character * 64, tmp_path / f"{character}.docx")
+        for character in ("c", "d")
+    ]
+
+    def persist(index: int) -> str:
+        blob = blobs[index]
+        try:
+            canonical_adapters._materialize_adapter_asset(
+                documents[index],
+                f"asset-{index}.png",
+                blob,
+                hashlib.sha256(blob).hexdigest(),
+                source_kind="test",
+                asset_cache_root=cache_root,
+            )
+        except DocumentParseError:
+            return "rejected"
+        return "persisted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(persist, range(2)))
+
+    assert sorted(outcomes) == ["persisted", "rejected"]
+    assert sum(path.stat().st_size for path in cache_root.rglob("*") if path.is_file()) <= 6
+
+
+def test_docx_enforces_cumulative_document_asset_limit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    first_image = tmp_path / "first.png"
+    second_image = tmp_path / "second.png"
+    _write_png(first_image)
+    second_image.write_bytes(first_image.read_bytes() + b"\x00")
+    path = tmp_path / "two-images.docx"
+    source = Document()
+    source.add_paragraph().add_run().add_picture(str(first_image))
+    source.add_paragraph().add_run().add_picture(str(second_image))
+    source.save(path)
+    limit = first_image.stat().st_size + second_image.stat().st_size - 1
+    monkeypatch.setattr(
+        canonical_adapters,
+        "ADAPTER_DOCUMENT_ASSET_MAX_BYTES",
+        limit,
+        raising=False,
+    )
+
+    with pytest.raises(DocumentParseError, match="document asset size limit"):
+        DocxCanonicalAdapter(asset_cache_root=tmp_path / "cache").parse(path)
 
 
 def test_docx_internal_target_part_failure_is_wrapped_with_source_and_cause(

@@ -862,6 +862,7 @@ def test_table_repair_with_valid_replacement_is_accepted(
                 page_index=0,
                 page_label="1",
                 source_block_id="mineru-table-1",
+                normalized_bbox=(0.100, 0.200, 0.400, 0.600),
             )
         ],
     )
@@ -883,6 +884,7 @@ def test_table_repair_with_valid_replacement_is_accepted(
                 page_index=0,
                 page_label="1",
                 source_block_id="document_intelligence-table-1",
+                normalized_bbox=(0.101, 0.199, 0.401, 0.601),
             )
         ],
     )
@@ -910,7 +912,7 @@ def test_table_repair_with_valid_replacement_is_accepted(
     assert result.tables[0].metadata["repair_original_table_id"] == "mineru-invalid"
     assert result.tables[0].metadata["repair_proof_validated"] is True
     proof = result.tables[0].metadata["repair_proof"]
-    assert proof["match_basis"] == "unique_table_on_page"
+    assert proof["match_basis"] == "normalized_bbox"
     assert proof["original_request"]["table_id"] == "mineru-invalid"
     assert proof["validated_mapping"] == {
         "original_table_id": "mineru-invalid",

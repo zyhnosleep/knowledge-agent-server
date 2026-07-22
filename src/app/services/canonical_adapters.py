@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import stat
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -46,13 +47,14 @@ MAX_TABLE_ROWS = 10_000
 MAX_TABLE_COLUMNS = 1_000
 MAX_TABLE_GRID_CELLS = 1_000_000
 MAX_SINGLE_ASSET_BYTES = 64 * 1024 * 1024
-MAX_DOCUMENT_ASSET_BYTES = 256 * 1024 * 1024
+ADAPTER_DOCUMENT_ASSET_MAX_BYTES = 256 * 1024 * 1024
 ASSET_COPY_CHUNK_BYTES = 1024 * 1024
 ADAPTER_ASSET_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 ADAPTER_ASSET_CACHE_CLEANUP_POLICY = (
-    "evict source-sha directories by oldest mtime, then lexical sha"
+    "reject new asset when durable cache total would exceed limit"
 )
 MAX_NESTING_DEPTH = 256
+_ADAPTER_ASSET_CACHE_LOCK = threading.RLock()
 
 
 class CanonicalAdapter(Protocol):
@@ -144,6 +146,36 @@ def _materialize_adapter_asset(
     source_kind: str,
     asset_cache_root: Path | None = None,
 ) -> Path:
+    with _ADAPTER_ASSET_CACHE_LOCK:
+        return _materialize_adapter_asset_locked(
+            document,
+            safe_name,
+            blob,
+            expected_sha,
+            source_kind=source_kind,
+            asset_cache_root=asset_cache_root,
+        )
+
+
+def _adapter_cache_size(root: Path) -> int:
+    total = 0
+    for entry in root.rglob("*"):
+        if _is_link_or_reparse_point(entry):
+            raise ValueError("asset cache contains a symbolic link or reparse point")
+        if entry.is_file():
+            total += entry.stat().st_size
+    return total
+
+
+def _materialize_adapter_asset_locked(
+    document: CanonicalDocument,
+    safe_name: str,
+    blob: bytes | Path,
+    expected_sha: str,
+    *,
+    source_kind: str,
+    asset_cache_root: Path | None = None,
+) -> Path:
     """Atomically persist an extracted asset outside parser temporary output."""
 
     source_path = Path(document.source_path or "document")
@@ -173,11 +205,13 @@ def _materialize_adapter_asset(
             source_stat = blob.stat()
             if source_stat.st_size > MAX_SINGLE_ASSET_BYTES:
                 raise ValueError("extracted asset size limit exceeded")
+            asset_size = source_stat.st_size
             with blob.open("rb") as source:
                 source_digest = hashlib.file_digest(source, "sha256").hexdigest()
         else:
             if len(blob) > MAX_SINGLE_ASSET_BYTES:
                 raise ValueError("extracted asset size limit exceeded")
+            asset_size = len(blob)
             source_digest = hashlib.sha256(blob).hexdigest()
         if source_digest != expected_sha:
             raise ValueError("extracted asset hash mismatch")
@@ -207,11 +241,20 @@ def _materialize_adapter_asset(
             )
         if destination.parent.resolve(strict=True) != resolved_directory:
             raise ValueError("asset cache destination escapes source directory")
+        cache_size_before = _adapter_cache_size(resolved_root)
+        if cache_size_before > ADAPTER_ASSET_CACHE_MAX_BYTES:
+            raise ValueError("adapter asset cache size limit already exceeded")
+        existing_size = destination.stat().st_size if destination.is_file() else 0
         if destination.is_file():
             with destination.open("rb") as persisted:
                 persisted_sha = hashlib.file_digest(persisted, "sha256").hexdigest()
             if persisted_sha == expected_sha:
                 return destination.resolve(strict=True)
+        if (
+            cache_size_before - existing_size + asset_size
+            > ADAPTER_ASSET_CACHE_MAX_BYTES
+        ):
+            raise ValueError("adapter asset cache size limit would be exceeded")
 
         temporary = directory / f".{safe_name}.{uuid4().hex}.tmp"
         if _is_link_or_reparse_point(temporary):
@@ -261,15 +304,32 @@ def _materialize_adapter_asset(
             raise ValueError(
                 "asset cache destination is a symbolic link or reparse point"
             )
+        if (
+            _is_link_or_reparse_point(root)
+            or _is_link_or_reparse_point(directory)
+            or root.resolve(strict=True) != resolved_root
+            or directory.resolve(strict=True) != resolved_directory
+        ):
+            raise ValueError("asset cache directory changed before atomic replace")
         os.replace(temporary, destination)
         if _is_link_or_reparse_point(destination):
             raise ValueError(
                 "asset cache destination became a symbolic link or reparse point"
             )
+        if (
+            _is_link_or_reparse_point(root)
+            or _is_link_or_reparse_point(directory)
+            or root.resolve(strict=True) != resolved_root
+            or directory.resolve(strict=True) != resolved_directory
+        ):
+            raise ValueError("asset cache directory changed during atomic replace")
         with destination.open("rb") as persisted:
             destination_sha = hashlib.file_digest(persisted, "sha256").hexdigest()
         if destination_sha != expected_sha:
             raise ValueError("persisted asset hash mismatch")
+        if _adapter_cache_size(resolved_root) > ADAPTER_ASSET_CACHE_MAX_BYTES:
+            destination.unlink()
+            raise ValueError("adapter asset cache size limit exceeded after write")
         return destination.resolve(strict=True)
     except Exception as exc:
         raise _parse_error(
@@ -362,7 +422,7 @@ def _register_local_figure_asset(
         )
         if (
             size_bytes > MAX_SINGLE_ASSET_BYTES
-            or existing_total + size_bytes > MAX_DOCUMENT_ASSET_BYTES
+            or existing_total + size_bytes > ADAPTER_DOCUMENT_ASSET_MAX_BYTES
         ):
             raise ValueError("canonical asset size limit exceeded")
         with resolved.open("rb") as source:
@@ -2418,6 +2478,20 @@ class DocxCanonicalAdapter:
             target_part = relationship.target_part
             blob = target_part.blob
             asset_sha = hashlib.sha256(blob).hexdigest()
+            existing_asset = next(
+                (asset for asset in document.assets if asset.sha256 == asset_sha),
+                None,
+            )
+            if existing_asset is None:
+                existing_total = sum(
+                    int(asset.metadata.get("size_bytes") or 0)
+                    for asset in document.assets
+                )
+                if (
+                    existing_total + len(blob)
+                    > ADAPTER_DOCUMENT_ASSET_MAX_BYTES
+                ):
+                    raise ValueError("DOCX document asset size limit exceeded")
             target_name = Path(str(target_part.partname)).name
             safe_name = self._safe_asset_name(target_name, asset_sha)
             asset_path = f"assets/{safe_name}"
@@ -3214,7 +3288,8 @@ def _register_pdf_figure_asset(
         )
         if (
             source_stat.st_size > MAX_SINGLE_ASSET_BYTES
-            or existing_total + source_stat.st_size > MAX_DOCUMENT_ASSET_BYTES
+            or existing_total + source_stat.st_size
+            > ADAPTER_DOCUMENT_ASSET_MAX_BYTES
         ):
             return None
         with source_path.open("rb") as source:
