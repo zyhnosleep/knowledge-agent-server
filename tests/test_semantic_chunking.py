@@ -962,6 +962,48 @@ def test_child_spans_use_precise_block_relative_character_ranges() -> None:
     assert all(item.metadata["source_span_mapping"] == "exact" for item in children)
 
 
+def test_source_span_mapping_is_approximate_when_all_units_lack_spans() -> None:
+    source_block = block("no-spans", "First sentence. Second sentence.", 0)
+    source_block.source_spans = []
+
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(
+        document(source_block)
+    )
+
+    assert chunks
+    assert all(not item.source_spans for item in chunks)
+    assert all(item.metadata["source_span_mapping"] == "approximate" for item in chunks)
+
+
+def test_source_span_mapping_is_approximate_when_any_unit_lacks_spans() -> None:
+    mapped = block("mapped", "Mapped sentence.", 0)
+    mapped.source_spans = [
+        SourceSpan(
+            source_block_id="mapped",
+            char_start=0,
+            char_end=len(mapped.text),
+        )
+    ]
+    unmapped = block("unmapped", "Unmapped sentence.", 1)
+    unmapped.source_spans = []
+
+    chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(mapped, unmapped))
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+    child = next(item for item in chunks if item.chunk_role == "child")
+
+    assert parent.source_block_ids == ["mapped", "unmapped"]
+    assert parent.metadata["source_span_mapping"] == "approximate"
+    assert child.metadata["source_span_mapping"] == "approximate"
+
+
 def test_locator_without_character_range_is_preserved_and_marked_approximate() -> None:
     source_block = block("locator", "First sentence. Second sentence.", 0)
     source_block.source_spans = [
@@ -1150,3 +1192,113 @@ def test_figure_and_formula_have_source_faithful_children_and_generated_provenan
         assert nearby_page in {item.page_index for item in parent.source_spans}
         assert object_id in {item.source_block_id for item in parent.source_spans}
         assert block_id in {item.source_block_id for item in parent.source_spans}
+
+
+@pytest.mark.parametrize("block_type", ["figure", "formula"])
+def test_structured_nearby_sources_share_retrievable_nonreference_allowlist(
+    block_type: str,
+) -> None:
+    structure_id = "f-filter" if block_type == "figure" else "q-filter"
+    structure = block(
+        f"{block_type}-block",
+        "",
+        0,
+        block_type=block_type,
+        figure_id=structure_id if block_type == "figure" else None,
+        formula_id=structure_id if block_type == "formula" else None,
+    )
+    allowed_narrative = block("allowed-narrative", "Allowed nearby narrative.", 1)
+    reference_narrative = block(
+        "reference-narrative",
+        "LEAKED REFERENCE PAYLOAD.",
+        2,
+        section_path=["References"],
+    )
+    hidden_narrative = block(
+        "hidden-narrative",
+        "LEAKED NONRETRIEVABLE PAYLOAD.",
+        3,
+    )
+    hidden_narrative.retrievable = False
+    nearby_ids = [
+        allowed_narrative.block_id,
+        reference_narrative.block_id,
+        hidden_narrative.block_id,
+    ]
+    doc = document(
+        structure,
+        allowed_narrative,
+        reference_narrative,
+        hidden_narrative,
+    )
+    if block_type == "figure":
+        doc.figures = [
+            CanonicalFigure(
+                figure_id=structure_id,
+                caption="Figure source caption.",
+                source_spans=[span("figure-source")],
+                nearby_block_ids=nearby_ids,
+                generated_summary="Generated figure analysis.",
+            )
+        ]
+    else:
+        doc.formulas = [
+            CanonicalFormula(
+                formula_id=structure_id,
+                latex="x = 1",
+                caption="Formula source caption.",
+                source_spans=[span("formula-source")],
+                nearby_block_ids=nearby_ids,
+                generated_explanation="Generated formula analysis.",
+            )
+        ]
+
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(doc)
+    structured = [item for item in chunks if item.block_type == block_type]
+
+    assert {item.chunk_role for item in structured} == {"parent", "child"}
+    for item in structured:
+        expected_caption = (
+            "Figure source caption."
+            if block_type == "figure"
+            else "Formula source caption."
+        )
+        assert expected_caption in item.text
+        assert "Allowed nearby narrative." in item.text
+        assert "LEAKED REFERENCE PAYLOAD." not in item.text
+        assert "LEAKED REFERENCE PAYLOAD." not in item.embedding_text
+        assert "LEAKED NONRETRIEVABLE PAYLOAD." not in item.text
+        assert "LEAKED NONRETRIEVABLE PAYLOAD." not in item.embedding_text
+        assert "reference-narrative" not in item.source_block_ids
+        assert "hidden-narrative" not in item.source_block_ids
+        assert "allowed-narrative" in item.source_block_ids
+        span_ids = {source_span.source_block_id for source_span in item.source_spans}
+        assert "reference-narrative" not in span_ids
+        assert "hidden-narrative" not in span_ids
+
+
+def test_semantic_grouping_token_counter_work_is_near_linear() -> None:
+    source = " ".join(f"S{index}." for index in range(1000))
+    scanned_characters = 0
+
+    def instrumented_counter(text: str) -> int:
+        nonlocal scanned_characters
+        scanned_characters += len(text)
+        return word_count(text)
+
+    chunks = SemanticChunker(
+        RecordingEmbedder(),
+        instrumented_counter,
+        parent_min_tokens=1,
+        parent_target_tokens=2000,
+        parent_max_tokens=2000,
+        child_min_tokens=1,
+        child_target_tokens=2000,
+        child_max_tokens=2000,
+        overlap_tokens=0,
+        break_percentile=20,
+    ).build(document(block("complexity", source, 0)))
+
+    assert {item.chunk_role for item in chunks} == {"parent", "child"}
+    near_linear_scan_budget = len(source) * 64
+    assert scanned_characters <= near_linear_scan_budget

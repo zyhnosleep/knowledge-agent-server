@@ -512,32 +512,66 @@ class SemanticChunker:
     ) -> list[_ChunkGroup]:
         if not units:
             return []
+        token_cache: dict[tuple[int, int], int] = {}
+
+        def range_tokens(start: int, end: int) -> int:
+            key = (start, end)
+            if key not in token_cache:
+                token_cache[key] = self._group_tokens(units[start:end])
+            return token_cache[key]
+
+        def largest_fitting_end(start: int) -> int:
+            first_end = start + 1
+            if range_tokens(start, first_end) > maximum:
+                return first_end
+            lower = first_end
+            distance = 1
+            while lower < len(units):
+                distance *= 2
+                probe = min(len(units), start + distance)
+                if range_tokens(start, probe) > maximum:
+                    upper = probe - 1
+                    break
+                lower = probe
+            else:
+                return lower
+            while lower < upper:
+                middle = (lower + upper + 1) // 2
+                if range_tokens(start, middle) <= maximum:
+                    lower = middle
+                else:
+                    upper = middle - 1
+            return lower
+
+        def first_end_reaching(start: int, end: int, threshold: int) -> int | None:
+            if range_tokens(start, end) < threshold:
+                return None
+            lower = start + 1
+            upper = end
+            while lower < upper:
+                middle = (lower + upper) // 2
+                if range_tokens(start, middle) >= threshold:
+                    upper = middle
+                else:
+                    lower = middle + 1
+            return lower
+
         groups: list[list[_RawUnit]] = []
         boundary_audit: dict[str, tuple[float | None, str]] = {}
         start = 0
         while start < len(units):
-            max_end = start
-            while max_end < len(units):
-                candidate = units[start : max_end + 1]
-                if max_end > start and self._group_tokens(candidate) > maximum:
-                    break
-                max_end += 1
-                if self._group_tokens(candidate) > maximum:
-                    break
-            max_end = max(start + 1, max_end)
+            max_end = largest_fitting_end(start)
 
             candidates: list[tuple[float, int]] = []
-            for end in range(start + 1, max_end + 1):
-                if end >= len(units):
-                    continue
-                candidate = units[start:end]
-                if self._group_tokens(candidate) < max(minimum, target):
-                    continue
-                left = units[end - 1].embedding
-                right = units[end].embedding
-                if left is None or right is None:
-                    raise RuntimeError("raw unit embedding missing")
-                candidates.append((self._cosine(left, right), end))
+            threshold = max(minimum, target)
+            first_candidate = first_end_reaching(start, max_end, threshold)
+            if first_candidate is not None:
+                for end in range(first_candidate, min(max_end + 1, len(units))):
+                    left = units[end - 1].embedding
+                    right = units[end].embedding
+                    if left is None or right is None:
+                        raise RuntimeError("raw unit embedding missing")
+                    candidates.append((self._cosine(left, right), end))
 
             if candidates:
                 percentile_count = max(
@@ -548,7 +582,18 @@ class SemanticChunker:
                     :percentile_count
                 ]
                 score, chosen_end = min(bottom, key=lambda item: item[1])
-                reason = "semantic_percentile"
+                chosen_tokens = range_tokens(start, chosen_end)
+                max_tokens = range_tokens(start, max_end)
+                if chosen_tokens > maximum or (
+                    chosen_tokens < threshold <= max_tokens
+                ):
+                    chosen_end = max_end
+                    score = None
+                    reason = (
+                        "section_end" if chosen_end >= len(units) else "max_tokens"
+                    )
+                else:
+                    reason = "semantic_percentile"
             else:
                 chosen_end = max_end
                 score = None
@@ -829,14 +874,17 @@ class SemanticChunker:
             )
             if figure is None:
                 raise ValueError(f"structured figure {block.figure_id!r} is missing")
-            source_parent = self._structured_builder.figure_chunk(figure, document.blocks)
+            contributors = self._structured_contributors(
+                figure.nearby_block_ids,
+                document.blocks,
+            )
+            source_parent = self._structured_builder.figure_chunk(figure, contributors)
             source_children = [source_parent.model_copy(deep=True)]
             structure_id = figure.figure_id
             structure_source_ids, structure_source_spans = self._structured_sources(
                 block,
-                figure.nearby_block_ids,
                 source_parent.source_spans,
-                document.blocks,
+                contributors,
             )
         elif block.block_type == "formula":
             formula = next(
@@ -845,14 +893,17 @@ class SemanticChunker:
             )
             if formula is None:
                 raise ValueError(f"structured formula {block.formula_id!r} is missing")
-            source_parent = self._structured_builder.formula_chunk(formula, document.blocks)
+            contributors = self._structured_contributors(
+                formula.nearby_block_ids,
+                document.blocks,
+            )
+            source_parent = self._structured_builder.formula_chunk(formula, contributors)
             source_children = [source_parent.model_copy(deep=True)]
             structure_id = formula.formula_id
             structure_source_ids, structure_source_spans = self._structured_sources(
                 block,
-                formula.nearby_block_ids,
                 source_parent.source_spans,
-                document.blocks,
+                contributors,
             )
         else:  # pragma: no cover - guarded by entry construction
             raise ValueError(f"unsupported structured block type: {block.block_type}")
@@ -928,22 +979,30 @@ class SemanticChunker:
         drafts.extend(children)
 
     @classmethod
-    def _structured_sources(
+    def _structured_contributors(
         cls,
-        structure_block: CanonicalBlock,
         nearby_block_ids: list[str],
-        structure_spans: Iterable[SourceSpan],
         blocks: Iterable[CanonicalBlock],
-    ) -> tuple[list[str], list[SourceSpan]]:
+    ) -> list[CanonicalBlock]:
         wanted = set(nearby_block_ids)
-        contributors = [
+        return [
             block
             for block in blocks
             if block.block_id in wanted
-            and block.block_type in {"narrative", "appendix"}
+            and block.retrievable
+            and cls._is_retrievable_narrative(block, list(block.section_path))
             and not block_is_generated(block)
             and block.text.strip()
         ]
+
+    @classmethod
+    def _structured_sources(
+        cls,
+        structure_block: CanonicalBlock,
+        structure_spans: Iterable[SourceSpan],
+        contributors: Iterable[CanonicalBlock],
+    ) -> tuple[list[str], list[SourceSpan]]:
+        contributors = list(contributors)
         source_ids = [structure_block.block_id]
         for block in contributors:
             if block.block_id not in source_ids:
@@ -1071,6 +1130,8 @@ class SemanticChunker:
     @staticmethod
     def _source_span_mapping(units: Iterable[_RawUnit]) -> str:
         for unit in units:
+            if not unit.source_spans:
+                return "approximate"
             for span in unit.source_spans:
                 if (
                     span.char_start is None
