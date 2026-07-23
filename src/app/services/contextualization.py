@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -110,30 +111,33 @@ _GENERIC_ENGLISH_ANCHORS = frozenset(
         "would",
     }
 )
-_GENERIC_CHINESE_ANCHORS = re.compile(
-    "|".join(
-        map(
-            re.escape,
-            (
-                "部分",
-                "说明",
-                "对应",
-                "关系",
-                "实验",
-                "论文",
-                "研究",
-                "方法",
-                "结果",
-                "章节",
-                "内容",
-                "模型",
-                "数据集",
-                "指标",
-                "公式",
-                "附录",
-            ),
-        )
-    )
+_GENERIC_CHINESE_ANCHORS = frozenset(
+    {
+        "部分",
+        "说明",
+        "对应",
+        "关系",
+        "实验",
+        "论文",
+        "研究",
+        "方法",
+        "结果",
+        "章节",
+        "内容",
+        "模型",
+        "模块",
+        "数据集",
+        "指标",
+        "公式",
+        "附录",
+        "实验章节",
+        "实验结果",
+        "论文内容",
+        "研究内容",
+        "研究方法",
+        "该模块",
+        "该部分",
+    }
 )
 _RELATION_PREDICATES = (
     "说明",
@@ -170,8 +174,8 @@ _NAMED_METRIC_MARKERS = (
 )
 _STRUCTURED_IDENTIFIER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.?|Equation|Eq\.?|表|图|公式)\s*"
-    r"(?:\(\s*\d+(?:\.\d+)*(?:[A-Za-z]+)?\s*\)"
-    r"|\d+(?:\.\d+)*(?:\s*\([A-Za-z]+\)|[A-Za-z]+)?)"
+    r"(?:\(\s*\d+(?:[.-]\d+)*(?:[A-Za-z]+)?\s*\)"
+    r"|\d+(?:[.-]\d+)*(?:\s*\([A-Za-z]+\)|[A-Za-z]+)?)"
     r"(?![A-Za-z0-9.])",
     re.IGNORECASE,
 )
@@ -186,6 +190,10 @@ _NUMERIC_IDENTIFIER_PATTERNS = (
 )
 _MAX_ERROR_IDS = 4
 _MAX_ERROR_ID_CHARS = 32
+
+
+def _lexical_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
 
 
 def _bounded_text(value: object, max_chars: int) -> str:
@@ -644,6 +652,16 @@ class ContextualizationService:
         ):
             raise ValueError(f"prefix copies most of child text for {child.local_id}")
 
+        evidence_source = f"{parent.text}\n{child.text}"
+        evidence_identifiers = set(self._numeric_identifiers(evidence_source))
+        prefix_identifiers = set(self._numeric_identifiers(prefix))
+        added_identifiers = sorted(prefix_identifiers - evidence_identifiers)
+        if added_identifiers:
+            raise ValueError(
+                f"prefix adds unsupported numeric identifier for {child.local_id}: "
+                f"{added_identifiers}"
+            )
+
         corpus_entities = set(self._english_entities(context_corpus))
         added_entities = sorted(
             entity
@@ -655,15 +673,6 @@ class ContextualizationService:
                 f"prefix adds inconsistent English entity for {child.local_id}: {added_entities}"
             )
 
-        evidence_source = f"{parent.text}\n{child.text}"
-        evidence_identifiers = set(self._numeric_identifiers(evidence_source))
-        prefix_identifiers = set(self._numeric_identifiers(prefix))
-        added_identifiers = sorted(prefix_identifiers - evidence_identifiers)
-        if added_identifiers:
-            raise ValueError(
-                f"prefix adds unsupported numeric identifier for {child.local_id}: "
-                f"{added_identifiers}"
-            )
         corpus_numbers = set(self._numbers(evidence_source))
         prefix_numbers = set(self._numbers(prefix))
         added_numbers = sorted(prefix_numbers - corpus_numbers)
@@ -739,6 +748,7 @@ class ContextualizationService:
 
     @staticmethod
     def _sentence_count(text: str) -> int:
+        text = _lexical_text(text)
         protected = re.sub(
             r"\b(?:e\.g\.|i\.e\.|et al\.|(?:[A-Za-z]\.){2,})",
             lambda match: match.group(0).replace(".", "<DOT>"),
@@ -751,10 +761,17 @@ class ContextualizationService:
 
     @staticmethod
     def _normalize_copy_text(text: str) -> str:
-        return re.sub(r"[^\w\u3400-\u9fff]+", "", text, flags=re.UNICODE).casefold()
+        return re.sub(
+            r"[^\w\u3400-\u9fff]+",
+            "",
+            _lexical_text(text),
+            flags=re.UNICODE,
+        ).casefold()
 
     @classmethod
     def _has_context_anchor(cls, prefix: str, corpus: str) -> bool:
+        prefix = _lexical_text(prefix)
+        corpus = _lexical_text(corpus)
         if set(cls._numeric_identifiers(prefix)) & set(cls._numeric_identifiers(corpus)):
             return True
 
@@ -784,15 +801,33 @@ class ContextualizationService:
         if prefix_abbreviations & corpus_abbreviations:
             return True
 
-        def chinese_ngrams(text: str) -> set[str]:
-            stripped = _GENERIC_CHINESE_ANCHORS.sub(" ", text)
-            return {
-                run[index : index + 4]
-                for run in re.findall(r"[\u3400-\u9fff]{4,}", stripped)
-                for index in range(len(run) - 3)
-            }
+        return cls._has_specific_chinese_anchor(prefix, corpus)
 
-        return bool(chinese_ngrams(prefix) & chinese_ngrams(corpus))
+    @staticmethod
+    def _has_specific_chinese_anchor(prefix: str, corpus: str) -> bool:
+        prefix_runs = re.findall(r"[\u3400-\u9fff]+", prefix)
+        corpus_runs = re.findall(r"[\u3400-\u9fff]+", corpus)
+        for prefix_run in prefix_runs:
+            for corpus_run in corpus_runs:
+                previous = [0] * (len(prefix_run) + 1)
+                for corpus_index, corpus_character in enumerate(corpus_run):
+                    current = [0]
+                    for prefix_index, prefix_character in enumerate(prefix_run, start=1):
+                        if prefix_character != corpus_character:
+                            current.append(0)
+                            continue
+                        length = previous[prefix_index - 1] + 1
+                        current.append(length)
+                        prefix_ended = prefix_index == len(prefix_run)
+                        corpus_ended = corpus_index + 1 == len(corpus_run)
+                        if not prefix_ended and not corpus_ended:
+                            if prefix_run[prefix_index] == corpus_run[corpus_index + 1]:
+                                continue
+                        candidate = prefix_run[prefix_index - length : prefix_index]
+                        if len(candidate) >= 2 and candidate not in _GENERIC_CHINESE_ANCHORS:
+                            return True
+                    previous = current
+        return False
 
     @staticmethod
     def _copies_most_child(normalized_child: str, normalized_prefix: str) -> bool:
@@ -815,13 +850,14 @@ class ContextualizationService:
 
     @staticmethod
     def _is_short_proper_name(text: str) -> bool:
-        stripped = text.strip()
+        stripped = _lexical_text(text).strip()
         return len(stripped) <= 24 and bool(
             re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*", stripped)
         )
 
     @staticmethod
     def _english_entities(text: str) -> list[str]:
+        text = _lexical_text(text)
         entities = re.findall(r"\b(?:[A-Za-z]\.){2,}", text)
         words = re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*\b", text)
         entities.extend(
@@ -837,9 +873,10 @@ class ContextualizationService:
 
     @staticmethod
     def _numbers(text: str) -> list[str]:
-        without_identifiers = list(text)
+        normalized = _lexical_text(text)
+        without_identifiers = list(normalized)
         for pattern in _NUMERIC_IDENTIFIER_PATTERNS:
-            for match in pattern.finditer(text):
+            for match in pattern.finditer(normalized):
                 without_identifiers[match.start() : match.end()] = " " * len(match.group(0))
         return re.findall(
             r"(?<![A-Za-z])\d+(?:\.\d+)?%?(?![A-Za-z])",
@@ -848,6 +885,7 @@ class ContextualizationService:
 
     @staticmethod
     def _numeric_identifiers(text: str) -> list[str]:
+        text = _lexical_text(text)
         return [
             re.sub(r"\s+", " ", match.group(0)).casefold()
             for pattern in _NUMERIC_IDENTIFIER_PATTERNS
@@ -862,6 +900,9 @@ class ContextualizationService:
         prefix: str,
         evidence_source: str,
     ) -> bool:
+        number = _lexical_text(number)
+        prefix = _lexical_text(prefix)
+        evidence_source = _lexical_text(evidence_source)
         table_label = re.compile(
             rf"(?<![A-Za-z0-9])(?:表|table)\s*{re.escape(number)}(?![\d.])",
             re.IGNORECASE,
@@ -876,7 +917,9 @@ class ContextualizationService:
 
     @staticmethod
     def _terms_are_near(text: str, marker: str, number: str, max_distance: int = 24) -> bool:
-        normalized = text.casefold()
+        normalized = _lexical_text(text).casefold()
+        marker = _lexical_text(marker)
+        number = _lexical_text(number)
         escaped_marker = re.escape(marker.casefold())
         marker_pattern = (
             rf"(?<![a-z0-9]){escaped_marker}(?![a-z0-9])"

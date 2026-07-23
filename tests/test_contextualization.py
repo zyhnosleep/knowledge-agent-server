@@ -601,8 +601,11 @@ def test_rejects_numeric_identifiers_whose_complete_label_is_not_grounded(
         ("Equation (5a)", "Equation (5b)"),
         ("model 3d2", "model 3d3"),
         ("图2", "图3"),
+        ("图2-1", "图2-2"),
         ("公式5", "公式6"),
         ("Fig 3", "Fig 4"),
+        ("表２（a）", "表２（b）"),
+        ("Qwen２", "Qwen３"),
     ],
 )
 def test_rejects_mutated_atomic_numeric_identifiers(
@@ -637,7 +640,17 @@ def test_rejects_mutated_atomic_numeric_identifiers(
 
 @pytest.mark.parametrize(
     "identifier",
-    ["Table 2(a)", "Equation (5a)", "model 3d2", "图2", "公式5", "Fig 3"],
+    [
+        "Table 2(a)",
+        "Equation (5a)",
+        "model 3d2",
+        "图2",
+        "图2-1",
+        "公式5",
+        "公式（5）",
+        "Fig 3",
+        "Qwen２",
+    ],
 )
 def test_allows_exactly_grounded_atomic_numeric_identifiers(identifier: str) -> None:
     parent = _chunk(
@@ -917,6 +930,41 @@ def test_relation_gate_allows_grounded_pure_chinese_topic_anchor() -> None:
                     prefix=prefix,
                 )
             ]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
+
+
+@pytest.mark.parametrize(
+    ("term", "parent_text"),
+    [
+        ("蒸馏", "教师网络通过蒸馏压缩参数规模。"),
+        ("注意力", "编码模块使用注意力聚合邻域信息。"),
+        ("模型蒸馏", "教师网络通过模型蒸馏压缩参数规模。"),
+    ],
+)
+def test_relation_gate_allows_grounded_short_chinese_terms(
+    term: str,
+    parent_text: str,
+) -> None:
+    parent = _chunk("parent-1", role="parent", text=parent_text)
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="该模块输出压缩后的参数。",
+    )
+    prefix = f"该部分说明{term}与该模块的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
         )
     )
 
