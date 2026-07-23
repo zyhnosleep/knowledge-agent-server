@@ -4,8 +4,9 @@ import hashlib
 import json
 import math
 import re
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from collections.abc import Iterable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -65,13 +66,14 @@ class SemanticChunker:
     ) -> None:
         settings = get_settings()
         self.embedder = embedder
-        self.token_counter = (
-            StructuredEvidenceBuilder(
+        self._default_token_provider: StructuredEvidenceBuilder | None = None
+        if token_counter is None:
+            self._default_token_provider = StructuredEvidenceBuilder(
                 tokenizer_name=settings.semantic_tokenizer_name
-            ).estimate_tokens
-            if token_counter is None
-            else token_counter
-        )
+            )
+            self.token_counter = self._default_token_provider.estimate_tokens
+        else:
+            self.token_counter = token_counter
         self.parent_token_limits = (
             settings.semantic_parent_min_tokens
             if parent_min_tokens is None
@@ -169,13 +171,82 @@ class SemanticChunker:
             raise ValueError("token counter must return a non-negative integer")
         return count
 
+    def _uses_monotonic_prefix_counts(self) -> bool:
+        if getattr(self.token_counter, "monotonic_prefix_counts", False) is True:
+            return True
+        provider = self._default_token_provider
+        return (
+            provider is not None
+            and provider.token_count_mode == "utf8_bytes_fallback"
+        )
+
+    def _offset_range_counter(
+        self,
+        units: list[_RawUnit],
+    ) -> Callable[[int, int], int] | None:
+        provider = self._default_token_provider
+        if provider is None or provider.token_count_mode != "transformers":
+            return None
+        tokenizer = getattr(provider, "_tokenizer", None)
+        if not callable(tokenizer):
+            return None
+        text = self._join_units(units)
+        try:
+            encoded = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            offsets = encoded.get("offset_mapping")
+        except (AttributeError, KeyError, NotImplementedError, TypeError, ValueError):
+            return None
+        if not isinstance(offsets, list):
+            return None
+        normalized_offsets: list[tuple[int, int]] = []
+        for offset in offsets:
+            if (
+                not isinstance(offset, (list, tuple))
+                or len(offset) != 2
+                or not all(isinstance(value, int) for value in offset)
+            ):
+                return None
+            left, right = offset
+            if left < 0 or right < left or right > len(text):
+                return None
+            if right > left:
+                normalized_offsets.append((left, right))
+        if (text and not normalized_offsets) or normalized_offsets != sorted(
+            normalized_offsets
+        ):
+            return None
+
+        unit_starts: list[int] = []
+        unit_ends: list[int] = []
+        cursor = 0
+        for index, unit in enumerate(units):
+            if index and units[index - 1].block_id != unit.block_id:
+                cursor += 2
+            unit_starts.append(cursor)
+            cursor += len(unit.text)
+            unit_ends.append(cursor)
+        token_starts = [left for left, _right in normalized_offsets]
+        token_ends = [right for _left, right in normalized_offsets]
+
+        def count_range(start: int, end: int) -> int:
+            char_start = unit_starts[start]
+            char_end = unit_ends[end - 1]
+            first_token = bisect_right(token_ends, char_start)
+            last_token = bisect_left(token_starts, char_end)
+            return max(0, last_token - first_token)
+
+        return count_range
+
     def _document_entries(
         self, document: CanonicalDocument
     ) -> tuple[list[_NarrativeSegment | _StructuredEntry], list[_RawUnit]]:
         entries: list[_NarrativeSegment | _StructuredEntry] = []
         raw_units: list[_RawUnit] = []
         current: _NarrativeSegment | None = None
-        heading_path: list[str] = []
 
         def flush() -> None:
             nonlocal current
@@ -184,14 +255,12 @@ class SemanticChunker:
                 raw_units.extend(current.units)
             current = None
 
-        for block in sorted(document.blocks, key=lambda item: item.reading_order):
+        for block, section_path in self._blocks_with_effective_section_paths(
+            document.blocks
+        ):
             if block.block_type == "heading":
                 flush()
-                heading_path = list(block.section_path) or (
-                    [block.text.strip()] if block.text.strip() else []
-                )
                 continue
-            section_path = list(block.section_path) or list(heading_path)
             if not block.retrievable or self._is_reference_section(section_path):
                 flush()
                 continue
@@ -247,6 +316,18 @@ class SemanticChunker:
                 )
         flush()
         return entries, raw_units
+
+    @staticmethod
+    def _blocks_with_effective_section_paths(
+        blocks: Iterable[CanonicalBlock],
+    ) -> Iterable[tuple[CanonicalBlock, list[str]]]:
+        heading_path: list[str] = []
+        for block in sorted(blocks, key=lambda item: item.reading_order):
+            if block.block_type == "heading":
+                heading_path = list(block.section_path) or (
+                    [block.text.strip()] if block.text.strip() else []
+                )
+            yield block, list(block.section_path) or list(heading_path)
 
     @staticmethod
     def _is_retrievable_narrative(
@@ -513,6 +594,7 @@ class SemanticChunker:
         if not units:
             return []
         token_cache: dict[tuple[int, int], int] = {}
+        monotonic_prefix_counts = self._uses_monotonic_prefix_counts()
 
         def range_tokens(start: int, end: int) -> int:
             key = (start, end)
@@ -520,16 +602,34 @@ class SemanticChunker:
                 token_cache[key] = self._group_tokens(units[start:end])
             return token_cache[key]
 
+        search_tokens = range_tokens
+        offsets_are_searchable = False
+        if not monotonic_prefix_counts:
+            offset_range_counter = self._offset_range_counter(units)
+            if offset_range_counter is not None:
+                # Fixed full-text offsets are monotonic search hints. Exact range
+                # counts below remain authoritative for emitted hard limits.
+                search_tokens = offset_range_counter
+                monotonic_prefix_counts = True
+                offsets_are_searchable = True
+
         def largest_fitting_end(start: int) -> int:
+            if not monotonic_prefix_counts:
+                end = start + 1
+                while end <= len(units):
+                    if range_tokens(start, end) > maximum:
+                        return end if end == start + 1 else end - 1
+                    end += 1
+                return len(units)
             first_end = start + 1
-            if range_tokens(start, first_end) > maximum:
+            if search_tokens(start, first_end) > maximum:
                 return first_end
             lower = first_end
             distance = 1
             while lower < len(units):
                 distance *= 2
                 probe = min(len(units), start + distance)
-                if range_tokens(start, probe) > maximum:
+                if search_tokens(start, probe) > maximum:
                     upper = probe - 1
                     break
                 lower = probe
@@ -537,20 +637,20 @@ class SemanticChunker:
                 return lower
             while lower < upper:
                 middle = (lower + upper + 1) // 2
-                if range_tokens(start, middle) <= maximum:
+                if search_tokens(start, middle) <= maximum:
                     lower = middle
                 else:
                     upper = middle - 1
             return lower
 
         def first_end_reaching(start: int, end: int, threshold: int) -> int | None:
-            if range_tokens(start, end) < threshold:
+            if search_tokens(start, end) < threshold:
                 return None
             lower = start + 1
             upper = end
             while lower < upper:
                 middle = (lower + upper) // 2
-                if range_tokens(start, middle) >= threshold:
+                if search_tokens(start, middle) >= threshold:
                     upper = middle
                 else:
                     lower = middle + 1
@@ -561,17 +661,34 @@ class SemanticChunker:
         start = 0
         while start < len(units):
             max_end = largest_fitting_end(start)
+            if offsets_are_searchable:
+                while (
+                    max_end > start + 1
+                    and range_tokens(start, max_end) > maximum
+                ):
+                    max_end -= 1
 
             candidates: list[tuple[float, int]] = []
             threshold = max(minimum, target)
-            first_candidate = first_end_reaching(start, max_end, threshold)
-            if first_candidate is not None:
-                for end in range(first_candidate, min(max_end + 1, len(units))):
-                    left = units[end - 1].embedding
-                    right = units[end].embedding
-                    if left is None or right is None:
-                        raise RuntimeError("raw unit embedding missing")
-                    candidates.append((self._cosine(left, right), end))
+            if monotonic_prefix_counts:
+                first_candidate = first_end_reaching(start, max_end, threshold)
+                candidate_ends = (
+                    range(first_candidate, min(max_end + 1, len(units)))
+                    if first_candidate is not None
+                    else ()
+                )
+            else:
+                candidate_ends = (
+                    end
+                    for end in range(start + 1, min(max_end + 1, len(units)))
+                    if range_tokens(start, end) >= threshold
+                )
+            for end in candidate_ends:
+                left = units[end - 1].embedding
+                right = units[end].embedding
+                if left is None or right is None:
+                    raise RuntimeError("raw unit embedding missing")
+                candidates.append((self._cosine(left, right), end))
 
             if candidates:
                 percentile_count = max(
@@ -987,10 +1104,11 @@ class SemanticChunker:
         wanted = set(nearby_block_ids)
         return [
             block
-            for block in blocks
+            for block, section_path in cls._blocks_with_effective_section_paths(blocks)
             if block.block_id in wanted
             and block.retrievable
-            and cls._is_retrievable_narrative(block, list(block.section_path))
+            and block.block_type in {"narrative", "appendix"}
+            and cls._is_retrievable_narrative(block, section_path)
             and not block_is_generated(block)
             and block.text.strip()
         ]

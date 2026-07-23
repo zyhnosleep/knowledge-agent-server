@@ -163,6 +163,70 @@ def test_default_token_counter_uses_configured_cached_tokenizer(
     assert loaded == [tokenizer_name]
 
 
+def test_default_offset_tokenizer_uses_evidenced_near_linear_grouping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = " ".join(f"D{index}." for index in range(1000))
+    loaded: list[str] = []
+
+    class FakeTokenizer:
+        def __init__(self) -> None:
+            self.scanned_characters = 0
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            self.scanned_characters += len(text)
+            return list(range(word_count(text)))
+
+        def __call__(
+            self,
+            text: str,
+            *,
+            add_special_tokens: bool,
+            return_offsets_mapping: bool,
+        ) -> dict[str, list[tuple[int, int]]]:
+            assert add_special_tokens is False
+            assert return_offsets_mapping is True
+            self.scanned_characters += len(text)
+            return {
+                "offset_mapping": [
+                    match.span() for match in re.finditer(r"\S+", text)
+                ]
+            }
+
+    tokenizer = FakeTokenizer()
+
+    def load(name: str) -> FakeTokenizer:
+        loaded.append(name)
+        return tokenizer
+
+    tokenizer_name = "test/qwen-offset-tokenizer"
+    monkeypatch.setattr(get_settings(), "semantic_tokenizer_name", tokenizer_name)
+    monkeypatch.setattr(StructuredEvidenceBuilder, "_tokenizer_cache", {})
+    monkeypatch.setattr(StructuredEvidenceBuilder, "_tokenizer_key_locks", {})
+    monkeypatch.setattr(
+        StructuredEvidenceBuilder,
+        "_load_local_tokenizer",
+        staticmethod(load),
+    )
+
+    chunks = SemanticChunker(
+        RecordingEmbedder(),
+        parent_min_tokens=1,
+        parent_target_tokens=2000,
+        parent_max_tokens=2000,
+        child_min_tokens=1,
+        child_target_tokens=2000,
+        child_max_tokens=2000,
+        overlap_tokens=0,
+        break_percentile=20,
+    ).build(document(block("default-complexity", source, 0)))
+
+    assert {item.chunk_role for item in chunks} == {"parent", "child"}
+    assert loaded == [tokenizer_name]
+    assert tokenizer.scanned_characters <= len(source) * 64
+
+
 def test_every_draft_has_roundtrippable_splitter_audit_and_boundary_reason() -> None:
     vectors = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
     embedder = NamedEmbedder(vectors)
@@ -1277,18 +1341,145 @@ def test_structured_nearby_sources_share_retrievable_nonreference_allowlist(
         assert "hidden-narrative" not in span_ids
 
 
+@pytest.mark.parametrize("block_type", ["figure", "formula"])
+def test_structured_nearby_sources_inherit_effective_reference_heading(
+    block_type: str,
+) -> None:
+    structure_id = "f-heading" if block_type == "figure" else "q-heading"
+    structure = block(
+        f"{block_type}-heading-block",
+        "",
+        0,
+        block_type=block_type,
+        figure_id=structure_id if block_type == "figure" else None,
+        formula_id=structure_id if block_type == "formula" else None,
+    )
+    heading = block(
+        "references-heading",
+        "References",
+        1,
+        block_type="heading",
+        section_path=["References"],
+    )
+    inherited_reference = block(
+        "inherited-reference",
+        "LEAKED INHERITED REFERENCE PAYLOAD.",
+        2,
+    )
+    inherited_reference.section_path = []
+    doc = document(structure, heading, inherited_reference)
+    if block_type == "figure":
+        doc.figures = [
+            CanonicalFigure(
+                figure_id=structure_id,
+                caption="Figure heading source.",
+                nearby_block_ids=[inherited_reference.block_id],
+            )
+        ]
+    else:
+        doc.formulas = [
+            CanonicalFormula(
+                formula_id=structure_id,
+                latex="y = 2",
+                caption="Formula heading source.",
+                nearby_block_ids=[inherited_reference.block_id],
+            )
+        ]
+
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(doc)
+    structured = [item for item in chunks if item.block_type == block_type]
+
+    assert structured
+    for item in structured:
+        assert "LEAKED INHERITED REFERENCE PAYLOAD." not in item.text
+        assert "LEAKED INHERITED REFERENCE PAYLOAD." not in item.embedding_text
+        assert inherited_reference.block_id not in item.source_block_ids
+        assert inherited_reference.block_id not in {
+            source_span.source_block_id for source_span in item.source_spans
+        }
+
+
+def test_nearby_caption_is_not_recorded_when_builder_does_not_consume_it() -> None:
+    structure = block(
+        "figure-caption-block",
+        "",
+        0,
+        block_type="figure",
+        figure_id="f-caption-filter",
+    )
+    nearby_caption = block(
+        "nearby-caption",
+        "Independent caption block.",
+        1,
+        block_type="caption",
+    )
+    doc = document(structure, nearby_caption)
+    doc.figures = [
+        CanonicalFigure(
+            figure_id="f-caption-filter",
+            caption="Canonical figure caption.",
+            nearby_block_ids=[nearby_caption.block_id],
+        )
+    ]
+
+    chunks = make_chunker(parent_max_tokens=100, child_max_tokens=100).build(doc)
+    structured = [item for item in chunks if item.block_type == "figure"]
+
+    assert structured
+    for item in structured:
+        assert "Canonical figure caption." in item.text
+        assert "Independent caption block." not in item.text
+        assert nearby_caption.block_id not in item.source_block_ids
+        assert nearby_caption.block_id not in {
+            source_span.source_block_id for source_span in item.source_spans
+        }
+
+
+def test_unmarked_nonmonotonic_counter_preserves_semantic_boundary() -> None:
+    prefix_counts = {1: 1, 2: 3, 3: 2, 4: 3, 5: 3}
+
+    def nonmonotonic_counter(text: str) -> int:
+        unit_count = len(re.findall(r"S\d+\.", text))
+        return prefix_counts.get(unit_count, unit_count)
+
+    chunks = SemanticChunker(
+        RecordingEmbedder(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+        ),
+        nonmonotonic_counter,
+        parent_min_tokens=1,
+        parent_target_tokens=3,
+        parent_max_tokens=3,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+        break_percentile=20,
+    ).build(document(block("nonmonotonic", "S1. S2. S3. S4. S5.", 0)))
+    parents = [item for item in chunks if item.chunk_role == "parent"]
+
+    assert parents[0].text == "S1. S2. "
+    assert parents[0].metadata["boundary_reason"] == "semantic_percentile"
+
+
 def test_semantic_grouping_token_counter_work_is_near_linear() -> None:
     source = " ".join(f"S{index}." for index in range(1000))
-    scanned_characters = 0
 
-    def instrumented_counter(text: str) -> int:
-        nonlocal scanned_characters
-        scanned_characters += len(text)
-        return word_count(text)
+    class InstrumentedMonotonicCounter:
+        monotonic_prefix_counts = True
+
+        def __init__(self) -> None:
+            self.scanned_characters = 0
+
+        def __call__(self, text: str) -> int:
+            self.scanned_characters += len(text)
+            return word_count(text)
+
+    counter = InstrumentedMonotonicCounter()
 
     chunks = SemanticChunker(
         RecordingEmbedder(),
-        instrumented_counter,
+        counter,
         parent_min_tokens=1,
         parent_target_tokens=2000,
         parent_max_tokens=2000,
@@ -1301,4 +1492,4 @@ def test_semantic_grouping_token_counter_work_is_near_linear() -> None:
 
     assert {item.chunk_role for item in chunks} == {"parent", "child"}
     near_linear_scan_budget = len(source) * 64
-    assert scanned_characters <= near_linear_scan_budget
+    assert counter.scanned_characters <= near_linear_scan_budget
