@@ -365,7 +365,13 @@ def test_rejects_non_exact_response_child_id_sets(
         else:
             ids.append("unexpected-child")
         return ContextualPrefixBatch(
-            items=[ContextualPrefixItem(child_id=item, prefix="该部分说明研究方法的关系。") for item in ids]
+            items=[
+                ContextualPrefixItem(
+                    child_id=item,
+                    prefix="该部分说明 GraphFormer 与研究方法的关系。",
+                )
+                for item in ids
+            ]
         )
 
     checkpoints: list[list[str]] = []
@@ -586,6 +592,79 @@ def test_rejects_numeric_identifiers_whose_complete_label_is_not_grounded(
             children=[child],
             parents={parent.local_id: parent},
         )
+
+
+@pytest.mark.parametrize(
+    ("source_identifier", "prefix_identifier"),
+    [
+        ("Table 2(a)", "Table 2(b)"),
+        ("Equation (5a)", "Equation (5b)"),
+        ("model 3d2", "model 3d3"),
+        ("图2", "图3"),
+        ("公式5", "公式6"),
+        ("Fig 3", "Fig 4"),
+    ],
+)
+def test_rejects_mutated_atomic_numeric_identifiers(
+    source_identifier: str,
+    prefix_identifier: str,
+) -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text=f"实验章节使用 {source_identifier} 展示候选生成流程。",
+    )
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="本节分析候选排序结果。",
+    )
+    prefix = f"该部分对应 {prefix_identifier}，并说明候选生成流程与实验章节的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="numeric"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["Table 2(a)", "Equation (5a)", "model 3d2", "图2", "公式5", "Fig 3"],
+)
+def test_allows_exactly_grounded_atomic_numeric_identifiers(identifier: str) -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text=f"实验章节使用 {identifier} 展示候选生成流程。",
+    )
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="本节分析候选排序结果。",
+    )
+    prefix = f"该部分对应 {identifier}，并说明候选生成流程与实验章节的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
 
 
 def test_rejects_ungrounded_bare_metric_value() -> None:
@@ -850,6 +929,57 @@ def test_relation_gate_allows_grounded_pure_chinese_topic_anchor() -> None:
     assert result[0].contextual_prefix == prefix
 
 
+@pytest.mark.parametrize(
+    ("parent_text", "child_text", "prefix"),
+    [
+        (
+            "实验章节介绍系统评估设置。",
+            "候选排序模块生成证据排名。",
+            "该部分说明今天天气与实验的关系。",
+        ),
+        (
+            "The experiment is described in this section.",
+            "候选排序模块生成证据排名。",
+            "该部分说明天气 is nice 与论文的关系。",
+        ),
+        (
+            "The experiment was reported in the paper.",
+            "候选排序模块生成证据排名。",
+            "该部分说明天气 was nice 与论文的关系。",
+        ),
+        (
+            "Table content is listed in this section.",
+            "候选排序模块生成证据排名。",
+            "该部分说明天气与 Table 的关系。",
+        ),
+    ],
+)
+def test_relation_gate_rejects_generic_shared_context_terms(
+    parent_text: str,
+    child_text: str,
+    prefix: str,
+) -> None:
+    parent = _chunk("parent-1", role="parent", text=parent_text)
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text=child_text,
+    )
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="prefix_anchor"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
 def test_rejects_new_lower_leading_internal_capital_entity() -> None:
     parent = _parent()
     child = _children(1)
@@ -946,6 +1076,60 @@ def test_rejects_prefix_that_copies_child_with_periodic_insertions() -> None:
             children=[child],
             parents={parent.local_id: parent},
         )
+
+
+@pytest.mark.parametrize("interval", [1, 2, 3])
+def test_rejects_prefix_that_copies_child_with_dense_insertions(interval: int) -> None:
+    parent = _parent()
+    child_text = "候选生成模块通过分层检索筛选相关段落并生成稳定的证据排序结果"
+    fragments = [
+        child_text[index : index + interval]
+        for index in range(0, len(child_text), interval)
+    ]
+    copied_with_insertions = "甲".join(fragments)
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text=child_text,
+    )
+    prefix = f"该部分说明{copied_with_insertions}与研究方法的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="prefix_copies_most"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
+def test_copy_check_handles_very_long_child_without_quadratic_work() -> None:
+    parent = _parent()
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="候选排序模块生成证据排名。" * 10_000,
+    )
+    prefix = "该部分说明 GraphFormer 与候选排序模块的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
 
 
 def test_rejects_prefix_that_covers_short_chinese_child_in_fragments() -> None:

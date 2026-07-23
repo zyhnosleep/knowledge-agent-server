@@ -36,6 +36,105 @@ _COMMON_ENGLISH_TERMS = frozenset(
         "i.e.",
     }
 )
+_GENERIC_ENGLISH_ANCHORS = frozenset(
+    {
+        "abstract",
+        "also",
+        "analysis",
+        "and",
+        "appendix",
+        "are",
+        "been",
+        "being",
+        "but",
+        "can",
+        "chapter",
+        "conclusion",
+        "content",
+        "could",
+        "data",
+        "dataset",
+        "describe",
+        "described",
+        "did",
+        "does",
+        "each",
+        "equation",
+        "evaluation",
+        "experiment",
+        "figure",
+        "for",
+        "from",
+        "has",
+        "have",
+        "introduction",
+        "into",
+        "its",
+        "listed",
+        "may",
+        "method",
+        "metric",
+        "might",
+        "model",
+        "not",
+        "our",
+        "paper",
+        "present",
+        "presented",
+        "research",
+        "report",
+        "reported",
+        "result",
+        "results",
+        "section",
+        "show",
+        "shown",
+        "study",
+        "table",
+        "that",
+        "the",
+        "their",
+        "these",
+        "this",
+        "those",
+        "through",
+        "under",
+        "use",
+        "used",
+        "uses",
+        "using",
+        "was",
+        "were",
+        "will",
+        "with",
+        "would",
+    }
+)
+_GENERIC_CHINESE_ANCHORS = re.compile(
+    "|".join(
+        map(
+            re.escape,
+            (
+                "部分",
+                "说明",
+                "对应",
+                "关系",
+                "实验",
+                "论文",
+                "研究",
+                "方法",
+                "结果",
+                "章节",
+                "内容",
+                "模型",
+                "数据集",
+                "指标",
+                "公式",
+                "附录",
+            ),
+        )
+    )
+)
 _RELATION_PREDICATES = (
     "说明",
     "对应",
@@ -70,13 +169,16 @@ _NAMED_METRIC_MARKERS = (
     "困惑度",
 )
 _STRUCTURED_IDENTIFIER_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.|Equation|Eq\.|表)\s*"
-    r"\d+(?:\.\d+)*(?:[A-Za-z])?(?![A-Za-z0-9.])",
+    r"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.?|Equation|Eq\.?|表|图|公式)\s*"
+    r"(?:\(\s*\d+(?:\.\d+)*(?:[A-Za-z]+)?\s*\)"
+    r"|\d+(?:\.\d+)*(?:\s*\([A-Za-z]+\)|[A-Za-z]+)?)"
+    r"(?![A-Za-z0-9.])",
     re.IGNORECASE,
 )
 _MODEL_VERSION_IDENTIFIER_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?=[A-Za-z0-9_.-]*\d)"
-    r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)*(?![A-Za-z0-9_.-])"
+    r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*[A-Za-z])"
+    r"(?=[A-Za-z0-9_.-]*\d)[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*"
+    r"(?![A-Za-z0-9_.-])"
 )
 _NUMERIC_IDENTIFIER_PATTERNS = (
     _STRUCTURED_IDENTIFIER_PATTERN,
@@ -653,50 +755,62 @@ class ContextualizationService:
 
     @classmethod
     def _has_context_anchor(cls, prefix: str, corpus: str) -> bool:
+        if set(cls._numeric_identifiers(prefix)) & set(cls._numeric_identifiers(corpus)):
+            return True
+
         prefix_terms = {
             term.casefold()
             for term in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]*\b", prefix)
-            if len(term) >= 2
+            if len(term) >= 3 and term.casefold() not in _GENERIC_ENGLISH_ANCHORS
         }
         corpus_terms = {
             term.casefold()
             for term in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]*\b", corpus)
-            if len(term) >= 2
+            if len(term) >= 3 and term.casefold() not in _GENERIC_ENGLISH_ANCHORS
         }
         if prefix_terms & corpus_terms:
             return True
 
-        normalized_corpus = cls._normalize_copy_text(corpus)
-        generic_terms = {"部分", "说明", "关系", "研究", "内容", "原文", "该部"}
-        for run in re.findall(r"[\u3400-\u9fff]{2,}", prefix):
-            if any(
-                run[index : index + 2] not in generic_terms
-                and run[index : index + 2] in normalized_corpus
-                for index in range(len(run) - 1)
-            ):
-                return True
-        return False
+        abbreviation_pattern = re.compile(
+            r"\b(?:e\.g\.|i\.e\.|et al\.|(?:[A-Za-z]\.){2,})",
+            re.IGNORECASE,
+        )
+        prefix_abbreviations = {
+            match.group(0).casefold() for match in abbreviation_pattern.finditer(prefix)
+        }
+        corpus_abbreviations = {
+            match.group(0).casefold() for match in abbreviation_pattern.finditer(corpus)
+        }
+        if prefix_abbreviations & corpus_abbreviations:
+            return True
+
+        def chinese_ngrams(text: str) -> set[str]:
+            stripped = _GENERIC_CHINESE_ANCHORS.sub(" ", text)
+            return {
+                run[index : index + 4]
+                for run in re.findall(r"[\u3400-\u9fff]{4,}", stripped)
+                for index in range(len(run) - 3)
+            }
+
+        return bool(chinese_ngrams(prefix) & chinese_ngrams(corpus))
 
     @staticmethod
     def _copies_most_child(normalized_child: str, normalized_prefix: str) -> bool:
         if len(normalized_child) < 8:
             return False
-        ngram_size = 4
-        prefix_ngrams = {
-            normalized_prefix[index : index + ngram_size]
-            for index in range(len(normalized_prefix) - ngram_size + 1)
-        }
-        coverage_delta = [0] * (len(normalized_child) + 1)
-        for index in range(len(normalized_child) - ngram_size + 1):
-            if normalized_child[index : index + ngram_size] not in prefix_ngrams:
-                continue
-            coverage_delta[index] += 1
-            coverage_delta[index + ngram_size] -= 1
-        active = 0
-        covered = 0
-        for delta in coverage_delta[:-1]:
-            active += delta
-            covered += active > 0
+        if min(len(normalized_child), len(normalized_prefix)) / len(normalized_child) < 0.75:
+            return False
+
+        previous = [0] * (len(normalized_prefix) + 1)
+        for child_character in normalized_child:
+            current = [0]
+            for index, prefix_character in enumerate(normalized_prefix, start=1):
+                if child_character == prefix_character:
+                    current.append(previous[index - 1] + 1)
+                else:
+                    current.append(max(previous[index], current[-1]))
+            previous = current
+        covered = previous[-1]
         return covered >= 8 and covered / len(normalized_child) >= 0.75
 
     @staticmethod
