@@ -135,6 +135,8 @@ _GENERIC_CHINESE_ANCHORS = frozenset(
         "论文内容",
         "研究内容",
         "研究方法",
+        "设置",
+        "系统",
         "该模块",
         "该部分",
     }
@@ -172,11 +174,15 @@ _NAMED_METRIC_MARKERS = (
     "特异度",
     "困惑度",
 )
+_HIERARCHICAL_NUMBER = r"\d+(?:[.-]\d+)*"
+_PANEL_SEQUENCE = r"[A-Za-z]+(?:\s*(?:,|、|-)\s*[A-Za-z]+)*"
+_STRUCTURED_IDENTIFIER_CORE = (
+    rf"{_HIERARCHICAL_NUMBER}(?:\s*\({_PANEL_SEQUENCE}\)|{_PANEL_SEQUENCE})?"
+)
 _STRUCTURED_IDENTIFIER_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.?|Equation|Eq\.?|表|图|公式)\s*"
-    r"(?:\(\s*\d+(?:[.-]\d+)*(?:[A-Za-z]+)?\s*\)"
-    r"|\d+(?:[.-]\d+)*(?:\s*\([A-Za-z]+\)|[A-Za-z]+)?)"
-    r"(?![A-Za-z0-9.])",
+    rf"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.?|Equation|Eq\.?|表|图|公式)\s*"
+    rf"(?:\(\s*{_STRUCTURED_IDENTIFIER_CORE}\s*\)|{_STRUCTURED_IDENTIFIER_CORE})"
+    rf"(?![A-Za-z0-9.(])",
     re.IGNORECASE,
 )
 _MODEL_VERSION_IDENTIFIER_PATTERN = re.compile(
@@ -623,7 +629,8 @@ class ContextualizationService:
     ) -> None:
         if not prefix:
             raise ValueError(f"empty prefix for {child.local_id}")
-        if len(prefix) > self.max_prefix_chars:
+        lexical_prefix = _lexical_text(prefix)
+        if len(prefix) > self.max_prefix_chars or len(lexical_prefix) > self.max_prefix_chars:
             raise ValueError(
                 f"prefix length for {child.local_id} exceeds {self.max_prefix_chars} characters"
             )
@@ -641,6 +648,15 @@ class ContextualizationService:
                 child.text,
             ]
         )
+        direct_context = "\n".join(
+            [
+                document.title,
+                *document.section_outline,
+                *child.section_path,
+                child.text,
+            ]
+        )
+        parent_context = "\n".join([document.source_abstract or "", parent.text])
         normalized_child = self._normalize_copy_text(child.text)
         normalized_prefix = self._normalize_copy_text(prefix)
         short_proper_name = self._is_short_proper_name(child.text)
@@ -696,7 +712,7 @@ class ContextualizationService:
             )
         if not any(predicate in prefix for predicate in _RELATION_PREDICATES):
             raise ValueError(f"prefix is not a contextual relation for {child.local_id}")
-        if not self._has_context_anchor(prefix, context_corpus):
+        if not self._has_context_anchor(prefix, direct_context, parent_context):
             raise ValueError(f"prefix has no grounded context anchor for {child.local_id}")
 
     def _apply_prefix(self, child: ChunkDraft, prefix: str) -> ContextualizedChunk:
@@ -769,9 +785,16 @@ class ContextualizationService:
         ).casefold()
 
     @classmethod
-    def _has_context_anchor(cls, prefix: str, corpus: str) -> bool:
+    def _has_context_anchor(
+        cls,
+        prefix: str,
+        direct_context: str,
+        parent_context: str,
+    ) -> bool:
         prefix = _lexical_text(prefix)
-        corpus = _lexical_text(corpus)
+        direct_context = _lexical_text(direct_context)
+        parent_context = _lexical_text(parent_context)
+        corpus = f"{direct_context}\n{parent_context}"
         if set(cls._numeric_identifiers(prefix)) & set(cls._numeric_identifiers(corpus)):
             return True
 
@@ -801,10 +824,24 @@ class ContextualizationService:
         if prefix_abbreviations & corpus_abbreviations:
             return True
 
-        return cls._has_specific_chinese_anchor(prefix, corpus)
+        return cls._has_specific_chinese_anchor(
+            prefix,
+            direct_context,
+            min_length=2,
+        ) or cls._has_specific_chinese_anchor(
+            prefix,
+            parent_context,
+            min_length=3,
+        )
 
-    @staticmethod
-    def _has_specific_chinese_anchor(prefix: str, corpus: str) -> bool:
+    @classmethod
+    def _has_specific_chinese_anchor(
+        cls,
+        prefix: str,
+        corpus: str,
+        *,
+        min_length: int,
+    ) -> bool:
         prefix_runs = re.findall(r"[\u3400-\u9fff]+", prefix)
         corpus_runs = re.findall(r"[\u3400-\u9fff]+", corpus)
         for prefix_run in prefix_runs:
@@ -824,10 +861,24 @@ class ContextualizationService:
                             if prefix_run[prefix_index] == corpus_run[corpus_index + 1]:
                                 continue
                         candidate = prefix_run[prefix_index - length : prefix_index]
-                        if len(candidate) >= 2 and candidate not in _GENERIC_CHINESE_ANCHORS:
+                        if len(candidate) >= min_length and not cls._is_generic_chinese_anchor(
+                            candidate
+                        ):
                             return True
                     previous = current
         return False
+
+    @staticmethod
+    def _is_generic_chinese_anchor(candidate: str) -> bool:
+        reachable = [False] * (len(candidate) + 1)
+        reachable[0] = True
+        for index in range(len(candidate)):
+            if not reachable[index]:
+                continue
+            for generic_term in _GENERIC_CHINESE_ANCHORS:
+                if candidate.startswith(generic_term, index):
+                    reachable[index + len(generic_term)] = True
+        return reachable[-1]
 
     @staticmethod
     def _copies_most_child(normalized_child: str, normalized_prefix: str) -> bool:

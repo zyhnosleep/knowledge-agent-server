@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -420,6 +421,67 @@ def test_rejects_empty_overlong_too_many_sentences_or_non_chinese_prefixes(
         )
 
 
+def test_rejects_nfkc_expanded_prefix_before_copy_work(monkeypatch) -> None:
+    parent = _parent()
+    compatibility_ligature = "\ufdfa"
+    prefix = f"该部分说明{compatibility_ligature * 200}与 GraphFormer 的关系。"
+    assert len(prefix) <= 240
+    assert len(unicodedata.normalize("NFKC", prefix)) > 3_000
+
+    def unexpected_copy_check(_child: str, _prefix: str) -> bool:
+        raise AssertionError("copy validation must not run for expanded overlong prefix")
+
+    monkeypatch.setattr(
+        ContextualizationService,
+        "_copies_most_child",
+        staticmethod(unexpected_copy_check),
+    )
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[
+                ContextualPrefixItem(
+                    child_id=payload["children"][0]["child_id"],
+                    prefix=prefix,
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="prefix_length"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=_children(1),
+            parents={parent.local_id: parent},
+        )
+
+
+def test_nfkc_validation_preserves_original_prefix_and_source_text() -> None:
+    parent = _chunk("parent-1", role="parent", text="实验使用 Qwen２ 生成候选结果。")
+    original_text = "Qwen２ 负责生成候选排序结果。"
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text=original_text,
+    )
+    prefix = "该部分说明 Qwen２ 与候选排序流程的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
+    assert result[0].text == original_text
+    assert result[0].embedding_text == f"{prefix}\n\n{original_text}"
+
+
 @pytest.mark.parametrize(
     ("prefix", "message"),
     [
@@ -639,6 +701,43 @@ def test_rejects_mutated_atomic_numeric_identifiers(
 
 
 @pytest.mark.parametrize(
+    ("source_identifier", "prefix_identifier"),
+    [
+        ("Figure 3(a,b)", "Figure 3(a,c)"),
+        ("表２（a、b）", "表２（a、c）"),
+    ],
+)
+def test_rejects_mutated_multi_panel_identifiers_atomically(
+    source_identifier: str,
+    prefix_identifier: str,
+) -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text=f"实验章节使用 {source_identifier} 展示候选生成流程。",
+    )
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="本节分析候选排序结果。",
+    )
+    prefix = f"该部分对应 {prefix_identifier}，并说明候选生成流程与实验章节的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="prefix_numeric_identifier"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
+@pytest.mark.parametrize(
     "identifier",
     [
         "Table 2(a)",
@@ -653,6 +752,38 @@ def test_rejects_mutated_atomic_numeric_identifiers(
     ],
 )
 def test_allows_exactly_grounded_atomic_numeric_identifiers(identifier: str) -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text=f"实验章节使用 {identifier} 展示候选生成流程。",
+    )
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="本节分析候选排序结果。",
+    )
+    prefix = f"该部分对应 {identifier}，并说明候选生成流程与实验章节的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["Figure 3(a,b)", "表２（a、b）", "Figure 3(a-c)", "表2（a-c）"],
+)
+def test_allows_grounded_multi_panel_identifier_lists_and_ranges(identifier: str) -> None:
     parent = _chunk(
         "parent-1",
         role="parent",
@@ -943,23 +1074,24 @@ def test_relation_gate_allows_grounded_pure_chinese_topic_anchor() -> None:
 
 
 @pytest.mark.parametrize(
-    ("term", "parent_text"),
+    ("term", "parent_text", "child_text"),
     [
-        ("蒸馏", "教师网络通过蒸馏压缩参数规模。"),
-        ("注意力", "编码模块使用注意力聚合邻域信息。"),
-        ("模型蒸馏", "教师网络通过模型蒸馏压缩参数规模。"),
+        ("蒸馏", "教师网络压缩参数规模。", "该模块通过蒸馏输出压缩参数。"),
+        ("注意力", "编码模块使用注意力聚合邻域信息。", "该模块输出编码表示。"),
+        ("模型蒸馏", "教师网络通过模型蒸馏压缩参数规模。", "该模块输出压缩参数。"),
     ],
 )
 def test_relation_gate_allows_grounded_short_chinese_terms(
     term: str,
     parent_text: str,
+    child_text: str,
 ) -> None:
     parent = _chunk("parent-1", role="parent", text=parent_text)
     child = _chunk(
         "child-1",
         role="child",
         parent_local_id=parent.local_id,
-        text="该模块输出压缩后的参数。",
+        text=child_text,
     )
     prefix = f"该部分说明{term}与该模块的关系。"
     client = FakeContextualizationClient(
@@ -975,6 +1107,29 @@ def test_relation_gate_allows_grounded_short_chinese_terms(
     )
 
     assert result[0].contextual_prefix == prefix
+
+
+def test_relation_gate_rejects_generic_parent_only_system_setting_anchor() -> None:
+    parent = _chunk("parent-1", role="parent", text="实验章节介绍系统设置。")
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="候选排序模块生成证据排名。",
+    )
+    prefix = "该部分说明今天天气与系统设置的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="prefix_anchor"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
 
 
 @pytest.mark.parametrize(
