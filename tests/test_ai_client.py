@@ -1,5 +1,10 @@
 from app.services import ai
-from app.services.ai import DocumentPagePayload, HeadAnalysisPayload, OllamaClient
+from app.services.ai import (
+    ContextualizationOllamaClient,
+    DocumentPagePayload,
+    HeadAnalysisPayload,
+    OllamaClient,
+)
 
 
 def test_keep_alive_numeric_strings_are_normalized_for_ollama_compatibility(monkeypatch) -> None:
@@ -321,3 +326,100 @@ def test_vision_json_retry_accepts_sections_without_provenance(monkeypatch) -> N
 
     assert parsed.sections == ["Recovered section"]
     assert "analysis_source" not in calls[1]["messages"][1]["content"]
+
+
+def test_contextualization_client_uses_dedicated_transport_and_strict_schema(monkeypatch) -> None:
+    from app.services import ai
+    from app.services.contextualization import ContextualPrefixBatch
+
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "message": {
+                    "content": '{"items":[{"child_id":"c1","prefix":"该部分说明方法关系。"}]}'
+                }
+            }
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs) -> None:
+            captured["timeout"] = kwargs["timeout"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def post(self, url: str, json: dict) -> FakeResponse:
+            captured.update({"url": url, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    client = ContextualizationOllamaClient(
+        base_url="http://context-only:11500/",
+        model="context-model",
+        timeout=37,
+        prompt_version="context-v9",
+        keep_alive="0",
+    )
+
+    result = client.generate_contextualization(
+        ContextualPrefixBatch,
+        system_prompt="contextualize",
+        user_prompt="batch",
+    )
+
+    assert result.items[0].child_id == "c1"
+    assert client.prompt_version == "context-v9"
+    assert captured["timeout"] == 37
+    assert captured["url"] == "http://context-only:11500/api/chat"
+    assert captured["json"]["model"] == "context-model"
+    assert captured["json"]["stream"] is False
+    assert captured["json"]["think"] is False
+    assert captured["json"]["keep_alive"] == 0
+    assert captured["json"]["format"] == ContextualPrefixBatch.model_json_schema()
+
+
+def test_contextualization_client_can_explicitly_disable_global_keep_alive(monkeypatch) -> None:
+    from app.services import ai
+
+    monkeypatch.setattr(ai.settings, "ollama_keep_alive", "5m", raising=False)
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"message": {"content": '{"items":[]}'}}
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def post(self, url: str, json: dict) -> FakeResponse:
+            captured.update(json)
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    client = ContextualizationOllamaClient(keep_alive=None)
+    from app.services.contextualization import ContextualPrefixBatch
+
+    client.generate_contextualization(
+        ContextualPrefixBatch,
+        system_prompt="contextualize",
+        user_prompt="batch",
+    )
+
+    assert "keep_alive" not in captured

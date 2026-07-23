@@ -17,6 +17,7 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+_DEFAULT_KEEP_ALIVE = object()
 
 
 class ExtractedEntity(BaseModel):#提取概念
@@ -457,6 +458,68 @@ class OllamaClient:
             except json.JSONDecodeError:
                 continue
         raise ValueError("No valid JSON object found in Ollama response.")
+
+
+class ContextualizationOllamaClient(OllamaClient):
+    """Ollama transport frozen to the contextualization model configuration."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        prompt_version: str | None = None,
+        keep_alive: str | int | None | object = _DEFAULT_KEEP_ALIVE,
+    ) -> None:
+        super().__init__(base_url=base_url or settings.contextualization_base_url)
+        self.model = model or settings.contextualization_model
+        self.timeout = timeout if timeout is not None else settings.contextualization_timeout
+        self.prompt_version = prompt_version or settings.contextualization_prompt_version
+        self.keep_alive = (
+            settings.ollama_keep_alive
+            if keep_alive is _DEFAULT_KEEP_ALIVE
+            else keep_alive
+        )
+
+    def generate_contextualization(
+        self,
+        schema: type[SchemaT],
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> SchemaT:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "think": False,
+            "format": schema.model_json_schema(),
+        }
+        data = self._post_contextualization(payload)
+        return self._parse_structured_content(schema, self._message_content(data))
+
+    def _post_contextualization(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.post(
+                f"{self.base_url}/api/chat",
+                json=self._with_configured_keep_alive(payload),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def _with_configured_keep_alive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.keep_alive is None:
+            return payload
+        keep_alive = self.keep_alive
+        if isinstance(keep_alive, str):
+            normalized = keep_alive.strip()
+            if normalized.lstrip("+-").isdigit():
+                keep_alive = int(normalized)
+        return {**payload, "keep_alive": keep_alive}
 
 
 class ExternalVerifier:
