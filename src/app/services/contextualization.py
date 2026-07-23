@@ -5,6 +5,8 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,7 +20,22 @@ RETRIEVABLE_BLOCK_TYPES = frozenset(
     {"narrative", "table", "figure", "formula", "caption", "appendix"}
 )
 _COMMON_ENGLISH_TERMS = frozenset(
-    {"AI", "API", "CPU", "GPU", "JSON", "LLM", "ML", "NLP", "OCR", "PDF", "RAG", "SOTA"}
+    {
+        "AI",
+        "API",
+        "CPU",
+        "GPU",
+        "JSON",
+        "LLM",
+        "ML",
+        "NLP",
+        "OCR",
+        "PDF",
+        "RAG",
+        "SOTA",
+        "e.g.",
+        "i.e.",
+    }
 )
 _RELATION_MARKERS = (
     "关系",
@@ -40,22 +57,23 @@ _RELATION_MARKERS = (
     "公式",
     "附录",
 )
-_METRIC_MARKERS = (
+_NAMED_METRIC_MARKERS = (
     "accuracy",
     "precision",
     "recall",
+    "specificity",
     "f1",
     "bleu",
     "rouge",
+    "auc",
+    "map",
+    "ndcg",
+    "perplexity",
     "准确率",
     "精确率",
     "召回率",
-    "指标",
-    "得分",
-    "性能",
-    "误差",
-    "损失",
-    "百分比",
+    "特异度",
+    "困惑度",
 )
 
 
@@ -82,6 +100,16 @@ class ContextualPrefixBatch(BaseModel):
     items: list[ContextualPrefixItem]
 
 
+class ContextualizedChunk(ChunkDraft):
+    """Contextualized child fields map directly to DocumentChunk columns."""
+
+    contextual_prefix: str
+    contextualization_model: str
+    contextualization_version: str
+    contextualization_prompt_version: str
+    contextualized_at: datetime
+
+
 class ContextualizationFailed(RuntimeError):
     def __init__(self, errors: Mapping[str, str]) -> None:
         self.errors = dict(errors)
@@ -90,7 +118,11 @@ class ContextualizationFailed(RuntimeError):
         super().__init__(f"contextualization failed for {sorted(self.failed_child_ids)}: {details}")
 
 
-Checkpoint = Callable[[list[ChunkDraft]], None]
+Checkpoint = Callable[[list[ContextualizedChunk]], None]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ContextualizationService:
@@ -103,7 +135,9 @@ class ContextualizationService:
         batch_size: int | None = None,
         max_retries: int | None = None,
         max_prefix_chars: int = 240,
+        contextualization_version: str = "contextualization-v1",
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         settings = get_settings()
         self.client = client or ContextualizationOllamaClient()
@@ -112,7 +146,10 @@ class ContextualizationService:
             settings.contextualization_max_retries if max_retries is None else max_retries
         )
         self.max_prefix_chars = max_prefix_chars
+        self.contextualization_model = str(getattr(self.client, "model", "")).strip()
+        self.contextualization_version = contextualization_version.strip()
         self.sleep = sleep
+        self.clock = clock
         self.prompt_version = self.client.prompt_version
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -120,6 +157,12 @@ class ContextualizationService:
             raise ValueError("max_retries must be non-negative")
         if self.max_prefix_chars <= 0:
             raise ValueError("max_prefix_chars must be positive")
+        if not self.contextualization_model:
+            raise ValueError("contextualization client must declare a non-empty model")
+        if not self.contextualization_version:
+            raise ValueError("contextualization_version must be non-empty")
+        if not str(self.prompt_version).strip():
+            raise ValueError("contextualization client must declare a non-empty prompt_version")
 
     def contextualize(
         self,
@@ -128,13 +171,13 @@ class ContextualizationService:
         children: Sequence[ChunkDraft],
         parents: Mapping[str, ChunkDraft],
         checkpoint: Checkpoint | None = None,
-    ) -> list[ChunkDraft]:
+    ) -> list[ContextualizedChunk]:
         ordered_children = list(children)
         resolved_parents = self._validate_inputs(ordered_children, parents)
         if not ordered_children:
             return []
 
-        successes: dict[str, ChunkDraft] = {}
+        successes: dict[str, ContextualizedChunk] = {}
         errors: dict[str, str] = {}
         for offset in range(0, len(ordered_children), self.batch_size):
             batch = ordered_children[offset : offset + self.batch_size]
@@ -158,63 +201,79 @@ class ContextualizationService:
         children: list[ChunkDraft],
         resolved_parents: Mapping[str, ChunkDraft],
         checkpoint: Checkpoint | None,
-    ) -> tuple[dict[str, ChunkDraft], dict[str, str]]:
+    ) -> tuple[dict[str, ContextualizedChunk], dict[str, str]]:
+        successes: dict[str, ContextualizedChunk] = {}
+        pending = list(children)
         try:
-            result = self._attempt(
+            result, errors = self._attempt(
                 document=document,
-                children=children,
+                children=pending,
                 resolved_parents=resolved_parents,
                 checkpoint=checkpoint,
             )
-            return result, {}
+            successes.update(result)
+            if not errors:
+                return successes, {}
+            pending = [child for child in pending if child.local_id in errors]
+            last_errors = errors
         except Exception as exc:  # noqa: BLE001
             if self._is_capacity_error(exc):
                 return self._shrink_for_capacity(
                     document=document,
-                    children=children,
+                    children=pending,
                     resolved_parents=resolved_parents,
                     checkpoint=checkpoint,
                     error=exc,
                 )
-            last_error = exc
+            last_errors = {
+                child.local_id: self._error_detail(exc) for child in pending
+            }
 
-        if self.max_retries >= 1:
+        if self.max_retries >= 1 and pending:
             self.sleep(2.0)
             try:
-                result = self._attempt(
+                result, errors = self._attempt(
                     document=document,
-                    children=children,
+                    children=pending,
                     resolved_parents=resolved_parents,
                     checkpoint=checkpoint,
-                    correction=self._error_detail(last_error),
+                    correction=self._errors_detail(last_errors),
                 )
-                return result, {}
+                successes.update(result)
+                if not errors:
+                    return successes, {}
+                pending = [child for child in pending if child.local_id in errors]
+                last_errors = errors
             except Exception as exc:  # noqa: BLE001
                 if self._is_capacity_error(exc):
-                    return self._shrink_for_capacity(
+                    shrunk_successes, shrunk_errors = self._shrink_for_capacity(
                         document=document,
-                        children=children,
+                        children=pending,
                         resolved_parents=resolved_parents,
                         checkpoint=checkpoint,
                         error=exc,
                     )
-                last_error = exc
+                    successes.update(shrunk_successes)
+                    return successes, shrunk_errors
+                last_errors = {
+                    child.local_id: self._error_detail(exc) for child in pending
+                }
 
-        if self.max_retries >= 2 and len(children) > 1:
+        if self.max_retries >= 2 and len(pending) > 1:
             self.sleep(8.0)
-            midpoint = len(children) // 2
-            successes: dict[str, ChunkDraft] = {}
+            midpoint = len(pending) // 2
             errors: dict[str, str] = {}
-            for half in (children[:midpoint], children[midpoint:]):
+            for half in (pending[:midpoint], pending[midpoint:]):
                 try:
-                    result = self._attempt(
+                    result, half_errors = self._attempt(
                         document=document,
                         children=half,
                         resolved_parents=resolved_parents,
                         checkpoint=checkpoint,
-                        correction=self._error_detail(last_error),
+                        correction=self._errors_detail(last_errors),
                     )
                     successes.update(result)
+                    errors.update(half_errors)
                 except Exception as exc:  # noqa: BLE001
                     if self._is_capacity_error(exc):
                         shrunk_successes, shrunk_errors = self._shrink_for_capacity(
@@ -231,8 +290,7 @@ class ContextualizationService:
                         errors.update({child.local_id: detail for child in half})
             return successes, errors
 
-        detail = self._error_detail(last_error)
-        return {}, {child.local_id: detail for child in children}
+        return successes, last_errors
 
     def _shrink_for_capacity(
         self,
@@ -242,15 +300,15 @@ class ContextualizationService:
         resolved_parents: Mapping[str, ChunkDraft],
         checkpoint: Checkpoint | None,
         error: Exception,
-    ) -> tuple[dict[str, ChunkDraft], dict[str, str]]:
+    ) -> tuple[dict[str, ContextualizedChunk], dict[str, str]]:
         if len(children) == 1:
             return {}, {children[0].local_id: self._error_detail(error)}
         midpoint = len(children) // 2
-        successes: dict[str, ChunkDraft] = {}
+        successes: dict[str, ContextualizedChunk] = {}
         errors: dict[str, str] = {}
         for half in (children[:midpoint], children[midpoint:]):
             try:
-                result = self._attempt(
+                result, half_errors = self._attempt(
                     document=document,
                     children=half,
                     resolved_parents=resolved_parents,
@@ -258,6 +316,7 @@ class ContextualizationService:
                     correction=self._error_detail(error),
                 )
                 successes.update(result)
+                errors.update(half_errors)
             except Exception as exc:  # noqa: BLE001
                 if self._is_capacity_error(exc):
                     half_successes, half_errors = self._shrink_for_capacity(
@@ -282,7 +341,7 @@ class ContextualizationService:
         resolved_parents: Mapping[str, ChunkDraft],
         checkpoint: Checkpoint | None,
         correction: str | None = None,
-    ) -> dict[str, ChunkDraft]:
+    ) -> tuple[dict[str, ContextualizedChunk], dict[str, str]]:
         system_prompt, user_prompt = self._prompts(
             document=document,
             children=children,
@@ -294,11 +353,18 @@ class ContextualizationService:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
-        by_id = self._validate_response(response, document, children, resolved_parents)
-        contextualized = [self._apply_prefix(child, by_id[child.local_id]) for child in children]
+        by_id, errors = self._validate_response(
+            response, document, children, resolved_parents
+        )
+        contextualized = [
+            self._apply_prefix(child, by_id[child.local_id])
+            for child in children
+            if child.local_id in by_id
+        ]
         if checkpoint is not None:
-            checkpoint(contextualized)
-        return {item.local_id: item for item in contextualized}
+            if contextualized:
+                checkpoint(contextualized)
+        return {item.local_id: item for item in contextualized}, errors
 
     def _prompts(
         self,
@@ -351,36 +417,42 @@ class ContextualizationService:
         document: DocumentContext,
         children: list[ChunkDraft],
         resolved_parents: Mapping[str, ChunkDraft],
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, str]]:
         expected_ids = [child.local_id for child in children]
         actual_ids = [item.child_id for item in response.items]
-        duplicate_ids = sorted(
+        duplicate_ids = {
             child_id for child_id, count in Counter(actual_ids).items() if count > 1
-        )
-        missing_ids = sorted(set(expected_ids) - set(actual_ids))
-        extra_ids = sorted(set(actual_ids) - set(expected_ids))
-        problems: list[str] = []
-        if duplicate_ids:
-            problems.append(f"duplicate child IDs: {duplicate_ids}")
-        if missing_ids:
-            problems.append(f"missing child IDs: {missing_ids}")
+        }
+        missing_ids = set(expected_ids) - set(actual_ids)
+        extra_ids = set(actual_ids) - set(expected_ids)
+        errors: dict[str, str] = {}
         if extra_ids:
-            problems.append(f"extra child IDs: {extra_ids}")
-        if problems:
-            raise ValueError("; ".join(problems))
+            detail = f"extra child IDs: {sorted(extra_ids)}"
+            return {}, {child_id: detail for child_id in expected_ids}
+        for child_id in missing_ids:
+            errors[child_id] = f"missing child ID: {child_id}"
+        for child_id in duplicate_ids:
+            if child_id in set(expected_ids):
+                errors[child_id] = f"duplicate child ID: {child_id}"
 
         by_child = {child.local_id: child for child in children}
         prefixes: dict[str, str] = {}
         for item in response.items:
+            if item.child_id not in by_child or item.child_id in duplicate_ids:
+                continue
             prefix = item.prefix.strip()
-            self._validate_prefix(
-                prefix=prefix,
-                child=by_child[item.child_id],
-                parent=resolved_parents[item.child_id],
-                document=document,
-            )
-            prefixes[item.child_id] = prefix
-        return prefixes
+            try:
+                self._validate_prefix(
+                    prefix=prefix,
+                    child=by_child[item.child_id],
+                    parent=resolved_parents[item.child_id],
+                    document=document,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors[item.child_id] = self._error_detail(exc)
+            else:
+                prefixes[item.child_id] = prefix
+        return prefixes, errors
 
     def _validate_prefix(
         self,
@@ -403,8 +475,11 @@ class ContextualizationService:
         if not any(marker in prefix for marker in _RELATION_MARKERS):
             raise ValueError(f"prefix is not a contextual relation for {child.local_id}")
         normalized_child = self._normalize_copy_text(child.text)
-        if normalized_child and normalized_child in self._normalize_copy_text(prefix):
+        normalized_prefix = self._normalize_copy_text(prefix)
+        if normalized_child and normalized_child in normalized_prefix:
             raise ValueError(f"prefix copies complete child text for {child.local_id}")
+        if self._copies_most_child(normalized_child, normalized_prefix):
+            raise ValueError(f"prefix copies most of child text for {child.local_id}")
 
         corpus = "\n".join(
             [
@@ -427,26 +502,44 @@ class ContextualizationService:
                 f"prefix adds inconsistent English entity for {child.local_id}: {added_entities}"
             )
 
-        corpus_numbers = set(self._numbers(corpus))
+        evidence_source = f"{parent.text}\n{child.text}"
+        corpus_numbers = set(self._numbers(evidence_source))
         prefix_numbers = set(self._numbers(prefix))
         added_numbers = sorted(prefix_numbers - corpus_numbers)
         if added_numbers:
             raise ValueError(
                 f"prefix adds unsupported numeric value for {child.local_id}: {added_numbers}"
             )
-        metric_context = f"{parent.text}\n{child.text}".casefold()
-        numbers_are_necessary = child.block_type in {"table", "figure", "formula"} or any(
-            marker in metric_context for marker in _METRIC_MARKERS
+        unnecessary_numbers = sorted(
+            number
+            for number in prefix_numbers
+            if not self._numeric_reference_is_necessary(
+                number=number,
+                prefix=prefix,
+                evidence_source=evidence_source,
+            )
         )
-        if prefix_numbers and not numbers_are_necessary:
+        if unnecessary_numbers:
             raise ValueError(
                 f"prefix includes unnecessary numeric value for {child.local_id}: "
-                f"{sorted(prefix_numbers)}"
+                f"{unnecessary_numbers}"
             )
 
-    def _apply_prefix(self, child: ChunkDraft, prefix: str) -> ChunkDraft:
-        contextualized = child.model_copy(deep=True)
-        contextualized.embedding_text = f"{prefix}\n\n{child.text}"
+    def _apply_prefix(self, child: ChunkDraft, prefix: str) -> ContextualizedChunk:
+        contextualized_at = self.clock()
+        if contextualized_at.tzinfo is None or contextualized_at.utcoffset() is None:
+            raise ValueError("contextualized_at must be timezone-aware")
+        contextualized = ContextualizedChunk.model_validate(
+            {
+                **child.model_dump(mode="python"),
+                "contextual_prefix": prefix,
+                "embedding_text": f"{prefix}\n\n{child.text}",
+                "contextualization_model": self.contextualization_model,
+                "contextualization_version": self.contextualization_version,
+                "contextualization_prompt_version": self.prompt_version,
+                "contextualized_at": contextualized_at,
+            }
+        )
         contextualized.metadata["contextual_prefix"] = {
             "text": prefix,
             "generated": True,
@@ -489,7 +582,13 @@ class ContextualizationService:
 
     @staticmethod
     def _sentence_count(text: str) -> int:
-        normalized = re.sub(r"(?<!\d)\.(?!\d)", "。", text)
+        protected = re.sub(
+            r"\b(?:e\.g\.|i\.e\.|et al\.|(?:[A-Za-z]\.){2,})",
+            lambda match: match.group(0).replace(".", "<DOT>"),
+            text,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(r"(?<!\d)\.(?!\d)", "。", protected)
         pieces = [piece.strip() for piece in re.split(r"[。！？!?]+", normalized) if piece.strip()]
         return max(1, len(pieces))
 
@@ -498,12 +597,73 @@ class ContextualizationService:
         return re.sub(r"[^\w\u3400-\u9fff]+", "", text, flags=re.UNICODE).casefold()
 
     @staticmethod
+    def _copies_most_child(normalized_child: str, normalized_prefix: str) -> bool:
+        if len(normalized_child) < 20:
+            return False
+        longest = SequenceMatcher(
+            None,
+            normalized_child,
+            normalized_prefix,
+            autojunk=False,
+        ).find_longest_match().size
+        return longest >= 20 and longest / len(normalized_child) >= 0.60
+
+    @staticmethod
     def _english_entities(text: str) -> list[str]:
-        return re.findall(r"\b[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*\b", text)
+        entities = re.findall(r"\b(?:[A-Za-z]\.){2,}", text)
+        words = re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)*\b", text)
+        entities.extend(
+            word
+            for word in words
+            if word[0].isupper()
+            or any(character.isupper() for character in word[1:])
+            or any(character.isdigit() for character in word)
+            or "-" in word
+            or "_" in word
+        )
+        return entities
 
     @staticmethod
     def _numbers(text: str) -> list[str]:
         return re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?(?![A-Za-z])", text)
+
+    @classmethod
+    def _numeric_reference_is_necessary(
+        cls,
+        *,
+        number: str,
+        prefix: str,
+        evidence_source: str,
+    ) -> bool:
+        table_label = re.compile(rf"表\s*{re.escape(number)}", re.IGNORECASE)
+        if table_label.search(prefix) and table_label.search(evidence_source):
+            return True
+        return any(
+            cls._terms_are_near(prefix, marker, number)
+            and cls._terms_are_near(evidence_source, marker, number)
+            for marker in _NAMED_METRIC_MARKERS
+        )
+
+    @staticmethod
+    def _terms_are_near(text: str, marker: str, number: str, max_distance: int = 24) -> bool:
+        normalized = text.casefold()
+        escaped_marker = re.escape(marker.casefold())
+        marker_pattern = (
+            rf"(?<![a-z0-9]){escaped_marker}(?![a-z0-9])"
+            if marker.isascii()
+            else escaped_marker
+        )
+        marker_positions = [
+            match.start() for match in re.finditer(marker_pattern, normalized)
+        ]
+        number_positions = [
+            match.start() for match in re.finditer(re.escape(number.casefold()), normalized)
+        ]
+        return any(
+            abs(marker_position - number_position) <= max_distance
+            for marker_position in marker_positions
+            for number_position in number_positions
+        )
 
     @staticmethod
     def _is_capacity_error(exc: Exception) -> bool:
@@ -525,3 +685,7 @@ class ContextualizationService:
     def _error_detail(exc: Exception) -> str:
         detail = str(exc).strip()
         return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+    @staticmethod
+    def _errors_detail(errors: Mapping[str, str]) -> str:
+        return "; ".join(f"{child_id}: {detail}" for child_id, detail in errors.items())

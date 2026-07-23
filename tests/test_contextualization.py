@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import pytest
 
@@ -22,9 +23,11 @@ class FakeContextualizationClient:
         responder: Callable[[dict, str], ContextualPrefixBatch],
         *,
         prompt_version: str = "context-test-v1",
+        model: str = "context-test-model",
     ) -> None:
         self.responder = responder
         self.prompt_version = prompt_version
+        self.model = model
         self.calls: list[dict] = []
 
     def generate_contextualization(
@@ -173,6 +176,39 @@ def test_prompt_contains_complete_source_context_and_contextualizes_every_struct
         assert prefix["source_block_ids"] == []
 
 
+def test_returns_first_class_contextualized_chunks_for_direct_persistence() -> None:
+    parent = _parent()
+    child = _children(1)[0]
+    checkpointed = []
+    fixed_time = datetime(2026, 7, 23, 8, 30, tzinfo=timezone.utc)
+    client = FakeContextualizationClient(
+        _valid_response,
+        model="context-model-v2",
+        prompt_version="context-prompt-v3",
+    )
+
+    result = ContextualizationService(
+        client=client,
+        contextualization_version="contextualizer-v4",
+        clock=lambda: fixed_time,
+    ).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+        checkpoint=lambda batch: checkpointed.extend(batch),
+    )
+
+    contextualized = result[0]
+    assert contextualized.contextual_prefix.startswith("该部分说明 GraphFormer")
+    assert contextualized.contextualization_model == "context-model-v2"
+    assert contextualized.contextualization_version == "contextualizer-v4"
+    assert contextualized.contextualization_prompt_version == "context-prompt-v3"
+    assert contextualized.contextualized_at == fixed_time
+    assert contextualized.contextualized_at.tzinfo is timezone.utc
+    assert checkpointed == [contextualized]
+    assert checkpointed[0] is contextualized
+
+
 def test_batches_at_twelve_without_reprocessing_successful_children() -> None:
     parent = _parent()
     client = FakeContextualizationClient(_valid_response)
@@ -187,8 +223,19 @@ def test_batches_at_twelve_without_reprocessing_successful_children() -> None:
     assert len(result) == 25
 
 
-@pytest.mark.parametrize("invalid_kind", ["missing", "duplicate", "extra"])
-def test_rejects_non_exact_response_child_id_sets(invalid_kind: str) -> None:
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_failed", "expected_checkpoint"),
+    [
+        ("missing", {"child-1"}, [["child-0"]]),
+        ("duplicate", {"child-0", "child-1"}, []),
+        ("extra", {"child-0", "child-1"}, []),
+    ],
+)
+def test_rejects_non_exact_response_child_id_sets(
+    invalid_kind: str,
+    expected_failed: set[str],
+    expected_checkpoint: list[list[str]],
+) -> None:
     parent = _parent()
     children = _children(2)
 
@@ -204,6 +251,7 @@ def test_rejects_non_exact_response_child_id_sets(invalid_kind: str) -> None:
             items=[ContextualPrefixItem(child_id=item, prefix="该部分说明研究方法的关系。") for item in ids]
         )
 
+    checkpoints: list[list[str]] = []
     with pytest.raises(ContextualizationFailed) as exc_info:
         ContextualizationService(
             client=FakeContextualizationClient(invalid_response),
@@ -212,9 +260,11 @@ def test_rejects_non_exact_response_child_id_sets(invalid_kind: str) -> None:
             document=_document(),
             children=children,
             parents={parent.local_id: parent},
+            checkpoint=lambda batch: checkpoints.append([item.local_id for item in batch]),
         )
 
-    assert exc_info.value.failed_child_ids == {item.local_id for item in children}
+    assert exc_info.value.failed_child_ids == expected_failed
+    assert checkpoints == expected_checkpoint
     assert invalid_kind in str(exc_info.value).lower()
 
 
@@ -336,6 +386,92 @@ def test_allows_grounded_metric_numbers_and_common_english_terms() -> None:
     assert result[0].embedding_text.startswith("该表说明 AI 方法")
 
 
+@pytest.mark.parametrize(
+    ("block_type", "parent_text", "child_text", "prefix"),
+    [
+        (
+            "figure",
+            "该 Parent 原文介绍研究时间线。",
+            "研究工作在 2024 年进入验证阶段。",
+            "该图说明 2024 年与研究时间线的关系。",
+        ),
+        (
+            "formula",
+            "该 Parent 原文介绍目标函数。",
+            "常量 3 用作偏移项。",
+            "该公式说明常量 3 与目标函数的关系。",
+        ),
+        (
+            "narrative",
+            "该 Parent 原文仅泛称模型性能表现。",
+            "训练过程执行 10 个步骤。",
+            "该部分说明 10 个步骤与实验流程的关系。",
+        ),
+        (
+            "narrative",
+            "该 Parent 原文讨论 mapping 操作。",
+            "mapping 操作包含 10 个阶段。",
+            "该部分说明 mapping 10 与研究流程的关系。",
+        ),
+    ],
+)
+def test_rejects_grounded_numbers_without_explicit_table_or_named_metric_necessity(
+    block_type: str,
+    parent_text: str,
+    child_text: str,
+    prefix: str,
+) -> None:
+    parent = _chunk("parent-1", role="parent", text=parent_text)
+    child = _chunk(
+        "child-1",
+        role="child",
+        block_type=block_type,
+        parent_local_id=parent.local_id,
+        text=child_text,
+    )
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="numeric"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
+def test_allows_grounded_table_identifier_when_both_source_and_prefix_identify_it() -> None:
+    parent = _parent()
+    child = _chunk(
+        "child-table",
+        role="child",
+        block_type="table",
+        parent_local_id=parent.local_id,
+        text="表2汇总不同方法的实验结果。",
+    )
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[
+                ContextualPrefixItem(
+                    child_id=payload["children"][0]["child_id"],
+                    prefix="该部分对应表2，并说明其与实验章节的关系。",
+                )
+            ]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix.startswith("该部分对应表2")
+
+
 def test_rejects_chinese_text_that_is_not_a_contextual_relationship() -> None:
     parent = _parent()
     child = _children(1)
@@ -356,6 +492,102 @@ def test_rejects_chinese_text_that_is_not_a_contextual_relationship() -> None:
             children=child,
             parents={parent.local_id: parent},
         )
+
+
+def test_rejects_new_lower_leading_internal_capital_entity() -> None:
+    parent = _parent()
+    child = _children(1)
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[
+                ContextualPrefixItem(
+                    child_id=payload["children"][0]["child_id"],
+                    prefix="该部分说明 eBPF 与研究方法的关系。",
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="entity"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=child,
+            parents={parent.local_id: parent},
+        )
+
+
+@pytest.mark.parametrize("abbreviation", ["U.S. Patent", "e.g.", "i.e.", "et al."])
+def test_english_abbreviations_do_not_create_false_sentence_boundaries(
+    abbreviation: str,
+) -> None:
+    parent = _parent()
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text=f"来源使用 {abbreviation} 作为已有英文表达，并继续描述上下文。",
+    )
+    prefix = f"该部分说明 {abbreviation} 与研究方法的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
+
+
+def test_rejects_prefix_that_copies_most_of_child_and_only_rewrites_the_tail() -> None:
+    parent = _parent()
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="GraphFormer通过分层注意力机制聚合局部邻居并生成稳定的图节点表示。",
+    )
+    prefix = "该部分说明GraphFormer通过分层注意力机制聚合局部邻居并生成可靠表示与研究方法的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="copies most"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
+def test_allows_repeating_short_grounded_names_without_copying_child_prose() -> None:
+    parent = _parent()
+    child = _chunk(
+        "child-1",
+        role="child",
+        parent_local_id=parent.local_id,
+        text="GraphFormer 使用 Cora 数据集评估节点分类，并分析不同设置。",
+    )
+    prefix = "该部分说明 GraphFormer 与 Cora 数据集在研究实验中的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[ContextualPrefixItem(child_id=payload["children"][0]["child_id"], prefix=prefix)]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
 
 
 def test_retries_with_two_second_correction_then_eight_second_split() -> None:
@@ -440,6 +672,51 @@ def test_partial_split_success_is_checkpointed_but_never_returned_as_complete() 
     assert "permanent contextualization failure" in exc_info.value.errors["child-2"]
     assert checkpoints == [["child-0", "child-1"]]
     assert [len(call["payload"]["children"]) for call in client.calls] == [4, 4, 2, 2]
+
+
+def test_partial_prefix_validation_checkpoints_only_valid_children_with_precise_failure() -> None:
+    parent = _parent()
+    call_ids: list[list[str]] = []
+
+    def responder(payload: dict, prompt: str) -> ContextualPrefixBatch:
+        ids = [item["child_id"] for item in payload["children"]]
+        call_ids.append(ids)
+        if len(call_ids) <= 2:
+            raise ValueError(f"whole batch failure {len(call_ids)}")
+        if ids == ["child-0", "child-1"]:
+            return ContextualPrefixBatch(
+                items=[
+                    ContextualPrefixItem(child_id="child-0", prefix=""),
+                    ContextualPrefixItem(
+                        child_id="child-1",
+                        prefix="该部分说明 GraphFormer 方法与研究章节的关系。",
+                    ),
+                ]
+            )
+        return _valid_response(payload, prompt)
+
+    checkpoints: list[list[str]] = []
+
+    with pytest.raises(ContextualizationFailed) as exc_info:
+        ContextualizationService(
+            client=FakeContextualizationClient(responder),
+            sleep=lambda _seconds: None,
+        ).contextualize(
+            document=_document(),
+            children=_children(4),
+            parents={parent.local_id: parent},
+            checkpoint=lambda batch: checkpoints.append([item.local_id for item in batch]),
+        )
+
+    assert exc_info.value.failed_child_ids == {"child-0"}
+    assert checkpoints == [["child-1"], ["child-2", "child-3"]]
+    assert sum("child-1" in ids for ids in call_ids) == 3
+    assert call_ids == [
+        ["child-0", "child-1", "child-2", "child-3"],
+        ["child-0", "child-1", "child-2", "child-3"],
+        ["child-0", "child-1"],
+        ["child-2", "child-3"],
+    ]
 
 
 @pytest.mark.parametrize("failure", ["parent-role", "missing-parent", "unsupported-type"])
