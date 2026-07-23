@@ -316,9 +316,15 @@ def test_sentence_units_preserve_exact_source_and_do_not_split_abbreviations_dec
     ]
 
 
-def test_narrative_merge_does_not_invent_separator_between_source_blocks() -> None:
-    first = block("first-source", "Alpha source.  \n", 0)
-    second = block("second-source", "\nBeta source.", 1)
+def test_narrative_merge_inserts_audited_separator_between_source_blocks() -> None:
+    first = block("first-source", "First paragraph.", 0)
+    second = block("second-source", "Second paragraph.", 1)
+    first.source_spans = [
+        SourceSpan(source_block_id="first-source", char_start=0, char_end=len(first.text))
+    ]
+    second.source_spans = [
+        SourceSpan(source_block_id="second-source", char_start=20, char_end=20 + len(second.text))
+    ]
     chunks = make_chunker(
         parent_min_tokens=1,
         parent_target_tokens=100,
@@ -329,8 +335,24 @@ def test_narrative_merge_does_not_invent_separator_between_source_blocks() -> No
         overlap_tokens=0,
     ).build(document(first, second))
     parent = next(item for item in chunks if item.chunk_role == "parent")
+    child = next(item for item in chunks if item.chunk_role == "child")
 
-    assert parent.text == first.text + second.text
+    expected = first.text + "\n\n" + second.text
+    assert parent.text == expected
+    assert parent.embedding_text == expected
+    assert parent.token_count == 4
+    assert child.text == expected
+    assert {span.source_block_id for span in parent.source_spans} == {
+        "first-source",
+        "second-source",
+    }
+    assert parent.metadata["structural_separators"] == [
+        {
+            "text": "\n\n",
+            "source_backed": False,
+            "between_block_ids": ["first-source", "second-source"],
+        }
+    ]
 
 
 def test_quoted_question_and_exclamation_marks_are_sentence_boundaries() -> None:
@@ -379,6 +401,59 @@ def test_academic_abbreviations_and_initialisms_do_not_create_false_boundaries()
         ]
     ]
     assert next(item for item in chunks if item.chunk_role == "parent").text == source
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "Prior work by Smith et al. This extends it.",
+            ["Prior work by Smith et al. ", "This extends it."],
+        ),
+        (
+            "The method is used in the U.S. Results improve.",
+            ["The method is used in the U.S. ", "Results improve."],
+        ),
+        (
+            "Several variants exist, etc. 下一句。",
+            ["Several variants exist, etc. ", "下一句。"],
+        ),
+    ],
+)
+def test_terminal_capable_abbreviation_splits_before_clear_new_sentence(
+    source: str,
+    expected: list[str],
+) -> None:
+    embedder = RecordingEmbedder()
+    make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(block("terminal-abbrev", source, 0)))
+
+    assert embedder.calls == [expected]
+
+
+def test_nonterminal_abbreviations_stay_attached_to_their_continuation() -> None:
+    source = "Dr. Smith used Fig. 2 and Eq. (3) with a U.S. model."
+    embedder = RecordingEmbedder()
+    make_chunker(
+        embedder,
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=100,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(document(block("nonterminal-abbrev", source, 0)))
+
+    assert embedder.calls == [[source]]
 
 
 def test_parent_max_is_hard_and_overlong_sentence_uses_lossless_token_windows() -> None:

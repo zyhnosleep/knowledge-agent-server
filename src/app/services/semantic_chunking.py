@@ -280,7 +280,7 @@ class SemanticChunker:
     def _sentence_ranges(text: str) -> list[tuple[int, int, str]]:
         if not text:
             return []
-        abbreviations = {
+        nonterminal_abbreviations = {
             "dr",
             "mr",
             "mrs",
@@ -290,15 +290,12 @@ class SemanticChunker:
             "jr",
             "st",
             "vs",
-            "etc",
-            "e.g",
-            "i.e",
             "fig",
             "eq",
             "sec",
             "ref",
-            "al",
         }
+        terminal_capable_abbreviations = {"al", "etc", "e.g", "i.e"}
         closers = {'"', "'", "”", "’", "）", ")", "]"}
         ranges: list[tuple[int, int, str]] = []
         start = 0
@@ -320,12 +317,30 @@ class SemanticChunker:
                 initialism = "." in token and all(
                     1 <= len(part) <= 2 for part in token.split(".")
                 )
-                abbreviation = token in abbreviations or initialism
-                boundary = (
-                    not decimal
-                    and not abbreviation
-                    and (not next_character or next_character.isspace() or next_character in closers)
+                punctuation_context = (
+                    not next_character
+                    or next_character.isspace()
+                    or next_character in closers
                 )
+                if token in nonterminal_abbreviations:
+                    boundary = False
+                elif token in terminal_capable_abbreviations or initialism:
+                    probe = index + 1
+                    while probe < len(text) and text[probe] in closers:
+                        probe += 1
+                    if probe < len(text) and not text[probe].isspace():
+                        boundary = False
+                    else:
+                        while probe < len(text) and text[probe].isspace():
+                            probe += 1
+                        following = text[probe] if probe < len(text) else ""
+                        boundary = punctuation_context and (
+                            not following
+                            or following.isupper()
+                            or "\u3400" <= following <= "\u9fff"
+                        )
+                else:
+                    boundary = not decimal and punctuation_context
             if not boundary:
                 index += 1
                 continue
@@ -468,6 +483,7 @@ class SemanticChunker:
                     "semantic_boundary_score": parent_group.boundary_score,
                     "boundary_reason": parent_group.boundary_reason,
                     "source_span_mapping": self._source_span_mapping(units),
+                    "structural_separators": self._structural_separators(units),
                 },
             )
             drafts.append(parent)
@@ -719,6 +735,7 @@ class SemanticChunker:
                             child_index
                         ].boundary_reason,
                         "source_span_mapping": self._source_span_mapping(group),
+                        "structural_separators": self._structural_separators(group),
                     },
                 )
             )
@@ -990,9 +1007,24 @@ class SemanticChunker:
         if not values:
             return ""
         parts = [values[0].text]
-        for _previous, current in zip(values, values[1:]):
+        for previous, current in zip(values, values[1:]):
+            if previous.block_id != current.block_id:
+                parts.append("\n\n")
             parts.append(current.text)
         return "".join(parts)
+
+    @staticmethod
+    def _structural_separators(units: Iterable[_RawUnit]) -> list[dict[str, Any]]:
+        values = list(units)
+        return [
+            {
+                "text": "\n\n",
+                "source_backed": False,
+                "between_block_ids": [previous.block_id, current.block_id],
+            }
+            for previous, current in zip(values, values[1:])
+            if previous.block_id != current.block_id
+        ]
 
     def _group_tokens(self, units: Iterable[_RawUnit]) -> int:
         return self._count_tokens(self._join_units(units))
