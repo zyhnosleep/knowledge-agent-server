@@ -49,7 +49,7 @@ class SemanticChunker:
     def __init__(
         self,
         embedder: Any,
-        token_counter: Any,
+        token_counter: Any | None = None,
         *,
         parent_min_tokens: int | None = None,
         parent_target_tokens: int | None = None,
@@ -65,7 +65,13 @@ class SemanticChunker:
     ) -> None:
         settings = get_settings()
         self.embedder = embedder
-        self.token_counter = token_counter
+        self.token_counter = (
+            StructuredEvidenceBuilder(
+                tokenizer_name=settings.semantic_tokenizer_name
+            ).estimate_tokens
+            if token_counter is None
+            else token_counter
+        )
         self.parent_token_limits = (
             settings.semantic_parent_min_tokens
             if parent_min_tokens is None
@@ -787,12 +793,6 @@ class SemanticChunker:
             if self._group_tokens([*candidate, *current]) > maximum:
                 break
             selected.append(unit)
-        if (
-            not selected
-            and previous
-            and self._group_tokens([previous[-1], *current]) <= maximum
-        ):
-            selected.append(previous[-1])
         selected.reverse()
         return selected
 

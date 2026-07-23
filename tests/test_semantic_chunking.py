@@ -5,6 +5,7 @@ import re
 
 import pytest
 
+from app.core.config import get_settings
 from app.services.canonical_models import (
     CanonicalBlock,
     CanonicalCell,
@@ -15,6 +16,7 @@ from app.services.canonical_models import (
     SourceSpan,
 )
 from app.services.semantic_chunking import ChunkDraft, SemanticChunker
+from app.services.structured_evidence import StructuredEvidenceBuilder
 
 
 def word_count(text: str) -> int:
@@ -126,6 +128,39 @@ def test_chunk_draft_is_serializable_and_defaults_come_from_settings() -> None:
         semantic_boundary_score=None,
     )
     assert draft.model_dump(mode="json")["source_spans"][0]["source_block_id"] == "b1"
+
+
+def test_default_token_counter_uses_configured_cached_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded: list[str] = []
+
+    class FakeTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[str]:
+            assert add_special_tokens is False
+            return text.split()
+
+    def load(name: str) -> FakeTokenizer:
+        loaded.append(name)
+        return FakeTokenizer()
+
+    tokenizer_name = "test/qwen-semantic-tokenizer"
+    monkeypatch.setattr(get_settings(), "semantic_tokenizer_name", tokenizer_name)
+    monkeypatch.setattr(StructuredEvidenceBuilder, "_tokenizer_cache", {})
+    monkeypatch.setattr(StructuredEvidenceBuilder, "_tokenizer_key_locks", {})
+    monkeypatch.setattr(
+        StructuredEvidenceBuilder,
+        "_load_local_tokenizer",
+        staticmethod(load),
+    )
+
+    first = SemanticChunker(RecordingEmbedder())
+    second = SemanticChunker(RecordingEmbedder())
+
+    assert loaded == []
+    assert first._count_tokens("alpha beta") == 2
+    assert second._count_tokens("gamma delta") == 2
+    assert loaded == [tokenizer_name]
 
 
 def test_every_draft_has_roundtrippable_splitter_audit_and_boundary_reason() -> None:
@@ -516,6 +551,28 @@ def test_children_use_whole_sentence_overlap_and_do_not_lose_source() -> None:
             if sentence not in recovered:
                 recovered.append(sentence)
     assert recovered == re.findall(r"Sentence\d+ has evidence\.", parent.text)
+
+
+def test_child_overlap_is_empty_when_no_complete_sentence_fits_budget() -> None:
+    source = (
+        "One two three four five six. "
+        "Seven eight nine ten eleven twelve."
+    )
+    chunks = make_chunker(
+        parent_min_tokens=1,
+        parent_target_tokens=100,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=6,
+        child_max_tokens=12,
+        overlap_tokens=4,
+    ).build(document(block("overlap-budget", source, 0)))
+    children = [item for item in chunks if item.chunk_role == "child"]
+
+    assert len(children) == 2
+    assert children[1].text == "Seven eight nine ten eleven twelve."
+    assert children[1].metadata["overlap_sentence_count"] == 0
+    assert children[1].metadata["overlap_tokens"] == 0
 
 
 def test_child_tail_is_merged_and_splittable_long_sentence_respects_child_max() -> None:
