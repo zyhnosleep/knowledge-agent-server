@@ -635,7 +635,10 @@ class ContextualizationService:
         prefix: str,
         evidence_source: str,
     ) -> bool:
-        table_label = re.compile(rf"表\s*{re.escape(number)}", re.IGNORECASE)
+        table_label = re.compile(
+            rf"(?<![A-Za-z0-9])(?:表|table)\s*{re.escape(number)}(?![\d.])",
+            re.IGNORECASE,
+        )
         if table_label.search(prefix) and table_label.search(evidence_source):
             return True
         return any(

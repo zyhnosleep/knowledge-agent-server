@@ -472,6 +472,72 @@ def test_allows_grounded_table_identifier_when_both_source_and_prefix_identify_i
     assert result[0].contextual_prefix.startswith("该部分对应表2")
 
 
+def test_allows_grounded_english_table_identifier() -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text="实验章节使用 Table 2 汇总主要结果。",
+    )
+    child = _chunk(
+        "child-table",
+        role="child",
+        block_type="table",
+        parent_local_id=parent.local_id,
+        text="Table 2 对比不同方法的准确率。",
+    )
+    prefix = "该部分对应 Table 2，并说明其与实验章节的关系。"
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[
+                ContextualPrefixItem(
+                    child_id=payload["children"][0]["child_id"],
+                    prefix=prefix,
+                )
+            ]
+        )
+    )
+
+    result = ContextualizationService(client=client, max_retries=0).contextualize(
+        document=_document(),
+        children=[child],
+        parents={parent.local_id: parent},
+    )
+
+    assert result[0].contextual_prefix == prefix
+
+
+def test_rejects_ungrounded_english_table_identifier() -> None:
+    parent = _chunk(
+        "parent-1",
+        role="parent",
+        text="实验章节使用 Table 2 汇总主要结果。",
+    )
+    child = _chunk(
+        "child-table",
+        role="child",
+        block_type="table",
+        parent_local_id=parent.local_id,
+        text="Table 2 对比不同方法的准确率。",
+    )
+    client = FakeContextualizationClient(
+        lambda payload, _prompt: ContextualPrefixBatch(
+            items=[
+                ContextualPrefixItem(
+                    child_id=payload["children"][0]["child_id"],
+                    prefix="该部分对应 Table 999，并说明其与实验章节的关系。",
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ContextualizationFailed, match="numeric"):
+        ContextualizationService(client=client, max_retries=0).contextualize(
+            document=_document(),
+            children=[child],
+            parents={parent.local_id: parent},
+        )
+
+
 def test_rejects_chinese_text_that_is_not_a_contextual_relationship() -> None:
     parent = _parent()
     child = _children(1)
