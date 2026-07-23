@@ -176,13 +176,20 @@ _NAMED_METRIC_MARKERS = (
 )
 _HIERARCHICAL_NUMBER = r"\d+(?:[.-]\d+)*"
 _PANEL_SEQUENCE = r"[A-Za-z]+(?:\s*(?:,|、|-)\s*[A-Za-z]+)*"
+_PARENTHESIZED_PANEL = rf"\(\s*{_PANEL_SEQUENCE}\s*\)"
+_SEPARATE_PANEL_RANGE = (
+    r"\(\s*[A-Za-z]+\s*\)\s*-\s*\(\s*[A-Za-z]+\s*\)"
+)
+_PANEL_SUFFIX = (
+    rf"(?:{_SEPARATE_PANEL_RANGE}|{_PARENTHESIZED_PANEL}|{_PANEL_SEQUENCE})"
+)
 _STRUCTURED_IDENTIFIER_CORE = (
-    rf"{_HIERARCHICAL_NUMBER}(?:\s*\({_PANEL_SEQUENCE}\)|{_PANEL_SEQUENCE})?"
+    rf"{_HIERARCHICAL_NUMBER}(?:\s*{_PANEL_SUFFIX})?"
 )
 _STRUCTURED_IDENTIFIER_PATTERN = re.compile(
     rf"(?<![A-Za-z0-9])(?:Table|Figure|Fig\.?|Equation|Eq\.?|表|图|公式)\s*"
     rf"(?:\(\s*{_STRUCTURED_IDENTIFIER_CORE}\s*\)|{_STRUCTURED_IDENTIFIER_CORE})"
-    rf"(?![A-Za-z0-9.(])",
+    rf"(?![A-Za-z0-9.(-])",
     re.IGNORECASE,
 )
 _MODEL_VERSION_IDENTIFIER_PATTERN = re.compile(
@@ -196,10 +203,13 @@ _NUMERIC_IDENTIFIER_PATTERNS = (
 )
 _MAX_ERROR_IDS = 4
 _MAX_ERROR_ID_CHARS = 32
+_DASH_TRANSLATION = str.maketrans(
+    {character: "-" for character in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe63\uff0d"}
+)
 
 
 def _lexical_text(text: str) -> str:
-    return unicodedata.normalize("NFKC", text)
+    return unicodedata.normalize("NFKC", text).translate(_DASH_TRANSLATION)
 
 
 def _bounded_text(value: object, max_chars: int) -> str:

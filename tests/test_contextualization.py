@@ -705,6 +705,8 @@ def test_rejects_mutated_atomic_numeric_identifiers(
     [
         ("Figure 3(a,b)", "Figure 3(a,c)"),
         ("表２（a、b）", "表２（a、c）"),
+        ("Figure 3(a)-(c)", "Figure 3(a)-(d)"),
+        ("表2（a）—（c）", "表2（a）—（d）"),
     ],
 )
 def test_rejects_mutated_multi_panel_identifiers_atomically(
@@ -781,7 +783,15 @@ def test_allows_exactly_grounded_atomic_numeric_identifiers(identifier: str) -> 
 
 @pytest.mark.parametrize(
     "identifier",
-    ["Figure 3(a,b)", "表２（a、b）", "Figure 3(a-c)", "表2（a-c）"],
+    [
+        "Figure 3(a,b)",
+        "表２（a、b）",
+        "Figure 3(a-c)",
+        "Figure 3(a–c)",
+        "表2（a-c）",
+        "Figure 3(a)-(c)",
+        "表2（a）—（c）",
+    ],
 )
 def test_allows_grounded_multi_panel_identifier_lists_and_ranges(identifier: str) -> None:
     parent = _chunk(
