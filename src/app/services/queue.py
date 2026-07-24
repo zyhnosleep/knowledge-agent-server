@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from redis import Redis
 from rq import Queue, Worker
+from rq.exceptions import DuplicateJobError
 
 from app.core.config import get_settings
 from app.services.ingestion_stages import INGESTION_STAGES, STAGE_QUEUES
@@ -51,13 +52,40 @@ class JobDispatcher:
             module_name, attr_name = function.rsplit(".", 1)
             imported = getattr(importlib.import_module(module_name), attr_name)
             return imported(document_id, version_key, stage)
-        return queue.enqueue_call(
-            func=function,
-            args=(document_id, version_key, stage),
-            timeout=settings.queue_job_timeout,
-            job_id=job_id,
-            unique=True,
-        )
+        enqueue_kwargs = {
+            "func": function,
+            "args": (document_id, version_key, stage),
+            "timeout": settings.queue_job_timeout,
+            "job_id": job_id,
+            "unique": True,
+        }
+        for attempt in range(3):
+            try:
+                return queue.enqueue_call(**enqueue_kwargs)
+            except DuplicateJobError as exc:
+                existing = queue.fetch_job(job_id)
+                if existing is None:
+                    if attempt < 2:
+                        continue
+                    raise RuntimeError(
+                        f"Duplicate RQ job {job_id!r} could not be resolved."
+                    ) from exc
+                status = existing.get_status()
+                status = getattr(status, "value", status)
+                if status in {"queued", "started", "deferred", "scheduled"}:
+                    return existing
+                if status == "failed":
+                    existing.requeue()
+                    return existing
+                if status == "finished":
+                    existing.delete(remove_from_queue=True)
+                    if attempt < 2:
+                        continue
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Duplicate RQ job {job_id!r} has unresolved status {status!r}."
+                    ) from exc
+        raise RuntimeError(f"Duplicate RQ job {job_id!r} could not be resolved.")
 
 
 def ingestion_stage_job_id(document_id: str, version_key: str, stage: str) -> str:

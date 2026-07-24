@@ -26,6 +26,7 @@ from app.services.ingestion_stages import (
     IngestionStageRunner,
     StageAlreadyClaimed,
     StageCheckpointTooLarge,
+    CapabilityUnavailable,
 )
 from app.services import queue as queue_module
 from app.services.contextualization import ContextualizedChunk
@@ -500,6 +501,13 @@ def test_checkpoint_payload_larger_than_cap_fails_before_completion_commit(
     assert version.stage_state["parse"]["status"] == "failed"
 
 
+def test_default_claim_lease_covers_rq_timeout_plus_safety_margin(
+    db: Session,
+) -> None:
+    runner = IngestionStageRunner(db, handlers=handlers([]))
+    assert runner.claim_ttl_seconds >= queue_module.settings.queue_job_timeout + 300
+
+
 def test_dispatcher_uses_named_queue_and_deterministic_job_id(monkeypatch) -> None:
     enqueued: list[tuple[str, tuple, dict]] = []
 
@@ -551,6 +559,68 @@ def test_dispatching_same_stage_twice_uses_unique_rq_contract(monkeypatch) -> No
     assert first == second == "ingestion-d1-v1-parse"
     assert len(calls) == 2
     assert all(call["unique"] is True for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_action"),
+    [
+        ("queued", "returned"),
+        ("started", "returned"),
+        ("deferred", "returned"),
+        ("scheduled", "returned"),
+        ("failed", "requeued"),
+        ("finished", "reenqueued"),
+    ],
+)
+def test_duplicate_stage_job_is_reconciled_by_rq_status(
+    monkeypatch, status: str, expected_action: str
+) -> None:
+    from rq.exceptions import DuplicateJobError
+
+    events: list[str] = []
+
+    class FakeJob:
+        def get_status(self):
+            return status
+
+        def requeue(self):
+            events.append("requeued")
+            return self
+
+        def delete(self, **_kwargs):
+            events.append("deleted")
+
+    existing = FakeJob()
+
+    class FakeQueue:
+        def __init__(self, name: str, connection) -> None:
+            self.name = name
+            self.attempts = 0
+
+        def enqueue_call(self, **_kwargs):
+            self.attempts += 1
+            if status == "finished" and self.attempts > 1:
+                events.append("reenqueued")
+                return "replacement"
+            raise DuplicateJobError("duplicate")
+
+        def fetch_job(self, _job_id):
+            return existing
+
+    monkeypatch.setattr(queue_module, "redis_connection", lambda: object())
+    monkeypatch.setattr(queue_module, "Queue", FakeQueue)
+
+    result = queue_module.JobDispatcher().enqueue_stage("d1", "v1", "parse")
+
+    if expected_action == "returned":
+        assert result is existing
+        assert events == []
+    elif expected_action == "requeued":
+        assert result is existing
+        assert events == ["requeued"]
+    else:
+        assert result == "replacement"
+        assert events == ["deleted", "reenqueued"]
 
 
 def test_worker_consumes_all_stage_queues_in_order_then_legacy(monkeypatch) -> None:
@@ -621,7 +691,18 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     document = db.get(Document, "d1")
     version = db.get(DocumentParseVersion, "pv1")
     document.raw_path = str(source)
+    document.status = "ready"
+    document.active_parse_version = "legacy"
     version.artifact_dir = str(tmp_path / "artifacts" / "d1" / "v1")
+    db.add(
+        DocumentParseVersion(
+            id="legacy-version",
+            document_id="d1",
+            version_key="legacy",
+            artifact_dir="legacy",
+            status="active",
+        )
+    )
     db.add(
         PipelineRun(
             id="run1",
@@ -723,7 +804,8 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     stored = db.get(Document, "d1")
     stored_version = db.get(DocumentParseVersion, "pv1")
     output = stored_version.stage_state["parse"]["output"]
-    assert stored.status == "quality_checking"
+    assert stored.status == "ready"
+    assert stored.active_parse_version == "legacy"
     assert db.query(DocumentChunk).filter_by(document_id="d1").count() == 0
     assert output["artifact_path"].endswith(".canonical.json")
     assert Path(output["artifact_path"]).is_file()
@@ -757,22 +839,21 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     runner.run_stage("d1", "v1", "index", enqueue_next=False)
 
     db.expire_all()
-    assert db.get(Document, "d1").status == "indexing"
+    assert db.get(Document, "d1").status == "ready"
+    assert db.get(Document, "d1").active_parse_version == "legacy"
     assert db.get(DocumentParseVersion, "pv1").status == "ready_to_activate"
     rows = db.query(DocumentChunk).filter_by(document_id="d1", parse_version="v1").all()
-    assert len(rows) == 2
-    parent_row = next(row for row in rows if row.chunk_role == "parent")
-    child_row = next(row for row in rows if row.chunk_role == "child")
-    assert child_row.parent_chunk_id == parent_row.id
-    assert child_row.contextual_prefix == "Context for child."
-    assert all(row.embedding for row in rows)
+    assert rows == []
     assert db.get(DocumentChunk, "legacy-chunk") is not None
+    index_output = db.get(DocumentParseVersion, "pv1").stage_state["index"]["output"]
+    assert Path(index_output["artifact_path"]).is_file()
 
-    runner.run_stage("d1", "v1", "activate", enqueue_next=False)
+    with pytest.raises(CapabilityUnavailable, match="Task 10"):
+        runner.run_stage("d1", "v1", "activate", enqueue_next=False)
     db.expire_all()
     assert db.get(Document, "d1").status == "ready"
-    assert db.get(Document, "d1").active_parse_version == "v1"
-    assert db.get(DocumentParseVersion, "pv1").status == "active"
+    assert db.get(Document, "d1").active_parse_version == "legacy"
+    assert db.get(DocumentParseVersion, "pv1").status == "activation_failed"
     run = db.get(PipelineRun, "run1")
-    assert run.status == RunStatus.completed.value
-    assert run.provider_report["progress"]["stage"] == "completed"
+    assert run.status == RunStatus.failed.value
+    assert run.provider_report["progress"]["stage"] == "activate_failed"

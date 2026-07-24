@@ -5,9 +5,8 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -44,6 +43,7 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.filesystem import compute_sha256, display_title_from_path, looks_like_internal_sample, readable_title_from_path, slugify, strip_upload_prefix
+from app.services.ingestion_stages import CapabilityUnavailable
 from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
 from app.services.parser import parse_document
 from app.services.parse_versions import ParseVersionService
@@ -520,147 +520,64 @@ class IngestionPipeline:
         payload = self._load_previous_stage_artifact(context)
         if not isinstance(payload, list) or not payload:
             raise RuntimeError("Index stage requires embedded chunk records.")
-        version_key = context.version.version_key
-        local_to_id = {
-            str(record["chunk"]["local_id"]): str(
-                uuid5(
-                    NAMESPACE_URL,
-                    f"knowledge-agent:{context.document.id}:{version_key}:"
-                    f"{record['chunk']['local_id']}",
+        expected = context.input.get("previous_output") or {}
+        expected_count = expected.get("chunk_count")
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count != len(payload)
+        ):
+            raise RuntimeError("Embedded chunk count does not match embed checkpoint.")
+        expected_dimensions = expected.get("dimensions")
+        local_ids: set[str] = set()
+        child_count = 0
+        for record in payload:
+            if not isinstance(record, dict) or not isinstance(record.get("chunk"), dict):
+                raise RuntimeError("Index stage found an invalid embedded chunk record.")
+            chunk = record["chunk"]
+            local_id = chunk.get("local_id")
+            if not isinstance(local_id, str) or not local_id:
+                raise RuntimeError("Embedded chunk requires a non-empty local ID.")
+            local_ids.add(local_id)
+            if chunk.get("chunk_role") == "child":
+                child_count += 1
+            embedding = record.get("embedding")
+            if (
+                not isinstance(embedding, list)
+                or not embedding
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in embedding
                 )
-            )
-            for record in payload
-        }
-        if len(local_to_id) != len(payload):
+            ):
+                raise RuntimeError("Index stage found an invalid embedding.")
+            if (
+                isinstance(expected_dimensions, bool)
+                or not isinstance(expected_dimensions, int)
+                or len(embedding) != expected_dimensions
+            ):
+                raise RuntimeError(
+                    "Embedding dimensions do not match the embed checkpoint."
+                )
+        if len(local_ids) != len(payload):
             raise RuntimeError("Embedded chunk local IDs are not unique.")
-        existing = {
-            row.id: row
-            for row in self.db.scalars(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id == context.document.id,
-                    DocumentChunk.parse_version == version_key,
-                )
-            )
-        }
-        rows: dict[str, DocumentChunk] = {}
-        for record in payload:
-            chunk = dict(record["chunk"])
-            local_id = str(chunk["local_id"])
-            row_id = local_to_id[local_id]
-            row = existing.get(row_id) or DocumentChunk(
-                id=row_id,
-                document_id=context.document.id,
-                ordinal=int(chunk["ordinal"]),
-                text=str(chunk["text"]),
-            )
-            self.db.add(row)
-            row.document_id = context.document.id
-            row.parse_version = version_key
-            row.parent_chunk_id = None
-            row.previous_chunk_id = None
-            row.next_chunk_id = None
-            row.chunk_role = str(chunk["chunk_role"])
-            row.block_type = str(chunk["block_type"])
-            row.ordinal = int(chunk["ordinal"])
-            row.section_path = list(chunk.get("section_path") or [])
-            row.heading = row.section_path[-1] if row.section_path else None
-            row.source_block_ids = list(chunk.get("source_block_ids") or [])
-            row.source_spans = list(chunk.get("source_spans") or [])
-            row.page_label = next(
-                (
-                    str(span["page_label"])
-                    for span in row.source_spans
-                    if span.get("page_label") is not None
-                ),
-                None,
-            )
-            row.text = str(chunk["text"])
-            row.contextual_prefix = chunk.get("contextual_prefix")
-            row.embedding_text = str(chunk["embedding_text"])
-            row.contextualization_model = chunk.get("contextualization_model")
-            row.contextualization_version = chunk.get("contextualization_version")
-            row.contextualization_prompt_version = chunk.get(
-                "contextualization_prompt_version"
-            )
-            contextualized_at = chunk.get("contextualized_at")
-            row.contextualized_at = (
-                datetime.fromisoformat(str(contextualized_at).replace("Z", "+00:00"))
-                if contextualized_at
-                else None
-            )
-            row.parser_name = context.version.parser_name
-            row.parser_version = context.version.parser_version
-            row.splitter_name = chunk.get("splitter_name")
-            row.splitter_version = chunk.get("splitter_version")
-            row.splitting_model = chunk.get("splitting_model")
-            row.semantic_boundary_score = chunk.get("semantic_boundary_score")
-            row.token_count = int(chunk.get("token_count") or 0)
-            row.token_estimate = row.token_count
-            row.embedding = [float(value) for value in record["embedding"]]
-            rows[local_id] = row
-        self.db.flush()
-        for stale_id, stale in existing.items():
-            if stale_id not in set(local_to_id.values()):
-                self.db.delete(stale)
-        self.db.flush()
-        for record in payload:
-            chunk = dict(record["chunk"])
-            local_id = str(chunk["local_id"])
-            row = rows[local_id]
-            row.parent_chunk_id = self._resolve_local_chunk_id(
-                local_to_id, chunk.get("parent_local_id")
-            )
-            row.previous_chunk_id = self._resolve_local_chunk_id(
-                local_to_id, chunk.get("previous_child_local_id")
-            )
-            row.next_chunk_id = self._resolve_local_chunk_id(
-                local_to_id, chunk.get("next_child_local_id")
-            )
-        self.db.flush()
-        return {
-            "row_count": len(rows),
-            "child_count": sum(
-                row.chunk_role == "child" for row in rows.values()
-            ),
-            "parse_version": version_key,
-        }
+        return self._write_stage_artifact(
+            context,
+            "index_payload.json",
+            payload,
+            extra={
+                "row_count": len(payload),
+                "child_count": child_count,
+                "parse_version": context.version.version_key,
+            },
+        )
 
     def _run_activation_gate_stage(self, context) -> dict[str, object]:
-        expected = context.input.get("previous_output") or {}
-        rows = list(
-            self.db.scalars(
-                select(DocumentChunk).where(
-                    DocumentChunk.document_id == context.document.id,
-                    DocumentChunk.parse_version == context.version.version_key,
-                )
-            )
+        raise CapabilityUnavailable(
+            "Task 10 version-scoped atomic persistence/search filtering is unavailable."
         )
-        if not rows or len(rows) != int(expected.get("row_count") or 0):
-            raise RuntimeError("Activation row count does not match index checkpoint.")
-        row_ids = {row.id for row in rows}
-        if any(not row.embedding for row in rows):
-            raise RuntimeError("Activation requires an embedding for every chunk.")
-        if any(
-            reference is not None and reference not in row_ids
-            for row in rows
-            for reference in (
-                row.parent_chunk_id,
-                row.previous_chunk_id,
-                row.next_chunk_id,
-            )
-        ):
-            raise RuntimeError("Activation found a cross-version or missing chunk link.")
-        children = [row for row in rows if row.chunk_role == "child"]
-        if not children or any(
-            not row.contextual_prefix or not row.contextualization_model
-            for row in children
-        ):
-            raise RuntimeError("Activation requires contextualized child chunks.")
-        return {
-            "row_count": len(rows),
-            "child_count": len(children),
-            "validated": True,
-        }
 
     def _write_stage_artifact(
         self,
@@ -729,17 +646,6 @@ class IngestionPipeline:
             for node in nodes
             for title in [node.title, *IngestionPipeline._outline_titles(node.children)]
         ]
-
-    @staticmethod
-    def _resolve_local_chunk_id(
-        local_to_id: dict[str, str], local_id: object
-    ) -> str | None:
-        if local_id is None:
-            return None
-        resolved = local_to_id.get(str(local_id))
-        if resolved is None:
-            raise RuntimeError(f"Chunk link references unknown local ID {local_id!r}.")
-        return resolved
 
     @staticmethod
     def _checkpoint_artifact_path(context) -> Path:

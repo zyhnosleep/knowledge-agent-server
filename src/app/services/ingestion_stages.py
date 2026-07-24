@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models.records import (
     Document,
     DocumentParseVersion,
@@ -80,6 +81,10 @@ class StageHandlerUnavailable(RuntimeError):
     """Raised instead of recording a stage as complete without real work."""
 
 
+class CapabilityUnavailable(RuntimeError):
+    """Raised when a stage depends on a capability that is not available yet."""
+
+
 class StageCheckpointTooLarge(ValueError):
     """Raised before committing a checkpoint that exceeds the durable JSON cap."""
 
@@ -108,7 +113,7 @@ class IngestionStageRunner:
         dispatcher: Any | None = None,
         clock: Callable[[], datetime] | None = None,
         claim_owner: str | None = None,
-        claim_ttl_seconds: int = 900,
+        claim_ttl_seconds: int | None = None,
         max_checkpoint_bytes: int = 256 * 1024,
     ) -> None:
         self.db = db
@@ -120,6 +125,8 @@ class IngestionStageRunner:
         self.dispatcher = dispatcher
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.claim_owner = claim_owner or uuid4().hex
+        if claim_ttl_seconds is None:
+            claim_ttl_seconds = get_settings().queue_job_timeout + 300
         if claim_ttl_seconds <= 0:
             raise ValueError("claim_ttl_seconds must be positive")
         if max_checkpoint_bytes <= 0:
@@ -175,7 +182,8 @@ class IngestionStageRunner:
 
         self._validate_order(version, stage)
         self._prepare_status_for_attempt(version, stage)
-        document.status = self._document_running_status(stage)
+        if self._can_update_document_status(document, version):
+            document.status = self._document_running_status(stage)
         self._set_pipeline_progress(document.id, stage, completed=False)
         attempt = int(checkpoint.get("attempts") or 0) + 1
         input_checkpoint = self._stage_input(version, stage)
@@ -221,7 +229,10 @@ class IngestionStageRunner:
                 document.status = "ready"
             else:
                 self.versions.transition(version, _COMPLETED_STATUS[stage])
-                if _COMPLETED_STATUS[stage] != "ready_to_activate":
+                if (
+                    _COMPLETED_STATUS[stage] != "ready_to_activate"
+                    and self._can_update_document_status(document, version)
+                ):
                     document.status = _COMPLETED_STATUS[stage]
             self._set_pipeline_progress(document.id, stage, completed=True)
             completed = {
@@ -353,7 +364,8 @@ class IngestionStageRunner:
         failed_status = _FAILED_STATUS[stage]
         if version.status != failed_status:
             self.versions.transition(version, failed_status)
-        document.status = failed_status
+        if self._can_update_document_status(document, version):
+            document.status = failed_status
         self._set_pipeline_failure(document.id, stage, exc)
         failed = {
             **running,
@@ -491,6 +503,12 @@ class IngestionStageRunner:
         if stage == "activate":
             return "indexing"
         return _RUNNING_STATUS[stage]
+
+    @staticmethod
+    def _can_update_document_status(
+        document: Document, version: DocumentParseVersion
+    ) -> bool:
+        return document.active_parse_version in (None, version.version_key)
 
 
 def _json_safe(value: Any) -> Any:
