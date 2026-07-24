@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import subprocess
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -37,6 +41,24 @@ from app.services.canonical_models import (
     CanonicalQualityReport,
 )
 from app.services.semantic_chunking import ChunkDraft
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory links are unavailable: {result.stderr}")
 
 
 @pytest.fixture
@@ -255,6 +277,71 @@ def test_process_document_preserves_active_version_until_activation_is_available
     assert db.get(Document, "d1").status == "ready"
     assert db.get(Document, "d1").active_parse_version == "legacy"
     assert db.get(DocumentParseVersion, "pv1").status == "activation_failed"
+
+
+def test_process_document_commits_retryable_state_before_dispatch(
+    db: Session, monkeypatch
+) -> None:
+    document = db.get(Document, "d1")
+    document.status = "pending"
+    version = db.get(DocumentParseVersion, "pv1")
+    version.version_key = "canonical-v1-abc"
+    db.add(
+        PipelineRun(
+            id="retry-run",
+            project_id="p1",
+            document_id="d1",
+            run_type=RunType.ingest.value,
+            status=RunStatus.failed.value,
+            provider_report={"old": True},
+        )
+    )
+    db.commit()
+    calls: list[tuple[str, str, str]] = []
+    transaction_states: list[tuple[bool, bool, bool]] = []
+
+    class FlakyDispatcher:
+        def enqueue_stage(self, document_id, version_key, stage):
+            transaction_states.append(
+                (db.in_transaction(), bool(db.dirty), bool(db.new))
+            )
+            calls.append((document_id, version_key, stage))
+            if len(calls) == 1:
+                raise RuntimeError("queue unavailable")
+
+    from app.services import pipeline as pipeline_module
+    from app.services import queue as queue_module
+
+    monkeypatch.setattr(pipeline_module.settings, "redis_url", "redis://local")
+    monkeypatch.setattr(
+        pipeline_module.settings, "canonical_pipeline_version", "canonical-v1"
+    )
+    monkeypatch.setattr(queue_module, "JobDispatcher", FlakyDispatcher)
+    pipeline = IngestionPipeline(db)
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        pipeline.process_document("d1")
+    assert transaction_states == [(False, False, False)]
+    db.rollback()
+    db.expire_all()
+
+    stored_run = db.get(PipelineRun, "retry-run")
+    assert stored_run.status == RunStatus.queued.value
+    assert stored_run.provider_report["progress"]["stage"] == "queued"
+    assert db.get(Document, "d1").status == "processing"
+
+    pipeline.process_document("d1")
+    db.rollback()
+    db.expire_all()
+    assert calls == [
+        ("d1", "canonical-v1-abc", "parse"),
+        ("d1", "canonical-v1-abc", "parse"),
+    ]
+    assert transaction_states == [
+        (False, False, False),
+        (False, False, False),
+    ]
+    assert db.get(PipelineRun, "retry-run").status == RunStatus.queued.value
 
 
 def test_malicious_pipeline_version_is_rejected_before_path_construction(
@@ -556,6 +643,32 @@ def test_checkpoint_payload_larger_than_cap_fails_before_completion_commit(
     assert version.stage_state["parse"]["status"] == "failed"
 
 
+def test_oversized_stage_error_is_bounded_and_durably_recorded(
+    db: Session,
+) -> None:
+    message = "sensitive failure\x00" + "x" * (300 * 1024)
+
+    def fail(_context):
+        raise RuntimeError(message)
+
+    runner = IngestionStageRunner(db, handlers={"parse": fail})
+
+    with pytest.raises(RuntimeError) as raised:
+        runner.run_stage("d1", "v1", "parse", enqueue_next=False)
+    assert not isinstance(raised.value, StageCheckpointTooLarge)
+    db.rollback()
+
+    version = db.get(DocumentParseVersion, "pv1")
+    checkpoint = version.stage_state["parse"]
+    assert version.status == "parse_failed"
+    assert checkpoint["status"] == "failed"
+    assert len(checkpoint["error"].encode("utf-8")) <= 4096
+    assert "\x00" not in checkpoint["error"]
+    assert checkpoint["error_sha256"] == hashlib.sha256(
+        message.encode("utf-8")
+    ).hexdigest()
+
+
 def test_default_claim_lease_covers_rq_timeout_plus_safety_margin(
     db: Session,
 ) -> None:
@@ -741,6 +854,125 @@ def test_run_ingestion_stage_always_closes_session(monkeypatch) -> None:
     assert events == [session, "closed"]
 
 
+def test_embed_stage_vectors_only_contextualized_children_and_keeps_parents(
+    db: Session, tmp_path: Path, monkeypatch
+) -> None:
+    from app.services import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module.settings, "canonical_artifacts_dir", tmp_path / "artifacts"
+    )
+    pipeline = IngestionPipeline(db)
+    directory = tmp_path / "artifacts" / "d1" / "v1.pipeline"
+    directory.mkdir(parents=True)
+    payload = [
+        {
+            "local_id": "parent-1",
+            "chunk_role": "parent",
+            "text": "Parent evidence",
+            "embedding_text": "Parent evidence",
+        },
+        {
+            "local_id": "child-1",
+            "chunk_role": "child",
+            "text": "Child evidence",
+            "contextual_prefix": "Child context.",
+            "contextualization_model": "context-model",
+            "embedding_text": "Child context.\n\nChild evidence",
+        },
+    ]
+    encoded = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    input_path = directory / "contextualized_chunks.json"
+    input_path.write_bytes(encoded)
+    context = SimpleNamespace(
+        document=db.get(Document, "d1"),
+        version=db.get(DocumentParseVersion, "pv1"),
+        stage="embed",
+        input={
+            "previous_output": {
+                "artifact_path": str(input_path),
+                "artifact_sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        },
+    )
+    calls: list[list[str]] = []
+
+    class FakeOllama:
+        def embed(self, texts):
+            calls.append(list(texts))
+            return [[0.25, 0.75]]
+
+    pipeline.ollama = FakeOllama()
+
+    output = pipeline._run_embed_stage(context)
+
+    assert calls == [["Child context.\n\nChild evidence"]]
+    assert output["chunk_count"] == 2
+    assert output["child_count"] == 1
+    assert output["embedded_count"] == 1
+    records = json.loads(Path(output["artifact_path"]).read_text("utf-8"))
+    assert records == [
+        {"chunk": payload[0], "embedding": None},
+        {"chunk": payload[1], "embedding": [0.25, 0.75]},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("document_id", "version_key"),
+    [("../escape", "v1"), ("d1", "CON")],
+)
+def test_stage_artifact_dir_rejects_nonportable_components(
+    db: Session,
+    tmp_path: Path,
+    monkeypatch,
+    document_id: str,
+    version_key: str,
+) -> None:
+    from app.services import pipeline as pipeline_module
+
+    root = tmp_path / "artifacts"
+    monkeypatch.setattr(pipeline_module.settings, "canonical_artifacts_dir", root)
+    context = SimpleNamespace(
+        document=SimpleNamespace(id=document_id),
+        version=SimpleNamespace(version_key=version_key, artifact_dir=None),
+    )
+
+    with pytest.raises(ValueError, match="path component"):
+        IngestionPipeline(db)._stage_artifact_dir(context)
+
+    assert not (tmp_path / "escape").exists()
+
+
+def test_stage_artifact_dir_rejects_linked_document_root(
+    db: Session, tmp_path: Path, monkeypatch
+) -> None:
+    from app.services import pipeline as pipeline_module
+
+    root = tmp_path / "artifacts"
+    external = tmp_path / "external-document"
+    root.mkdir()
+    external.mkdir()
+    linked_document = root / "d1"
+    _create_directory_link(linked_document, external)
+    monkeypatch.setattr(pipeline_module.settings, "canonical_artifacts_dir", root)
+    context = SimpleNamespace(
+        document=SimpleNamespace(id="d1"),
+        version=SimpleNamespace(version_key="v1", artifact_dir=None),
+    )
+
+    try:
+        with pytest.raises(ValueError, match="symbolic link"):
+            IngestionPipeline(db)._stage_artifact_dir(context)
+        assert list(external.iterdir()) == []
+    finally:
+        if linked_document.is_symlink():
+            linked_document.unlink()
+        elif linked_document.exists():
+            os.rmdir(linked_document)
+
+
 def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     db: Session, tmp_path: Path, monkeypatch
 ) -> None:
@@ -749,6 +981,8 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     document = db.get(Document, "d1")
     version = db.get(DocumentParseVersion, "pv1")
     document.raw_path = str(source)
+    document.title = "Published title"
+    document.metadata_json = {"published": "metadata"}
     document.status = "ready"
     document.active_parse_version = "legacy"
     version.artifact_dir = str(tmp_path / "artifacts" / "d1" / "v1")
@@ -864,9 +1098,14 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     output = stored_version.stage_state["parse"]["output"]
     assert stored.status == "ready"
     assert stored.active_parse_version == "legacy"
+    assert stored.title == "Published title"
+    assert stored.metadata_json == {"published": "metadata"}
     assert db.query(DocumentChunk).filter_by(document_id="d1").count() == 0
     assert output["artifact_path"].endswith(".canonical.json")
     assert Path(output["artifact_path"]).is_file()
+    parse_artifact = json.loads(Path(output["artifact_path"]).read_text("utf-8"))
+    assert parse_artifact["title"] == "Evidence"
+    assert "metadata" in parse_artifact
     assert "provider_report" not in output
     run = db.get(PipelineRun, "run1")
     assert run.status == RunStatus.running.value
@@ -899,6 +1138,8 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     db.expire_all()
     assert db.get(Document, "d1").status == "ready"
     assert db.get(Document, "d1").active_parse_version == "legacy"
+    assert db.get(Document, "d1").title == "Published title"
+    assert db.get(Document, "d1").metadata_json == {"published": "metadata"}
     assert db.get(DocumentParseVersion, "pv1").status == "ready_to_activate"
     rows = db.query(DocumentChunk).filter_by(document_id="d1", parse_version="v1").all()
     assert rows == []

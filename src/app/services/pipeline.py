@@ -174,14 +174,18 @@ class IngestionPipeline:
         }
         context.version.quality_json = quality
         context.version.parser_name = canonical.parser_source
-        context.document.title = canonical.title or context.document.title
-        metadata = dict(context.document.metadata_json or {})
-        metadata["canonical_ingestion"] = {
-            "version_key": context.version.version_key,
-            "input_fingerprint": input_fingerprint,
-            "quality": quality,
-        }
-        context.document.metadata_json = metadata
+        if context.document.active_parse_version in (
+            None,
+            context.version.version_key,
+        ):
+            context.document.title = canonical.title or context.document.title
+            metadata = dict(context.document.metadata_json or {})
+            metadata["canonical_ingestion"] = {
+                "version_key": context.version.version_key,
+                "input_fingerprint": input_fingerprint,
+                "quality": quality,
+            }
+            context.document.metadata_json = metadata
         return {
             "artifact_path": str(draft_path),
             "input_fingerprint": input_fingerprint,
@@ -480,15 +484,34 @@ class IngestionPipeline:
 
     def _run_embed_stage(self, context) -> dict[str, object]:
         payload = self._load_previous_stage_artifact(context)
-        texts = [str(item.get("embedding_text") or "") for item in payload]
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("Embedding stage requires contextualized chunks.")
+        children = [
+            item
+            for item in payload
+            if isinstance(item, dict) and item.get("chunk_role") == "child"
+        ]
+        parent_count = sum(
+            isinstance(item, dict) and item.get("chunk_role") == "parent"
+            for item in payload
+        )
+        if len(children) + parent_count != len(payload):
+            raise RuntimeError("Embedding input contains an invalid chunk role.")
+        if any(
+            not item.get("contextual_prefix")
+            or not item.get("contextualization_model")
+            for item in children
+        ):
+            raise RuntimeError("Embedding requires contextualized child chunks.")
+        texts = [str(item.get("embedding_text") or "") for item in children]
         if not texts or any(not text.strip() for text in texts):
-            raise RuntimeError("Embedding input contains an empty chunk.")
+            raise RuntimeError("Embedding input contains an empty child chunk.")
         embeddings = self.ollama.embed(texts)
-        if len(embeddings) != len(payload):
-            raise RuntimeError("Embedding response count does not match chunk count.")
+        if len(embeddings) != len(children):
+            raise RuntimeError("Embedding response count does not match child count.")
         dimensions: int | None = None
-        records: list[dict[str, object]] = []
-        for item, embedding in zip(payload, embeddings, strict=True):
+        child_embeddings: list[list[float]] = []
+        for embedding in embeddings:
             if (
                 not isinstance(embedding, list)
                 or not embedding
@@ -503,17 +526,27 @@ class IngestionPipeline:
             dimensions = dimensions or len(embedding)
             if len(embedding) != dimensions:
                 raise RuntimeError("Embedding response dimensions are inconsistent.")
-            records.append(
-                {
-                    "chunk": item,
-                    "embedding": [float(value) for value in embedding],
-                }
-            )
+            child_embeddings.append([float(value) for value in embedding])
+        embedded = iter(child_embeddings)
+        records = [
+            {
+                "chunk": item,
+                "embedding": next(embedded)
+                if item["chunk_role"] == "child"
+                else None,
+            }
+            for item in payload
+        ]
         return self._write_stage_artifact(
             context,
             "embedded_chunks.json",
             records,
-            extra={"chunk_count": len(records), "dimensions": dimensions},
+            extra={
+                "chunk_count": len(records),
+                "child_count": len(children),
+                "embedded_count": len(child_embeddings),
+                "dimensions": dimensions,
+            },
         )
 
     def _run_index_stage(self, context) -> dict[str, object]:
@@ -529,8 +562,15 @@ class IngestionPipeline:
         ):
             raise RuntimeError("Embedded chunk count does not match embed checkpoint.")
         expected_dimensions = expected.get("dimensions")
+        if (
+            isinstance(expected_dimensions, bool)
+            or not isinstance(expected_dimensions, int)
+            or expected_dimensions <= 0
+        ):
+            raise RuntimeError("Embed checkpoint has invalid dimensions.")
         local_ids: set[str] = set()
         child_count = 0
+        embedded_count = 0
         for record in payload:
             if not isinstance(record, dict) or not isinstance(record.get("chunk"), dict):
                 raise RuntimeError("Index stage found an invalid embedded chunk record.")
@@ -539,30 +579,37 @@ class IngestionPipeline:
             if not isinstance(local_id, str) or not local_id:
                 raise RuntimeError("Embedded chunk requires a non-empty local ID.")
             local_ids.add(local_id)
-            if chunk.get("chunk_role") == "child":
-                child_count += 1
+            chunk_role = chunk.get("chunk_role")
             embedding = record.get("embedding")
-            if (
-                not isinstance(embedding, list)
-                or not embedding
-                or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    for value in embedding
-                )
-            ):
-                raise RuntimeError("Index stage found an invalid embedding.")
-            if (
-                isinstance(expected_dimensions, bool)
-                or not isinstance(expected_dimensions, int)
-                or len(embedding) != expected_dimensions
-            ):
-                raise RuntimeError(
-                    "Embedding dimensions do not match the embed checkpoint."
-                )
+            if chunk_role == "child":
+                child_count += 1
+                if (
+                    not isinstance(embedding, list)
+                    or not embedding
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in embedding
+                    )
+                ):
+                    raise RuntimeError("Index stage found an invalid child embedding.")
+                if len(embedding) != expected_dimensions:
+                    raise RuntimeError(
+                        "Embedding dimensions do not match the embed checkpoint."
+                    )
+                embedded_count += 1
+            elif chunk_role == "parent":
+                if embedding is not None:
+                    raise RuntimeError("Parent chunks must not contain embeddings.")
+            else:
+                raise RuntimeError("Index stage found an invalid chunk role.")
         if len(local_ids) != len(payload):
             raise RuntimeError("Embedded chunk local IDs are not unique.")
+        if child_count != expected.get("child_count") or embedded_count != expected.get(
+            "embedded_count"
+        ):
+            raise RuntimeError("Embedded child counts do not match embed checkpoint.")
         return self._write_stage_artifact(
             context,
             "index_payload.json",
@@ -627,17 +674,33 @@ class IngestionPipeline:
         return json.loads(encoded)
 
     def _stage_artifact_dir(self, context) -> Path:
-        self._validate_version_component(
-            context.version.version_key,
-            label="parse version key",
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        store._validate_component(context.document.id)  # noqa: SLF001
+        store._validate_component(context.version.version_key)  # noqa: SLF001
+        document_root = store._prepare_document_root(  # noqa: SLF001
+            context.document.id,
+            create=True,
         )
-        root = (settings.canonical_artifacts_dir / context.document.id).resolve()
-        directory = (root / f"{context.version.version_key}.pipeline").resolve()
-        if directory.parent != root:
+        directory = document_root / f"{context.version.version_key}.pipeline"
+        store._validate_component(directory.name)  # noqa: SLF001
+        if store._is_link_or_reparse_point(directory):  # noqa: SLF001
+            raise ValueError(
+                f"stage artifact directory cannot be a symbolic link: {directory}"
+            )
+        if directory.exists():
+            if not directory.is_dir():
+                raise ValueError(
+                    f"stage artifact directory is not a directory: {directory}"
+                )
+        else:
+            directory.mkdir()
+        resolved = directory.resolve()
+        if resolved.parent != document_root.resolve():
             raise ValueError("Stage artifact directory escapes its document root.")
-        directory.mkdir(parents=True, exist_ok=True)
-        context.version.artifact_dir = str(directory)
-        return directory
+        context.version.artifact_dir = str(resolved)
+        return resolved
 
     @staticmethod
     def _outline_titles(nodes) -> list[str]:
@@ -785,7 +848,9 @@ class IngestionPipeline:
                 100,
                 "completed",
                 f"Canonical ingestion version {version.version_key} is active.",
+                commit=False,
             )
+            self.db.commit()
             return run
         run.status = RunStatus.queued.value
         if document.active_parse_version in (None, version.version_key):
@@ -795,7 +860,9 @@ class IngestionPipeline:
             5,
             "queued",
             f"Canonical ingestion version {version.version_key} queued for {actionable_stage}.",
+            commit=False,
         )
+        self.db.commit()
         from app.services.queue import JobDispatcher
 
         JobDispatcher().enqueue_stage(
@@ -1068,7 +1135,15 @@ class IngestionPipeline:
             return fallback
         return "Untitled document"
 
-    def _set_progress(self, run: PipelineRun, percent: int, stage: str, message: str) -> None:
+    def _set_progress(
+        self,
+        run: PipelineRun,
+        percent: int,
+        stage: str,
+        message: str,
+        *,
+        commit: bool = True,
+    ) -> None:
         report = dict(run.provider_report or {})
         report["progress"] = {
             "percent": max(0, min(percent, 100)),
@@ -1085,7 +1160,8 @@ class IngestionPipeline:
             run.id,
             message,
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     @staticmethod
     def _progress_bar(percent: int, width: int = 24) -> str:

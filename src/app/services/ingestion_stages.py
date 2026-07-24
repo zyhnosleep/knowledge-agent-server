@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -40,6 +41,8 @@ INGESTION_STAGES = (
 )
 
 STAGE_QUEUES = {stage: f"ingest.{stage}" for stage in INGESTION_STAGES}
+
+_MAX_STAGE_ERROR_BYTES = 4096
 
 _COMPLETED_STATUS = {
     "parse": "quality_checking",
@@ -366,15 +369,38 @@ class IngestionStageRunner:
             self.versions.transition(version, failed_status)
         if self._can_update_document_status(document, version):
             document.status = failed_status
-        self._set_pipeline_failure(document.id, stage, exc)
+        error, error_sha256, error_truncated = _bounded_stage_error(exc)
+        self._set_pipeline_failure(document.id, stage, error)
         failed = {
             **running,
             "status": "failed",
             "progress": 0,
-            "error": str(exc),
+            "error": error,
+            "error_type": type(exc).__name__,
+            "error_sha256": error_sha256,
+            "error_truncated": error_truncated,
             "failed_at": self._timestamp(),
         }
-        self._set_checkpoint(version, stage, failed)
+        try:
+            self._set_checkpoint(version, stage, failed)
+        except StageCheckpointTooLarge:
+            self._set_checkpoint(
+                version,
+                stage,
+                {
+                    "status": "failed",
+                    "attempts": running["attempts"],
+                    "progress": 0,
+                    "error": (
+                        f"{type(exc).__name__}: details omitted; "
+                        f"sha256={error_sha256}"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error_sha256": error_sha256,
+                    "error_truncated": True,
+                    "failed_at": self._timestamp(),
+                },
+            )
         self.db.commit()
 
     def _enqueue_next(self, version: DocumentParseVersion, stage: str) -> None:
@@ -480,23 +506,23 @@ class IngestionStageRunner:
         )
 
     def _set_pipeline_failure(
-        self, document_id: str, stage: str, exc: Exception
+        self, document_id: str, stage: str, error: str
     ) -> None:
         run = self._latest_pipeline_run(document_id)
         if run is None:
             return
         report = dict(run.provider_report or {})
-        report["error"] = str(exc)
+        report["error"] = error
         report["progress"] = {
             "percent": round(
                 100 * INGESTION_STAGES.index(stage) / len(INGESTION_STAGES)
             ),
             "stage": f"{stage}_failed",
-            "message": str(exc),
+            "message": error,
         }
         run.provider_report = report
         run.status = RunStatus.failed.value
-        run.notes = str(exc)
+        run.notes = error
 
     @staticmethod
     def _document_running_status(stage: str) -> str:
@@ -535,3 +561,20 @@ def _json_safe(value: Any) -> Any:
         json.dumps(converted, allow_nan=False)
         return converted
     raise TypeError(f"Stage checkpoint value {type(value).__name__} is not JSON serializable.")
+
+
+def _bounded_stage_error(exc: Exception) -> tuple[str, str, bool]:
+    raw = str(exc)
+    raw_bytes = raw.encode("utf-8", errors="replace")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    sanitized = "".join(
+        character if character.isprintable() or character in "\n\t" else "?"
+        for character in raw
+    )
+    encoded = sanitized.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_STAGE_ERROR_BYTES:
+        return sanitized, digest, False
+    suffix = f"... [truncated; sha256={digest}]"
+    budget = _MAX_STAGE_ERROR_BYTES - len(suffix.encode("ascii"))
+    prefix = encoded[:budget].decode("utf-8", errors="ignore")
+    return prefix + suffix, digest, True
