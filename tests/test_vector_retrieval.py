@@ -101,6 +101,203 @@ def test_pgvector_store_normalizes_query_and_preserves_document_scope(monkeypatc
     }
 
 
+def test_pgvector_query_joins_document_active_parse_version() -> None:
+    class RowsResult:
+        def all(self):
+            return []
+
+    class RecordingPostgresDatabase(_FakeDatabase):
+        def __init__(self) -> None:
+            super().__init__("postgresql")
+            self.sql = ""
+            self.parameters = {}
+
+        def execute(self, statement, parameters):
+            self.sql = str(statement)
+            self.parameters = parameters
+            return RowsResult()
+
+    db = RecordingPostgresDatabase()
+    store = PGVectorStore(db)  # type: ignore[arg-type]
+
+    assert store._search_rows([1.0, 0.0], 5, ["d1"]) == []
+    assert "idx.parse_version = document.active_parse_version" in db.sql
+    assert "idx.document_id IN" in db.sql
+    assert "idx.parse_version" in db.sql
+
+
+def test_sqlite_vec_hits_include_only_the_document_active_parse_version() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="Paper",
+            file_name="paper.pdf",
+            sha256="abc",
+            raw_path="raw/paper.pdf",
+            status="ready",
+            active_parse_version="new-v",
+        )
+    )
+    db.add_all(
+        [
+            DocumentChunk(
+                id="old-child",
+                document_id="d1",
+                parse_version="old-v",
+                ordinal=0,
+                text="Old evidence",
+            ),
+            DocumentChunk(
+                id="new-child",
+                document_id="d1",
+                parse_version="new-v",
+                ordinal=0,
+                text="New evidence",
+            ),
+        ]
+    )
+    db.commit()
+    store = SQLiteVecStore(db)
+    store._ensure_meta_table()
+    now = "2026-07-24T12:00:00"
+    db.execute(
+        text(
+            "INSERT INTO document_chunk_vector_index "
+            "(id, chunk_id, document_id, parse_version, dimensions, created_at, updated_at) "
+            "VALUES (1, 'old-child', 'd1', 'old-v', 2, :now, :now), "
+            "(2, 'new-child', 'd1', 'new-v', 2, :now, :now)"
+        ),
+        {"now": now},
+    )
+
+    hits = store._hits_from_vector_rows(
+        [
+            SimpleNamespace(rowid=1, distance=0.01),
+            SimpleNamespace(rowid=2, distance=0.02),
+        ],
+        ["d1"],
+    )
+
+    assert hits == [
+        VectorHit(chunk_id="new-child", distance=0.02, parse_version="new-v")
+    ]
+
+
+def test_sqlite_vec_unscoped_search_expands_past_inactive_versions(monkeypatch) -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="Paper",
+            file_name="paper.pdf",
+            sha256="abc",
+            raw_path="raw/paper.pdf",
+            status="ready",
+            active_parse_version="new-v",
+        )
+    )
+    db.add_all(
+        [
+            DocumentChunk(
+                id="old-child",
+                document_id="d1",
+                parse_version="old-v",
+                ordinal=0,
+                text="Old evidence",
+            ),
+            DocumentChunk(
+                id="new-child",
+                document_id="d1",
+                parse_version="new-v",
+                ordinal=0,
+                text="New evidence",
+            ),
+        ]
+    )
+    db.commit()
+    store = SQLiteVecStore(db)
+    monkeypatch.setattr(store, "available", lambda: True)
+    monkeypatch.setattr(store, "_ensure_vector_table", lambda _dimensions: None)
+    monkeypatch.setattr(store, "_serialize", lambda embedding: b"vector")
+    store._ensure_meta_table()
+    store._insert_mapping("old-child", "d1", 2, parse_version="old-v")
+    store._insert_mapping("new-child", "d1", 2, parse_version="new-v")
+    ranked = [
+        SimpleNamespace(rowid=1, distance=0.01),
+        SimpleNamespace(rowid=2, distance=0.02),
+    ]
+    monkeypatch.setattr(
+        store,
+        "_search_vector_rows",
+        lambda _dimensions, _embedding, limit: ranked[:limit],
+    )
+
+    hits = store.search([1.0, 0.0], limit=1)
+
+    assert hits == [
+        VectorHit(chunk_id="new-child", distance=0.02, parse_version="new-v")
+    ]
+
+
+def test_json_fallback_ignores_inactive_parse_versions(monkeypatch) -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="Paper",
+            file_name="paper.pdf",
+            sha256="abc",
+            raw_path="raw/paper.pdf",
+            status="ready",
+            active_parse_version="new-v",
+        )
+    )
+    db.add_all(
+        [
+            DocumentChunk(
+                id="old-child",
+                document_id="d1",
+                parse_version="old-v",
+                ordinal=0,
+                text="inactive unique evidence",
+                embedding=[1.0, 0.0],
+            ),
+            DocumentChunk(
+                id="new-child",
+                document_id="d1",
+                parse_version="new-v",
+                ordinal=0,
+                text="active evidence",
+                embedding=[0.0, 1.0],
+            ),
+        ]
+    )
+    db.commit()
+
+    class UnavailableVectorStore:
+        def search(self, *args, **kwargs):
+            return []
+
+    import app.services.search as search_module
+
+    monkeypatch.setattr(search_module, "get_vector_store", lambda _db: UnavailableVectorStore())
+    service = QueryService(db)
+    service.ollama = EmbedOnlyOllama([1.0, 0.0])
+
+    contexts = service._search_source_chunks(
+        "inactive unique evidence", "p1", ["d1"], limit=5
+    )
+
+    assert all(item.citation.chunk_id != "old-child" for item in contexts)
+
+
 def test_search_source_chunks_prefers_sqlite_vec_hits(monkeypatch) -> None:
     db = make_session()
     db.add(Project(id="p1", slug="demo", name="Demo"))

@@ -22,6 +22,11 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "ready_to_activate": {"active", "activation_failed"},
 }
 
+
+class ActivationError(RuntimeError):
+    """Raised when a staged parse version is not complete enough to publish."""
+
+
 FAILED_STAGE_RETRIES: dict[str, str] = {
     "parse_failed": "parsing",
     "table_repair_failed": "repairing",

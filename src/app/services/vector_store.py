@@ -21,6 +21,7 @@ settings = get_settings()
 class VectorHit:
     chunk_id: str
     distance: float
+    parse_version: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class ChunkVector:
     chunk_id: str
     document_id: str
     embedding: list[float]
+    parse_version: str = "legacy"
 
 
 class SQLiteVecStore:
@@ -74,7 +76,12 @@ class SQLiteVecStore:
 
     def replace_document_chunks(self, document_id: str, vectors: Iterable[ChunkVector]) -> None:
         vectors = [
-            ChunkVector(chunk_id=vector.chunk_id, document_id=vector.document_id, embedding=normalized_embedding)
+            ChunkVector(
+                chunk_id=vector.chunk_id,
+                document_id=vector.document_id,
+                embedding=normalized_embedding,
+                parse_version=vector.parse_version,
+            )
             for vector in vectors
             if self._valid_embedding(vector.embedding)
             for normalized_embedding in [self._normalize_embedding(vector.embedding)]
@@ -85,12 +92,19 @@ class SQLiteVecStore:
         try:
             with self.db.begin_nested():
                 self._ensure_meta_table()
-                self._delete_document_rows(document_id)
+                parse_versions = {vector.parse_version for vector in vectors}
+                for parse_version in parse_versions:
+                    self._delete_document_rows(document_id, parse_version=parse_version)
                 for vector in vectors:
                     dimensions = len(vector.embedding)
                     self._ensure_vector_table(dimensions)
                     self._delete_chunk_row(vector.chunk_id)
-                    row_id = self._insert_mapping(vector.chunk_id, vector.document_id, dimensions)
+                    row_id = self._insert_mapping(
+                        vector.chunk_id,
+                        vector.document_id,
+                        dimensions,
+                        parse_version=vector.parse_version,
+                    )
                     self.db.execute(
                         text(
                             f"INSERT INTO {self._vector_table_name(dimensions)}(rowid, embedding) "
@@ -114,14 +128,30 @@ class SQLiteVecStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("sqlite-vec cleanup failed for document %s; JSON embeddings remain available: %s", document_id, exc)
 
-    def _delete_document_rows(self, document_id: str) -> None:
+    def _delete_document_rows(
+        self, document_id: str, *, parse_version: str | None = None
+    ) -> None:
+        version_filter = ""
+        parameters = {"document_id": document_id}
+        if parse_version is not None:
+            version_filter = " AND parse_version = :parse_version"
+            parameters["parse_version"] = parse_version
         rows = self.db.execute(
-            text(f"SELECT id, dimensions FROM {self._META_TABLE} WHERE document_id = :document_id"),
-            {"document_id": document_id},
+            text(
+                f"SELECT id, dimensions FROM {self._META_TABLE} "
+                f"WHERE document_id = :document_id{version_filter}"
+            ),
+            parameters,
         ).all()
         for row_id, dimensions in rows:
             self._delete_vector_row(int(row_id), int(dimensions))
-        self.db.execute(text(f"DELETE FROM {self._META_TABLE} WHERE document_id = :document_id"), {"document_id": document_id})
+        self.db.execute(
+            text(
+                f"DELETE FROM {self._META_TABLE} "
+                f"WHERE document_id = :document_id{version_filter}"
+            ),
+            parameters,
+        )
 
     def _delete_chunk_row(self, chunk_id: str) -> None:
         row = self.db.execute(
@@ -149,9 +179,6 @@ class SQLiteVecStore:
         try:
             self._ensure_meta_table()
             self._ensure_vector_table(dimensions)
-            if not scoped_document_ids:
-                return self._hits_from_vector_rows(self._search_vector_rows(dimensions, normalized_embedding, limit), [])[:limit]
-
             total_rows = self._indexed_row_count(dimensions)
             if total_rows <= 0:
                 return []
@@ -194,18 +221,29 @@ class SQLiteVecStore:
             document_filter = f"AND idx.document_id IN ({document_placeholders}) "
         mapping_rows = self.db.execute(
             text(
-                f"SELECT idx.id, idx.chunk_id FROM {self._META_TABLE} AS idx "
+                f"SELECT idx.id, idx.chunk_id, idx.parse_version FROM {self._META_TABLE} AS idx "
                 "JOIN document_chunks AS chunk ON chunk.id = idx.chunk_id "
+                "JOIN documents AS document ON document.id = idx.document_id "
                 f"WHERE idx.id IN ({row_id_placeholders}) "
+                "AND (idx.parse_version = document.active_parse_version "
+                "OR (document.active_parse_version IS NULL AND idx.parse_version = 'legacy')) "
+                "AND chunk.parse_version = idx.parse_version "
                 f"{document_filter}"
             ),
             parameters,
         ).all()
-        chunk_ids_by_row_id = {int(row.id): str(row.chunk_id) for row in mapping_rows}
+        chunks_by_row_id = {
+            int(row.id): (str(row.chunk_id), str(row.parse_version))
+            for row in mapping_rows
+        }
         return [
-            VectorHit(chunk_id=chunk_ids_by_row_id[int(row.rowid)], distance=float(row.distance))
+            VectorHit(
+                chunk_id=chunks_by_row_id[int(row.rowid)][0],
+                distance=float(row.distance),
+                parse_version=chunks_by_row_id[int(row.rowid)][1],
+            )
             for row in rows
-            if int(row.rowid) in chunk_ids_by_row_id
+            if int(row.rowid) in chunks_by_row_id
         ]
 
     def _indexed_row_count(self, dimensions: int) -> int:
@@ -213,6 +251,20 @@ class SQLiteVecStore:
             self.db.execute(
                 text(f"SELECT COUNT(*) FROM {self._META_TABLE} WHERE dimensions = :dimensions"),
                 {"dimensions": dimensions},
+            ).scalar_one()
+        )
+
+    def count_document_chunks(self, document_id: str, parse_version: str) -> int:
+        if not self.available():
+            return 0
+        self._ensure_meta_table()
+        return int(
+            self.db.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {self._META_TABLE} "
+                    "WHERE document_id = :document_id AND parse_version = :parse_version"
+                ),
+                {"document_id": document_id, "parse_version": parse_version},
             ).scalar_one()
         )
 
@@ -224,6 +276,7 @@ class SQLiteVecStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chunk_id TEXT NOT NULL UNIQUE,
                     document_id TEXT NOT NULL,
+                    parse_version TEXT NOT NULL DEFAULT 'legacy',
                     dimensions INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -231,6 +284,19 @@ class SQLiteVecStore:
                 """
             )
         )
+        columns = {
+            str(row.name)
+            for row in self.db.execute(
+                text(f"PRAGMA table_info({self._META_TABLE})")
+            ).all()
+        }
+        if "parse_version" not in columns:
+            self.db.execute(
+                text(
+                    f"ALTER TABLE {self._META_TABLE} ADD COLUMN "
+                    "parse_version TEXT NOT NULL DEFAULT 'legacy'"
+                )
+            )
         self.db.execute(
             text(
                 f"CREATE INDEX IF NOT EXISTS ix_{self._META_TABLE}_document_id "
@@ -248,15 +314,24 @@ class SQLiteVecStore:
             )
         )
 
-    def _insert_mapping(self, chunk_id: str, document_id: str, dimensions: int) -> int:
+    def _insert_mapping(
+        self,
+        chunk_id: str,
+        document_id: str,
+        dimensions: int,
+        parse_version: str = "legacy",
+    ) -> int:
         now = datetime.utcnow().isoformat(timespec="seconds")
         self.db.execute(
             text(
                 f"""
-                INSERT INTO {self._META_TABLE} (chunk_id, document_id, dimensions, created_at, updated_at)
-                VALUES (:chunk_id, :document_id, :dimensions, :created_at, :updated_at)
+                INSERT INTO {self._META_TABLE}
+                    (chunk_id, document_id, parse_version, dimensions, created_at, updated_at)
+                VALUES
+                    (:chunk_id, :document_id, :parse_version, :dimensions, :created_at, :updated_at)
                 ON CONFLICT(chunk_id) DO UPDATE SET
                     document_id = excluded.document_id,
+                    parse_version = excluded.parse_version,
                     dimensions = excluded.dimensions,
                     updated_at = excluded.updated_at
                 """
@@ -264,6 +339,7 @@ class SQLiteVecStore:
             {
                 "chunk_id": chunk_id,
                 "document_id": document_id,
+                "parse_version": parse_version,
                 "dimensions": dimensions,
                 "created_at": now,
                 "updated_at": now,
@@ -344,6 +420,7 @@ class PGVectorStore:
                 chunk_id=vector.chunk_id,
                 document_id=vector.document_id,
                 embedding=embedding,
+                parse_version=vector.parse_version,
             )
             for vector in vectors
             if self._valid_embedding(vector.embedding)
@@ -354,21 +431,25 @@ class PGVectorStore:
             return
         try:
             with self.db.begin_nested():
-                self.delete_document(document_id)
+                parse_versions = {vector.parse_version for vector in normalized}
+                for parse_version in parse_versions:
+                    self.delete_document(document_id, parse_version=parse_version)
                 if normalized:
                     self.db.execute(
                         text(
                             f"INSERT INTO {self._TABLE_NAME} "
-                            "(chunk_id, document_id, embedding) "
-                            "VALUES (:chunk_id, :document_id, CAST(:embedding AS vector)) "
+                            "(chunk_id, document_id, parse_version, embedding) "
+                            "VALUES (:chunk_id, :document_id, :parse_version, CAST(:embedding AS vector)) "
                             "ON CONFLICT (chunk_id) DO UPDATE SET "
                             "document_id = EXCLUDED.document_id, "
+                            "parse_version = EXCLUDED.parse_version, "
                             "embedding = EXCLUDED.embedding"
                         ),
                         [
                             {
                                 "chunk_id": vector.chunk_id,
                                 "document_id": vector.document_id,
+                                "parse_version": vector.parse_version,
                                 "embedding": self._serialize(vector.embedding),
                             }
                             for vector in normalized
@@ -381,13 +462,17 @@ class PGVectorStore:
                 exc,
             )
 
-    def delete_document(self, document_id: str) -> None:
+    def delete_document(
+        self, document_id: str, *, parse_version: str | None = None
+    ) -> None:
         if not self.available():
             return
-        self.db.execute(
-            text(f"DELETE FROM {self._TABLE_NAME} WHERE document_id = :document_id"),
-            {"document_id": document_id},
-        )
+        sql = f"DELETE FROM {self._TABLE_NAME} WHERE document_id = :document_id"
+        parameters = {"document_id": document_id}
+        if parse_version is not None:
+            sql += " AND parse_version = :parse_version"
+            parameters["parse_version"] = parse_version
+        self.db.execute(text(sql), parameters)
 
     def search(
         self,
@@ -409,12 +494,29 @@ class PGVectorStore:
         try:
             rows = self._search_rows(normalized, limit, scoped_document_ids)
             return [
-                VectorHit(chunk_id=str(row.chunk_id), distance=float(row.distance))
+                VectorHit(
+                    chunk_id=str(row.chunk_id),
+                    distance=float(row.distance),
+                    parse_version=str(getattr(row, "parse_version", "legacy")),
+                )
                 for row in rows
             ]
         except Exception as exc:  # noqa: BLE001
             logger.warning("pgvector search failed; falling back to JSON embeddings: %s", exc)
             return []
+
+    def count_document_chunks(self, document_id: str, parse_version: str) -> int:
+        if not self.available():
+            return 0
+        return int(
+            self.db.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {self._TABLE_NAME} "
+                    "WHERE document_id = :document_id AND parse_version = :parse_version"
+                ),
+                {"document_id": document_id, "parse_version": parse_version},
+            ).scalar_one()
+        )
 
     def _search_rows(
         self, embedding: list[float], limit: int, document_ids: list[str]
@@ -430,11 +532,16 @@ class PGVectorStore:
                 key = f"document_id_{index}"
                 parameters[key] = document_id
                 placeholders.append(f":{key}")
-            scope_sql = f"WHERE document_id IN ({','.join(placeholders)}) "
+            scope_sql = f"AND idx.document_id IN ({','.join(placeholders)}) "
         return self.db.execute(
             text(
-                f"SELECT chunk_id, embedding <=> CAST(:embedding AS vector) AS distance "
-                f"FROM {self._TABLE_NAME} {scope_sql}"
+                f"SELECT idx.chunk_id, idx.parse_version, "
+                "idx.embedding <=> CAST(:embedding AS vector) AS distance "
+                f"FROM {self._TABLE_NAME} AS idx "
+                "JOIN documents AS document ON document.id = idx.document_id "
+                "WHERE (idx.parse_version = document.active_parse_version "
+                "OR (document.active_parse_version IS NULL AND idx.parse_version = 'legacy')) "
+                f"{scope_sql}"
                 "ORDER BY distance LIMIT :limit"
             ),
             parameters,

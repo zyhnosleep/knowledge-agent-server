@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import re
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -43,10 +44,9 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.filesystem import compute_sha256, display_title_from_path, looks_like_internal_sample, readable_title_from_path, slugify, strip_upload_prefix
-from app.services.ingestion_stages import CapabilityUnavailable
 from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
 from app.services.parser import parse_document
-from app.services.parse_versions import ParseVersionService
+from app.services.parse_versions import ActivationError, ParseVersionService
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
 from app.services.vector_store import ChunkVector, get_vector_store
@@ -527,6 +527,11 @@ class IngestionPipeline:
             if len(embedding) != dimensions:
                 raise RuntimeError("Embedding response dimensions are inconsistent.")
             child_embeddings.append([float(value) for value in embedding])
+        if dimensions != settings.ollama_embedding_dimensions:
+            raise RuntimeError(
+                "Embedding response dimensions do not match the configured "
+                f"embedding dimensions ({settings.ollama_embedding_dimensions})."
+            )
         embedded = iter(child_embeddings)
         records = [
             {
@@ -568,6 +573,10 @@ class IngestionPipeline:
             or expected_dimensions <= 0
         ):
             raise RuntimeError("Embed checkpoint has invalid dimensions.")
+        if expected_dimensions != settings.ollama_embedding_dimensions:
+            raise RuntimeError(
+                "Embedding dimensions do not match the configured embedding dimensions."
+            )
         local_ids: set[str] = set()
         child_count = 0
         embedded_count = 0
@@ -610,6 +619,7 @@ class IngestionPipeline:
             "embedded_count"
         ):
             raise RuntimeError("Embedded child counts do not match embed checkpoint.")
+        self._persist_versioned_chunks(context, payload)
         return self._write_stage_artifact(
             context,
             "index_payload.json",
@@ -617,14 +627,232 @@ class IngestionPipeline:
             extra={
                 "row_count": len(payload),
                 "child_count": child_count,
+                "indexed_count": embedded_count,
+                "dimensions": expected_dimensions,
                 "parse_version": context.version.version_key,
             },
         )
 
     def _run_activation_gate_stage(self, context) -> dict[str, object]:
-        raise CapabilityUnavailable(
-            "Task 10 version-scoped atomic persistence/search filtering is unavailable."
+        payload = self._load_previous_stage_artifact(context)
+        if not isinstance(payload, list) or not payload:
+            raise ActivationError("Activation artifact validation failed: empty index payload.")
+        checkpoint = context.input.get("previous_output") or {}
+        version_key = context.version.version_key
+        if checkpoint.get("parse_version") != version_key:
+            raise ActivationError("Activation artifact validation failed: wrong parse version.")
+        children = list(
+            context.db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == context.document.id,
+                    DocumentChunk.parse_version == version_key,
+                    DocumentChunk.chunk_role == "child",
+                )
+            ).all()
         )
+        retrievable_count = len(children)
+        if retrievable_count <= 0:
+            raise ActivationError("Activation requires non-zero retrievable Child chunks.")
+        contextualized_count = sum(
+            bool(chunk.contextual_prefix)
+            and bool(chunk.contextualization_model)
+            and bool(chunk.contextualization_version)
+            and bool(chunk.contextualization_prompt_version)
+            and chunk.contextualized_at is not None
+            and chunk.embedding_text == f"{chunk.contextual_prefix}\n\n{chunk.text}"
+            for chunk in children
+        )
+        dimensions = settings.ollama_embedding_dimensions
+        embedded_count = sum(
+            isinstance(chunk.embedding, list)
+            and len(chunk.embedding) == dimensions
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                for value in chunk.embedding
+            )
+            for chunk in children
+        )
+        valid_span_count = sum(self._chunk_has_valid_source_spans(chunk) for chunk in children)
+        indexed_count = self._indexed_child_count(
+            context.document.id,
+            version_key,
+            fallback=embedded_count,
+        )
+        artifact_child_count = sum(
+            isinstance(item, dict)
+            and isinstance(item.get("chunk"), dict)
+            and item["chunk"].get("chunk_role") == "child"
+            and item["chunk"].get("parse_version") == version_key
+            for item in payload
+        )
+        counts = {
+            "retrievable": retrievable_count,
+            "contextualized": contextualized_count,
+            "embedded": embedded_count,
+            "indexed": indexed_count,
+            "valid_source_spans": valid_span_count,
+            "artifact": artifact_child_count,
+        }
+        if len(set(counts.values())) != 1:
+            raise ActivationError(
+                "Activation embedding completeness check failed: "
+                + ", ".join(f"{name}={value}" for name, value in counts.items())
+            )
+        expected_child_count = checkpoint.get("child_count")
+        expected_indexed_count = checkpoint.get("indexed_count")
+        if expected_child_count != retrievable_count or expected_indexed_count != indexed_count:
+            raise ActivationError(
+                "Activation artifact validation failed: checkpoint counts differ from index."
+            )
+        return {"parse_version": version_key, **counts}
+
+    def _persist_versioned_chunks(self, context, payload: list[dict]) -> None:
+        from app.services.contextualization import ContextualizedChunk
+        from app.services.semantic_chunking import ChunkDraft
+
+        version_key = context.version.version_key
+        context.db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == context.document.id,
+            DocumentChunk.parse_version == version_key,
+        ).delete(synchronize_session=False)
+        records: dict[str, DocumentChunk] = {}
+        items_by_role = {
+            role: [item for item in payload if item["chunk"]["chunk_role"] == role]
+            for role in ("parent", "child")
+        }
+        for item in items_by_role["parent"]:
+            draft = ChunkDraft.model_validate(item["chunk"])
+            if draft.parse_version != version_key:
+                raise RuntimeError("Chunk parse version does not match the index version.")
+            record = self._document_chunk_from_draft(context, draft, embedding=None)
+            context.db.add(record)
+            records[draft.local_id] = record
+        context.db.flush()
+        vectors: list[ChunkVector] = []
+        for item in items_by_role["child"]:
+            draft = ContextualizedChunk.model_validate(item["chunk"])
+            if draft.parse_version != version_key:
+                raise RuntimeError("Chunk parse version does not match the index version.")
+            parent = records.get(draft.parent_local_id or "")
+            if parent is None:
+                raise RuntimeError("Contextualized Child references a missing Parent chunk.")
+            embedding = [float(value) for value in item["embedding"]]
+            record = self._document_chunk_from_draft(
+                context,
+                draft,
+                embedding=embedding,
+                parent_chunk_id=parent.id,
+            )
+            context.db.add(record)
+            records[draft.local_id] = record
+            vectors.append(
+                ChunkVector(
+                    chunk_id=record.id,
+                    document_id=context.document.id,
+                    embedding=embedding,
+                    parse_version=version_key,
+                )
+            )
+        context.db.flush()
+        for item in items_by_role["child"]:
+            draft = ContextualizedChunk.model_validate(item["chunk"])
+            record = records[draft.local_id]
+            record.previous_chunk_id = draft.previous_child_local_id
+            record.next_chunk_id = draft.next_child_local_id
+        context.db.flush()
+        vector_store = get_vector_store(context.db)
+        vector_store.replace_document_chunks(
+            context.document.id,
+            vectors,
+        )
+        if vector_store.available() and vector_store.count_document_chunks(
+            context.document.id, version_key
+        ) != len(vectors):
+            raise RuntimeError("Version-scoped vector index is incomplete.")
+
+    @staticmethod
+    def _document_chunk_from_draft(
+        context,
+        draft,
+        *,
+        embedding: list[float] | None,
+        parent_chunk_id: str | None = None,
+    ) -> DocumentChunk:
+        contextualized_at = getattr(draft, "contextualized_at", None)
+        if isinstance(contextualized_at, str):
+            contextualized_at = datetime.fromisoformat(contextualized_at)
+        source_spans = [span.model_dump(mode="json") for span in draft.source_spans]
+        page_label = next(
+            (span.get("page_label") for span in source_spans if span.get("page_label")),
+            None,
+        )
+        return DocumentChunk(
+            id=draft.local_id,
+            document_id=context.document.id,
+            parse_version=context.version.version_key,
+            parent_chunk_id=parent_chunk_id,
+            chunk_role=draft.chunk_role,
+            block_type=draft.block_type,
+            ordinal=draft.ordinal,
+            heading=draft.section_path[-1] if draft.section_path else None,
+            page_label=page_label,
+            section_path=list(draft.section_path),
+            source_block_ids=list(draft.source_block_ids),
+            source_spans=source_spans,
+            text=draft.text,
+            contextual_prefix=getattr(draft, "contextual_prefix", None),
+            embedding_text=draft.embedding_text,
+            contextualization_model=getattr(draft, "contextualization_model", None),
+            contextualization_version=getattr(draft, "contextualization_version", None),
+            contextualization_prompt_version=getattr(
+                draft, "contextualization_prompt_version", None
+            ),
+            contextualized_at=contextualized_at,
+            splitter_name=draft.splitter_name,
+            splitter_version=draft.splitter_version,
+            splitting_model=draft.splitting_model,
+            semantic_boundary_score=draft.semantic_boundary_score,
+            token_count=draft.token_count,
+            token_estimate=draft.token_count,
+            previous_chunk_id=None,
+            next_chunk_id=None,
+            embedding=embedding,
+        )
+
+    @staticmethod
+    def _chunk_has_valid_source_spans(chunk: DocumentChunk) -> bool:
+        from app.services.canonical_models import SourceSpan
+
+        spans = chunk.source_spans
+        if not isinstance(spans, list) or not spans:
+            return False
+        locator_fields = (
+            "page_index",
+            "source_block_id",
+            "paragraph_id",
+            "table_id",
+            "image_relationship_id",
+            "xpath",
+            "css_selector",
+            "element_id",
+            "line_start",
+            "char_start",
+        )
+        try:
+            validated = [SourceSpan.model_validate(span) for span in spans]
+        except Exception:
+            return False
+        return all(any(getattr(span, field) is not None for field in locator_fields) for span in validated)
+
+    def _indexed_child_count(
+        self, document_id: str, parse_version: str, *, fallback: int
+    ) -> int:
+        store = get_vector_store(self.db)
+        if not store.available():
+            return fallback
+        return store.count_document_chunks(document_id, parse_version)
 
     def _write_stage_artifact(
         self,

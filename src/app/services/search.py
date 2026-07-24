@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -1894,7 +1894,15 @@ class QueryService:
             for hit in vector_hits
         }
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
-            DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value)
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+            or_(
+                Document.active_parse_version == DocumentChunk.parse_version,
+                and_(
+                    Document.active_parse_version.is_(None),
+                    DocumentChunk.parse_version == "legacy",
+                ),
+            ),
         )
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))

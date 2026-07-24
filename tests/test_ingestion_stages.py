@@ -30,7 +30,6 @@ from app.services.ingestion_stages import (
     IngestionStageRunner,
     StageAlreadyClaimed,
     StageCheckpointTooLarge,
-    CapabilityUnavailable,
 )
 from app.services import queue as queue_module
 from app.services.contextualization import ContextualizedChunk
@@ -268,7 +267,7 @@ def test_process_document_preserves_active_version_until_activation_is_available
     stage_handlers["activate"] = pipeline.ingestion_stage_handlers()["activate"]
     runner = IngestionStageRunner(db, handlers=stage_handlers)
     runner.run_until_blocked("d1", "canonical-v1-abc")
-    with pytest.raises(CapabilityUnavailable, match="Task 10"):
+    with pytest.raises(RuntimeError, match="artifact reference"):
         runner.run_stage(
             "d1", "canonical-v1-abc", "activate", enqueue_next=False
         )
@@ -862,6 +861,7 @@ def test_embed_stage_vectors_only_contextualized_children_and_keeps_parents(
     monkeypatch.setattr(
         pipeline_module.settings, "canonical_artifacts_dir", tmp_path / "artifacts"
     )
+    monkeypatch.setattr(pipeline_module.settings, "ollama_embedding_dimensions", 2)
     pipeline = IngestionPipeline(db)
     directory = tmp_path / "artifacts" / "d1" / "v1.pipeline"
     directory.mkdir(parents=True)
@@ -1012,6 +1012,7 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     monkeypatch.setattr(
         pipeline_module.settings, "canonical_artifacts_dir", tmp_path / "artifacts"
     )
+    monkeypatch.setattr(pipeline_module.settings, "ollama_embedding_dimensions", 2)
     pipeline = IngestionPipeline(db)
     pipeline.ollama = type(
         "FakeEmbeddingClient",
@@ -1028,7 +1029,7 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
         embedding_text="Parent evidence",
         token_count=2,
         source_block_ids=["block-1"],
-        source_spans=[],
+        source_spans=[{"page_index": 0, "page_label": "1"}],
         section_path=["Evidence"],
         ordinal=0,
         splitter_name="test",
@@ -1045,7 +1046,7 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
         token_count=2,
         parent_local_id="parent-1",
         source_block_ids=["block-1"],
-        source_spans=[],
+        source_spans=[{"page_index": 0, "page_label": "1"}],
         section_path=["Evidence"],
         ordinal=1,
         splitter_name="test",
@@ -1142,17 +1143,17 @@ def test_production_staged_parse_writes_artifact_without_legacy_side_effects(
     assert db.get(Document, "d1").metadata_json == {"published": "metadata"}
     assert db.get(DocumentParseVersion, "pv1").status == "ready_to_activate"
     rows = db.query(DocumentChunk).filter_by(document_id="d1", parse_version="v1").all()
-    assert rows == []
+    assert {row.chunk_role for row in rows} == {"parent", "child"}
     assert db.get(DocumentChunk, "legacy-chunk") is not None
     index_output = db.get(DocumentParseVersion, "pv1").stage_state["index"]["output"]
     assert Path(index_output["artifact_path"]).is_file()
 
-    with pytest.raises(CapabilityUnavailable, match="Task 10"):
-        runner.run_stage("d1", "v1", "activate", enqueue_next=False)
+    runner.run_stage("d1", "v1", "activate", enqueue_next=False)
     db.expire_all()
     assert db.get(Document, "d1").status == "ready"
-    assert db.get(Document, "d1").active_parse_version == "legacy"
-    assert db.get(DocumentParseVersion, "pv1").status == "activation_failed"
+    assert db.get(Document, "d1").active_parse_version == "v1"
+    assert db.get(DocumentParseVersion, "pv1").status == "active"
+    assert db.get(DocumentParseVersion, "legacy-version").status == "superseded"
     run = db.get(PipelineRun, "run1")
-    assert run.status == RunStatus.failed.value
-    assert run.provider_report["progress"]["stage"] == "activate_failed"
+    assert run.status == RunStatus.completed.value
+    assert run.provider_report["progress"]["stage"] == "completed"
