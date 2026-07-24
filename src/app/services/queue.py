@@ -77,7 +77,7 @@ class JobDispatcher:
                 if status == "failed":
                     existing.requeue()
                     return existing
-                if status == "finished":
+                if status in {"finished", "stopped", "canceled"}:
                     existing.delete(remove_from_queue=True)
                     if attempt < 2:
                         continue

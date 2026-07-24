@@ -202,6 +202,61 @@ def test_process_document_keeps_completed_version_ready_without_enqueue(
     assert db.get(Document, "d1").status == "ready"
 
 
+def test_process_document_preserves_active_version_until_activation_is_available(
+    db: Session, monkeypatch
+) -> None:
+    document = db.get(Document, "d1")
+    document.status = "ready"
+    document.active_parse_version = "legacy"
+    version = db.get(DocumentParseVersion, "pv1")
+    version.version_key = "canonical-v1-abc"
+    db.add(
+        DocumentParseVersion(
+            id="legacy-version",
+            document_id="d1",
+            version_key="legacy",
+            artifact_dir="legacy",
+            status="active",
+        )
+    )
+    db.commit()
+    enqueued: list[tuple[str, str, str]] = []
+
+    class FakeDispatcher:
+        def enqueue_stage(self, document_id, version_key, stage):
+            enqueued.append((document_id, version_key, stage))
+
+    from app.services import pipeline as pipeline_module
+    from app.services import queue as queue_module
+
+    monkeypatch.setattr(pipeline_module.settings, "redis_url", "redis://local")
+    monkeypatch.setattr(
+        pipeline_module.settings, "canonical_pipeline_version", "canonical-v1"
+    )
+    monkeypatch.setattr(queue_module, "JobDispatcher", FakeDispatcher)
+    pipeline = IngestionPipeline(db)
+
+    pipeline.process_document("d1")
+
+    assert enqueued == [("d1", "canonical-v1-abc", "parse")]
+    assert db.get(Document, "d1").status == "ready"
+    assert db.get(Document, "d1").active_parse_version == "legacy"
+
+    stage_handlers = handlers([])
+    stage_handlers["activate"] = pipeline.ingestion_stage_handlers()["activate"]
+    runner = IngestionStageRunner(db, handlers=stage_handlers)
+    runner.run_until_blocked("d1", "canonical-v1-abc")
+    with pytest.raises(CapabilityUnavailable, match="Task 10"):
+        runner.run_stage(
+            "d1", "canonical-v1-abc", "activate", enqueue_next=False
+        )
+
+    db.expire_all()
+    assert db.get(Document, "d1").status == "ready"
+    assert db.get(Document, "d1").active_parse_version == "legacy"
+    assert db.get(DocumentParseVersion, "pv1").status == "activation_failed"
+
+
 def test_malicious_pipeline_version_is_rejected_before_path_construction(
     db: Session, tmp_path: Path, monkeypatch
 ) -> None:
@@ -570,6 +625,8 @@ def test_dispatching_same_stage_twice_uses_unique_rq_contract(monkeypatch) -> No
         ("scheduled", "returned"),
         ("failed", "requeued"),
         ("finished", "reenqueued"),
+        ("stopped", "reenqueued"),
+        ("canceled", "reenqueued"),
     ],
 )
 def test_duplicate_stage_job_is_reconciled_by_rq_status(
@@ -587,7 +644,8 @@ def test_duplicate_stage_job_is_reconciled_by_rq_status(
             events.append("requeued")
             return self
 
-        def delete(self, **_kwargs):
+        def delete(self, *, remove_from_queue):
+            assert remove_from_queue is True
             events.append("deleted")
 
     existing = FakeJob()
@@ -599,7 +657,7 @@ def test_duplicate_stage_job_is_reconciled_by_rq_status(
 
         def enqueue_call(self, **_kwargs):
             self.attempts += 1
-            if status == "finished" and self.attempts > 1:
+            if status in {"finished", "stopped", "canceled"} and self.attempts > 1:
                 events.append("reenqueued")
                 return "replacement"
             raise DuplicateJobError("duplicate")

@@ -788,7 +788,8 @@ class IngestionPipeline:
             )
             return run
         run.status = RunStatus.queued.value
-        document.status = DocumentStatus.processing.value
+        if document.active_parse_version in (None, version.version_key):
+            document.status = DocumentStatus.processing.value
         self._set_progress(
             run,
             5,
