@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from collections.abc import Callable
 
 from redis import Redis
@@ -50,25 +51,37 @@ class JobDispatcher:
             module_name, attr_name = function.rsplit(".", 1)
             imported = getattr(importlib.import_module(module_name), attr_name)
             return imported(document_id, version_key, stage)
-        return queue.enqueue(
-            function,
-            document_id,
-            version_key,
-            stage,
-            job_timeout=settings.queue_job_timeout,
+        return queue.enqueue_call(
+            func=function,
+            args=(document_id, version_key, stage),
+            timeout=settings.queue_job_timeout,
             job_id=job_id,
+            unique=True,
         )
 
 
 def ingestion_stage_job_id(document_id: str, version_key: str, stage: str) -> str:
     if stage not in STAGE_QUEUES:
         raise ValueError(f"Unknown ingestion stage {stage!r}.")
-    return f"ingestion:{document_id}:{version_key}:{stage}"
+    return f"ingestion-{document_id}-{version_key}-{stage}"
 
 
 def create_worker() -> Worker:
+    queues = [*(STAGE_QUEUES[stage] for stage in INGESTION_STAGES), "ingest"]
+    configured_queues = os.getenv("INGESTION_WORKER_QUEUES")
+    if configured_queues is not None:
+        parsed_queues = [
+            value.strip() for value in configured_queues.split(",") if value.strip()
+        ]
+        if parsed_queues != queues:
+            raise RuntimeError(
+                "INGESTION_WORKER_QUEUES must list all stage queues in order "
+                "followed by the legacy ingest queue."
+            )
+    concurrency = os.getenv("INGESTION_WORKER_CONCURRENCY", "1")
+    if concurrency != "1":
+        raise RuntimeError("INGESTION_WORKER_CONCURRENCY must be 1.")
     connection = redis_connection()
     if connection is None:
         raise RuntimeError("REDIS_URL is not configured.")
-    queues = [*(STAGE_QUEUES[stage] for stage in INGESTION_STAGES), "ingest"]
     return Worker(queues, connection=connection)

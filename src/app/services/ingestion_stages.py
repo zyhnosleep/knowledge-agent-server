@@ -4,10 +4,11 @@ import json
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -79,6 +80,10 @@ class StageHandlerUnavailable(RuntimeError):
     """Raised instead of recording a stage as complete without real work."""
 
 
+class StageCheckpointTooLarge(ValueError):
+    """Raised before committing a checkpoint that exceeds the durable JSON cap."""
+
+
 @dataclass(frozen=True)
 class IngestionStageContext:
     db: Session
@@ -102,6 +107,9 @@ class IngestionStageRunner:
         handlers: Mapping[str, StageHandler] | None = None,
         dispatcher: Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        claim_owner: str | None = None,
+        claim_ttl_seconds: int = 900,
+        max_checkpoint_bytes: int = 256 * 1024,
     ) -> None:
         self.db = db
         self.handlers = dict(handlers or {})
@@ -111,6 +119,13 @@ class IngestionStageRunner:
             raise ValueError(f"Unknown ingestion stage handlers: {names}.")
         self.dispatcher = dispatcher
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.claim_owner = claim_owner or uuid4().hex
+        if claim_ttl_seconds <= 0:
+            raise ValueError("claim_ttl_seconds must be positive")
+        if max_checkpoint_bytes <= 0:
+            raise ValueError("max_checkpoint_bytes must be positive")
+        self.claim_ttl_seconds = claim_ttl_seconds
+        self.max_checkpoint_bytes = max_checkpoint_bytes
         self.versions = ParseVersionService(db)
 
     def run_until_blocked(
@@ -151,11 +166,12 @@ class IngestionStageRunner:
                 self._enqueue_next(version, stage)
             return version
         if checkpoint.get("status") == "running":
-            self.db.rollback()
-            raise StageAlreadyClaimed(
-                f"Ingestion stage {stage!r} is already claimed for "
-                f"document {document_id!r}, version {version_key!r}."
-            )
+            if not self._claim_expired(checkpoint):
+                self.db.rollback()
+                raise StageAlreadyClaimed(
+                    f"Ingestion stage {stage!r} is already claimed for "
+                    f"document {document_id!r}, version {version_key!r}."
+                )
 
         self._validate_order(version, stage)
         self._prepare_status_for_attempt(version, stage)
@@ -174,6 +190,10 @@ class IngestionStageRunner:
             "completed_at": None,
             "failed_at": None,
             "next_enqueued": False,
+            "claim_owner": self.claim_owner,
+            "lease_expires_at": self._timestamp(
+                self._now() + timedelta(seconds=self.claim_ttl_seconds)
+            ),
         }
         self._set_checkpoint(version, stage, running)
         self.db.commit()
@@ -370,19 +390,48 @@ class IngestionStageRunner:
         self._set_checkpoint(locked_version, stage, checkpoint)
         self.db.commit()
 
-    @staticmethod
     def _set_checkpoint(
+        self,
         version: DocumentParseVersion, stage: str, checkpoint: dict[str, Any]
     ) -> None:
         state = dict(version.stage_state or {})
         state[stage] = _json_safe(checkpoint)
+        encoded = json.dumps(
+            state,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > self.max_checkpoint_bytes:
+            raise StageCheckpointTooLarge(
+                f"Ingestion checkpoint is {len(encoded)} bytes; "
+                f"maximum is {self.max_checkpoint_bytes} bytes."
+            )
         version.stage_state = state
 
-    def _timestamp(self) -> str:
+    def _now(self) -> datetime:
         value = self.clock()
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def _timestamp(self, value: datetime | None = None) -> str:
+        value = value or self._now()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _claim_expired(self, checkpoint: Mapping[str, Any]) -> bool:
+        raw_expiry = checkpoint.get("lease_expires_at")
+        if not isinstance(raw_expiry, str):
+            return False
+        try:
+            expiry = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return expiry.astimezone(timezone.utc) <= self._now()
 
     def _latest_pipeline_run(self, document_id: str) -> PipelineRun | None:
         return self.db.scalar(

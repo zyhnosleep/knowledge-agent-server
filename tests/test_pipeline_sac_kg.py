@@ -304,7 +304,15 @@ def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch
         )
     )
     assert version is not None
-    assert version.version_key == "canonical-v1-abc"
+    assert version.version_key == "legacy"
+    assert version.status == "active"
+    assert db.get(Document, "d1").active_parse_version == "legacy"
+    assert {
+        chunk.parse_version
+        for chunk in db.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == "d1")
+        )
+    } == {"legacy"}
 
 
 @pytest.mark.parametrize(

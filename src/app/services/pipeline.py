@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+import math
 import re
+from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -132,27 +134,23 @@ class IngestionPipeline:
             "parse": self._run_canonical_parse_stage,
             "repair": self._run_canonical_repair_gate_stage,
             "canonicalize": self._run_canonical_promotion_stage,
+            "semantic_split": self._run_semantic_split_stage,
+            "contextualize": self._run_contextualize_stage,
+            "embed": self._run_embed_stage,
+            "index": self._run_index_stage,
+            "activate": self._run_activation_gate_stage,
         }
 
     def _run_canonical_parse_stage(self, context) -> dict[str, object]:
-        from app.services.canonical_adapters import parse_canonical_document
-        from app.services.canonical_artifacts import CanonicalArtifactStore
-
-        canonical = parse_canonical_document(Path(context.document.raw_path))
+        canonical = self._parse_canonical_phase(Path(context.document.raw_path))
         canonical = canonical.model_copy(
             update={
                 "document_id": context.document.id,
                 "parse_version": context.version.version_key,
             }
         )
-        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
-        document_root = store._prepare_document_root(  # noqa: SLF001
-            context.document.id,
-            create=True,
-        )
-        draft_path = document_root / (
-            f"{context.version.version_key}.canonical.json"
-        )
+        document_root = self._stage_artifact_dir(context)
+        draft_path = document_root / "parse.canonical.json"
         payload = canonical.model_dump_json().encode("utf-8")
         input_fingerprint = hashlib.sha256(payload).hexdigest()
         if draft_path.exists():
@@ -209,6 +207,10 @@ class IngestionPipeline:
         if actual_fingerprint != expected_fingerprint:
             raise RuntimeError("Canonical parse draft fingerprint does not match checkpoint.")
         canonical = CanonicalDocument.model_validate_json(payload)
+        canonical = self._repair_canonical_phase(
+            canonical,
+            Path(context.document.raw_path),
+        )
         store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
         staging = store.write_staging(
             context.document.id,
@@ -247,6 +249,150 @@ class IngestionPipeline:
             ),
         }
 
+    def _parse_canonical_phase(self, path: Path):
+        if path.suffix.lower() != ".pdf":
+            from app.services.canonical_adapters import parse_canonical_document
+
+            return parse_canonical_document(path)
+
+        from app.services import parser
+        from app.services import canonical_adapters as adapters
+        from app.services.canonical_quality import CanonicalQualityGate
+
+        path = adapters._validate_path(path)  # noqa: SLF001
+        page_count = parser._validate_pdf_basic(path)
+        attempts: list[str] = []
+        primary = None
+        if parser.settings.mineru_enabled:
+            try:
+                primary = adapters.run_mineru(path, page_count)
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"mineru:failed:{type(exc).__name__}:{exc}")
+            else:
+                attempts.append(
+                    "mineru:success" if primary is not None else "mineru:unavailable"
+                )
+        else:
+            attempts.append("mineru:disabled")
+        page_texts, warnings = adapters._read_text_layer_for_audit(  # noqa: SLF001
+            path, page_count
+        )
+        if primary is None:
+            primary = adapters.run_text_layer_fallback(
+                path,
+                page_count,
+                page_texts,
+                text_layer_warnings=warnings,
+            )
+            attempts.append("pypdf_text_layer:success")
+        adapters._attach_pdf_audit(  # noqa: SLF001
+            primary,
+            page_count=page_count,
+            page_texts=page_texts,
+            text_layer_warnings=warnings,
+            attempts=attempts,
+            primary_parser=primary.parser_source,
+        )
+        CanonicalQualityGate().evaluate(primary)
+        adapters._finalize_structured_evidence(primary)  # noqa: SLF001
+        return adapters._finalize_pdf_audit(primary)  # noqa: SLF001
+
+    def _repair_canonical_phase(self, primary, path: Path):
+        if path.suffix.lower() != ".pdf":
+            return primary
+
+        from app.services import parser
+        from app.services import canonical_adapters as adapters
+        from app.services.canonical_quality import CanonicalQualityGate
+
+        issues = list(primary.quality.issues)
+        repair_issues = [issue for issue in issues if issue.repairable]
+        scopes = [
+            issue.repair_scope
+            for issue in repair_issues
+            if issue.repair_scope
+        ]
+        page_count = int(primary.metadata.get("expected_page_count") or 0)
+        page_texts = list(primary.metadata.get("text_layer_pages") or [])
+        warnings = list(primary.metadata.get("text_layer_warnings") or [])
+        attempts = list(primary.parser_metadata.get("attempts") or [])
+        fatal = any(issue.severity == "fatal" for issue in issues)
+        targeted_pages = adapters._repair_page_indices(  # noqa: SLF001
+            scopes, page_count
+        )
+        repaired = None
+        if (
+            not fatal
+            and repair_issues
+            and targeted_pages
+            and parser.settings.document_intelligence_enabled
+        ):
+            try:
+                repair = adapters.run_document_intelligence(
+                    path,
+                    page_count,
+                    page_texts,
+                    page_indices=targeted_pages,
+                )
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(
+                    f"document_intelligence:targeted:failed:{type(exc).__name__}:{exc}"
+                )
+            else:
+                attempts.append(
+                    "document_intelligence:targeted:success"
+                    if repair is not None
+                    else "document_intelligence:targeted:unavailable"
+                )
+                if repair is not None and adapters._targeted_repair_has_complete_coverage(  # noqa: SLF001
+                    repair, targeted_pages
+                ):
+                    candidate = adapters._merge_pdf_page_repairs(  # noqa: SLF001
+                        primary.model_copy(deep=True),
+                        repair,
+                        targeted_pages,
+                        issues=repair_issues,
+                    )
+                    report = CanonicalQualityGate().evaluate(candidate)
+                    if (
+                        not any(issue.severity == "fatal" for issue in report.issues)
+                        and adapters._targeted_repair_satisfies_issues(  # noqa: SLF001
+                            primary,
+                            repair,
+                            candidate,
+                            repair_issues,
+                            targeted_pages,
+                        )
+                    ):
+                        repaired = candidate
+        if repaired is None and fatal and parser.settings.document_intelligence_enabled:
+            try:
+                candidate = adapters.run_document_intelligence(
+                    path, page_count, page_texts
+                )
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(
+                    f"document_intelligence:full:failed:{type(exc).__name__}:{exc}"
+                )
+            else:
+                if candidate is not None:
+                    report = CanonicalQualityGate().evaluate(candidate)
+                    if not any(issue.severity == "fatal" for issue in report.issues):
+                        repaired = candidate
+                        attempts.append("document_intelligence:full:success")
+        result = repaired or primary
+        adapters._attach_pdf_audit(  # noqa: SLF001
+            result,
+            page_count=page_count,
+            page_texts=page_texts,
+            text_layer_warnings=warnings,
+            attempts=attempts,
+            primary_parser=primary.parser_source,
+            repair_scopes=scopes,
+        )
+        adapters._finalize_structured_evidence(result)  # noqa: SLF001
+        return adapters._finalize_pdf_audit(result)  # noqa: SLF001
+
     def _run_canonical_promotion_stage(self, context) -> dict[str, object]:
         from app.services.canonical_artifacts import CanonicalArtifactStore
 
@@ -272,6 +418,328 @@ class IngestionPipeline:
             "block_count": len(canonical.blocks),
             "table_count": len(canonical.tables),
         }
+
+    def _run_semantic_split_stage(self, context) -> dict[str, object]:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+        from app.services.semantic_chunking import SemanticChunker
+
+        canonical = CanonicalArtifactStore(settings.canonical_artifacts_dir).load(
+            context.document.id,
+            context.version.version_key,
+        )
+        chunker = SemanticChunker(self.ollama)
+        drafts = chunker.build(canonical)
+        if not drafts:
+            raise RuntimeError("Semantic splitting produced no chunk drafts.")
+        return self._write_stage_artifact(
+            context,
+            "semantic_chunks.json",
+            [draft.model_dump(mode="json") for draft in drafts],
+            extra={"chunk_count": len(drafts)},
+        )
+
+    def _run_contextualize_stage(self, context) -> dict[str, object]:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+        from app.services.contextualization import (
+            ContextualizationService,
+            DocumentContext,
+        )
+        from app.services.semantic_chunking import ChunkDraft
+
+        payload = self._load_previous_stage_artifact(context)
+        drafts = [ChunkDraft.model_validate(item) for item in payload]
+        parents = {
+            draft.local_id: draft for draft in drafts if draft.chunk_role == "parent"
+        }
+        children = [draft for draft in drafts if draft.chunk_role == "child"]
+        canonical = CanonicalArtifactStore(settings.canonical_artifacts_dir).load(
+            context.document.id,
+            context.version.version_key,
+        )
+        contextualized = ContextualizationService().contextualize(
+            document=DocumentContext(
+                title=canonical.title,
+                source_abstract=canonical.abstract,
+                section_outline=self._outline_titles(canonical.outline),
+            ),
+            children=children,
+            parents=parents,
+        )
+        combined = [
+            *(parent.model_dump(mode="json") for parent in parents.values()),
+            *(child.model_dump(mode="json") for child in contextualized),
+        ]
+        if len(combined) != len(drafts):
+            raise RuntimeError("Contextualization did not preserve the chunk inventory.")
+        return self._write_stage_artifact(
+            context,
+            "contextualized_chunks.json",
+            combined,
+            extra={"chunk_count": len(combined), "child_count": len(contextualized)},
+        )
+
+    def _run_embed_stage(self, context) -> dict[str, object]:
+        payload = self._load_previous_stage_artifact(context)
+        texts = [str(item.get("embedding_text") or "") for item in payload]
+        if not texts or any(not text.strip() for text in texts):
+            raise RuntimeError("Embedding input contains an empty chunk.")
+        embeddings = self.ollama.embed(texts)
+        if len(embeddings) != len(payload):
+            raise RuntimeError("Embedding response count does not match chunk count.")
+        dimensions: int | None = None
+        records: list[dict[str, object]] = []
+        for item, embedding in zip(payload, embeddings, strict=True):
+            if (
+                not isinstance(embedding, list)
+                or not embedding
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in embedding
+                )
+            ):
+                raise RuntimeError("Embedding response contains an invalid vector.")
+            dimensions = dimensions or len(embedding)
+            if len(embedding) != dimensions:
+                raise RuntimeError("Embedding response dimensions are inconsistent.")
+            records.append(
+                {
+                    "chunk": item,
+                    "embedding": [float(value) for value in embedding],
+                }
+            )
+        return self._write_stage_artifact(
+            context,
+            "embedded_chunks.json",
+            records,
+            extra={"chunk_count": len(records), "dimensions": dimensions},
+        )
+
+    def _run_index_stage(self, context) -> dict[str, object]:
+        payload = self._load_previous_stage_artifact(context)
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("Index stage requires embedded chunk records.")
+        version_key = context.version.version_key
+        local_to_id = {
+            str(record["chunk"]["local_id"]): str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"knowledge-agent:{context.document.id}:{version_key}:"
+                    f"{record['chunk']['local_id']}",
+                )
+            )
+            for record in payload
+        }
+        if len(local_to_id) != len(payload):
+            raise RuntimeError("Embedded chunk local IDs are not unique.")
+        existing = {
+            row.id: row
+            for row in self.db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == context.document.id,
+                    DocumentChunk.parse_version == version_key,
+                )
+            )
+        }
+        rows: dict[str, DocumentChunk] = {}
+        for record in payload:
+            chunk = dict(record["chunk"])
+            local_id = str(chunk["local_id"])
+            row_id = local_to_id[local_id]
+            row = existing.get(row_id) or DocumentChunk(
+                id=row_id,
+                document_id=context.document.id,
+                ordinal=int(chunk["ordinal"]),
+                text=str(chunk["text"]),
+            )
+            self.db.add(row)
+            row.document_id = context.document.id
+            row.parse_version = version_key
+            row.parent_chunk_id = None
+            row.previous_chunk_id = None
+            row.next_chunk_id = None
+            row.chunk_role = str(chunk["chunk_role"])
+            row.block_type = str(chunk["block_type"])
+            row.ordinal = int(chunk["ordinal"])
+            row.section_path = list(chunk.get("section_path") or [])
+            row.heading = row.section_path[-1] if row.section_path else None
+            row.source_block_ids = list(chunk.get("source_block_ids") or [])
+            row.source_spans = list(chunk.get("source_spans") or [])
+            row.page_label = next(
+                (
+                    str(span["page_label"])
+                    for span in row.source_spans
+                    if span.get("page_label") is not None
+                ),
+                None,
+            )
+            row.text = str(chunk["text"])
+            row.contextual_prefix = chunk.get("contextual_prefix")
+            row.embedding_text = str(chunk["embedding_text"])
+            row.contextualization_model = chunk.get("contextualization_model")
+            row.contextualization_version = chunk.get("contextualization_version")
+            row.contextualization_prompt_version = chunk.get(
+                "contextualization_prompt_version"
+            )
+            contextualized_at = chunk.get("contextualized_at")
+            row.contextualized_at = (
+                datetime.fromisoformat(str(contextualized_at).replace("Z", "+00:00"))
+                if contextualized_at
+                else None
+            )
+            row.parser_name = context.version.parser_name
+            row.parser_version = context.version.parser_version
+            row.splitter_name = chunk.get("splitter_name")
+            row.splitter_version = chunk.get("splitter_version")
+            row.splitting_model = chunk.get("splitting_model")
+            row.semantic_boundary_score = chunk.get("semantic_boundary_score")
+            row.token_count = int(chunk.get("token_count") or 0)
+            row.token_estimate = row.token_count
+            row.embedding = [float(value) for value in record["embedding"]]
+            rows[local_id] = row
+        self.db.flush()
+        for stale_id, stale in existing.items():
+            if stale_id not in set(local_to_id.values()):
+                self.db.delete(stale)
+        self.db.flush()
+        for record in payload:
+            chunk = dict(record["chunk"])
+            local_id = str(chunk["local_id"])
+            row = rows[local_id]
+            row.parent_chunk_id = self._resolve_local_chunk_id(
+                local_to_id, chunk.get("parent_local_id")
+            )
+            row.previous_chunk_id = self._resolve_local_chunk_id(
+                local_to_id, chunk.get("previous_child_local_id")
+            )
+            row.next_chunk_id = self._resolve_local_chunk_id(
+                local_to_id, chunk.get("next_child_local_id")
+            )
+        self.db.flush()
+        return {
+            "row_count": len(rows),
+            "child_count": sum(
+                row.chunk_role == "child" for row in rows.values()
+            ),
+            "parse_version": version_key,
+        }
+
+    def _run_activation_gate_stage(self, context) -> dict[str, object]:
+        expected = context.input.get("previous_output") or {}
+        rows = list(
+            self.db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == context.document.id,
+                    DocumentChunk.parse_version == context.version.version_key,
+                )
+            )
+        )
+        if not rows or len(rows) != int(expected.get("row_count") or 0):
+            raise RuntimeError("Activation row count does not match index checkpoint.")
+        row_ids = {row.id for row in rows}
+        if any(not row.embedding for row in rows):
+            raise RuntimeError("Activation requires an embedding for every chunk.")
+        if any(
+            reference is not None and reference not in row_ids
+            for row in rows
+            for reference in (
+                row.parent_chunk_id,
+                row.previous_chunk_id,
+                row.next_chunk_id,
+            )
+        ):
+            raise RuntimeError("Activation found a cross-version or missing chunk link.")
+        children = [row for row in rows if row.chunk_role == "child"]
+        if not children or any(
+            not row.contextual_prefix or not row.contextualization_model
+            for row in children
+        ):
+            raise RuntimeError("Activation requires contextualized child chunks.")
+        return {
+            "row_count": len(rows),
+            "child_count": len(children),
+            "validated": True,
+        }
+
+    def _write_stage_artifact(
+        self,
+        context,
+        filename: str,
+        payload: object,
+        *,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        directory = self._stage_artifact_dir(context)
+        path = directory / filename
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fingerprint = hashlib.sha256(encoded).hexdigest()
+        if path.exists() and path.read_bytes() != encoded:
+            raise RuntimeError(f"Stage artifact conflicts with checkpoint: {path}")
+        if not path.exists():
+            temporary = directory / f".{filename}.{uuid4().hex}.tmp"
+            try:
+                temporary.write_bytes(encoded)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return {
+            "artifact_path": str(path),
+            "artifact_sha256": fingerprint,
+            **dict(extra or {}),
+        }
+
+    def _load_previous_stage_artifact(self, context):
+        checkpoint = context.input.get("previous_output") or {}
+        raw_path = checkpoint.get("artifact_path")
+        expected_hash = checkpoint.get("artifact_sha256")
+        if not isinstance(raw_path, str) or not isinstance(expected_hash, str):
+            raise RuntimeError(f"Stage {context.stage!r} requires an artifact reference.")
+        path = Path(raw_path).resolve()
+        directory = self._stage_artifact_dir(context).resolve()
+        if path.parent != directory or not path.is_file():
+            raise RuntimeError(f"Stage artifact is missing or outside its version: {path}")
+        encoded = path.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != expected_hash:
+            raise RuntimeError(f"Stage artifact fingerprint mismatch: {path}")
+        return json.loads(encoded)
+
+    def _stage_artifact_dir(self, context) -> Path:
+        self._validate_version_component(
+            context.version.version_key,
+            label="parse version key",
+        )
+        root = (settings.canonical_artifacts_dir / context.document.id).resolve()
+        directory = (root / f"{context.version.version_key}.pipeline").resolve()
+        if directory.parent != root:
+            raise ValueError("Stage artifact directory escapes its document root.")
+        directory.mkdir(parents=True, exist_ok=True)
+        context.version.artifact_dir = str(directory)
+        return directory
+
+    @staticmethod
+    def _outline_titles(nodes) -> list[str]:
+        return [
+            title
+            for node in nodes
+            for title in [node.title, *IngestionPipeline._outline_titles(node.children)]
+        ]
+
+    @staticmethod
+    def _resolve_local_chunk_id(
+        local_to_id: dict[str, str], local_id: object
+    ) -> str | None:
+        if local_id is None:
+            return None
+        resolved = local_to_id.get(str(local_id))
+        if resolved is None:
+            raise RuntimeError(f"Chunk link references unknown local ID {local_id!r}.")
+        return resolved
 
     @staticmethod
     def _checkpoint_artifact_path(context) -> Path:
@@ -302,20 +770,17 @@ class IngestionPipeline:
             )
         return resolved
 
-    @staticmethod
-    def _checkpoint_canonical_draft(context) -> Path:
+    def _checkpoint_canonical_draft(self, context) -> Path:
         value = context.input.get("previous_output") or {}
         artifact_path = value.get("artifact_path")
         if not isinstance(artifact_path, str) or not artifact_path:
             raise RuntimeError("Repair stage requires a canonical parse draft checkpoint.")
         path = Path(artifact_path)
-        expected_name = f"{context.version.version_key}.canonical.json"
+        expected_name = "parse.canonical.json"
         if path.name != expected_name or not path.is_file():
             raise RuntimeError(f"Canonical parse draft checkpoint is missing: {path}")
         resolved = path.resolve()
-        document_root = (
-            settings.canonical_artifacts_dir / context.document.id
-        ).resolve()
+        document_root = self._stage_artifact_dir(context).resolve()
         if resolved.parent != document_root:
             raise RuntimeError(
                 f"Canonical parse draft escapes its document root: {path}"
@@ -380,11 +845,14 @@ class IngestionPipeline:
         document = self.db.get(Document, document_id)
         if document is None:
             raise ValueError(f"Document {document_id} not found")
+        if not settings.redis_url:
+            run = self._process_document_legacy(document_id)
+            if run.status == RunStatus.completed.value:
+                self._activate_legacy_parse_version(document_id)
+            return run
+
         version = self._get_or_create_parse_version(document)
         self.db.commit()
-
-        if not settings.redis_url:
-            return self._process_document_legacy(document_id)
 
         run = self.db.scalar(
             select(PipelineRun)
@@ -400,25 +868,46 @@ class IngestionPipeline:
             )
             self.db.add(run)
             self.db.flush()
+        actionable_stage = self._first_actionable_stage(version)
+        if actionable_stage is None:
+            run.status = RunStatus.completed.value
+            document.status = DocumentStatus.ready.value
+            if version.status == "active":
+                document.active_parse_version = version.version_key
+            self._set_progress(
+                run,
+                100,
+                "completed",
+                f"Canonical ingestion version {version.version_key} is active.",
+            )
+            return run
         run.status = RunStatus.queued.value
         document.status = DocumentStatus.processing.value
         self._set_progress(
             run,
             5,
             "queued",
-            f"Canonical ingestion version {version.version_key} queued for parsing.",
+            f"Canonical ingestion version {version.version_key} queued for {actionable_stage}.",
         )
         from app.services.queue import JobDispatcher
 
-        JobDispatcher().enqueue_stage(document.id, version.version_key, "parse")
+        JobDispatcher().enqueue_stage(
+            document.id,
+            version.version_key,
+            actionable_stage,
+        )
         return run
 
     def _get_or_create_parse_version(
         self, document: Document
     ) -> DocumentParseVersion:
-        version_key = (
-            f"{settings.canonical_pipeline_version}-{document.sha256[:12]}"
+        pipeline_version = str(settings.canonical_pipeline_version)
+        self._validate_version_component(
+            pipeline_version,
+            label="CANONICAL_PIPELINE_VERSION",
         )
+        version_key = f"{pipeline_version}-{document.sha256[:12]}"
+        self._validate_version_component(version_key, label="parse version key")
         existing = self.db.scalar(
             select(DocumentParseVersion).where(
                 DocumentParseVersion.document_id == document.id,
@@ -427,11 +916,75 @@ class IngestionPipeline:
         )
         if existing is not None:
             return existing
-        artifact_dir = settings.canonical_artifacts_dir / document.id / version_key
+        artifact_dir = (
+            settings.canonical_artifacts_dir
+            / document.id
+            / f"{version_key}.pipeline"
+        )
         return ParseVersionService(self.db).create(
             document.id,
             version_key,
             str(artifact_dir),
+        )
+
+    def _activate_legacy_parse_version(self, document_id: str) -> None:
+        document = self.db.get(Document, document_id)
+        if document is None or document.status != DocumentStatus.ready.value:
+            raise RuntimeError("Legacy activation requires a ready document.")
+        version = self.db.scalar(
+            select(DocumentParseVersion).where(
+                DocumentParseVersion.document_id == document_id,
+                DocumentParseVersion.version_key == "legacy",
+            )
+        )
+        if version is None:
+            version = ParseVersionService(self.db).create(
+                document_id,
+                "legacy",
+                "legacy",
+                parser_name="legacy",
+            )
+        version.stage_state = {
+            **dict(version.stage_state or {}),
+            "legacy": {
+                "status": "completed",
+                "chunk_count": self.db.scalar(
+                    select(func.count(DocumentChunk.id)).where(
+                        DocumentChunk.document_id == document_id,
+                        DocumentChunk.parse_version == "legacy",
+                    )
+                ),
+            },
+        }
+        if version.status != "active":
+            version.status = "ready_to_activate"
+            self.db.flush()
+            ParseVersionService(self.db).activate(document, version)
+        else:
+            document.active_parse_version = "legacy"
+        self.db.commit()
+
+    @staticmethod
+    def _validate_version_component(value: str, *, label: str) -> None:
+        if (
+            not value
+            or value in {".", ".."}
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value)
+        ):
+            raise ValueError(f"{label} is not a safe path component: {value!r}.")
+
+    @staticmethod
+    def _first_actionable_stage(version: DocumentParseVersion) -> str | None:
+        from app.services.ingestion_stages import INGESTION_STAGES
+
+        state = version.stage_state or {}
+        return next(
+            (
+                stage
+                for stage in INGESTION_STAGES
+                if (state.get(stage) or {}).get("status") != "completed"
+            ),
+            None,
         )
 
     def _process_document_legacy(self, document_id: str) -> PipelineRun:
