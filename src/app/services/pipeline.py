@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 import re
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +16,7 @@ from app.models.records import (
     Claim,
     Document,
     DocumentChunk,
+    DocumentParseVersion,
     DocumentStatus,
     Entity,
     PipelineRun,
@@ -41,6 +44,7 @@ from app.services.ai import (
 from app.services.filesystem import compute_sha256, display_title_from_path, looks_like_internal_sample, readable_title_from_path, slugify, strip_upload_prefix
 from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
 from app.services.parser import parse_document
+from app.services.parse_versions import ParseVersionService
 from app.services.repositories import get_or_create_project
 from app.services.storage import ObjectStorage
 from app.services.vector_store import ChunkVector, get_vector_store
@@ -117,6 +121,207 @@ class IngestionPipeline:
         self.verifier = ExternalVerifier()
         self.storage = ObjectStorage()
 
+    def ingestion_stage_handlers(self) -> dict[str, object]:
+        """Expose stages backed by durable canonical artifact operations.
+
+        Chunk persistence and the later model/index operations need the formal
+        version-scoped implementation. They remain absent so workers fail closed
+        at the first unavailable stage.
+        """
+        return {
+            "parse": self._run_canonical_parse_stage,
+            "repair": self._run_canonical_repair_gate_stage,
+            "canonicalize": self._run_canonical_promotion_stage,
+        }
+
+    def _run_canonical_parse_stage(self, context) -> dict[str, object]:
+        from app.services.canonical_adapters import parse_canonical_document
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        canonical = parse_canonical_document(Path(context.document.raw_path))
+        canonical = canonical.model_copy(
+            update={
+                "document_id": context.document.id,
+                "parse_version": context.version.version_key,
+            }
+        )
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        document_root = store._prepare_document_root(  # noqa: SLF001
+            context.document.id,
+            create=True,
+        )
+        draft_path = document_root / (
+            f"{context.version.version_key}.canonical.json"
+        )
+        payload = canonical.model_dump_json().encode("utf-8")
+        input_fingerprint = hashlib.sha256(payload).hexdigest()
+        if draft_path.exists():
+            if draft_path.read_bytes() != payload:
+                raise RuntimeError(
+                    f"Canonical parse draft conflicts with checkpoint: {draft_path}"
+                )
+        else:
+            temporary = document_root / (
+                f".{context.version.version_key}.{uuid4().hex}.tmp"
+            )
+            try:
+                temporary.write_bytes(payload)
+                temporary.replace(draft_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        quality = canonical.quality.model_dump(mode="json")
+        context.version.manifest_json = {
+            "artifact_path": str(draft_path),
+            "input_fingerprint": input_fingerprint,
+        }
+        context.version.quality_json = quality
+        context.version.parser_name = canonical.parser_source
+        context.document.title = canonical.title or context.document.title
+        metadata = dict(context.document.metadata_json or {})
+        metadata["canonical_ingestion"] = {
+            "version_key": context.version.version_key,
+            "input_fingerprint": input_fingerprint,
+            "quality": quality,
+        }
+        context.document.metadata_json = metadata
+        return {
+            "artifact_path": str(draft_path),
+            "input_fingerprint": input_fingerprint,
+            "quality": {
+                "status": quality.get("status"),
+                "accepted": quality.get("accepted"),
+                "score": quality.get("score"),
+            },
+            "block_count": len(canonical.blocks),
+            "table_count": len(canonical.tables),
+        }
+
+    def _run_canonical_repair_gate_stage(self, context) -> dict[str, object]:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+        from app.services.canonical_models import CanonicalDocument
+
+        draft_path = self._checkpoint_canonical_draft(context)
+        payload = draft_path.read_bytes()
+        expected_fingerprint = (context.input.get("previous_output") or {}).get(
+            "input_fingerprint"
+        )
+        actual_fingerprint = hashlib.sha256(payload).hexdigest()
+        if actual_fingerprint != expected_fingerprint:
+            raise RuntimeError("Canonical parse draft fingerprint does not match checkpoint.")
+        canonical = CanonicalDocument.model_validate_json(payload)
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        staging = store.write_staging(
+            context.document.id,
+            context.version.version_key,
+            canonical,
+        )
+        manifest_path = staging / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        quality = dict(manifest["quality"])
+        if (
+            quality.get("accepted") is not True
+            or quality.get("status")
+            not in {"accepted", "accepted_with_warnings"}
+        ):
+            raise RuntimeError(
+                f"Canonical repair gate rejected quality {quality.get('status')!r}."
+            )
+        context.version.manifest_json = {
+            "artifact_path": str(manifest_path),
+            "input_fingerprint": manifest["input_fingerprint"],
+            "canonical_markdown_sha256": manifest["canonical_markdown_sha256"],
+        }
+        context.version.quality_json = quality
+        return {
+            "artifact_path": str(manifest_path),
+            "input_fingerprint": manifest["input_fingerprint"],
+            "quality": {
+                "status": quality.get("status"),
+                "accepted": quality.get("accepted"),
+                "score": quality.get("score"),
+            },
+            "repair_requests": list(
+                manifest.get("document", {})
+                .get("metadata", {})
+                .get("table_repair_requests", [])
+            ),
+        }
+
+    def _run_canonical_promotion_stage(self, context) -> dict[str, object]:
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        final = (
+            settings.canonical_artifacts_dir
+            / context.document.id
+            / context.version.version_key
+        )
+        if not final.is_dir():
+            self._checkpoint_artifact_path(context)
+            final = store.promote(
+                context.document.id,
+                context.version.version_key,
+            )
+        canonical = store.load(context.document.id, context.version.version_key)
+        manifest_path = final / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return {
+            "artifact_path": str(manifest_path),
+            "input_fingerprint": manifest["input_fingerprint"],
+            "canonical_markdown_sha256": manifest["canonical_markdown_sha256"],
+            "block_count": len(canonical.blocks),
+            "table_count": len(canonical.tables),
+        }
+
+    @staticmethod
+    def _checkpoint_artifact_path(context) -> Path:
+        value = context.input.get("previous_output") or {}
+        artifact_path = value.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            raise RuntimeError(
+                f"Stage {context.stage!r} requires a canonical artifact checkpoint."
+            )
+        path = Path(artifact_path)
+        if path.name != "manifest.json" or not path.is_file():
+            raise RuntimeError(f"Canonical artifact checkpoint is missing: {path}")
+        resolved = path.resolve()
+        document_root = (
+            settings.canonical_artifacts_dir / context.document.id
+        ).resolve()
+        if resolved.parent.parent != document_root:
+            raise RuntimeError(
+                f"Canonical artifact checkpoint escapes its document root: {path}"
+            )
+        bundle_name = resolved.parent.name
+        version_key = context.version.version_key
+        if bundle_name != version_key and not bundle_name.startswith(
+            f"{version_key}.staging-"
+        ):
+            raise RuntimeError(
+                f"Canonical artifact checkpoint has the wrong version: {path}"
+            )
+        return resolved
+
+    @staticmethod
+    def _checkpoint_canonical_draft(context) -> Path:
+        value = context.input.get("previous_output") or {}
+        artifact_path = value.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            raise RuntimeError("Repair stage requires a canonical parse draft checkpoint.")
+        path = Path(artifact_path)
+        expected_name = f"{context.version.version_key}.canonical.json"
+        if path.name != expected_name or not path.is_file():
+            raise RuntimeError(f"Canonical parse draft checkpoint is missing: {path}")
+        resolved = path.resolve()
+        document_root = (
+            settings.canonical_artifacts_dir / context.document.id
+        ).resolve()
+        if resolved.parent != document_root:
+            raise RuntimeError(
+                f"Canonical parse draft escapes its document root: {path}"
+            )
+        return resolved
+
     def register_document(self, project_slug: str, project_name: str, file_path: Path) -> tuple[Project, Document, PipelineRun]:
         project = get_or_create_project(self.db, slug=project_slug, name=project_name)
         sha256 = compute_sha256(file_path)
@@ -172,6 +377,64 @@ class IngestionPipeline:
         return project, document, run
 
     def process_document(self, document_id: str) -> PipelineRun:
+        document = self.db.get(Document, document_id)
+        if document is None:
+            raise ValueError(f"Document {document_id} not found")
+        version = self._get_or_create_parse_version(document)
+        self.db.commit()
+
+        if not settings.redis_url:
+            return self._process_document_legacy(document_id)
+
+        run = self.db.scalar(
+            select(PipelineRun)
+            .where(PipelineRun.document_id == document_id)
+            .order_by(PipelineRun.created_at.desc())
+        )
+        if run is None:
+            run = PipelineRun(
+                project_id=document.project_id,
+                document_id=document.id,
+                run_type=RunType.ingest.value,
+                status=RunStatus.queued.value,
+            )
+            self.db.add(run)
+            self.db.flush()
+        run.status = RunStatus.queued.value
+        document.status = DocumentStatus.processing.value
+        self._set_progress(
+            run,
+            5,
+            "queued",
+            f"Canonical ingestion version {version.version_key} queued for parsing.",
+        )
+        from app.services.queue import JobDispatcher
+
+        JobDispatcher().enqueue_stage(document.id, version.version_key, "parse")
+        return run
+
+    def _get_or_create_parse_version(
+        self, document: Document
+    ) -> DocumentParseVersion:
+        version_key = (
+            f"{settings.canonical_pipeline_version}-{document.sha256[:12]}"
+        )
+        existing = self.db.scalar(
+            select(DocumentParseVersion).where(
+                DocumentParseVersion.document_id == document.id,
+                DocumentParseVersion.version_key == version_key,
+            )
+        )
+        if existing is not None:
+            return existing
+        artifact_dir = settings.canonical_artifacts_dir / document.id / version_key
+        return ParseVersionService(self.db).create(
+            document.id,
+            version_key,
+            str(artifact_dir),
+        )
+
+    def _process_document_legacy(self, document_id: str) -> PipelineRun:
         document = self.db.get(Document, document_id)
         if document is None:
             raise ValueError(f"Document {document_id} not found")

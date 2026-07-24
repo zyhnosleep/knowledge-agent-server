@@ -74,6 +74,23 @@ def test_redis_is_local_and_each_environment_has_an_isolated_worker() -> None:
     assert "app.workers.runner" in test_worker
     assert "EnvironmentFile=%h/knowledge-agent-dev/runtime/app.env" in dev_worker
     assert "EnvironmentFile=%h/knowledge-agent-test/runtime/app.env" in test_worker
+    expected_queues = ",".join(
+        [
+            "ingest.parse",
+            "ingest.repair",
+            "ingest.canonicalize",
+            "ingest.semantic_split",
+            "ingest.contextualize",
+            "ingest.embed",
+            "ingest.index",
+            "ingest.activate",
+            "ingest",
+        ]
+    )
+    assert f"Environment=INGESTION_WORKER_QUEUES={expected_queues}" in dev_worker
+    assert f"Environment=INGESTION_WORKER_QUEUES={expected_queues}" in test_worker
+    assert "Environment=INGESTION_WORKER_CONCURRENCY=1" in dev_worker
+    assert "Environment=INGESTION_WORKER_CONCURRENCY=1" in test_worker
 
 
 def test_active_product_files_use_knowledge_agent_brand() -> None:

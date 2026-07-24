@@ -9,6 +9,8 @@ Type=simple
 WorkingDirectory=%h/knowledge-agent-test
 EnvironmentFile=%h/knowledge-agent-test/runtime/app.env
 Environment=PYTHONPATH=%h/knowledge-agent-test/src
+Environment=INGESTION_WORKER_QUEUES=ingest.parse,ingest.repair,ingest.canonicalize,ingest.semantic_split,ingest.contextualize,ingest.embed,ingest.index,ingest.activate,ingest
+Environment=INGESTION_WORKER_CONCURRENCY=1
 ExecStart=%h/knowledge-agent-test/.venv/bin/python -m app.workers.runner
 Restart=on-failure
 RestartSec=5

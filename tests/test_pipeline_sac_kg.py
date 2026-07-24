@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
@@ -8,6 +8,7 @@ from app.models.records import (
     Claim,
     Document,
     DocumentChunk,
+    DocumentParseVersion,
     DocumentStatus,
     Entity,
     PipelineRun,
@@ -297,6 +298,13 @@ def test_process_document_can_complete_rag_only_when_sac_kg_disabled(monkeypatch
     assert report["sac_kg_enabled"] is False
     assert report["claims"] == 0
     assert report["progress"]["stage"] == "completed"
+    version = db.scalar(
+        select(DocumentParseVersion).where(
+            DocumentParseVersion.document_id == "d1"
+        )
+    )
+    assert version is not None
+    assert version.version_key == "canonical-v1-abc"
 
 
 @pytest.mark.parametrize(
