@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 from pathlib import Path
 from urllib.parse import quote
@@ -18,12 +19,16 @@ from app.models.records import (
     ConversationSession,
     Document,
     DocumentChunk,
+    DocumentParseVersion,
     PipelineRun,
     Project,
     QuestionAnswer,
     ReviewItem,
 )
 from app.schemas.common import (
+    CanonicalMarkdownRead,
+    CanonicalParseRead,
+    CitationLocationRead,
     DocumentRead,
     HealthResponse,
     IngestResponse,
@@ -34,6 +39,7 @@ from app.schemas.common import (
     ReviewItemRead,
 )
 from app.services.filesystem import InvalidStoragePathError, UploadTooLargeError, _ensure_within, safe_project_slug, save_upload
+from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.conversation_memory import ConversationMemory
 from app.services.pipeline import IngestionPipeline
 from app.services.queue import JobDispatcher
@@ -107,6 +113,198 @@ def _document_raw_path_or_404(document: Document) -> Path:
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
     return path
+
+
+def _active_parse_or_404(
+    db: Session,
+    document_id: str,
+) -> tuple[Document, DocumentParseVersion]:
+    document = db.get(Document, document_id)
+    if document is None or not document.active_parse_version:
+        raise HTTPException(status_code=404, detail="Active parse not found.")
+    version = db.scalar(
+        select(DocumentParseVersion).where(
+            DocumentParseVersion.document_id == document.id,
+            DocumentParseVersion.version_key == document.active_parse_version,
+        )
+    )
+    if version is None:
+        raise HTTPException(status_code=404, detail="Active parse not found.")
+    return document, version
+
+
+def _validated_active_canonical_bundle(
+    document: Document,
+    version: DocumentParseVersion,
+) -> tuple[Path, object, dict]:
+    store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+    try:
+        root = settings.canonical_artifacts_dir.expanduser().resolve()
+        artifact_reference = Path(version.artifact_dir)
+        if not artifact_reference.is_absolute():
+            artifact_reference = root / artifact_reference
+        if store._is_link_or_reparse_point(artifact_reference):  # noqa: SLF001
+            raise ValueError("parse-version artifact directory cannot be a link")
+        resolved_reference = artifact_reference.resolve()
+        document_root = (root / document.id).resolve()
+        if (
+            not resolved_reference.is_dir()
+            or resolved_reference.parent != document_root
+            or resolved_reference.name
+            not in {version.version_key, f"{version.version_key}.pipeline"}
+        ):
+            raise ValueError("parse-version artifact directory escapes its document root")
+        canonical = store.load(document.id, version.version_key)
+        bundle = settings.canonical_artifacts_dir / document.id / version.version_key
+        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
+
+    checkpoint = version.manifest_json if isinstance(version.manifest_json, dict) else {}
+    expected_input = checkpoint.get("input_fingerprint")
+    expected_markdown = checkpoint.get("canonical_markdown_sha256")
+    if (
+        not isinstance(expected_input, str)
+        or not isinstance(expected_markdown, str)
+        or manifest.get("input_fingerprint") != expected_input
+        or manifest.get("canonical_markdown_sha256") != expected_markdown
+    ):
+        raise HTTPException(status_code=404, detail="Canonical artifact not found.")
+    return bundle, canonical, manifest
+
+
+def _parse_progress(version: DocumentParseVersion) -> dict:
+    if version.status == "active":
+        return {"stage": "completed", "percent": 100}
+    stages = (
+        "parse",
+        "repair",
+        "canonicalize",
+        "semantic_split",
+        "contextualize",
+        "embed",
+        "index",
+        "activate",
+    )
+    state = version.stage_state if isinstance(version.stage_state, dict) else {}
+    completed_count = 0
+    for stage in stages:
+        checkpoint = state.get(stage) if isinstance(state.get(stage), dict) else {}
+        checkpoint_status = checkpoint.get("status")
+        if checkpoint_status == "completed":
+            completed_count += 1
+            continue
+        if checkpoint_status in {"running", "failed"}:
+            suffix = "_failed" if checkpoint_status == "failed" else ""
+            return {
+                "stage": stage + suffix,
+                "percent": round(100 * completed_count / len(stages)),
+            }
+        break
+    return {
+        "stage": version.status or "unknown",
+        "percent": round(100 * completed_count / len(stages)),
+    }
+
+
+def _repair_pages(version: DocumentParseVersion) -> list[int]:
+    state = version.stage_state if isinstance(version.stage_state, dict) else {}
+    repair = state.get("repair") if isinstance(state.get("repair"), dict) else {}
+    output = repair.get("output") if isinstance(repair.get("output"), dict) else {}
+    requests = output.get("repair_requests")
+    if not isinstance(requests, list):
+        return []
+    pages: set[int] = set()
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        page_index = request.get("page_index")
+        if isinstance(page_index, int) and not isinstance(page_index, bool) and page_index >= 0:
+            pages.add(page_index)
+        page_indices = request.get("page_indices")
+        if isinstance(page_indices, list):
+            pages.update(
+                page
+                for page in page_indices
+                if isinstance(page, int) and not isinstance(page, bool) and page >= 0
+            )
+    return sorted(pages)
+
+
+def _source_type(document: Document) -> str:
+    suffix = Path(document.file_name or "").suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix == ".docx":
+        return "docx"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    return "text"
+
+
+def _source_fragment(source_type: str, spans: list[dict]) -> str:
+    span = next((item for item in spans if isinstance(item, dict)), {})
+    if source_type == "pdf":
+        page_index = span.get("page_index")
+        if isinstance(page_index, int) and not isinstance(page_index, bool) and page_index >= 0:
+            return f"#page={page_index + 1}"
+    elif source_type == "docx":
+        paragraph_id = span.get("paragraph_id")
+        if isinstance(paragraph_id, str) and paragraph_id:
+            return f"#paragraph={quote(paragraph_id, safe='')}"
+    elif source_type == "html":
+        for key, label in (("element_id", "element"), ("css_selector", "selector"), ("xpath", "xpath")):
+            value = span.get(key)
+            if isinstance(value, str) and value:
+                return f"#{label}={quote(value, safe='')}"
+    else:
+        line_start = span.get("line_start")
+        if isinstance(line_start, int) and not isinstance(line_start, bool) and line_start >= 0:
+            return f"#line={line_start}"
+    return ""
+
+
+def _public_source_spans(spans: list[dict]) -> list[dict]:
+    fields = {
+        "page_index",
+        "page_label",
+        "bbox",
+        "normalized_bbox",
+        "source_block_id",
+        "paragraph_id",
+        "table_id",
+        "row_index",
+        "column_index",
+        "image_relationship_id",
+        "xpath",
+        "css_selector",
+        "element_id",
+        "heading_path",
+        "line_start",
+        "line_end",
+        "char_start",
+        "char_end",
+    }
+    metadata_fields = {
+        "table_id",
+        "figure_id",
+        "formula_id",
+        "asset_id",
+        "source_role",
+        "structure_type",
+    }
+    public: list[dict] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        item = {key: value for key, value in span.items() if key in fields}
+        metadata = span.get("metadata")
+        if isinstance(metadata, dict):
+            item["metadata"] = {
+                key: value for key, value in metadata.items() if key in metadata_fields
+            }
+        public.append(item)
+    return public
 
 
 def _delete_document_file(db: Session, document: Document) -> bool:
@@ -541,6 +739,116 @@ def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRea
         status=document.status,
         sha256=document.sha256,
         metadata_json=document.metadata_json,
+    )
+
+
+@router.get("/documents/{document_id}/parse", response_model=CanonicalParseRead)
+def get_active_parse(
+    document_id: str,
+    db: Session = Depends(get_db),
+) -> CanonicalParseRead:
+    document, version = _active_parse_or_404(db, document_id)
+    canonical = None
+    download_available = False
+    try:
+        _, canonical, _ = _validated_active_canonical_bundle(document, version)
+        download_available = True
+    except HTTPException:
+        pass
+    quality = version.quality_json if isinstance(version.quality_json, dict) else {}
+    warnings = getattr(canonical, "warnings", None)
+    warning_count = len(warnings) if isinstance(warnings, list) else sum(
+        1
+        for issue in quality.get("issues", [])
+        if isinstance(issue, dict) and issue.get("severity") == "warning"
+    )
+    return CanonicalParseRead(
+        document_id=document.id,
+        version=version.version_key,
+        parser=version.parser_name,
+        parser_version=version.parser_version,
+        progress=_parse_progress(version),
+        quality={
+            "status": quality.get("status"),
+            "accepted": quality.get("accepted"),
+            "score": quality.get("score"),
+        },
+        repair_pages=_repair_pages(version),
+        warning_count=warning_count,
+        download_available=download_available,
+    )
+
+
+@router.get(
+    "/documents/{document_id}/parse/markdown",
+    response_model=CanonicalMarkdownRead,
+)
+def get_active_parse_markdown(
+    document_id: str,
+    db: Session = Depends(get_db),
+) -> CanonicalMarkdownRead:
+    document, version = _active_parse_or_404(db, document_id)
+    bundle, _, _ = _validated_active_canonical_bundle(document, version)
+    try:
+        markdown = (bundle / "canonical.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
+    return CanonicalMarkdownRead(
+        document_id=document.id,
+        version=version.version_key,
+        markdown=markdown,
+    )
+
+
+@router.get("/documents/{document_id}/parse/download", response_class=FileResponse)
+def download_active_parse(
+    document_id: str,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    document, version = _active_parse_or_404(db, document_id)
+    bundle, _, _ = _validated_active_canonical_bundle(document, version)
+    return FileResponse(
+        bundle / "canonical.md",
+        media_type="text/markdown; charset=utf-8",
+        filename="canonical.md",
+        content_disposition_type="attachment",
+    )
+
+
+@router.get(
+    "/documents/{document_id}/citations/{chunk_id}/location",
+    response_model=CitationLocationRead,
+)
+def get_citation_location(
+    document_id: str,
+    chunk_id: str,
+    db: Session = Depends(get_db),
+) -> CitationLocationRead:
+    document, version = _active_parse_or_404(db, document_id)
+    chunk = db.scalar(
+        select(DocumentChunk).where(
+            DocumentChunk.id == chunk_id,
+            DocumentChunk.document_id == document.id,
+            DocumentChunk.parse_version == version.version_key,
+            DocumentChunk.block_type != "reference",
+        )
+    )
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Citation location not found.")
+    file_metadata = _document_file_metadata(document)
+    source_url = file_metadata.get("source_file_url")
+    if not isinstance(source_url, str):
+        raise HTTPException(status_code=404, detail="Source file not found.")
+    spans = chunk.source_spans if isinstance(chunk.source_spans, list) else []
+    public_spans = _public_source_spans(spans)
+    source_type = _source_type(document)
+    return CitationLocationRead(
+        document_id=document.id,
+        chunk_id=chunk.id,
+        parse_version=version.version_key,
+        source_type=source_type,
+        source_url=source_url + _source_fragment(source_type, spans),
+        source_spans=public_spans,
     )
 
 

@@ -36,6 +36,44 @@ class DocumentRead(BaseModel):
     metadata_json: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParseProgress(BaseModel):
+    stage: str
+    percent: int = Field(ge=0, le=100)
+
+
+class ParseQualitySummary(BaseModel):
+    status: str | None = None
+    accepted: bool | None = None
+    score: float | None = None
+
+
+class CanonicalParseRead(BaseModel):
+    document_id: str
+    version: str
+    parser: str | None = None
+    parser_version: str | None = None
+    progress: ParseProgress
+    quality: ParseQualitySummary
+    repair_pages: list[int] = Field(default_factory=list)
+    warning_count: int = Field(ge=0)
+    download_available: bool
+
+
+class CanonicalMarkdownRead(BaseModel):
+    document_id: str
+    version: str
+    markdown: str
+
+
+class CitationLocationRead(BaseModel):
+    document_id: str
+    chunk_id: str
+    parse_version: str
+    source_type: str
+    source_url: str
+    source_spans: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class QueryRequest(BaseModel):
     project_slug: str
     question: str
