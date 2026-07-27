@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import stat
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,20 @@ _FILE_CHUNK_BYTES = 1024 * 1024
 class _VerifiedMarkdown:
     handle: BinaryIO
     size: int
+    expected_sha256: str
+    manifest: dict
+
+
+class _SnapshotStreamingResponse(StreamingResponse):
+    def __init__(self, snapshot: BinaryIO, **kwargs) -> None:
+        self._snapshot = snapshot
+        super().__init__(_stream_open_file(snapshot), **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._snapshot.close()
 
 
 def _validated_project_slug(project_slug: str) -> str:
@@ -190,6 +205,66 @@ def _sha256_open_file(handle: BinaryIO) -> str:
     return digest.hexdigest()
 
 
+def _read_markdown_bytes(handle: BinaryIO) -> bytes:
+    handle.seek(0)
+    return handle.read(_MAX_CANONICAL_MARKDOWN_JSON_BYTES + 1)
+
+
+def _copy_markdown_snapshot(source: BinaryIO, snapshot: BinaryIO) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    source.seek(0)
+    snapshot.seek(0)
+    snapshot.truncate(0)
+    for chunk in iter(lambda: source.read(_FILE_CHUNK_BYTES), b""):
+        digest.update(chunk)
+        snapshot.write(chunk)
+        size += len(chunk)
+    snapshot.seek(0)
+    return digest.hexdigest(), size
+
+
+def _validate_markdown_content(
+    verified: _VerifiedMarkdown,
+    *,
+    actual_sha256: str,
+    actual_size: int,
+) -> None:
+    if actual_size != verified.size:
+        raise ValueError("canonical markdown size changed during snapshot")
+    if actual_sha256 != verified.expected_sha256:
+        raise ValueError("canonical markdown fingerprint mismatch")
+
+
+def _snapshot_verified_markdown(verified: _VerifiedMarkdown) -> BinaryIO:
+    snapshot = tempfile.SpooledTemporaryFile(
+        max_size=_MAX_CANONICAL_MARKDOWN_JSON_BYTES,
+        mode="w+b",
+    )
+    try:
+        actual_sha256, actual_size = _copy_markdown_snapshot(
+            verified.handle,
+            snapshot,
+        )
+        _validate_markdown_content(
+            verified,
+            actual_sha256=actual_sha256,
+            actual_size=actual_size,
+        )
+        snapshot.seek(0)
+        return snapshot
+    except (OSError, ValueError, TypeError) as exc:
+        snapshot.close()
+        raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
+    finally:
+        verified.handle.close()
+
+
+def _stream_open_file(handle: BinaryIO) -> Iterator[bytes]:
+    for chunk in iter(lambda: handle.read(_FILE_CHUNK_BYTES), b""):
+        yield chunk
+
+
 def _same_open_file(path: Path, handle: BinaryIO) -> bool:
     try:
         path_stat = os.stat(path, follow_symlinks=False)
@@ -271,24 +346,18 @@ def _open_verified_canonical_markdown(
 
         markdown_handle = _open_regular_file(markdown_path)
         size = os.fstat(markdown_handle.fileno()).st_size
-        actual_markdown = _sha256_open_file(markdown_handle)
-        if actual_markdown != expected_markdown:
-            raise ValueError("canonical markdown fingerprint mismatch")
         if not _same_open_file(markdown_path, markdown_handle):
             raise ValueError("canonical markdown changed during verification")
-        return _VerifiedMarkdown(handle=markdown_handle, size=size)
+        return _VerifiedMarkdown(
+            handle=markdown_handle,
+            size=size,
+            expected_sha256=expected_markdown,
+            manifest=manifest,
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         if markdown_handle is not None:
             markdown_handle.close()
         raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
-
-
-def _stream_verified_markdown(verified: _VerifiedMarkdown) -> Iterator[bytes]:
-    try:
-        for chunk in iter(lambda: verified.handle.read(_FILE_CHUNK_BYTES), b""):
-            yield chunk
-    finally:
-        verified.handle.close()
 
 
 def _parse_progress(version: DocumentParseVersion) -> dict:
@@ -860,18 +929,27 @@ def get_active_parse(
 ) -> CanonicalParseRead:
     document, version = _active_parse_or_404(db, document_id, project_slug)
     download_available = False
+    verified_manifest: dict | None = None
     try:
         verified = _open_verified_canonical_markdown(document, version)
-        verified.handle.close()
+        snapshot = _snapshot_verified_markdown(verified)
+        snapshot.close()
+        verified_manifest = verified.manifest
         download_available = True
     except HTTPException:
         pass
     quality = version.quality_json if isinstance(version.quality_json, dict) else {}
-    warning_count = sum(
-        1
-        for issue in quality.get("issues", [])
-        if isinstance(issue, dict) and issue.get("severity") == "warning"
+    manifest_warnings = (
+        verified_manifest.get("warnings") if verified_manifest is not None else None
     )
+    if isinstance(manifest_warnings, list):
+        warning_count = len(manifest_warnings)
+    else:
+        warning_count = sum(
+            1
+            for issue in quality.get("issues", [])
+            if isinstance(issue, dict) and issue.get("severity") == "warning"
+        )
     return CanonicalParseRead(
         document_id=document.id,
         version=version.version_key,
@@ -904,8 +982,19 @@ def get_active_parse_markdown(
         verified.handle.close()
         raise HTTPException(status_code=413, detail="Canonical Markdown is too large for JSON view.")
     try:
-        markdown = verified.handle.read().decode("utf-8")
-    except UnicodeError as exc:
+        content = _read_markdown_bytes(verified.handle)
+        if len(content) > _MAX_CANONICAL_MARKDOWN_JSON_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Canonical Markdown is too large for JSON view.",
+            )
+        _validate_markdown_content(
+            verified,
+            actual_sha256=hashlib.sha256(content).hexdigest(),
+            actual_size=len(content),
+        )
+        markdown = content.decode("utf-8")
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
         raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
     finally:
         verified.handle.close()
@@ -924,8 +1013,9 @@ def download_active_parse(
 ) -> StreamingResponse:
     document, version = _active_parse_or_404(db, document_id, project_slug)
     verified = _open_verified_canonical_markdown(document, version)
-    return StreamingResponse(
-        _stream_verified_markdown(verified),
+    snapshot = _snapshot_verified_markdown(verified)
+    return _SnapshotStreamingResponse(
+        snapshot,
         media_type="text/markdown; charset=utf-8",
         headers={
             "Content-Disposition": 'attachment; filename="canonical.md"',

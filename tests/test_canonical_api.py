@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ from urllib.parse import quote
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -632,44 +634,25 @@ def test_markdown_response_never_reopens_replaced_verified_path(
     replacement = b"---\ntitle: attacker\n---\n\n# Replaced\n"
     replaced = False
 
-    if hasattr(routes, "_sha256_open_file"):
-        original_hash = routes._sha256_open_file
+    original_read = routes._read_markdown_bytes
 
-        def replace_after_hash(handle):
-            nonlocal replaced
-            digest = original_hash(handle)
-            if not replaced:
-                replaced = True
-                if replace_bundle:
-                    moved = tmp_path / "moved-bundle"
-                    bundle.rename(moved)
-                    bundle.mkdir()
-                    (bundle / "canonical.md").write_bytes(replacement)
-                else:
-                    moved = tmp_path / "moved-canonical.md"
-                    (bundle / "canonical.md").replace(moved)
-                    (bundle / "canonical.md").write_bytes(replacement)
-            return digest
+    def replace_after_read(handle):
+        nonlocal replaced
+        content = original_read(handle)
+        if not replaced:
+            replaced = True
+            if replace_bundle:
+                moved = tmp_path / "moved-bundle"
+                bundle.rename(moved)
+                bundle.mkdir()
+                (bundle / "canonical.md").write_bytes(replacement)
+            else:
+                moved = tmp_path / "moved-canonical.md"
+                (bundle / "canonical.md").replace(moved)
+                (bundle / "canonical.md").write_bytes(replacement)
+        return content
 
-        monkeypatch.setattr(routes, "_sha256_open_file", replace_after_hash)
-    else:
-        original_read_text = Path.read_text
-
-        def replace_after_manifest(path: Path, *args, **kwargs):
-            nonlocal replaced
-            content = original_read_text(path, *args, **kwargs)
-            if path.name == "manifest.json" and not replaced:
-                if replace_bundle:
-                    moved = tmp_path / "moved-bundle"
-                    bundle.rename(moved)
-                    bundle.mkdir()
-                    (bundle / "canonical.md").write_bytes(replacement)
-                else:
-                    (bundle / "canonical.md").write_bytes(replacement)
-                replaced = True
-            return content
-
-        monkeypatch.setattr(Path, "read_text", replace_after_manifest)
+    monkeypatch.setattr(routes, "_read_markdown_bytes", replace_after_read)
 
     response = _client(db).get(
         _project_url(f"/api/documents/{document.id}/parse/markdown")
@@ -752,3 +735,170 @@ def test_parse_endpoints_close_every_verified_markdown_handle(
 
     assert len(opened) == 3
     assert all(handle.closed for handle in opened)
+
+
+@pytest.mark.parametrize("endpoint", ["markdown", "download"])
+def test_parse_response_never_serves_same_inode_in_place_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, active, bundle = _seed_active_parse(db, root)
+    original = b"---\ntitle: stable\n---\n\n" + b"a" * (64 * 1024)
+    replacement = b"---\ntitle: changed\n---\n\n" + b"b" * (
+        len(original) - len(b"---\ntitle: changed\n---\n\n")
+    )
+    _replace_markdown_and_fingerprints(bundle, active, original)
+    db.commit()
+    markdown_path = bundle / "canonical.md"
+    overwritten = False
+
+    def overwrite_source() -> None:
+        nonlocal overwritten
+        with markdown_path.open("r+b", buffering=0) as writer:
+            writer.seek(0)
+            writer.write(replacement)
+            writer.flush()
+            os.fsync(writer.fileno())
+        overwritten = True
+
+    if endpoint == "markdown" and hasattr(routes, "_read_markdown_bytes"):
+        original_read = routes._read_markdown_bytes
+
+        def overwrite_after_read(handle):
+            content = original_read(handle)
+            overwrite_source()
+            return content
+
+        monkeypatch.setattr(routes, "_read_markdown_bytes", overwrite_after_read)
+    elif endpoint == "download" and hasattr(routes, "_copy_markdown_snapshot"):
+        original_copy = routes._copy_markdown_snapshot
+
+        def overwrite_after_copy(source, snapshot):
+            result = original_copy(source, snapshot)
+            overwrite_source()
+            return result
+
+        monkeypatch.setattr(routes, "_copy_markdown_snapshot", overwrite_after_copy)
+    else:
+        original_hash = routes._sha256_open_file
+
+        def overwrite_after_hash(handle):
+            digest = original_hash(handle)
+            overwrite_source()
+            return digest
+
+        monkeypatch.setattr(routes, "_sha256_open_file", overwrite_after_hash)
+
+    response = _client(db).get(
+        _project_url(f"/api/documents/{document.id}/parse/{endpoint}")
+    )
+
+    assert overwritten is True
+    assert response.status_code in {200, 404}
+    if response.status_code == 200 and endpoint == "markdown":
+        actual = response.json()["markdown"].encode("utf-8")
+        assert hashlib.sha256(actual).digest() == hashlib.sha256(original).digest()
+    if response.status_code == 200 and endpoint == "download":
+        assert hashlib.sha256(response.content).digest() == hashlib.sha256(original).digest()
+    assert response.content != replacement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "send_error",
+    [None, OSError("socket closed"), ClientDisconnect(), asyncio.CancelledError()],
+    ids=["complete", "os-error", "client-disconnect", "cancelled"],
+)
+async def test_download_response_closes_handle_for_every_asgi_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    send_error: BaseException | None,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, _, _ = _seed_active_parse(db, root)
+    opened = []
+    original_open = routes._open_verified_canonical_markdown
+
+    def capture_open(*args, **kwargs):
+        verified = original_open(*args, **kwargs)
+        opened.append(verified.handle)
+        return verified
+
+    monkeypatch.setattr(routes, "_open_verified_canonical_markdown", capture_open)
+    response = routes.download_active_parse(document.id, "demo", db)
+    snapshot = response._snapshot
+    sent = []
+
+    assert len(opened) == 1
+    assert opened[0].closed is True
+    assert snapshot.closed is False
+
+    async def receive():
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if send_error is not None:
+            raise send_error
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+
+    if send_error is None:
+        await response(scope, receive, send)
+        assert any(message["type"] == "http.response.body" for message in sent)
+    else:
+        with pytest.raises(BaseException) as caught:
+            await response(scope, receive, send)
+        expected_types = (type(send_error),)
+        if isinstance(send_error, OSError):
+            expected_types += (ClientDisconnect,)
+        assert isinstance(caught.value, expected_types) or send_error in getattr(
+            caught.value, "exceptions", []
+        )
+
+    assert snapshot.closed is True
+
+
+def test_parse_status_counts_manifest_warnings_when_quality_has_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, active, bundle = _seed_active_parse(db, root)
+    active.quality_json = {
+        "status": "accepted_with_warnings",
+        "accepted": True,
+        "score": 0.97,
+        "issues": [],
+    }
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["warnings"] = ["vision unavailable", "formula analysis unavailable"]
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    db.commit()
+
+    response = _client(db).get(_project_url(f"/api/documents/{document.id}/parse"))
+
+    assert response.status_code == 200
+    assert response.json()["warning_count"] == 2
