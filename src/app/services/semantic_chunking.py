@@ -1146,6 +1146,8 @@ class SemanticChunker:
         annotated: list[SourceSpan] = []
         for span in source_spans:
             metadata = dict(span.metadata)
+            if table_id is not None and span.table_id is None:
+                metadata["table_id"] = table_id
             if figure_id is not None:
                 metadata["figure_id"] = figure_id
             if formula_id is not None:
@@ -1154,10 +1156,7 @@ class SemanticChunker:
                 metadata["asset_id"] = asset_id
             annotated.append(
                 span.model_copy(
-                    update={
-                        "table_id": table_id if table_id is not None else span.table_id,
-                        "metadata": metadata,
-                    }
+                    update={"metadata": metadata}
                 )
             )
         return annotated

@@ -795,3 +795,58 @@ def test_metadata_only_figure_span_preserves_typed_id_without_fake_location() ->
         )
     )
     assert IngestionPipeline._chunk_has_valid_source_spans(persisted) is False
+
+
+def test_metadata_only_table_span_preserves_typed_id_without_fake_location() -> None:
+    annotated = SemanticChunker._annotate_structure_spans(
+        [SourceSpan(metadata={"parser": "mineru"})],
+        table_id="table-real",
+    )
+    record = chunk(
+        "table-child",
+        "Table 5: Results\n\n| Dataset | F1 |\n| --- | --- |\n| OIE2016 | 91.2 |",
+        block_type="table",
+        source_spans=[span.model_dump(mode="json") for span in annotated],
+    )
+    citation = service_for(make_session())._expand_child_hit(
+        record,
+        question="OIE2016 results",
+        score=1.0,
+        page_fields={},
+        evidence_kind="table",
+        related_chunks={},
+    ).citation
+
+    assert citation.table_id == "table-real"
+    assert record.source_spans[0]["table_id"] is None
+    assert record.source_spans[0]["metadata"] == {
+        "parser": "mineru",
+        "table_id": "table-real",
+    }
+    assert IngestionPipeline._chunk_has_valid_source_spans(record) is False
+
+
+def test_existing_table_locator_is_preserved_and_remains_valid() -> None:
+    annotated = SemanticChunker._annotate_structure_spans(
+        [
+            SourceSpan(
+                table_id="source-table-locator",
+                row_index=2,
+                column_index=1,
+                metadata={"parser": "mineru"},
+            )
+        ],
+        table_id="table-real",
+    )
+    record = chunk(
+        "table-child",
+        "OIE2016 | 91.2",
+        block_type="table",
+        source_spans=[span.model_dump(mode="json") for span in annotated],
+    )
+
+    assert record.source_spans[0]["table_id"] == "source-table-locator"
+    assert record.source_spans[0]["row_index"] == 2
+    assert record.source_spans[0]["column_index"] == 1
+    assert record.source_spans[0]["metadata"] == {"parser": "mineru"}
+    assert IngestionPipeline._chunk_has_valid_source_spans(record) is True
