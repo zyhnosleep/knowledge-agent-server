@@ -970,6 +970,7 @@ class SemanticChunker:
         structure_id: str
         structure_source_ids = [block.block_id]
         structure_source_spans: list[SourceSpan] = []
+        figure_asset_id: str | None = None
         if block.block_type == "table":
             table = next(
                 (item for item in document.tables if item.table_id == block.table_id),
@@ -984,6 +985,21 @@ class SemanticChunker:
             structure_source_spans = self._deduplicate_spans(
                 [*block.source_spans, *source_parent.source_spans]
             )
+            structure_source_spans = self._annotate_structure_spans(
+                structure_source_spans,
+                table_id=table.table_id,
+            )
+            source_children = [
+                child.model_copy(
+                    update={
+                        "source_spans": self._annotate_structure_spans(
+                            child.source_spans,
+                            table_id=table.table_id,
+                        )
+                    }
+                )
+                for child in source_children
+            ]
         elif block.block_type == "figure":
             figure = next(
                 (item for item in document.figures if item.figure_id == block.figure_id),
@@ -1003,6 +1019,12 @@ class SemanticChunker:
                 source_parent.source_spans,
                 contributors,
             )
+            figure_asset_id = self._figure_asset_id(document, figure)
+            structure_source_spans = self._annotate_structure_spans(
+                structure_source_spans,
+                figure_id=figure.figure_id,
+                asset_id=figure_asset_id,
+            )
         elif block.block_type == "formula":
             formula = next(
                 (item for item in document.formulas if item.formula_id == block.formula_id),
@@ -1021,6 +1043,10 @@ class SemanticChunker:
                 block,
                 source_parent.source_spans,
                 contributors,
+            )
+            structure_source_spans = self._annotate_structure_spans(
+                structure_source_spans,
+                formula_id=formula.formula_id,
             )
         else:  # pragma: no cover - guarded by entry construction
             raise ValueError(f"unsupported structured block type: {block.block_type}")
@@ -1094,6 +1120,48 @@ class SemanticChunker:
             )
         self._link_neighbors(children)
         drafts.extend(children)
+
+    @staticmethod
+    def _annotate_structure_spans(
+        spans: Iterable[SourceSpan],
+        *,
+        table_id: str | None = None,
+        figure_id: str | None = None,
+        formula_id: str | None = None,
+        asset_id: str | None = None,
+    ) -> list[SourceSpan]:
+        annotated: list[SourceSpan] = []
+        for span in spans:
+            metadata = dict(span.metadata)
+            if figure_id is not None:
+                metadata["figure_id"] = figure_id
+            if formula_id is not None:
+                metadata["formula_id"] = formula_id
+            if asset_id is not None:
+                metadata["asset_id"] = asset_id
+            annotated.append(
+                span.model_copy(
+                    update={
+                        "table_id": table_id if table_id is not None else span.table_id,
+                        "metadata": metadata,
+                    }
+                )
+            )
+        return annotated
+
+    @staticmethod
+    def _figure_asset_id(document: CanonicalDocument, figure) -> str | None:
+        metadata_asset_id = figure.metadata.get("asset_id")
+        if isinstance(metadata_asset_id, str) and metadata_asset_id.strip():
+            return metadata_asset_id.strip()
+        asset_path = str(figure.asset_path or "").replace("\\", "/").removeprefix("./")
+        if not asset_path:
+            return None
+        for asset in document.assets:
+            candidate_path = str(asset.path or "").replace("\\", "/").removeprefix("./")
+            if candidate_path == asset_path:
+                return asset.asset_id
+        return None
 
     @classmethod
     def _structured_contributors(

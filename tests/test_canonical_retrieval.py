@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, literal, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.session import Base
-from app.models.records import Document, DocumentChunk, Project
+from app.models.records import Claim, Document, DocumentChunk, Project
 from app.schemas.agent import EvidenceItem
 from app.schemas.common import Citation
 from app.services.ai import QueryAnswerPayload
+from app.services.canonical_models import (
+    CanonicalAsset,
+    CanonicalBlock,
+    CanonicalCell,
+    CanonicalDocument,
+    CanonicalFigure,
+    CanonicalFormula,
+    CanonicalTable,
+    SourceSpan,
+)
+from app.services.pipeline import IngestionPipeline
+from app.services.semantic_chunking import SemanticChunker
 from app.services.search import QueryService, RetrievedContext
 
 
@@ -245,8 +257,18 @@ def test_figure_and_formula_hits_keep_typed_ids_assets_and_source_spans() -> Non
                 parent_chunk_id="figure-parent",
                 block_type="figure",
                 ordinal=1,
-                source_block_ids=["figure-2"],
-                source_spans=[{"page_index": 2, "page_label": "3", "image_relationship_id": "asset-rId7"}],
+                source_block_ids=["figure-block-not-id"],
+                source_spans=[
+                    {
+                        "page_index": 2,
+                        "page_label": "3",
+                        "image_relationship_id": "relationship-not-asset-id",
+                        "metadata": {
+                            "figure_id": "figure-2",
+                            "asset_id": "asset-rId7",
+                        },
+                    }
+                ],
             ),
             chunk("formula-parent", "Equation 4: L = L_r + lambda L_c", chunk_role="parent", block_type="formula", ordinal=2),
             chunk(
@@ -337,3 +359,301 @@ def test_answer_enforces_context_token_budget_before_drafting(monkeypatch) -> No
     monkeypatch.setattr(service, "_draft_answer", draft)
 
     service.answer("project", "ordinary grounded question", save_answer=False)
+
+
+def test_claim_search_correlates_each_chunk_to_its_own_active_document() -> None:
+    db = make_session()
+    add_document(db, document_id="d1", active_parse_version="v1")
+    add_document(db, document_id="d2", active_parse_version="v2")
+    active = chunk(
+        "active-claim-child",
+        "SAC-KG reports OIE2016 evidence.",
+        document_id="d1",
+        parse_version="v1",
+    )
+    inactive = chunk(
+        "inactive-claim-child",
+        "SAC-KG reports OIE2016 evidence with many extra matching SAC-KG OIE2016 terms.",
+        document_id="d2",
+        parse_version="v1",
+    )
+    db.add_all(
+        [
+            active,
+            inactive,
+            Claim(
+                id="active-claim",
+                project_id="p1",
+                document_id="d1",
+                subject="SAC-KG",
+                predicate="reports",
+                object_text="OIE2016 evidence",
+                evidence_chunk_id=active.id,
+                confidence=0.1,
+            ),
+            Claim(
+                id="inactive-claim",
+                project_id="p1",
+                document_id="d2",
+                subject="SAC-KG OIE2016",
+                predicate="reports",
+                object_text="SAC-KG OIE2016 evidence",
+                evidence_chunk_id=inactive.id,
+                confidence=1.0,
+            ),
+        ]
+    )
+    db.commit()
+
+    contexts = service_for(db)._search_claim_evidence_contexts(
+        "Compare SAC-KG OIE2016 results", "p1", ["d1", "d2"], limit=1
+    )
+
+    assert [context.citation.chunk_id for context in contexts] == [active.id]
+
+
+def test_source_search_bulk_loads_only_top_hit_relationships() -> None:
+    db = make_session()
+    add_document(db)
+    rows: list[DocumentChunk] = []
+    for index in range(30):
+        parent_id = f"parent-{index}"
+        child_id = f"child-{index}"
+        rows.extend(
+            [
+                chunk(
+                    parent_id,
+                    f"Parent section {index} contains shared evidence.",
+                    chunk_role="parent",
+                    ordinal=index * 2,
+                ),
+                chunk(
+                    child_id,
+                    f"Child {index} contains shared evidence.",
+                    parent_chunk_id=parent_id,
+                    ordinal=index * 2 + 1,
+                ),
+            ]
+        )
+    db.add_all(rows)
+    db.commit()
+    db.expunge_all()
+    service = service_for(db)
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        contexts = service._search_source_chunks(
+            "shared evidence", "p1", ["d1"], limit=3
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    assert len(contexts) == 3
+    assert len(statements) <= 4
+
+
+def test_structured_ids_survive_semantic_chunking_persistence_and_retrieval() -> None:
+    table_span = SourceSpan(page_index=1, source_block_id="table-source")
+    figure_span = SourceSpan(page_index=2, source_block_id="figure-source")
+    formula_span = SourceSpan(page_index=3, source_block_id="formula-source")
+    canonical = CanonicalDocument(
+        document_id="d1",
+        parser_source="test",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="table-block-not-id",
+                block_type="table",
+                text="",
+                reading_order=0,
+                parser_source="test",
+                table_id="table-real",
+                source_spans=[table_span],
+            ),
+            CanonicalBlock(
+                block_id="figure-block-not-id",
+                block_type="figure",
+                text="",
+                reading_order=1,
+                parser_source="test",
+                figure_id="figure-real",
+                source_spans=[figure_span],
+            ),
+            CanonicalBlock(
+                block_id="formula-block-not-id",
+                block_type="formula",
+                text="",
+                reading_order=2,
+                parser_source="test",
+                formula_id="formula-real",
+                source_spans=[formula_span],
+            ),
+        ],
+        tables=[
+            CanonicalTable(
+                table_id="table-real",
+                caption="Table 5: Results",
+                headers=["Dataset", "F1"],
+                rows=[["OIE2016", "91.2"]],
+                cells=[
+                    CanonicalCell(text="Dataset", row_index=0, column_index=0, is_header=True),
+                    CanonicalCell(text="F1", row_index=0, column_index=1, is_header=True),
+                    CanonicalCell(text="OIE2016", row_index=1, column_index=0),
+                    CanonicalCell(text="91.2", row_index=1, column_index=1),
+                ],
+                source_spans=[table_span],
+            )
+        ],
+        figures=[
+            CanonicalFigure(
+                figure_id="figure-real",
+                caption="Figure 2: Accuracy",
+                asset_path="assets/figure-two.png",
+                source_spans=[figure_span],
+            )
+        ],
+        formulas=[
+            CanonicalFormula(
+                formula_id="formula-real",
+                latex="L=L_r+lambda L_c",
+                caption="Equation 4",
+                source_spans=[formula_span],
+            )
+        ],
+        assets=[
+            CanonicalAsset(
+                asset_id="asset-real",
+                path="assets/figure-two.png",
+                media_type="image/png",
+            )
+        ],
+    )
+    drafts = SemanticChunker(
+        embedder=NoVectorOllama(),
+        token_counter=lambda text: len(text.split()),
+        parent_min_tokens=1,
+        parent_target_tokens=20,
+        parent_max_tokens=100,
+        child_min_tokens=1,
+        child_target_tokens=20,
+        child_max_tokens=100,
+        overlap_tokens=0,
+    ).build(canonical)
+    context = type(
+        "PipelineContext",
+        (),
+        {
+            "document": type("PipelineDocument", (), {"id": "d1"})(),
+            "version": type("PipelineVersion", (), {"version_key": "canonical-v1"})(),
+        },
+    )()
+    persisted = {
+        draft.block_type: IngestionPipeline._document_chunk_from_draft(
+            context,
+            draft,
+            embedding=None,
+            parent_chunk_id=draft.parent_local_id,
+        )
+        for draft in drafts
+        if draft.chunk_role == "child"
+    }
+
+    retrieval = service_for(make_session())
+    table_ids = retrieval._expand_child_hit(
+        persisted["table"],
+        question="OIE2016 results",
+        score=1.0,
+        page_fields={},
+        evidence_kind="table",
+        related_chunks={},
+    ).citation
+    figure_ids = retrieval._expand_child_hit(
+        persisted["figure"],
+        question="Figure 2 accuracy",
+        score=1.0,
+        page_fields={},
+        evidence_kind="figure",
+        related_chunks={},
+    ).citation
+    formula_ids = retrieval._expand_child_hit(
+        persisted["formula"],
+        question="Equation 4",
+        score=1.0,
+        page_fields={},
+        evidence_kind="formula",
+        related_chunks={},
+    ).citation
+
+    assert table_ids.table_id == "table-real"
+    assert table_ids.asset_id is None
+    assert figure_ids.figure_id == "figure-real"
+    assert figure_ids.asset_id == "asset-real"
+    assert formula_ids.formula_id == "formula-real"
+
+
+def test_untyped_source_and_relationship_ids_never_become_typed_ids() -> None:
+    untyped = chunk(
+        "figure-child",
+        "Figure source text",
+        block_type="figure",
+        source_block_ids=["block-id-is-not-figure-id"],
+        source_spans=[
+            {
+                "page_index": 1,
+                "image_relationship_id": "relationship-id-is-not-asset-id",
+            }
+        ],
+    )
+
+    assert QueryService._canonical_chunk_identifiers(untyped) == {
+        "asset_id": None,
+        "table_id": None,
+        "figure_id": None,
+        "formula_id": None,
+    }
+
+
+def test_context_budget_counts_the_exact_draft_representation() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 5
+    service._retrieval_token_counter = lambda text: len(text.split())
+    context = RetrievedContext(
+        citation=Citation(score=1.0, excerpt="fallback has three"),
+        prompt_text="surface has four tokens",
+        score=1.0,
+    )
+
+    fitted = service._fit_contexts_to_token_budget(
+        [context], question="ordinary question"
+    )
+
+    assert len(fitted) == 1
+    assert fitted[0].prompt_text == "fallback has three"
+    rendered = f"[0] {service._prompt_context_text('ordinary question', fitted[0])}"
+    assert service._retrieval_token_counter(rendered) <= 5
+
+
+def test_active_child_condition_is_strict_for_canonical_and_nullable_for_legacy() -> None:
+    db = make_session()
+    canonical_null_role = QueryService._active_child_chunk_condition(
+        document_active_version=literal("canonical-v1"),
+        chunk_parse_version=literal("canonical-v1"),
+        chunk_role=literal(None),
+        block_type=literal("narrative"),
+    )
+    legacy_null_fields = QueryService._active_child_chunk_condition(
+        document_active_version=literal(None),
+        chunk_parse_version=literal("legacy"),
+        chunk_role=literal(None),
+        block_type=literal(None),
+    )
+
+    assert db.scalar(select(literal(1)).where(canonical_null_role)) is None
+    assert db.scalar(select(literal(1)).where(legacy_null_fields)) == 1

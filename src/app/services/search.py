@@ -419,7 +419,10 @@ class QueryService:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
             if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
-        contexts = self._fit_contexts_to_token_budget(contexts)
+        contexts = self._fit_contexts_to_token_budget(
+            contexts,
+            question=question,
+        )
         if not contexts:
             answer_payload = self._draft_answer(question, None, [])
             response = QueryResponse(answer_markdown=answer_payload.answer_markdown, citations=[], verification_status="local-only")
@@ -1846,11 +1849,13 @@ class QueryService:
                     DocumentChunk.document_id == Claim.document_id,
                 ),
             )
+            .join(Document, Document.id == DocumentChunk.document_id)
             .where(
                 Claim.project_id == project_id,
                 Claim.document_id.in_(document_ids),
                 Claim.evidence_chunk_id.is_not(None),
-                DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
+                Document.project_id == project_id,
+                Document.status == DocumentStatus.ready.value,
                 *self._active_child_chunk_conditions(),
             )
         )
@@ -1932,33 +1937,11 @@ class QueryService:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
-            or_(
-                Document.active_parse_version == DocumentChunk.parse_version,
-                and_(
-                    Document.active_parse_version.is_(None),
-                    or_(
-                        DocumentChunk.parse_version == "legacy",
-                        DocumentChunk.parse_version.is_(None),
-                    ),
-                ),
-            ),
-            or_(
-                DocumentChunk.chunk_role == "child",
-                DocumentChunk.chunk_role.is_(None),
-            ),
-            or_(
-                DocumentChunk.block_type.is_(None),
-                DocumentChunk.block_type != "reference",
-            ),
+            *self._active_child_chunk_conditions(),
         )
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
         chunks = self.db.scalars(statement).all()
-        source_page_fields = self._source_page_fields_by_document_id(
-            project_id,
-            sorted({chunk.document_id for chunk in chunks}),
-        )
-
         base_query_terms = self._tokenize(question)
         route_query_terms = self._tokenize(" ".join(route_terms or []))
         query_terms = base_query_terms | route_query_terms
@@ -1967,7 +1950,7 @@ class QueryService:
             for chunk in chunks:
                 route_token_counts.update(route_query_terms & self._tokenize(chunk.text))
         rare_route_terms = {term for term, count in route_token_counts.items() if count <= 3}
-        scored: list[RetrievedContext] = []
+        scored: list[tuple[DocumentChunk, float, str | None]] = []
         for chunk in chunks:
             score = 0.0
             chunk_terms = self._tokenize(chunk.text)
@@ -1999,39 +1982,99 @@ class QueryService:
                 evidence_kind = "table"
             else:
                 evidence_kind = chunk.block_type if chunk.block_type in {"figure", "formula"} else None
-            scored.append(
-                self._expand_child_hit(
-                    chunk,
-                    question=question,
-                    score=score,
-                    page_fields=source_page_fields.get(chunk.document_id, {}),
-                    evidence_kind=evidence_kind,
-                )
+            scored.append((chunk, score, evidence_kind))
+        top_candidates = sorted(scored, key=lambda item: item[1], reverse=True)[:limit]
+        return self._expand_source_candidates(
+            top_candidates,
+            question=question,
+            project_id=project_id,
+        )
+
+    def _expand_source_candidates(
+        self,
+        candidates: list[tuple[DocumentChunk, float, str | None]],
+        *,
+        question: str,
+        project_id: str,
+    ) -> list[RetrievedContext]:
+        if not candidates:
+            return []
+        include_neighbors = (
+            self._is_document_overview_query(question)
+            or self._is_cross_paper_query(question)
+        )
+        related_ids = {
+            related_id
+            for chunk, _score, _kind in candidates
+            for related_id in (
+                chunk.parent_chunk_id,
+                chunk.previous_chunk_id if include_neighbors else None,
+                chunk.next_chunk_id if include_neighbors else None,
             )
-        return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
+            if related_id
+        }
+        related_chunks = (
+            {
+                item.id: item
+                for item in self.db.scalars(
+                    select(DocumentChunk).where(DocumentChunk.id.in_(related_ids))
+                ).all()
+            }
+            if related_ids
+            else {}
+        )
+        page_fields = self._source_page_fields_by_document_id(
+            project_id,
+            sorted({chunk.document_id for chunk, _score, _kind in candidates}),
+        )
+        return [
+            self._expand_child_hit(
+                chunk,
+                question=question,
+                score=score,
+                page_fields=page_fields.get(chunk.document_id, {}),
+                evidence_kind=evidence_kind,
+                related_chunks=related_chunks,
+            )
+            for chunk, score, evidence_kind in candidates
+        ]
 
     @staticmethod
-    def _active_child_chunk_conditions():
-        return (
-            or_(
-                Document.active_parse_version == DocumentChunk.parse_version,
-                and_(
-                    Document.active_parse_version.is_(None),
-                    or_(
-                        DocumentChunk.parse_version == "legacy",
-                        DocumentChunk.parse_version.is_(None),
-                    ),
-                ),
-            ),
-            or_(
-                DocumentChunk.chunk_role == "child",
-                DocumentChunk.chunk_role.is_(None),
-            ),
-            or_(
-                DocumentChunk.block_type.is_(None),
-                DocumentChunk.block_type != "reference",
-            ),
+    def _active_child_chunk_condition(
+        *,
+        document_active_version=Document.active_parse_version,
+        chunk_parse_version=DocumentChunk.parse_version,
+        chunk_role=DocumentChunk.chunk_role,
+        block_type=DocumentChunk.block_type,
+    ):
+        canonical = and_(
+            document_active_version.is_not(None),
+            document_active_version != "legacy",
+            chunk_parse_version == document_active_version,
+            chunk_role == "child",
+            block_type.is_not(None),
+            block_type != "reference",
         )
+        legacy = and_(
+            or_(
+                document_active_version.is_(None),
+                document_active_version == "legacy",
+            ),
+            or_(
+                chunk_parse_version.is_(None),
+                chunk_parse_version == "legacy",
+            ),
+            or_(
+                chunk_role.is_(None),
+                chunk_role == "child",
+            ),
+            or_(block_type.is_(None), block_type != "reference"),
+        )
+        return or_(canonical, legacy)
+
+    @classmethod
+    def _active_child_chunk_conditions(cls):
+        return (cls._active_child_chunk_condition(),)
 
     def _expand_child_hit(
         self,
@@ -2041,8 +2084,13 @@ class QueryService:
         score: float,
         page_fields: dict[str, str],
         evidence_kind: str | None,
+        related_chunks: dict[str, DocumentChunk] | None = None,
     ) -> RetrievedContext:
-        parent = chunk.parent
+        parent = (
+            related_chunks.get(chunk.parent_chunk_id or "")
+            if related_chunks is not None
+            else chunk.parent
+        )
         if parent is not None and (
             parent.document_id != chunk.document_id
             or parent.parse_version != chunk.parse_version
@@ -2055,7 +2103,11 @@ class QueryService:
         ]
         if chunk.text.strip() and chunk.text.strip() not in context_text:
             prompt_parts.append(f"Matched child:\n{chunk.text.strip()}")
-        neighbor_text = self._neighbor_context_text(chunk, question)
+        neighbor_text = self._neighbor_context_text(
+            chunk,
+            question,
+            related_chunks=related_chunks,
+        )
         if neighbor_text:
             prompt_parts.append(f"Neighbor context:\n{neighbor_text}")
         identifiers = self._canonical_chunk_identifiers(chunk)
@@ -2082,7 +2134,13 @@ class QueryService:
             neighbor_text=neighbor_text,
         )
 
-    def _neighbor_context_text(self, chunk: DocumentChunk, question: str) -> str:
+    def _neighbor_context_text(
+        self,
+        chunk: DocumentChunk,
+        question: str,
+        *,
+        related_chunks: dict[str, DocumentChunk] | None = None,
+    ) -> str:
         if not (
             self._is_document_overview_query(question)
             or self._is_cross_paper_query(question)
@@ -2093,7 +2151,11 @@ class QueryService:
         for chunk_id in (chunk.previous_chunk_id, chunk.next_chunk_id):
             if not chunk_id:
                 continue
-            neighbor = self.db.get(DocumentChunk, chunk_id)
+            neighbor = (
+                related_chunks.get(chunk_id)
+                if related_chunks is not None
+                else self.db.get(DocumentChunk, chunk_id)
+            )
             if neighbor is None or (
                 neighbor.document_id != chunk.document_id
                 or neighbor.parse_version != chunk.parse_version
@@ -2123,21 +2185,11 @@ class QueryService:
                     return str(metadata[field])
             return None
 
-        source_id = next(
-            (str(value) for value in (chunk.source_block_ids or []) if str(value).strip()),
-            None,
-        )
-        block_type = chunk.block_type
         return {
-            "asset_id": span_value("asset_id")
-            or span_value("asset_path")
-            or span_value("image_relationship_id"),
-            "table_id": span_value("table_id")
-            or (source_id if block_type == "table" else None),
-            "figure_id": span_value("figure_id")
-            or (source_id if block_type == "figure" else None),
-            "formula_id": span_value("formula_id")
-            or (source_id if block_type == "formula" else None),
+            "asset_id": span_value("asset_id"),
+            "table_id": span_value("table_id"),
+            "figure_id": span_value("figure_id"),
+            "formula_id": span_value("formula_id"),
         }
 
     def _count_retrieval_tokens(self, text: str) -> int:
@@ -2148,33 +2200,40 @@ class QueryService:
         return int(counter(text))
 
     def _fit_contexts_to_token_budget(
-        self, contexts: list[RetrievedContext]
+        self,
+        contexts: list[RetrievedContext],
+        *,
+        question: str,
     ) -> list[RetrievedContext]:
         remaining = int(self.DRAFT_CONTEXT_TOKEN_BUDGET)
         selected: list[RetrievedContext] = []
         for context in contexts:
-            prompt_text = context.prompt_text.strip()
-            cost = self._count_retrieval_tokens(
-                f"[{len(selected)}] {prompt_text}"
+            rendered = (
+                f"[{len(selected)}] "
+                f"{self._prompt_context_text(question, context)}"
             )
-            if prompt_text and cost <= remaining:
+            cost = self._count_retrieval_tokens(rendered)
+            if context.prompt_text.strip() and cost <= remaining:
                 selected.append(context)
                 remaining -= cost
                 continue
             excerpt = context.citation.excerpt.strip()
-            excerpt_cost = self._count_retrieval_tokens(
-                f"[{len(selected)}] {excerpt}"
+            if not excerpt:
+                continue
+            fallback = replace(
+                context,
+                prompt_text=excerpt,
+                context_text=excerpt,
+                neighbor_text="",
             )
-            if excerpt and excerpt_cost <= remaining:
-                selected.append(
-                    replace(
-                        context,
-                        prompt_text=excerpt,
-                        context_text=excerpt,
-                        neighbor_text="",
-                    )
-                )
-                remaining -= excerpt_cost
+            fallback_rendered = (
+                f"[{len(selected)}] "
+                f"{self._prompt_context_text(question, fallback)}"
+            )
+            fallback_cost = self._count_retrieval_tokens(fallback_rendered)
+            if fallback_cost <= remaining:
+                selected.append(fallback)
+                remaining -= fallback_cost
         return selected
 
     @staticmethod
