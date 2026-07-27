@@ -156,6 +156,15 @@ class EvidenceItem(BaseModel):
     page_label: str | None = None
     score: float = 0.0
     excerpt: str = ""
+    context_text: str = ""
+    parse_version: str | None = None
+    parent_chunk_id: str | None = None
+    block_type: str | None = None
+    source_spans: list[dict[str, Any]] = Field(default_factory=list)
+    asset_id: str | None = None
+    table_id: str | None = None
+    figure_id: str | None = None
+    formula_id: str | None = None
     evidence_kind: str | None = None
     source_stage: str = "unknown"
     support_hint: str = "weak"

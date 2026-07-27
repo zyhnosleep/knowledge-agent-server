@@ -53,6 +53,14 @@ class Citation(BaseModel):
     score: float
     page_label: str | None = None
     excerpt: str
+    parse_version: str | None = None
+    parent_chunk_id: str | None = None
+    block_type: str | None = None
+    source_spans: list[dict[str, Any]] = Field(default_factory=list)
+    asset_id: str | None = None
+    table_id: str | None = None
+    figure_id: str | None = None
+    formula_id: str | None = None
 
 
 class QueryResponse(BaseModel):
