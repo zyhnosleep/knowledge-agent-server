@@ -657,3 +657,141 @@ def test_active_child_condition_is_strict_for_canonical_and_nullable_for_legacy(
 
     assert db.scalar(select(literal(1)).where(canonical_null_role)) is None
     assert db.scalar(select(literal(1)).where(legacy_null_fields)) == 1
+
+
+def test_context_budget_counts_join_separators_in_complete_draft_prompt() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 11
+    service._retrieval_token_counter = (
+        lambda text: len(text.split()) + text.count("\n\n") * 2
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(score=2.0, excerpt="alpha beta gamma delta"),
+            prompt_text="alpha beta gamma delta",
+            score=2.0,
+        ),
+        RetrievedContext(
+            citation=Citation(score=1.0, excerpt="epsilon zeta eta theta"),
+            prompt_text="epsilon zeta eta theta",
+            score=1.0,
+        ),
+    ]
+
+    fitted = service._fit_contexts_to_token_budget(
+        contexts,
+        question="ordinary question",
+    )
+
+    individual_cost = sum(
+        service._retrieval_token_counter(
+            f"[{index}] {service._prompt_context_text('ordinary question', context)}"
+        )
+        for index, context in enumerate(contexts)
+    )
+    complete_cost = service._retrieval_token_counter(
+        "\n\n".join(
+            f"[{index}] {service._prompt_context_text('ordinary question', context)}"
+            for index, context in enumerate(contexts)
+        )
+    )
+    assert individual_cost == 10
+    assert complete_cost == 12
+    assert len(fitted) == 1
+
+
+def test_metadata_only_figure_span_preserves_typed_id_without_fake_location() -> None:
+    canonical = CanonicalDocument(
+        document_id="d1",
+        parser_source="test",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="figure-block-not-id",
+                block_type="figure",
+                text="",
+                reading_order=0,
+                parser_source="test",
+                figure_id="figure-real",
+                source_spans=[],
+            )
+        ],
+        figures=[
+            CanonicalFigure(
+                figure_id="figure-real",
+                caption="Figure 7: No locator",
+                asset_path="assets/figure-seven.png",
+                source_spans=[],
+            )
+        ],
+        assets=[
+            CanonicalAsset(
+                asset_id="asset-real",
+                path="assets/figure-seven.png",
+                media_type="image/png",
+            )
+        ],
+    )
+    draft = next(
+        item
+        for item in SemanticChunker(
+            embedder=NoVectorOllama(),
+            token_counter=lambda text: len(text.split()),
+            parent_min_tokens=1,
+            parent_target_tokens=20,
+            parent_max_tokens=100,
+            child_min_tokens=1,
+            child_target_tokens=20,
+            child_max_tokens=100,
+            overlap_tokens=0,
+        ).build(canonical)
+        if item.chunk_role == "child" and item.block_type == "figure"
+    )
+    pipeline_context = type(
+        "PipelineContext",
+        (),
+        {
+            "document": type("PipelineDocument", (), {"id": "d1"})(),
+            "version": type("PipelineVersion", (), {"version_key": "canonical-v1"})(),
+        },
+    )()
+    persisted = IngestionPipeline._document_chunk_from_draft(
+        pipeline_context,
+        draft,
+        embedding=None,
+        parent_chunk_id=draft.parent_local_id,
+    )
+    citation = service_for(make_session())._expand_child_hit(
+        persisted,
+        question="Figure 7",
+        score=1.0,
+        page_fields={},
+        evidence_kind="figure",
+        related_chunks={},
+    ).citation
+
+    assert citation.figure_id == "figure-real"
+    assert citation.asset_id == "asset-real"
+    assert len(citation.source_spans) == 1
+    derived_span = citation.source_spans[0]
+    assert derived_span["metadata"] == {
+        "figure_id": "figure-real",
+        "asset_id": "asset-real",
+    }
+    assert all(
+        derived_span.get(field) is None
+        for field in (
+            "page_index",
+            "source_block_id",
+            "paragraph_id",
+            "table_id",
+            "image_relationship_id",
+            "xpath",
+            "css_selector",
+            "element_id",
+            "line_start",
+            "char_start",
+        )
+    )
+    assert IngestionPipeline._chunk_has_valid_source_spans(persisted) is False

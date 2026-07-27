@@ -1130,8 +1130,21 @@ class SemanticChunker:
         formula_id: str | None = None,
         asset_id: str | None = None,
     ) -> list[SourceSpan]:
+        source_spans = list(spans)
+        if not source_spans:
+            metadata = {
+                key: value
+                for key, value in {
+                    "table_id": table_id,
+                    "figure_id": figure_id,
+                    "formula_id": formula_id,
+                    "asset_id": asset_id,
+                }.items()
+                if value is not None
+            }
+            return [SourceSpan(metadata=metadata)] if metadata else []
         annotated: list[SourceSpan] = []
-        for span in spans:
+        for span in source_spans:
             metadata = dict(span.metadata)
             if figure_id is not None:
                 metadata["figure_id"] = figure_id

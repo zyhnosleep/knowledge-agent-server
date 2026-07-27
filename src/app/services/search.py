@@ -2205,17 +2205,22 @@ class QueryService:
         *,
         question: str,
     ) -> list[RetrievedContext]:
-        remaining = int(self.DRAFT_CONTEXT_TOKEN_BUDGET)
+        budget = int(self.DRAFT_CONTEXT_TOKEN_BUDGET)
         selected: list[RetrievedContext] = []
-        for context in contexts:
-            rendered = (
-                f"[{len(selected)}] "
-                f"{self._prompt_context_text(question, context)}"
+
+        def representation(values: list[RetrievedContext]) -> str:
+            return "\n\n".join(
+                f"[{index}] {self._prompt_context_text(question, context)}"
+                for index, context in enumerate(values)
             )
-            cost = self._count_retrieval_tokens(rendered)
-            if context.prompt_text.strip() and cost <= remaining:
+
+        for context in contexts:
+            candidate = [*selected, context]
+            if (
+                context.prompt_text.strip()
+                and self._count_retrieval_tokens(representation(candidate)) <= budget
+            ):
                 selected.append(context)
-                remaining -= cost
                 continue
             excerpt = context.citation.excerpt.strip()
             if not excerpt:
@@ -2226,14 +2231,12 @@ class QueryService:
                 context_text=excerpt,
                 neighbor_text="",
             )
-            fallback_rendered = (
-                f"[{len(selected)}] "
-                f"{self._prompt_context_text(question, fallback)}"
-            )
-            fallback_cost = self._count_retrieval_tokens(fallback_rendered)
-            if fallback_cost <= remaining:
+            fallback_candidate = [*selected, fallback]
+            if (
+                self._count_retrieval_tokens(representation(fallback_candidate))
+                <= budget
+            ):
                 selected.append(fallback)
-                remaining -= fallback_cost
         return selected
 
     @staticmethod
