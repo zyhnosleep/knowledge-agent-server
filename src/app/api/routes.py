@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
+import os
+import stat
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -34,6 +41,7 @@ from app.schemas.common import (
     IngestResponse,
     ProjectCreate,
     ProjectRead,
+    PublicSourceSpan,
     QueryRequest,
     QueryResponse,
     ReviewItemRead,
@@ -51,6 +59,15 @@ from app.services.model_runtime import get_model_runtime
 
 router = APIRouter()
 settings = get_settings()
+_MAX_CANONICAL_MANIFEST_BYTES = 1024 * 1024
+_MAX_CANONICAL_MARKDOWN_JSON_BYTES = 10 * 1024 * 1024
+_FILE_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass
+class _VerifiedMarkdown:
+    handle: BinaryIO
+    size: int
 
 
 def _validated_project_slug(project_slug: str) -> str:
@@ -118,9 +135,16 @@ def _document_raw_path_or_404(document: Document) -> Path:
 def _active_parse_or_404(
     db: Session,
     document_id: str,
+    project_slug: str,
 ) -> tuple[Document, DocumentParseVersion]:
+    safe_slug = _validated_project_slug(project_slug)
     document = db.get(Document, document_id)
-    if document is None or not document.active_parse_version:
+    if (
+        document is None
+        or document.project is None
+        or document.project.slug != safe_slug
+        or not document.active_parse_version
+    ):
         raise HTTPException(status_code=404, detail="Active parse not found.")
     version = db.scalar(
         select(DocumentParseVersion).where(
@@ -133,44 +157,138 @@ def _active_parse_or_404(
     return document, version
 
 
-def _validated_active_canonical_bundle(
+def _open_regular_file(path: Path, *, maximum_bytes: int | None = None) -> BinaryIO:
+    if CanonicalArtifactStore._is_link_or_reparse_point(path):  # noqa: SLF001
+        raise ValueError(f"verified file cannot be a link: {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"verified file is not regular: {path.name}")
+        if maximum_bytes is not None and file_stat.st_size > maximum_bytes:
+            raise ValueError(f"verified file exceeds size limit: {path.name}")
+        path_stat = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (file_stat.st_dev, file_stat.st_ino)
+        ):
+            raise ValueError(f"verified file identity changed: {path.name}")
+        return os.fdopen(descriptor, "rb", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _sha256_open_file(handle: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    handle.seek(0)
+    for chunk in iter(lambda: handle.read(_FILE_CHUNK_BYTES), b""):
+        digest.update(chunk)
+    handle.seek(0)
+    return digest.hexdigest()
+
+
+def _same_open_file(path: Path, handle: BinaryIO) -> bool:
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+        file_stat = os.fstat(handle.fileno())
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(path_stat.st_mode)
+        and (path_stat.st_dev, path_stat.st_ino)
+        == (file_stat.st_dev, file_stat.st_ino)
+        and not CanonicalArtifactStore._is_link_or_reparse_point(path)  # noqa: SLF001
+    )
+
+
+def _active_canonical_paths(
     document: Document,
     version: DocumentParseVersion,
-) -> tuple[Path, object, dict]:
+) -> tuple[Path, Path]:
     store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+    root = settings.canonical_artifacts_dir.expanduser().resolve()
+    store._validate_component(document.id)  # noqa: SLF001
+    store._validate_component(version.version_key)  # noqa: SLF001
+    document_root = store._prepare_document_root(  # noqa: SLF001
+        document.id,
+        create=False,
+    ).resolve()
+    bundle = document_root / version.version_key
+    if store._is_link_or_reparse_point(bundle):  # noqa: SLF001
+        raise ValueError("canonical bundle cannot be a link")
+    if not bundle.is_dir() or bundle.resolve().parent != document_root:
+        raise ValueError("canonical bundle escapes its document root")
+
+    artifact_reference = Path(version.artifact_dir)
+    if not artifact_reference.is_absolute():
+        artifact_reference = root / artifact_reference
+    if store._is_link_or_reparse_point(artifact_reference):  # noqa: SLF001
+        raise ValueError("parse-version artifact directory cannot be a link")
+    resolved_reference = artifact_reference.resolve()
+    if (
+        not resolved_reference.is_dir()
+        or resolved_reference.parent != document_root
+        or resolved_reference.name
+        not in {version.version_key, f"{version.version_key}.pipeline"}
+    ):
+        raise ValueError("parse-version artifact directory escapes its document root")
+    return bundle / "manifest.json", bundle / "canonical.md"
+
+
+def _open_verified_canonical_markdown(
+    document: Document,
+    version: DocumentParseVersion,
+) -> _VerifiedMarkdown:
+    markdown_handle: BinaryIO | None = None
     try:
-        root = settings.canonical_artifacts_dir.expanduser().resolve()
-        artifact_reference = Path(version.artifact_dir)
-        if not artifact_reference.is_absolute():
-            artifact_reference = root / artifact_reference
-        if store._is_link_or_reparse_point(artifact_reference):  # noqa: SLF001
-            raise ValueError("parse-version artifact directory cannot be a link")
-        resolved_reference = artifact_reference.resolve()
-        document_root = (root / document.id).resolve()
+        manifest_path, markdown_path = _active_canonical_paths(document, version)
+        with _open_regular_file(
+            manifest_path,
+            maximum_bytes=_MAX_CANONICAL_MANIFEST_BYTES,
+        ) as manifest_handle:
+            manifest = json.loads(manifest_handle.read().decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("canonical manifest is not an object")
         if (
-            not resolved_reference.is_dir()
-            or resolved_reference.parent != document_root
-            or resolved_reference.name
-            not in {version.version_key, f"{version.version_key}.pipeline"}
+            manifest.get("document_id") != document.id
+            or manifest.get("version") != version.version_key
         ):
-            raise ValueError("parse-version artifact directory escapes its document root")
-        canonical = store.load(document.id, version.version_key)
-        bundle = settings.canonical_artifacts_dir / document.id / version.version_key
-        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+            raise ValueError("canonical manifest identity mismatch")
+
+        checkpoint = version.manifest_json if isinstance(version.manifest_json, dict) else {}
+        expected_input = checkpoint.get("input_fingerprint")
+        expected_markdown = checkpoint.get("canonical_markdown_sha256")
+        if (
+            not isinstance(expected_input, str)
+            or not isinstance(expected_markdown, str)
+            or manifest.get("input_fingerprint") != expected_input
+            or manifest.get("canonical_markdown_sha256") != expected_markdown
+        ):
+            raise ValueError("canonical checkpoint fingerprint mismatch")
+
+        markdown_handle = _open_regular_file(markdown_path)
+        size = os.fstat(markdown_handle.fileno()).st_size
+        actual_markdown = _sha256_open_file(markdown_handle)
+        if actual_markdown != expected_markdown:
+            raise ValueError("canonical markdown fingerprint mismatch")
+        if not _same_open_file(markdown_path, markdown_handle):
+            raise ValueError("canonical markdown changed during verification")
+        return _VerifiedMarkdown(handle=markdown_handle, size=size)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        if markdown_handle is not None:
+            markdown_handle.close()
         raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
 
-    checkpoint = version.manifest_json if isinstance(version.manifest_json, dict) else {}
-    expected_input = checkpoint.get("input_fingerprint")
-    expected_markdown = checkpoint.get("canonical_markdown_sha256")
-    if (
-        not isinstance(expected_input, str)
-        or not isinstance(expected_markdown, str)
-        or manifest.get("input_fingerprint") != expected_input
-        or manifest.get("canonical_markdown_sha256") != expected_markdown
-    ):
-        raise HTTPException(status_code=404, detail="Canonical artifact not found.")
-    return bundle, canonical, manifest
+
+def _stream_verified_markdown(verified: _VerifiedMarkdown) -> Iterator[bytes]:
+    try:
+        for chunk in iter(lambda: verified.handle.read(_FILE_CHUNK_BYTES), b""):
+            yield chunk
+    finally:
+        verified.handle.close()
 
 
 def _parse_progress(version: DocumentParseVersion) -> dict:
@@ -221,6 +339,15 @@ def _repair_pages(version: DocumentParseVersion) -> list[int]:
         page_index = request.get("page_index")
         if isinstance(page_index, int) and not isinstance(page_index, bool) and page_index >= 0:
             pages.add(page_index)
+        locator = request.get("locator")
+        if isinstance(locator, dict):
+            locator_page = locator.get("page_index")
+            if (
+                isinstance(locator_page, int)
+                and not isinstance(locator_page, bool)
+                and locator_page >= 0
+            ):
+                pages.add(locator_page)
         page_indices = request.get("page_indices")
         if isinstance(page_indices, list):
             pages.update(
@@ -243,67 +370,50 @@ def _source_type(document: Document) -> str:
 
 
 def _source_fragment(source_type: str, spans: list[dict]) -> str:
-    span = next((item for item in spans if isinstance(item, dict)), {})
-    if source_type == "pdf":
-        page_index = span.get("page_index")
-        if isinstance(page_index, int) and not isinstance(page_index, bool) and page_index >= 0:
-            return f"#page={page_index + 1}"
-    elif source_type == "docx":
-        paragraph_id = span.get("paragraph_id")
-        if isinstance(paragraph_id, str) and paragraph_id:
-            return f"#paragraph={quote(paragraph_id, safe='')}"
-    elif source_type == "html":
-        for key, label in (("element_id", "element"), ("css_selector", "selector"), ("xpath", "xpath")):
-            value = span.get(key)
-            if isinstance(value, str) and value:
-                return f"#{label}={quote(value, safe='')}"
-    else:
-        line_start = span.get("line_start")
-        if isinstance(line_start, int) and not isinstance(line_start, bool) and line_start >= 0:
-            return f"#line={line_start}"
-    return ""
-
-
-def _public_source_spans(spans: list[dict]) -> list[dict]:
-    fields = {
-        "page_index",
-        "page_label",
-        "bbox",
-        "normalized_bbox",
-        "source_block_id",
-        "paragraph_id",
-        "table_id",
-        "row_index",
-        "column_index",
-        "image_relationship_id",
-        "xpath",
-        "css_selector",
-        "element_id",
-        "heading_path",
-        "line_start",
-        "line_end",
-        "char_start",
-        "char_end",
-    }
-    metadata_fields = {
-        "table_id",
-        "figure_id",
-        "formula_id",
-        "asset_id",
-        "source_role",
-        "structure_type",
-    }
-    public: list[dict] = []
     for span in spans:
         if not isinstance(span, dict):
             continue
-        item = {key: value for key, value in span.items() if key in fields}
-        metadata = span.get("metadata")
-        if isinstance(metadata, dict):
-            item["metadata"] = {
-                key: value for key, value in metadata.items() if key in metadata_fields
-            }
-        public.append(item)
+        if source_type == "pdf":
+            page_index = span.get("page_index")
+            if (
+                isinstance(page_index, int)
+                and not isinstance(page_index, bool)
+                and page_index >= 0
+            ):
+                return f"#page={page_index + 1}"
+        elif source_type == "docx":
+            paragraph_id = span.get("paragraph_id")
+            if isinstance(paragraph_id, str) and paragraph_id:
+                return f"#paragraph={quote(paragraph_id, safe='')}"
+        elif source_type == "html":
+            for key, label in (
+                ("element_id", "element"),
+                ("css_selector", "selector"),
+                ("xpath", "xpath"),
+            ):
+                value = span.get(key)
+                if isinstance(value, str) and value:
+                    return f"#{label}={quote(value, safe='')}"
+        else:
+            line_start = span.get("line_start")
+            if (
+                isinstance(line_start, int)
+                and not isinstance(line_start, bool)
+                and line_start >= 0
+            ):
+                return f"#line={line_start}"
+    return ""
+
+
+def _public_source_spans(spans: list[dict]) -> list[PublicSourceSpan]:
+    public: list[PublicSourceSpan] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+        try:
+            public.append(PublicSourceSpan.model_validate(span))
+        except ValidationError:
+            continue
     return public
 
 
@@ -745,19 +855,19 @@ def get_document(document_id: str, db: Session = Depends(get_db)) -> DocumentRea
 @router.get("/documents/{document_id}/parse", response_model=CanonicalParseRead)
 def get_active_parse(
     document_id: str,
+    project_slug: str = Query(...),
     db: Session = Depends(get_db),
 ) -> CanonicalParseRead:
-    document, version = _active_parse_or_404(db, document_id)
-    canonical = None
+    document, version = _active_parse_or_404(db, document_id, project_slug)
     download_available = False
     try:
-        _, canonical, _ = _validated_active_canonical_bundle(document, version)
+        verified = _open_verified_canonical_markdown(document, version)
+        verified.handle.close()
         download_available = True
     except HTTPException:
         pass
     quality = version.quality_json if isinstance(version.quality_json, dict) else {}
-    warnings = getattr(canonical, "warnings", None)
-    warning_count = len(warnings) if isinstance(warnings, list) else sum(
+    warning_count = sum(
         1
         for issue in quality.get("issues", [])
         if isinstance(issue, dict) and issue.get("severity") == "warning"
@@ -785,14 +895,20 @@ def get_active_parse(
 )
 def get_active_parse_markdown(
     document_id: str,
+    project_slug: str = Query(...),
     db: Session = Depends(get_db),
 ) -> CanonicalMarkdownRead:
-    document, version = _active_parse_or_404(db, document_id)
-    bundle, _, _ = _validated_active_canonical_bundle(document, version)
+    document, version = _active_parse_or_404(db, document_id, project_slug)
+    verified = _open_verified_canonical_markdown(document, version)
+    if verified.size > _MAX_CANONICAL_MARKDOWN_JSON_BYTES:
+        verified.handle.close()
+        raise HTTPException(status_code=413, detail="Canonical Markdown is too large for JSON view.")
     try:
-        markdown = (bundle / "canonical.md").read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+        markdown = verified.handle.read().decode("utf-8")
+    except UnicodeError as exc:
         raise HTTPException(status_code=404, detail="Canonical artifact not found.") from exc
+    finally:
+        verified.handle.close()
     return CanonicalMarkdownRead(
         document_id=document.id,
         version=version.version_key,
@@ -800,31 +916,37 @@ def get_active_parse_markdown(
     )
 
 
-@router.get("/documents/{document_id}/parse/download", response_class=FileResponse)
+@router.get("/documents/{document_id}/parse/download", response_class=StreamingResponse)
 def download_active_parse(
     document_id: str,
+    project_slug: str = Query(...),
     db: Session = Depends(get_db),
-) -> FileResponse:
-    document, version = _active_parse_or_404(db, document_id)
-    bundle, _, _ = _validated_active_canonical_bundle(document, version)
-    return FileResponse(
-        bundle / "canonical.md",
+) -> StreamingResponse:
+    document, version = _active_parse_or_404(db, document_id, project_slug)
+    verified = _open_verified_canonical_markdown(document, version)
+    return StreamingResponse(
+        _stream_verified_markdown(verified),
         media_type="text/markdown; charset=utf-8",
-        filename="canonical.md",
-        content_disposition_type="attachment",
+        headers={
+            "Content-Disposition": 'attachment; filename="canonical.md"',
+            "Content-Length": str(verified.size),
+        },
     )
 
 
 @router.get(
     "/documents/{document_id}/citations/{chunk_id}/location",
     response_model=CitationLocationRead,
+    response_model_exclude_defaults=True,
+    response_model_exclude_none=True,
 )
 def get_citation_location(
     document_id: str,
     chunk_id: str,
+    project_slug: str = Query(...),
     db: Session = Depends(get_db),
 ) -> CitationLocationRead:
-    document, version = _active_parse_or_404(db, document_id)
+    document, version = _active_parse_or_404(db, document_id, project_slug)
     chunk = db.scalar(
         select(DocumentChunk).where(
             DocumentChunk.id == chunk_id,
@@ -841,13 +963,16 @@ def get_citation_location(
         raise HTTPException(status_code=404, detail="Source file not found.")
     spans = chunk.source_spans if isinstance(chunk.source_spans, list) else []
     public_spans = _public_source_spans(spans)
+    public_span_dicts = [
+        span.model_dump(mode="json", exclude_none=True) for span in public_spans
+    ]
     source_type = _source_type(document)
     return CitationLocationRead(
         document_id=document.id,
         chunk_id=chunk.id,
         parse_version=version.version_key,
         source_type=source_type,
-        source_url=source_url + _source_fragment(source_type, spans),
+        source_url=source_url + _source_fragment(source_type, public_span_dicts),
         source_spans=public_spans,
     )
 

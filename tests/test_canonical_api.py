@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -27,6 +28,12 @@ from app.models.records import (
 )
 from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.canonical_models import CanonicalBlock, CanonicalDocument, SourceSpan
+from app.services.structured_evidence import TableRepairRequest
+
+
+def _project_url(path: str, project_slug: str = "demo") -> str:
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}project_slug={quote(project_slug)}"
 
 
 def _session() -> Session:
@@ -143,7 +150,12 @@ def _seed_active_parse(
             "input_fingerprint": manifest["input_fingerprint"],
             "canonical_markdown_sha256": manifest["canonical_markdown_sha256"],
         },
-        quality_json={"status": "accepted_with_warnings", "accepted": True, "score": 0.97},
+        quality_json={
+            "status": "accepted_with_warnings",
+            "accepted": True,
+            "score": 0.97,
+            "issues": [{"severity": "warning", "code": "figure-analysis"}],
+        },
         stage_state={
             "repair": {
                 "status": "completed",
@@ -185,7 +197,7 @@ def test_current_parse_status_markdown_and_download_expose_only_active_version(
     db.commit()
     client = _client(db)
 
-    response = client.get(f"/api/documents/{document.id}/parse")
+    response = client.get(_project_url(f"/api/documents/{document.id}/parse"))
     assert response.status_code == 200
     assert response.json() == {
         "document_id": document.id,
@@ -201,13 +213,13 @@ def test_current_parse_status_markdown_and_download_expose_only_active_version(
     assert "canonical-old" not in response.text
     assert "contextual_prefix" not in response.text
 
-    markdown = client.get(f"/api/documents/{document.id}/parse/markdown")
+    markdown = client.get(_project_url(f"/api/documents/{document.id}/parse/markdown"))
     assert markdown.status_code == 200
     assert markdown.json()["version"] == active.version_key
     assert "# Paper" in markdown.json()["markdown"]
     assert markdown.headers["content-type"].startswith("application/json")
 
-    download = client.get(f"/api/documents/{document.id}/parse/download")
+    download = client.get(_project_url(f"/api/documents/{document.id}/parse/download"))
     assert download.status_code == 200
     assert download.content == (bundle / "canonical.md").read_bytes()
     assert download.headers["content-disposition"].startswith("attachment;")
@@ -238,7 +250,7 @@ def test_parse_status_does_not_leak_newer_inactive_run_progress(
     )
     db.commit()
 
-    response = _client(db).get(f"/api/documents/{document.id}/parse")
+    response = _client(db).get(_project_url(f"/api/documents/{document.id}/parse"))
 
     assert response.status_code == 200
     assert response.json()["progress"] == {"stage": "completed", "percent": 100}
@@ -283,7 +295,7 @@ def test_location_returns_active_source_spans_and_format_specific_source_url(
     db.commit()
 
     response = _client(db).get(
-        f"/api/documents/{document.id}/citations/{chunk.id}/location"
+        _project_url(f"/api/documents/{document.id}/citations/{chunk.id}/location")
     )
 
     assert response.status_code == 200
@@ -324,7 +336,7 @@ def test_location_rejects_old_other_document_and_reference_chunks(
 
     for chunk_id in ("old", "other", "reference", "missing"):
         assert client.get(
-            f"/api/documents/{document.id}/citations/{chunk_id}/location"
+            _project_url(f"/api/documents/{document.id}/citations/{chunk_id}/location")
         ).status_code == 404
 
 
@@ -362,7 +374,7 @@ def test_location_redacts_derived_text_and_server_paths_from_span_metadata(
     db.commit()
 
     response = _client(db).get(
-        f"/api/documents/{document.id}/citations/chunk-sensitive/location"
+        _project_url(f"/api/documents/{document.id}/citations/chunk-sensitive/location")
     )
 
     assert response.status_code == 200
@@ -383,11 +395,11 @@ def test_parse_artifacts_reject_artifact_directory_outside_store_root(
     db.commit()
     client = _client(db)
 
-    status = client.get(f"/api/documents/{document.id}/parse")
+    status = client.get(_project_url(f"/api/documents/{document.id}/parse"))
     assert status.status_code == 200
     assert status.json()["download_available"] is False
-    assert client.get(f"/api/documents/{document.id}/parse/markdown").status_code == 404
-    assert client.get(f"/api/documents/{document.id}/parse/download").status_code == 404
+    assert client.get(_project_url(f"/api/documents/{document.id}/parse/markdown")).status_code == 404
+    assert client.get(_project_url(f"/api/documents/{document.id}/parse/download")).status_code == 404
 
 
 def test_parse_artifacts_reject_checkpoint_fingerprint_mismatch(
@@ -401,7 +413,7 @@ def test_parse_artifacts_reject_checkpoint_fingerprint_mismatch(
     active.manifest_json = {"input_fingerprint": "0" * 64}
     db.commit()
 
-    response = _client(db).get(f"/api/documents/{document.id}/parse/markdown")
+    response = _client(db).get(_project_url(f"/api/documents/{document.id}/parse/markdown"))
 
     assert response.status_code == 404
 
@@ -420,6 +432,323 @@ def test_parse_artifacts_reject_linked_bundle(
     active.artifact_dir = str(bundle)
     db.commit()
 
-    response = _client(db).get(f"/api/documents/{document.id}/parse/markdown")
+    response = _client(db).get(_project_url(f"/api/documents/{document.id}/parse/markdown"))
 
     assert response.status_code == 404
+
+
+def test_all_canonical_routes_require_matching_project_slug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    db = _session()
+    document, active, _ = _seed_active_parse(db, root)
+    chunk = DocumentChunk(
+        id="chunk-project",
+        document_id=document.id,
+        parse_version=active.version_key,
+        ordinal=1,
+        text="Evidence",
+        source_spans=[{"page_index": 0}],
+    )
+    db.add(chunk)
+    db.commit()
+    client = _client(db)
+    paths = [
+        f"/api/documents/{document.id}/parse",
+        f"/api/documents/{document.id}/parse/markdown",
+        f"/api/documents/{document.id}/parse/download",
+        f"/api/documents/{document.id}/citations/{chunk.id}/location",
+    ]
+
+    for path in paths:
+        assert client.get(path).status_code == 422
+        assert client.get(_project_url(path, "other")).status_code == 404
+        assert client.get(_project_url(path, "../demo")).status_code == 400
+
+
+def test_location_drops_invalid_nested_public_span_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    db = _session()
+    document, active, _ = _seed_active_parse(db, root)
+    db.add(
+        DocumentChunk(
+            id="chunk-invalid-span",
+            document_id=document.id,
+            parse_version=active.version_key,
+            ordinal=1,
+            text="Evidence",
+            source_spans=[
+                {
+                    "page_index": 1,
+                    "bbox": [0, 0, {"contextual_prefix": "secret"}, 1],
+                    "heading_path": ["Results", {"artifact_path": "C:/private"}],
+                    "metadata": {
+                        "table_id": {"artifact_path": "C:/private"},
+                        "figure_id": ["figure-1"],
+                        "source_role": {"contextual_prefix": "secret"},
+                    },
+                },
+                {
+                    "page_index": True,
+                    "metadata": {"table_id": "safe-looking-but-invalid-span"},
+                },
+                {
+                    "page_index": 2,
+                    "metadata": {
+                        "table_id": "table-1",
+                        "contextual_prefix": {"nested": "secret"},
+                        "artifact_path": ["C:/private"],
+                    },
+                },
+            ],
+        )
+    )
+    db.commit()
+
+    response = _client(db).get(
+        _project_url(f"/api/documents/{document.id}/citations/chunk-invalid-span/location")
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source_spans"] == [
+        {"page_index": 2, "metadata": {"table_id": "table-1"}}
+    ]
+    assert "secret" not in response.text
+    assert "C:/private" not in response.text
+
+
+def test_parse_status_reads_nested_table_repair_request_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, active, _ = _seed_active_parse(db, root)
+    request = TableRepairRequest(
+        table_id="table-1",
+        reasons=["header_mismatch"],
+        locator={"page_index": 7, "bbox": [0.1, 0.2, 0.8, 0.9]},
+        source_fingerprint="f" * 64,
+        instructions="Repair the located table.",
+    )
+    active.stage_state = {
+        "repair": {
+            "status": "completed",
+            "output": {"repair_requests": [request.model_dump(mode="json")]},
+        }
+    }
+    db.commit()
+
+    response = _client(db).get(_project_url(f"/api/documents/{document.id}/parse"))
+
+    assert response.status_code == 200
+    assert response.json()["repair_pages"] == [7]
+
+
+@pytest.mark.parametrize(
+    ("file_name", "media_type", "locator", "expected_fragment"),
+    [
+        ("paper.pdf", "application/pdf", {"page_index": 4}, "#page=5"),
+        ("paper.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", {"paragraph_id": "p-9"}, "#paragraph=p-9"),
+        ("paper.html", "text/html", {"element_id": "discussion"}, "#element=discussion"),
+        ("paper.txt", "text/plain", {"line_start": 22, "line_end": 24}, "#line=22"),
+    ],
+)
+def test_location_uses_first_span_with_format_specific_locator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_name: str,
+    media_type: str,
+    locator: dict,
+    expected_fragment: str,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    monkeypatch.setattr(routes.settings, "raw_dir", tmp_path)
+    db = _session()
+    document, active, _ = _seed_active_parse(
+        db,
+        root,
+        file_name=file_name,
+        media_type=media_type,
+    )
+    db.add(
+        DocumentChunk(
+            id="chunk-multi-span",
+            document_id=document.id,
+            parse_version=active.version_key,
+            ordinal=1,
+            text="Evidence",
+            source_spans=[{"source_block_id": "no-format-locator"}, locator],
+        )
+    )
+    db.commit()
+
+    response = _client(db).get(
+        _project_url(f"/api/documents/{document.id}/citations/chunk-multi-span/location")
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source_url"].endswith(expected_fragment)
+
+
+def _replace_markdown_and_fingerprints(
+    bundle: Path,
+    version: DocumentParseVersion,
+    content: bytes,
+) -> None:
+    markdown_hash = hashlib.sha256(content).hexdigest()
+    (bundle / "canonical.md").write_bytes(content)
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["canonical_markdown_sha256"] = markdown_hash
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    checkpoint = dict(version.manifest_json)
+    checkpoint["canonical_markdown_sha256"] = markdown_hash
+    version.manifest_json = checkpoint
+
+
+@pytest.mark.parametrize("replace_bundle", [False, True])
+def test_markdown_response_never_reopens_replaced_verified_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replace_bundle: bool,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, _, bundle = _seed_active_parse(db, root)
+    original = (bundle / "canonical.md").read_bytes()
+    replacement = b"---\ntitle: attacker\n---\n\n# Replaced\n"
+    replaced = False
+
+    if hasattr(routes, "_sha256_open_file"):
+        original_hash = routes._sha256_open_file
+
+        def replace_after_hash(handle):
+            nonlocal replaced
+            digest = original_hash(handle)
+            if not replaced:
+                replaced = True
+                if replace_bundle:
+                    moved = tmp_path / "moved-bundle"
+                    bundle.rename(moved)
+                    bundle.mkdir()
+                    (bundle / "canonical.md").write_bytes(replacement)
+                else:
+                    moved = tmp_path / "moved-canonical.md"
+                    (bundle / "canonical.md").replace(moved)
+                    (bundle / "canonical.md").write_bytes(replacement)
+            return digest
+
+        monkeypatch.setattr(routes, "_sha256_open_file", replace_after_hash)
+    else:
+        original_read_text = Path.read_text
+
+        def replace_after_manifest(path: Path, *args, **kwargs):
+            nonlocal replaced
+            content = original_read_text(path, *args, **kwargs)
+            if path.name == "manifest.json" and not replaced:
+                if replace_bundle:
+                    moved = tmp_path / "moved-bundle"
+                    bundle.rename(moved)
+                    bundle.mkdir()
+                    (bundle / "canonical.md").write_bytes(replacement)
+                else:
+                    (bundle / "canonical.md").write_bytes(replacement)
+                replaced = True
+            return content
+
+        monkeypatch.setattr(Path, "read_text", replace_after_manifest)
+
+    response = _client(db).get(
+        _project_url(f"/api/documents/{document.id}/parse/markdown")
+    )
+
+    assert replaced is True, response.text
+    assert response.status_code in {200, 404}
+    if response.status_code == 200:
+        assert response.json()["markdown"].encode("utf-8") == original
+    assert replacement not in response.content
+
+
+def test_parse_endpoints_do_not_load_full_canonical_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, _, bundle = _seed_active_parse(db, root)
+
+    def forbidden_load(*args, **kwargs):
+        raise AssertionError("CanonicalArtifactStore.load must not serve parse endpoints")
+
+    monkeypatch.setattr(CanonicalArtifactStore, "load", forbidden_load)
+    client = _client(db)
+
+    status = client.get(_project_url(f"/api/documents/{document.id}/parse"))
+    download = client.get(_project_url(f"/api/documents/{document.id}/parse/download"))
+
+    assert status.status_code == 200
+    assert status.json()["download_available"] is True
+    assert download.status_code == 200
+    assert download.content == (bundle / "canonical.md").read_bytes()
+
+
+def test_large_markdown_json_is_rejected_but_download_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, active, bundle = _seed_active_parse(db, root)
+    content = b"---\ntitle: large\n---\n\n" + b"x" * (10 * 1024 * 1024)
+    _replace_markdown_and_fingerprints(bundle, active, content)
+    db.commit()
+    client = _client(db)
+
+    markdown = client.get(_project_url(f"/api/documents/{document.id}/parse/markdown"))
+    download = client.get(_project_url(f"/api/documents/{document.id}/parse/download"))
+
+    assert markdown.status_code == 413
+    assert download.status_code == 200
+    assert download.content == content
+
+
+def test_parse_endpoints_close_every_verified_markdown_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "parsed"
+    monkeypatch.setattr(routes.settings, "canonical_artifacts_dir", root)
+    db = _session()
+    document, _, _ = _seed_active_parse(db, root)
+    opened = []
+    original_open = routes._open_verified_canonical_markdown
+
+    def capture_open(*args, **kwargs):
+        verified = original_open(*args, **kwargs)
+        opened.append(verified.handle)
+        return verified
+
+    monkeypatch.setattr(routes, "_open_verified_canonical_markdown", capture_open)
+    client = _client(db)
+
+    assert client.get(_project_url(f"/api/documents/{document.id}/parse")).status_code == 200
+    assert client.get(_project_url(f"/api/documents/{document.id}/parse/markdown")).status_code == 200
+    assert client.get(_project_url(f"/api/documents/{document.id}/parse/download")).status_code == 200
+
+    assert len(opened) == 3
+    assert all(handle.closed for handle in opened)

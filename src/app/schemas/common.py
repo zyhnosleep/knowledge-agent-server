@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ProjectCreate(BaseModel):
@@ -65,13 +66,93 @@ class CanonicalMarkdownRead(BaseModel):
     markdown: str
 
 
+class PublicSourceMetadata(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    table_id: str | None = Field(default=None, max_length=512)
+    figure_id: str | None = Field(default=None, max_length=512)
+    formula_id: str | None = Field(default=None, max_length=512)
+    asset_id: str | None = Field(default=None, max_length=512)
+    source_role: str | None = Field(default=None, max_length=128)
+    structure_type: str | None = Field(default=None, max_length=128)
+
+
+class PublicSourceSpan(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    page_index: int | None = Field(default=None, ge=0)
+    page_label: str | None = Field(default=None, max_length=128)
+    bbox: tuple[float, float, float, float] | None = None
+    normalized_bbox: tuple[float, float, float, float] | None = None
+    source_block_id: str | None = Field(default=None, max_length=512)
+    paragraph_id: str | None = Field(default=None, max_length=512)
+    table_id: str | None = Field(default=None, max_length=512)
+    row_index: int | None = Field(default=None, ge=0)
+    column_index: int | None = Field(default=None, ge=0)
+    image_relationship_id: str | None = Field(default=None, max_length=512)
+    xpath: str | None = Field(default=None, max_length=4096)
+    css_selector: str | None = Field(default=None, max_length=4096)
+    element_id: str | None = Field(default=None, max_length=512)
+    heading_path: list[str] = Field(default_factory=list, max_length=64)
+    line_start: int | None = Field(default=None, ge=0)
+    line_end: int | None = Field(default=None, ge=0)
+    char_start: int | None = Field(default=None, ge=0)
+    char_end: int | None = Field(default=None, ge=0)
+    metadata: PublicSourceMetadata = Field(default_factory=PublicSourceMetadata)
+
+    @field_validator("bbox", "normalized_bbox", mode="before")
+    @classmethod
+    def validate_bbox(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            raise ValueError("bbox must contain exactly four coordinates")
+        if any(
+            isinstance(coordinate, bool)
+            or not isinstance(coordinate, (int, float))
+            or not math.isfinite(coordinate)
+            for coordinate in value
+        ):
+            raise ValueError("bbox coordinates must be finite numbers")
+        x0, y0, x1, y1 = (float(coordinate) for coordinate in value)
+        if x1 < x0 or y1 < y0:
+            raise ValueError("bbox coordinates are out of order")
+        return (x0, y0, x1, y1)
+
+    @field_validator("normalized_bbox")
+    @classmethod
+    def validate_normalized_bbox(cls, value):
+        if value is not None and any(coordinate < 0 or coordinate > 1 for coordinate in value):
+            raise ValueError("normalized bbox coordinates must be within 0..1")
+        return value
+
+    @field_validator("heading_path")
+    @classmethod
+    def validate_heading_path(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(item, str) or len(item) > 512 for item in value):
+            raise ValueError("heading path entries must be bounded strings")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ranges(self):
+        if (self.line_start is None) != (self.line_end is None):
+            raise ValueError("line range must contain both endpoints")
+        if self.line_start is not None and self.line_end < self.line_start:
+            raise ValueError("line range is out of order")
+        if (self.char_start is None) != (self.char_end is None):
+            raise ValueError("character range must contain both endpoints")
+        if self.char_start is not None and self.char_end < self.char_start:
+            raise ValueError("character range is out of order")
+        return self
+
+
 class CitationLocationRead(BaseModel):
     document_id: str
     chunk_id: str
     parse_version: str
     source_type: str
     source_url: str
-    source_spans: list[dict[str, Any]] = Field(default_factory=list)
+    source_spans: list[PublicSourceSpan] = Field(default_factory=list)
 
 
 class QueryRequest(BaseModel):
