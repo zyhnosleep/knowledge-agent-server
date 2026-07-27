@@ -706,7 +706,7 @@
         top: 104px;
         min-height: calc(100dvh - 134px);
         display: grid;
-        grid-template-rows: auto minmax(0, 1fr) auto;
+        grid-template-rows: auto auto minmax(0, 1fr) auto;
         overflow: hidden;
         border: 1.5px solid var(--purple-soft);
         border-radius: 12px;
@@ -727,6 +727,53 @@
         margin: 0;
         font-size: 22px;
       }
+
+      .drawer-head-copy {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .drawer-head-copy small {
+        overflow: hidden;
+        color: var(--faint);
+        font: 11px ui-monospace, monospace;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .drawer-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 0 0 auto;
+      }
+
+      .drawer-actions a.icon-button {
+        display: grid;
+        place-items: center;
+        text-decoration: none;
+      }
+
+      .parse-status-panel {
+        display: grid;
+        grid-template-columns: minmax(150px, 1fr) minmax(160px, 1.2fr) auto;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        background: var(--night-850);
+      }
+
+      .parse-status-panel[hidden] { display: none; }
+      .parse-status-copy { min-width: 0; }
+      .parse-status-copy strong, .parse-status-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .parse-status-copy strong { font-size: 12px; }
+      .parse-status-copy span { margin-top: 3px; color: var(--paper-500); font-size: 10px; }
+      .parse-progress-track { height: 5px; overflow: hidden; background: var(--line); }
+      .parse-progress-track i { display: block; width: 0; height: 100%; background: var(--signal); transition: width .2s ease; }
+      .parse-status-meta { color: var(--paper-300); font: 10px ui-monospace, monospace; white-space: nowrap; }
 
       .icon-button {
         width: 34px;
@@ -809,6 +856,47 @@
         font-size: 13px;
         line-height: 1.6;
       }
+
+      .pdf-frame-wrap {
+        position: relative;
+        min-width: 0;
+        min-height: 0;
+        height: 100%;
+      }
+
+      .source-highlight-layer {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        pointer-events: none;
+      }
+
+      .source-highlight-box {
+        position: absolute;
+        border: 2px solid var(--amber);
+        background: rgb(245 166 35 / 18%);
+        box-shadow: 0 0 0 1px rgb(7 10 14 / 65%);
+      }
+
+      .canonical-markdown-panel {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        min-width: 0;
+        min-height: 0;
+        height: 100%;
+        padding: 14px;
+        border: 1px solid var(--line);
+        background: var(--night-850);
+      }
+
+      .canonical-markdown-panel[hidden] { display: none; }
+      .canonical-markdown-panel header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 10px; }
+      .canonical-markdown-panel h3 { margin: 0; font-size: 13px; }
+      .canonical-markdown-panel pre { min-width: 0; min-height: 0; margin: 0; overflow: auto; color: var(--paper-300); font: 12px/1.7 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .source-line { display: block; min-height: 1.7em; }
+      .source-line.highlighted { margin: 0 -6px; padding: 0 6px; background: rgb(245 166 35 / 20%); color: var(--paper-100); }
+      .location-note { color: var(--amber); }
+      .source-citation-action { padding: 0; border: 0; background: none; color: var(--evidence); text-align: left; text-decoration: underline; cursor: pointer; }
 
       .flow-card {
         margin-top: 18px;
@@ -1534,7 +1622,7 @@
       .chat-messages { padding: 28px 0 150px; }
       .message { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 18px 0; }
       .message.agent > div:not(.message-sources), .answer-text { font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
-      .citation-ref { color: #70a8ff; font: 11px ui-monospace, monospace; vertical-align: super; cursor: default; }
+      .citation-ref { color: #70a8ff; font: 11px ui-monospace, monospace; vertical-align: super; cursor: pointer; }
       .thinking-feed { margin-top: 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); }
       .thinking-step { border: 0; border-bottom: 1px solid var(--line-soft); background: none; }
       .trace-summary { max-width: 850px; margin: 28px 0 0 40px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); color: var(--paper-300); }
@@ -1591,7 +1679,7 @@
       .runs-overview-rail h3 { margin-top: 40px; color: var(--paper-500); font-size: 12px; }.runs-overview-rail ol { list-style: none; padding: 0; color: var(--paper-500); font-size: 10px; line-height: 1.7; }.runs-overview-rail li { border-left: 1px solid var(--line); padding: 0 0 18px 15px; }
       .runs-layout.drawer-open { grid-template-columns: minmax(430px, .82fr) minmax(620px, 1.18fr); }
       .runs-layout.drawer-open .runs-overview-rail { display: none; }
-      .source-drawer { position: relative; inset: auto; width: auto; height: clamp(600px, calc(100dvh - 230px), 780px); max-height: 780px; min-height: 600px; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; border: 1px solid var(--line); border-bottom: 0; background: var(--night-900); box-shadow: -24px 0 70px rgb(0 0 0 / 18%); }
+      .source-drawer { position: relative; inset: auto; width: auto; height: clamp(600px, calc(100dvh - 230px), 780px); max-height: 780px; min-height: 600px; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; border: 1px solid var(--line); border-bottom: 0; background: var(--night-900); box-shadow: -24px 0 70px rgb(0 0 0 / 18%); }
       .source-drawer[hidden] { display: none; }
       .drawer-body { display: grid; grid-template-columns: minmax(350px, 1.2fr) minmax(240px, .8fr); gap: 14px; min-height: 0; overflow: hidden; padding: 14px; }
       .pdf-panel, .markdown-panel { grid-row: auto; min-height: 0; height: 100%; margin: 0; align-self: stretch; }
@@ -1876,9 +1964,21 @@
 
             <aside class="source-drawer" id="sourceDrawer" aria-live="polite" hidden>
               <div class="drawer-head">
-                <h2>原文回溯</h2>
-                <button class="icon-button" type="button" id="closeDrawerButton" aria-label="关闭原文回溯">X</button>
+                <div class="drawer-head-copy">
+                  <h2>原文回溯</h2>
+                  <small id="sourceDrawerVersion">尚未选择解析版本</small>
+                </div>
+                <div class="drawer-actions">
+                  <button class="icon-button" type="button" id="viewParseMarkdownButton" title="查看解析 Markdown" aria-label="查看解析 Markdown" disabled>M</button>
+                  <a class="icon-button" id="downloadParseMarkdownButton" title="下载 canonical.md" aria-label="下载 canonical.md" hidden>↓</a>
+                  <button class="icon-button" type="button" id="closeDrawerButton" title="关闭原文回溯" aria-label="关闭原文回溯">×</button>
+                </div>
               </div>
+              <section class="parse-status-panel" id="parseStatusPanel" aria-label="当前解析状态" hidden>
+                <div class="parse-status-copy"><strong id="parseStatusTitle"></strong><span id="parseStatusDetail"></span></div>
+                <div class="parse-progress-track" aria-hidden="true"><i id="parseStatusBar"></i></div>
+                <div class="parse-status-meta" id="parseStatusMeta"></div>
+              </section>
               <div class="drawer-body" id="sourceDrawerBody">
                 <div class="empty">选择一条已完成的文献记录后，这里会显示可校对的 RAG Chunk。</div>
                 <template id="sourceWorkspaceTemplate"><iframe class="pdf-frame" title="原始 PDF"></iframe><div class="chunk-list"></div></template>
@@ -1903,6 +2003,10 @@
       var activeSessionId = null;
       var activeDocumentId = null;
       var activeDocumentTitle = null;
+      var activeSourceDocumentId = null;
+      var activeSourceData = null;
+      var activeParseStatus = null;
+      var activeCanonicalMarkdown = null;
       var projects = [];
       var activeAttachments = [];
       var currentSessions = [];
@@ -1974,7 +2078,18 @@
         return String(text || "").replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "");
       }
 
-      function renderCitedText(text, container) {
+      function citationForMarker(marker, citations) {
+        var indexes = String(marker || "").split(",").map(function (value) { return parseInt(value.trim(), 10); });
+        for (var i = 0; i < indexes.length; i += 1) {
+          if (!Number.isFinite(indexes[i])) continue;
+          var citation = (citations || [])[indexes[i]];
+          if (!citation && indexes[i] > 0) citation = (citations || [])[indexes[i] - 1];
+          if (citation && citation.document_id && citation.chunk_id) return citation;
+        }
+        return null;
+      }
+
+      function renderCitedText(text, container, citations) {
         container.replaceChildren();
         var source = String(text || "");
         var pattern = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
@@ -1987,6 +2102,20 @@
           reference.textContent = "[" + match[1] + "]";
           reference.setAttribute("data-citation-index", match[1]);
           reference.setAttribute("aria-label", "引用 " + match[1]);
+          var citation = citationForMarker(match[1], citations);
+          if (citation) {
+            reference.setAttribute("role", "button");
+            reference.tabIndex = 0;
+            (function (targetCitation) {
+              reference.addEventListener("click", function () { openCitationLocation(targetCitation); });
+              reference.addEventListener("keydown", function (event) {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  openCitationLocation(targetCitation);
+                }
+              });
+            })(citation);
+          }
           container.appendChild(reference);
           cursor = pattern.lastIndex;
         }
@@ -1996,7 +2125,7 @@
       function getSourceKey(citation) {
         var id = citation.document_id || citation.attachment_id || "";
         var title = citation.page_title || citation.title || citation.file_name || "";
-        return id + "|" + title;
+        return id + "|" + title + "|" + (citation.chunk_id || "");
       }
 
       function getSourceTitle(citation) {
@@ -2037,7 +2166,14 @@
           var item = document.createElement("li");
           var title = getSourceTitle(c);
           var url = getSourceUrl(c);
-          if (url) {
+          if (c.document_id && c.chunk_id) {
+            var button = document.createElement("button");
+            button.type = "button";
+            button.className = "source-citation-action";
+            button.textContent = title + (c.page_label ? " · page " + c.page_label : "");
+            button.addEventListener("click", function () { openCitationLocation(c); });
+            item.appendChild(button);
+          } else if (url) {
             var link = document.createElement("a");
             link.href = url;
             link.target = "_blank";
@@ -2165,7 +2301,7 @@
           chip.textContent = item;
           $("answerMeta").appendChild(chip);
         });
-        renderCitedText(text, $("answerText"));
+        renderCitedText(text, $("answerText"), citations);
         renderSources(citations, $("answerSources"));
       }
 
@@ -2180,7 +2316,7 @@
         var roleName = roleNames[role] || role;
         label.textContent = meta ? roleName + " · " + meta : roleName;
         var body = document.createElement("div");
-        renderCitedText(content || "", body);
+        renderCitedText(content || "", body, citations);
         div.appendChild(label);
         div.appendChild(body);
         if ((role === "agent" || role === "tool") && citations && citations.length) {
@@ -2553,8 +2689,17 @@
       }
 
       function resetSourceDrawer() {
+        activeSourceDocumentId = null;
+        activeSourceData = null;
+        activeParseStatus = null;
+        activeCanonicalMarkdown = null;
         $("sourceDrawerBody").innerHTML = '<div class="empty">选择一条已完成的文献记录后，这里会显示可校对的原始 PDF 或 RAG Chunk。</div>';
         $("sourceDrawerFoot").textContent = "无需离开运行页，即可对照原始 PDF、解析进程与向量块源文本。";
+        $("sourceDrawerVersion").textContent = "尚未选择解析版本";
+        $("parseStatusPanel").hidden = true;
+        $("viewParseMarkdownButton").disabled = true;
+        $("downloadParseMarkdownButton").hidden = true;
+        $("downloadParseMarkdownButton").removeAttribute("href");
         $("sourceDrawer").hidden = true;
         if ($("runsLayout")) $("runsLayout").classList.remove("drawer-open");
       }
@@ -2738,7 +2883,7 @@
           renderTopicCards(activeTopic);
           if (activeTopic) updateActiveTopicCard(activeTopic);
           renderRuns(data.runs || []);
-          if (data.runs && data.runs.length) {
+          if (!activeSourceDocumentId && data.runs && data.runs.length) {
             var firstReady = data.runs.find(function (run) { return run.action_available && run.document_id; });
             if (firstReady) openSource(firstReady.document_id, true);
           }
@@ -2748,7 +2893,188 @@
         });
       }
 
+      function parseUrl(documentId, suffix) {
+        return "/api/documents/" + encodeURIComponent(documentId) + "/parse" + (suffix || "")
+          + "?project_slug=" + encodeURIComponent(activeProjectSlug);
+      }
+
+      function parseMarkdownUrl(documentId) {
+        return "/api/documents/" + encodeURIComponent(documentId) + "/parse/markdown"
+          + "?project_slug=" + encodeURIComponent(activeProjectSlug);
+      }
+
+      function parseDownloadUrl(documentId) {
+        return "/api/documents/" + encodeURIComponent(documentId) + "/parse/download"
+          + "?project_slug=" + encodeURIComponent(activeProjectSlug);
+      }
+
+      function renderParseStatus(status) {
+        activeParseStatus = status;
+        var progress = status && status.progress ? status.progress : {};
+        var quality = status && status.quality ? status.quality : {};
+        var percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+        var parser = status.parser || "unknown parser";
+        var parserVersion = status.parser_version ? " " + status.parser_version : "";
+        $("sourceDrawerVersion").textContent = status.version || "active parse";
+        $("parseStatusTitle").textContent = (progress.stage || "unknown") + " · " + percent + "%";
+        var qualityLabel = String(quality.status || "quality pending").replace(/_/g, " ");
+        $("parseStatusDetail").textContent = parser + parserVersion + " · " + qualityLabel;
+        $("parseStatusBar").style.width = percent + "%";
+        var repairPages = Array.isArray(status.repair_pages) && status.repair_pages.length
+          ? "修复页 " + status.repair_pages.map(function (page) { return page + 1; }).join(", ")
+          : "无需定向修复";
+        $("parseStatusMeta").textContent = repairPages + " · " + (status.warning_count || 0) + " 条警告";
+        $("parseStatusPanel").hidden = false;
+        $("viewParseMarkdownButton").disabled = !status.download_available;
+        var download = $("downloadParseMarkdownButton");
+        download.hidden = !status.download_available;
+        if (status.download_available) download.href = parseDownloadUrl(status.document_id);
+      }
+
+      function showCanonicalMarkdown(markdown, sourceSpans, heading) {
+        var body = $("sourceDrawerBody");
+        var panel = body.querySelector(".canonical-markdown-panel");
+        if (!panel) {
+          panel = document.createElement("section");
+          panel.className = "canonical-markdown-panel";
+          var header = document.createElement("header");
+          var title = document.createElement("h3");
+          var close = document.createElement("button");
+          close.type = "button";
+          close.className = "icon-button";
+          close.title = "关闭 Markdown";
+          close.setAttribute("aria-label", "关闭 Markdown");
+          close.textContent = "×";
+          close.addEventListener("click", function () {
+            panel.remove();
+            var browser = body.querySelector(".source-chunk-browser");
+            if (browser) browser.hidden = false;
+          });
+          header.appendChild(title);
+          header.appendChild(close);
+          panel.appendChild(header);
+          panel.appendChild(document.createElement("pre"));
+          body.appendChild(panel);
+        }
+        panel.querySelector("h3").textContent = heading || "Canonical Markdown";
+        var pre = panel.querySelector("pre");
+        pre.replaceChildren();
+        var lineSpans = (sourceSpans || []).filter(function (span) {
+          return Number.isInteger(span.line_start) && Number.isInteger(span.line_end);
+        });
+        if (!lineSpans.length) {
+          pre.textContent = markdown || "";
+        } else {
+          String(markdown || "").split("\n").forEach(function (line, index) {
+            var row = document.createElement("span");
+            row.className = "source-line";
+            if (lineSpans.some(function (span) { return index >= span.line_start && index <= span.line_end; })) {
+              row.classList.add("highlighted");
+            }
+            row.textContent = line || " ";
+            pre.appendChild(row);
+          });
+          var first = pre.querySelector(".highlighted");
+          if (first) first.scrollIntoView({ block: "center" });
+        }
+        var browser = body.querySelector(".source-chunk-browser");
+        if (browser) browser.hidden = true;
+        panel.hidden = false;
+      }
+
+      function loadCanonicalMarkdown(sourceSpans, heading) {
+        if (!activeSourceDocumentId) return Promise.resolve();
+        var documentId = activeSourceDocumentId;
+        if (activeCanonicalMarkdown !== null) {
+          showCanonicalMarkdown(activeCanonicalMarkdown, sourceSpans || [], heading);
+          return Promise.resolve();
+        }
+        $("viewParseMarkdownButton").disabled = true;
+        return fetchJson(parseMarkdownUrl(documentId)).then(function (data) {
+          if (activeSourceDocumentId !== documentId) return;
+          activeCanonicalMarkdown = data.markdown || "";
+          showCanonicalMarkdown(activeCanonicalMarkdown, sourceSpans || [], heading);
+        }).catch(function (err) {
+          $("sourceDrawerFoot").textContent = "Markdown 读取失败: " + (err.message || String(err));
+        }).finally(function () {
+          if (activeSourceDocumentId === documentId && activeParseStatus) {
+            $("viewParseMarkdownButton").disabled = !activeParseStatus.download_available;
+          }
+        });
+      }
+
+      function highlightSourceSpans(location, citation) {
+        var spans = Array.isArray(location.source_spans) ? location.source_spans : [];
+        var body = $("sourceDrawerBody");
+        var frame = body.querySelector(".pdf-frame");
+        if (frame && location.source_url) frame.src = location.source_url;
+        var openLink = body.querySelector(".pdf-toolbar a");
+        if (openLink && location.source_url) openLink.href = location.source_url;
+        body.querySelectorAll(".source-highlight-layer").forEach(function (layer) { layer.remove(); });
+        var wrap = body.querySelector(".pdf-frame-wrap");
+        var normalized = spans.filter(function (span) {
+          var box = span.normalized_bbox;
+          return Array.isArray(box) && box.length === 4;
+        });
+        if (wrap && normalized.length) {
+          var targetPage = normalized[0].page_index;
+          var layer = document.createElement("div");
+          layer.className = "source-highlight-layer";
+          normalized.filter(function (span) { return span.page_index === targetPage; }).forEach(function (span) {
+            var box = span.normalized_bbox;
+            var marker = document.createElement("i");
+            marker.className = "source-highlight-box";
+            marker.style.left = (box[0] * 100) + "%";
+            marker.style.top = (box[1] * 100) + "%";
+            marker.style.width = ((box[2] - box[0]) * 100) + "%";
+            marker.style.height = ((box[3] - box[1]) * 100) + "%";
+            layer.appendChild(marker);
+          });
+          wrap.appendChild(layer);
+        }
+        var hasLines = spans.some(function (span) { return Number.isInteger(span.line_start); });
+        if (hasLines) {
+          var sourceMarkdown = activeSourceData && activeSourceData.markdown;
+          if (typeof sourceMarkdown === "string" && sourceMarkdown) {
+            showCanonicalMarkdown(sourceMarkdown, spans, "来源文本定位");
+          } else {
+            loadCanonicalMarkdown(spans, "来源文本定位");
+          }
+        }
+        var imageAnalysis = citation && citation.block_type === "figure" || spans.some(function (span) {
+          var metadata = span.metadata || {};
+          return !!metadata.figure_id || metadata.structure_type === "figure" || metadata.source_role === "ai_observation";
+        });
+        var locator = spans[0] || {};
+        var note = imageAnalysis ? "图像分析（非原文文本）" : "已定位原始证据";
+        if (locator.page_label) note += " · page " + locator.page_label;
+        if (Number.isInteger(locator.line_start)) note += " · lines " + locator.line_start + "–" + locator.line_end;
+        $("sourceDrawerFoot").textContent = note;
+        $("sourceDrawerFoot").classList.toggle("location-note", true);
+      }
+
+      function openCitationLocation(citation) {
+        if (!citation || !citation.document_id || !citation.chunk_id) return;
+        activeSourceDocumentId = citation.document_id;
+        setView("runs");
+        return openSource(citation.document_id).then(function () {
+          var url = "/api/documents/" + encodeURIComponent(citation.document_id)
+            + "/citations/" + encodeURIComponent(citation.chunk_id)
+            + "/location?project_slug=" + encodeURIComponent(activeProjectSlug);
+          return fetchJson(url);
+        }).then(function (location) {
+          if (activeSourceDocumentId === citation.document_id) highlightSourceSpans(location, citation);
+        }).catch(function (err) {
+          $("sourceDrawerFoot").textContent = "引用定位失败: " + (err.message || String(err));
+        });
+      }
+
       function openSource(documentId, silent) {
+        activeSourceDocumentId = documentId;
+        activeSourceData = null;
+        activeParseStatus = null;
+        activeCanonicalMarkdown = null;
+        $("sourceDrawerFoot").classList.remove("location-note");
         if (!silent) {
           $("sourceDrawer").hidden = false;
           if ($("runsLayout")) $("runsLayout").classList.add("drawer-open");
@@ -2756,10 +3082,23 @@
         if (!silent) {
           $("sourceDrawerBody").innerHTML = '<div class="empty">正在读取原文...</div>';
         }
-        return fetchJson("/api/documents/" + encodeURIComponent(documentId) + "/source").then(function (data) {
-          renderSource(data);
+        var sourceRequest = fetchJson("/api/documents/" + encodeURIComponent(documentId) + "/source?project_slug=" + encodeURIComponent(activeProjectSlug));
+        var parseRequest = fetchJson(parseUrl(documentId, "")).catch(function () { return null; });
+        return Promise.all([sourceRequest, parseRequest]).then(function (results) {
+          if (activeSourceDocumentId !== documentId) return;
+          activeSourceData = results[0];
+          renderSource(results[0]);
+          if (results[1]) renderParseStatus(results[1]);
+          else {
+            $("sourceDrawerVersion").textContent = "当前解析不可用";
+            $("parseStatusPanel").hidden = true;
+            $("viewParseMarkdownButton").disabled = true;
+            $("downloadParseMarkdownButton").hidden = true;
+          }
         }).catch(function (err) {
-          $("sourceDrawerBody").innerHTML = '<div class="empty">原文读取失败: ' + escapeHtml(err.message || String(err)) + "</div>";
+          if (activeSourceDocumentId === documentId) {
+            $("sourceDrawerBody").innerHTML = '<div class="empty">原文读取失败: ' + escapeHtml(err.message || String(err)) + "</div>";
+          }
         });
       }
 
@@ -2845,7 +3184,7 @@
             '<strong></strong>',
             '<a class="table-action" target="_blank" rel="noopener">新窗口打开</a>',
             "</div>",
-            '<iframe class="pdf-frame" title="原始 PDF"></iframe>'
+            '<div class="pdf-frame-wrap"><iframe class="pdf-frame" title="原始 PDF"></iframe></div>'
           ].join("");
           pdfPanel.querySelector("strong").textContent = data.source_file_is_pdf ? "原始 PDF" : "原始文件";
           openLink = pdfPanel.querySelector("a");
@@ -3243,6 +3582,10 @@
       });
 
       $("refreshRunsButton").addEventListener("click", loadPipelineDashboard);
+
+      $("viewParseMarkdownButton").addEventListener("click", function () {
+        loadCanonicalMarkdown([], "Canonical Markdown");
+      });
 
       $("closeDrawerButton").addEventListener("click", function () {
         $("sourceDrawerBody").innerHTML = '<div class="empty">选择一条已完成的文献记录后，这里会显示可校对的 RAG Chunk。</div>';

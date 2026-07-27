@@ -91,6 +91,24 @@ def test_source_markdown_body_referenced() -> None:
     assert "新窗口打开" in html
 
 
+def test_frontend_exposes_current_parse_actions_only() -> None:
+    html = _html()
+    assert "查看解析 Markdown" in html
+    assert "下载 canonical.md" in html
+    assert "/parse/markdown" in html
+    assert "/parse/download" in html
+    assert "历史解析版本" not in html
+    assert "contextual_prefix" not in html
+
+
+def test_source_view_uses_location_spans_for_highlighting() -> None:
+    html = _html()
+    assert "/citations/" in html
+    assert "source_spans" in html
+    assert "highlightSourceSpans" in html
+    assert "(citations || [])[indexes[i]]" in html
+
+
 def test_active_project_state_exists() -> None:
     html = _html()
     assert "activeProjectSlug" in html
