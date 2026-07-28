@@ -1,0 +1,119 @@
+{
+  "version": "canonical-ingestion-v1",
+  "description": "Strict canonical parsing, retrieval, citation, and location acceptance cases.",
+  "cases": [
+    {
+      "id": "sac_kg_narrative",
+      "category": "narrative_retrieval",
+      "project_slug": "internal-research",
+      "question": "What are the three main components of SAC-KG?",
+      "expected_source_identities": ["sources/sac-kg", "sources/knowledge-graph-sac-kg-framework-overview"],
+      "expected_block_type": "narrative",
+      "expected_page_label": null,
+      "required_terms": ["Generator", "Verifier", "Pruner"],
+      "location_requirement": "bbox",
+      "require_answer": true,
+      "answer_required_terms": ["Generator", "Verifier", "Pruner"]
+    },
+    {
+      "id": "sac_kg_chinese_to_english",
+      "category": "chinese_to_english",
+      "project_slug": "internal-research",
+      "question": "SAC-KG 在 OIE2016 和 NYT 数据集上的 F1 与 AUC 分别是多少？",
+      "expected_source_identities": ["sources/sac-kg", "sources/knowledge-graph-sac-kg-framework-overview"],
+      "expected_block_type": "table",
+      "expected_page_label": null,
+      "required_terms": ["OIE2016", "74.7", "73.2", "NYT", "88.8", "87.3"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "opls5_long_table",
+      "category": "long_table",
+      "project_slug": "internal-research",
+      "question": "OPLS5 表格中的芳香小分子 HFE、GLU pKa 和 binding RMSE 相比 OPLS4 如何变化？",
+      "expected_source_identity": "sources/opls5-force-field-development-and-validation",
+      "expected_block_type": "table",
+      "expected_page_label": null,
+      "required_terms": ["Table 2", "0.76", "0.46", "GLU", "0.70", "0.61", "1.18", "1.12"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "oplsaa_cross_page_table",
+      "category": "cross_page_table",
+      "project_slug": "internal-research",
+      "question": "OPLS-AA 的表格如何比较 butane 构象能与 methanol 汽化焓？",
+      "expected_source_identity": "sources/opls-aa-force-field-development-and-validation",
+      "expected_block_type": "table",
+      "expected_page_label": null,
+      "required_terms": ["butane", "6.04", "6.19", "methanol", "8.95"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "sac_kg_figure",
+      "category": "figure",
+      "project_slug": "internal-research",
+      "question": "Figure 1 如何展示 SAC-KG 的输入、处理流程和输出？",
+      "expected_source_identities": ["sources/sac-kg", "sources/knowledge-graph-sac-kg-framework-overview"],
+      "expected_block_type": "figure",
+      "expected_page_label": null,
+      "required_terms": ["Figure 1", "SAC-KG"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "ff14sb_formula",
+      "category": "formula",
+      "project_slug": "internal-research",
+      "question": "ff14SB 参数拟合目标函数中的 restraint 与 fitting 项是怎样定义的？",
+      "expected_source_identity": "sources/ff14sb",
+      "expected_block_type": "formula",
+      "expected_page_label": null,
+      "required_terms": ["restraint", "fitting"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "ff19sb_appendix",
+      "category": "appendix",
+      "project_slug": "internal-research",
+      "question": "ff19SB 附录或补充材料如何说明 Leu、Ile 和 Val 的 CMAP 分配？",
+      "expected_source_identity": "sources/ff19sb-amino-acid-specific-protein-backbone-parameters",
+      "expected_block_type": "narrative",
+      "expected_page_label": null,
+      "required_terms": ["Leu", "Ile", "Val", "CMAP"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "reference_exclusion",
+      "category": "reference_exclusion",
+      "project_slug": "internal-research",
+      "question": "Why does ff99sb-disp use TIP4P-D for intrinsically disordered proteins?",
+      "expected_source_identity": "sources/ff99sb-disp",
+      "expected_block_type": "narrative",
+      "expected_page_label": null,
+      "required_terms": ["TIP4P-D", "dispersion", "IDP"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "contextual_prefix_citation_exclusion",
+      "category": "contextual_prefix_citation_exclusion",
+      "project_slug": "internal-research",
+      "question": "What OIE2016 metrics are reported for SAC-KG?",
+      "expected_source_identities": ["sources/sac-kg", "sources/knowledge-graph-sac-kg-framework-overview"],
+      "expected_block_type": "table",
+      "expected_page_label": null,
+      "required_terms": ["OIE2016", "74.7", "73.2"],
+      "forbidden_excerpt_terms": ["This chunk is related to the whole document because", "Document context:", "Contextual summary:"],
+      "location_requirement": "bbox"
+    },
+    {
+      "id": "sac_kg_bbox_location",
+      "category": "bbox_location",
+      "project_slug": "internal-research",
+      "question": "Locate the source table containing SAC-KG's OIE2016 F1 score of 74.7.",
+      "expected_source_identities": ["sources/sac-kg", "sources/knowledge-graph-sac-kg-framework-overview"],
+      "expected_block_type": "table",
+      "expected_page_label": null,
+      "required_terms": ["OIE2016", "74.7"],
+      "location_requirement": "bbox"
+    }
+  ]
+}
