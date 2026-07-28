@@ -20,7 +20,7 @@ embedded directly as the original Child text.
 
 | Child block type | LLM contextualization | Embedding input |
 | --- | --- | --- |
-| `table` | required | `contextual_prefix + "\n\n" + child.text` |
+| `table` | forbidden | `child.text` |
 | `figure` | required | `contextual_prefix + "\n\n" + child.text` |
 | `formula` | required | `contextual_prefix + "\n\n" + child.text` |
 | `narrative` | forbidden | `child.text` |
@@ -39,8 +39,8 @@ carry contextualization fields or a modified embedding input.
 ```text
 semantic Child chunks
   -> partition by block type
-     -> table/figure/formula -> LLM prefix -> prefix + Child embedding text
-     -> narrative/caption/appendix -------> raw Child embedding text
+     -> figure/formula -------------------> LLM prefix -> prefix + Child embedding text
+     -> narrative/caption/appendix/table -> raw Child embedding text
   -> merge in original chunk order
   -> embed every Child
   -> persist every Child and its vector
@@ -96,12 +96,12 @@ every Child has a valid vector and source span.
 - A failed structured contextualization blocks activation.
 - Plain Children never call the contextualization model and therefore cannot
   fail due to contextualization output formatting.
-- The selective policy uses a new `canonical-v2-<source-sha-prefix>` parse
-  version. It never resumes or activates a `canonical-v1` checkpoint produced
-  by the all-Child contextualization policy.
-- The interrupted `ff14sb` `canonical-v1` checkpoint remains preserved as an
-  inactive development artifact; the canary starts a clean `canonical-v2`
-  pipeline instead of deleting or rewriting it.
+- The table-direct policy uses a new `canonical-v3-<source-sha-prefix>` parse
+  version. It never resumes or activates a `canonical-v1` or `canonical-v2`
+  checkpoint produced by an earlier contextualization policy.
+- The interrupted `ff14sb` `canonical-v1` and `canonical-v2` checkpoints remain
+  preserved as inactive development artifacts; the canary starts a clean
+  `canonical-v3` pipeline instead of deleting or rewriting them.
 - Existing active versions, old chunks, vectors, artifacts, MinerU outputs, and
   source files remain untouched.
 - The test environment remains a read-only old-version baseline.
@@ -111,8 +111,9 @@ every Child has a valid vector and source span.
 
 Tests are written before implementation and must prove:
 
-1. The pipeline sends only `table`, `figure`, and `formula` Children to the LLM.
-2. Plain Children retain `embedding_text == text` and have no contextual fields.
+1. The pipeline sends only `figure` and `formula` Children to the LLM.
+2. Narrative, caption, appendix, and table Children retain
+   `embedding_text == text` and have no contextual fields.
 3. Structured Children retain `embedding_text == prefix + "\n\n" + text`.
 4. Mixed Child inventories embed, persist, link, and activate without loss.
 5. Missing context on an eligible structured Child fails closed.
