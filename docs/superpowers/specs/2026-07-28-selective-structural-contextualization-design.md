@@ -96,9 +96,12 @@ every Child has a valid vector and source span.
 - A failed structured contextualization blocks activation.
 - Plain Children never call the contextualization model and therefore cannot
   fail due to contextualization output formatting.
-- The interrupted `ff14sb` contextualization checkpoint is development-only and
-  will be released through the existing stage recovery mechanism before the
-  canary is resumed with the new code.
+- The selective policy uses a new `canonical-v2-<source-sha-prefix>` parse
+  version. It never resumes or activates a `canonical-v1` checkpoint produced
+  by the all-Child contextualization policy.
+- The interrupted `ff14sb` `canonical-v1` checkpoint remains preserved as an
+  inactive development artifact; the canary starts a clean `canonical-v2`
+  pipeline instead of deleting or rewriting it.
 - Existing active versions, old chunks, vectors, artifacts, MinerU outputs, and
   source files remain untouched.
 - The test environment remains a read-only old-version baseline.
