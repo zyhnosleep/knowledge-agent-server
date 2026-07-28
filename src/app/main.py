@@ -4,8 +4,8 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.agent_routes import agent_router
@@ -71,6 +71,29 @@ def _startup_purge() -> None:
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+
+def _maintenance_blocks(method: str, path: str) -> bool:
+    if method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    if not path.startswith("/api") or path.startswith("/api/auth"):
+        return False
+    return True
+
+
+@app.middleware("http")
+async def enforce_maintenance_mode(request: Request, call_next):
+    if settings.maintenance_mode_enabled and _maintenance_blocks(
+        request.method, request.url.path
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service is in maintenance mode."},
+            headers={"Retry-After": "60"},
+        )
+    return await call_next(request)
+
+
 business_api_dependencies = [Depends(require_business_api_user)]
 app.include_router(router, prefix="/api", dependencies=business_api_dependencies)
 app.include_router(
