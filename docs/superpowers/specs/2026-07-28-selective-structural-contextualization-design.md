@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-28
 
-**Status:** Approved approach, pending written-spec review
+**Status:** Approved final approach
 
 ## 1. Problem
 
@@ -12,17 +12,18 @@ produced 465 chunks and more than 120 generation requests before the canary was
 stopped. Long prompts were truncated at the Ollama context limit, which caused
 validation retries and made contextualization dominate rebuild time.
 
-The user-approved policy is to generate LLM context only where a chunk is
-structurally difficult to understand in isolation. Ordinary text must be
-embedded directly as the original Child text.
+The final user-approved policy removes generated contextual prefixes from the
+ingestion path. Every retrievable Child is embedded directly as its original
+text. Figure and formula Children already contain the parser-produced
+description or representation that belongs in the searchable document.
 
 ## 2. Approved Policy
 
 | Child block type | LLM contextualization | Embedding input |
 | --- | --- | --- |
 | `table` | forbidden | `child.text` |
-| `figure` | required | `contextual_prefix + "\n\n" + child.text` |
-| `formula` | required | `contextual_prefix + "\n\n" + child.text` |
+| `figure` | forbidden | `child.text` |
+| `formula` | forbidden | `child.text` |
 | `narrative` | forbidden | `child.text` |
 | `caption` | forbidden | `child.text` |
 | `appendix` | forbidden | `child.text` |
@@ -30,34 +31,28 @@ embedded directly as the original Child text.
 Parent chunks remain unembedded. They continue to provide hierarchy, expansion,
 and display context for retrievable Child chunks.
 
-The policy is explicit and fail-closed. A structured Child cannot silently fall
-back to raw-text embedding when contextualization fails. A plain Child cannot
-carry contextualization fields or a modified embedding input.
+The policy is explicit and fail-closed. No Child may carry contextualization
+fields or a modified embedding input.
 
 ## 3. Data Flow
 
 ```text
 semantic Child chunks
-  -> partition by block type
-     -> figure/formula -------------------> LLM prefix -> prefix + Child embedding text
-     -> narrative/caption/appendix/table -> raw Child embedding text
-  -> merge in original chunk order
+  -> validate embedding_text == child.text
   -> embed every Child
   -> persist every Child and its vector
   -> activation integrity gate
 ```
 
-`ContextualizationService` keeps its single responsibility: it receives only
-eligible structured Children and returns `ContextualizedChunk` objects. The
-pipeline owns policy selection and merges contextualized and plain chunks.
+`ContextualizationService` is no longer constructed by the ingestion pipeline.
+It remains an isolated utility for compatibility until a separate cleanup task
+decides whether other callers still require it.
 
 ## 4. Artifact And Persistence Contract
 
 The contextualization-stage artifact contains a mixed Child inventory:
 
-- Structured Children validate as `ContextualizedChunk` and must contain all
-  contextualization provenance fields.
-- Plain Children validate as `ChunkDraft`; their contextualization fields must
+- All Children validate as `ChunkDraft`; their contextualization fields must
   be absent and `embedding_text` must equal `text` exactly.
 - Parent chunks remain `ChunkDraft` values and receive no vector.
 - Chunk IDs, source spans, source block IDs, ordering links, metadata, and
@@ -69,9 +64,8 @@ mistaken for an intentional raw Child embedding.
 
 ## 5. Integrity Metrics
 
-`contextual_prefix_completeness` changes meaning from "all Children have a
-prefix" to "all context-eligible structured Children have a valid prefix".
-An empty eligible set is complete.
+`contextual_prefix_completeness` remains in reports for compatibility. Its
+eligible denominator is always empty, so the value must be `1.0`.
 
 The rebuild report adds:
 
@@ -87,21 +81,20 @@ Strict acceptance requires:
 - `pgvector_completeness == 1.0` when pgvector is active
 - the existing table, source-span, and artifact checks remain `1.0`
 
-The activation gate separately proves that every eligible structured Child is
-contextualized, every plain Child is unmodified raw-text embedding input, and
-every Child has a valid vector and source span.
+The activation gate separately proves that the eligible set is empty, every
+Child has unmodified raw-text embedding input, and every Child has a valid
+vector and source span.
 
 ## 6. Failure And Resume Behavior
 
-- A failed structured contextualization blocks activation.
-- Plain Children never call the contextualization model and therefore cannot
+- Children never call the contextualization model and therefore cannot
   fail due to contextualization output formatting.
-- The table-direct policy uses a new `canonical-v3-<source-sha-prefix>` parse
-  version. It never resumes or activates a `canonical-v1` or `canonical-v2`
-  checkpoint produced by an earlier contextualization policy.
-- The interrupted `ff14sb` `canonical-v1` and `canonical-v2` checkpoints remain
-  preserved as inactive development artifacts; the canary starts a clean
-  `canonical-v3` pipeline instead of deleting or rewriting them.
+- The all-direct policy uses a new `canonical-v4-<source-sha-prefix>` parse
+  version. It never resumes or activates a `canonical-v1`, `canonical-v2`, or
+  `canonical-v3` checkpoint produced by an earlier contextualization policy.
+- The interrupted `ff14sb` V1, V2, and V3 checkpoints remain preserved as
+  inactive development artifacts; the canary starts a clean `canonical-v4`
+  pipeline instead of deleting or rewriting them.
 - Existing active versions, old chunks, vectors, artifacts, MinerU outputs, and
   source files remain untouched.
 - The test environment remains a read-only old-version baseline.
@@ -111,20 +104,18 @@ every Child has a valid vector and source span.
 
 Tests are written before implementation and must prove:
 
-1. The pipeline sends only `figure` and `formula` Children to the LLM.
-2. Narrative, caption, appendix, and table Children retain
+1. The pipeline never constructs or calls the contextualization model.
+2. Narrative, caption, appendix, table, figure, and formula Children retain
    `embedding_text == text` and have no contextual fields.
-3. Structured Children retain `embedding_text == prefix + "\n\n" + text`.
-4. Mixed Child inventories embed, persist, link, and activate without loss.
-5. Missing context on an eligible structured Child fails closed.
-6. Context fields or modified embedding text on a plain Child fail closed.
-7. Rebuild metrics use the eligible denominator and report plain completeness.
-8. A document with no structured Children reports contextual prefix completeness
-   as `1.0` without making any LLM call.
+3. All Child inventories embed, persist, link, and activate without loss.
+4. Context fields or modified embedding text on any Child fail closed.
+5. Rebuild metrics report zero eligible Children and complete plain embeddings.
+6. Every document reports contextual prefix completeness as `1.0` without an
+   LLM call.
 
 ## 8. Task 15 Execution Change
 
-The stopped `ff14sb` run is not accepted. After local and development tests pass,
-Task 15 restarts at the `ff14sb` canary with the selective policy. `opls5`, the
+The stopped V3 `ff14sb` run is not accepted. After local and development tests
+pass, Task 15 restarts at the `ff14sb` canary with the all-direct V4 policy. `opls5`, the
 17-document rebuild, and retrieval comparison remain blocked until the canary
 meets every strict integrity requirement.
