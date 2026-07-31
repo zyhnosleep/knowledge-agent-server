@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -14,16 +14,29 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.schemas.agent import EvidencePack
 from app.services.rag_adapter import RAGAdapter
-from scripts.rebuild_canonical_index import collect_integrity_metrics
+from app.services.ingestion_identity import (
+    build_ingestion_config_snapshot,
+    canonical_ingestion_config_hash,
+)
+from scripts.rebuild_canonical_index import (
+    activate_rebuild_batch,
+    collect_integrity_metrics,
+)
 
 
 STRICT_INTEGRITY_GATES = (
     "parse_completeness",
+    "source_fidelity_completeness",
+    "structured_limit_completeness",
     "contextual_prefix_completeness",
+    "plain_embedding_completeness",
     "embedding_completeness",
     "table_validation_rate",
     "source_span_validity",
     "artifact_link_validity",
+    "config_identity_completeness",
+    "source_version_identity_completeness",
+    "child_token_limit_completeness",
 )
 
 RetrieveFunction = Callable[[dict[str, Any], int], EvidencePack]
@@ -272,8 +285,17 @@ def run_acceptance(
     db: Session,
     cases: list[dict[str, Any]],
     artifact_root: Path | None = None,
+    parse_version_map: dict[str, str] | None = None,
+    expected_ingestion_config: dict[str, Any] | None = None,
+    expected_ingestion_config_sha256: str | None = None,
 ) -> dict[str, Any]:
     rag = RAGAdapter()
+    if expected_ingestion_config is None:
+        expected_ingestion_config = build_ingestion_config_snapshot()
+    if expected_ingestion_config_sha256 is None:
+        expected_ingestion_config_sha256 = canonical_ingestion_config_hash(
+            expected_ingestion_config
+        )
 
     def retrieve(case: dict[str, Any], limit: int) -> EvidencePack:
         return rag.retrieve_evidence(
@@ -282,6 +304,7 @@ def run_acceptance(
             case["question"],
             limit=limit,
             document_id=case.get("query_document_id"),
+            parse_version_map=parse_version_map,
         )
 
     def answer(case: dict[str, Any]):
@@ -290,28 +313,74 @@ def run_acceptance(
             case["project_slug"],
             case["question"],
             document_id=case.get("query_document_id"),
+            parse_version_map=parse_version_map,
         )
 
-    integrity = collect_integrity_metrics(db, artifact_root=artifact_root)
+    integrity = collect_integrity_metrics(
+        db,
+        artifact_root=artifact_root,
+        document_ids=set(parse_version_map) if parse_version_map else None,
+        expected_ingestion_config=expected_ingestion_config,
+        expected_ingestion_config_sha256=expected_ingestion_config_sha256,
+        parse_version_map=parse_version_map,
+    )
     retrieval = evaluate_cases(cases, retrieve, answer)
-    return apply_strict_gates(integrity, retrieval)
+    report = apply_strict_gates(integrity, retrieval)
+    report["parse_version_map"] = dict(sorted((parse_version_map or {}).items()))
+    return report
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate canonical retrieval acceptance")
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--parse-version-map", type=Path)
+    parser.add_argument("--activate-on-success", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.activate_on_success and args.parse_version_map is None:
+        _parser().error("--activate-on-success requires --parse-version-map")
     payload = json.loads(args.cases.read_text(encoding="utf-8"))
     cases = payload.get("cases")
     if not isinstance(cases, list):
         raise ValueError("Acceptance case file must contain a cases array.")
+    parse_version_map: dict[str, str] | None = None
+    if args.parse_version_map is not None:
+        map_payload = json.loads(args.parse_version_map.read_text(encoding="utf-8"))
+        if (
+            isinstance(map_payload, dict)
+            and isinstance(map_payload.get("parse_version_map"), dict)
+        ):
+            map_payload = map_payload["parse_version_map"]
+        if not isinstance(map_payload, dict):
+            raise ValueError("Parse version map file must contain a JSON object.")
+        parse_version_map = {
+            str(document_id): str(version_key)
+            for document_id, version_key in map_payload.items()
+            if str(document_id) and str(version_key)
+        }
+        if not parse_version_map or len(parse_version_map) != len(map_payload):
+            raise ValueError("Parse version map contains an empty document or version key.")
     with SessionLocal() as db:
-        report = run_acceptance(db=db, cases=cases)
+        report = run_acceptance(
+            db=db,
+            cases=cases,
+            parse_version_map=parse_version_map,
+        )
+        if args.activate_on_success and report.get("strict_pass") is True:
+            assert parse_version_map is not None
+            activate_rebuild_batch(
+                db,
+                parse_version_map=parse_version_map,
+                acceptance_report=report,
+            )
+            report["activation"] = {
+                "status": "completed",
+                "activated_document_ids": sorted(parse_version_map),
+            }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
