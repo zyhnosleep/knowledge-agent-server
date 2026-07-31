@@ -22,6 +22,7 @@ from app.services.canonical_models import (
 from app.services.pipeline import IngestionPipeline
 from app.services.semantic_chunking import SemanticChunker
 from app.services.search import QueryService, RetrievedContext
+from app.services.structured_evidence import StructuredEvidenceBuilder
 
 
 def make_session() -> Session:
@@ -118,6 +119,169 @@ def test_active_retrieval_returns_only_children_and_excludes_references() -> Non
     )
 
     assert {item.citation.chunk_id for item in contexts} == {"active", "appendix"}
+
+
+def test_shadow_parse_version_map_queries_staged_children_without_switching_pointer() -> None:
+    db = make_session()
+    document = add_document(db, active_parse_version="old-v")
+    db.add_all(
+        [
+            chunk(
+                "old-child",
+                "old baseline evidence",
+                parse_version="old-v",
+            ),
+            chunk(
+                "staged-child",
+                "staged unique evidence",
+                parse_version="staged-v",
+            ),
+        ]
+    )
+    db.commit()
+    service = QueryService(db, parse_version_map={document.id: "staged-v"})
+    service.ollama = NoVectorOllama()
+
+    contexts = service._search_source_chunks(
+        "staged unique evidence",
+        "p1",
+        [document.id],
+        limit=10,
+    )
+
+    assert [item.citation.chunk_id for item in contexts] == ["staged-child"]
+    assert db.get(Document, document.id).active_parse_version == "old-v"
+
+
+def test_shadow_map_is_mixed_with_active_versions_without_leaking_old_chunks() -> None:
+    db = make_session()
+    staged_document = add_document(db, document_id="d1", active_parse_version="old-v")
+    active_document = add_document(
+        db,
+        document_id="d2",
+        active_parse_version="active-v",
+    )
+    active_document.title = "Second Paper"
+    db.add_all(
+        [
+            chunk(
+                "old-child",
+                "old staged target evidence",
+                document_id=staged_document.id,
+                parse_version="old-v",
+            ),
+            chunk(
+                "staged-child",
+                "staged target evidence",
+                document_id=staged_document.id,
+                parse_version="staged-v",
+            ),
+            chunk(
+                "active-child",
+                "active target evidence",
+                document_id=active_document.id,
+                parse_version="active-v",
+            ),
+            chunk(
+                "inactive-child",
+                "inactive target evidence",
+                document_id=active_document.id,
+                parse_version="inactive-v",
+            ),
+        ]
+    )
+    db.commit()
+    service = QueryService(db, parse_version_map={staged_document.id: "staged-v"})
+    service.ollama = NoVectorOllama()
+
+    contexts = service._search_source_chunks(
+        "staged active target evidence",
+        "p1",
+        [staged_document.id, active_document.id],
+        limit=10,
+    )
+
+    assert {item.citation.chunk_id for item in contexts} == {
+        "staged-child",
+        "active-child",
+    }
+    assert db.get(Document, staged_document.id).active_parse_version == "old-v"
+
+
+def test_shadow_retrieve_evidence_routes_with_staged_child_text() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="project", name="Project"))
+    staged_document = Document(
+        id="d1",
+        project_id="p1",
+        title="First Paper",
+        file_name="first.pdf",
+        sha256="sha-d1",
+        raw_path="raw/first.pdf",
+        raw_text="The old active version discusses unrelated evidence.",
+        metadata_json={
+            "source_slug": "sources/first-paper",
+            "paper_profile": {
+                "profile_version": "paper-profile-v1",
+                "source_text_sha256": "stale",
+                "aliases": [],
+                "key_terms": ["OldOnlyTerm"],
+            },
+        },
+        status="ready",
+        active_parse_version="old-v",
+    )
+    distractor = Document(
+        id="d2",
+        project_id="p1",
+        title="Second Paper",
+        file_name="second.pdf",
+        sha256="sha-d2",
+        raw_path="raw/second.pdf",
+        raw_text="NMX is mentioned as background, not introduced here.",
+        metadata_json={"source_slug": "sources/second-paper"},
+        status="ready",
+        active_parse_version="active-v",
+    )
+    db.add_all(
+        [
+            staged_document,
+            distractor,
+            chunk(
+                "staged-child",
+                "This paper introduces NMX architecture for the target task evidence.",
+                document_id="d1",
+                parse_version="staged-v",
+            ),
+            chunk(
+                "old-child",
+                "Unrelated old active evidence.",
+                document_id="d1",
+                parse_version="old-v",
+            ),
+            chunk(
+                "distractor-child",
+                "NMX is background in this other paper.",
+                document_id="d2",
+                parse_version="active-v",
+            ),
+        ]
+    )
+    db.commit()
+    service = QueryService(db, parse_version_map={"d1": "staged-v"})
+    service.ollama = NoVectorOllama()
+
+    evidence = service.retrieve_evidence(
+        "project",
+        "What NMX architecture is used for the target task evidence?",
+        limit=5,
+    )
+
+    assert evidence.items
+    assert evidence.items[0].document_id == "d1"
+    assert evidence.items[0].chunk_id == "staged-child"
+    assert db.get(Document, "d1").active_parse_version == "old-v"
+    assert db.get(Document, "d1").raw_text.startswith("The old active version")
 
 
 def test_child_hit_expands_parent_but_cites_only_original_child_text() -> None:
@@ -638,6 +802,554 @@ def test_context_budget_counts_the_exact_draft_representation() -> None:
     assert fitted[0].prompt_text == "fallback has three"
     rendered = f"[0] {service._prompt_context_text('ordinary question', fitted[0])}"
     assert service._retrieval_token_counter(rendered) <= 5
+
+
+def test_prompt_context_preserves_complete_parent_without_character_window() -> None:
+    evidence = "prefix " + ("x" * 2600) + " exact-tail"
+    context = RetrievedContext(
+        citation=Citation(score=1.0, excerpt="matched child"),
+        prompt_text=evidence,
+        score=1.0,
+        parent_chunk_id="parent-long",
+    )
+
+    rendered = QueryService._prompt_context_text("ordinary question", context)
+
+    assert rendered == evidence + "\n\nmatched child"
+    assert rendered.endswith("exact-tail\n\nmatched child")
+
+
+def test_answer_budget_expands_at_most_six_unique_parents_without_reranking() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 10_000
+    service._retrieval_token_counter = lambda text: len(text.split())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                score=float(10 - index),
+                chunk_id=f"child-{index}",
+                excerpt=f"matched child {index}",
+            ),
+            prompt_text=f"complete parent evidence {index}",
+            context_text=f"complete parent evidence {index}",
+            score=float(10 - index),
+            parent_chunk_id=f"parent-{index}",
+        )
+        for index in range(10)
+    ]
+    original_ranking = [item.citation.chunk_id for item in contexts]
+
+    fitted = service._fit_contexts_to_token_budget(
+        contexts,
+        question="ordinary question",
+    )
+
+    assert [item.citation.chunk_id for item in contexts] == original_ranking
+    assert [item.citation.chunk_id for item in fitted] == original_ranking
+    expanded = [
+        item for item in fitted if item.prompt_text.startswith("complete parent")
+    ]
+    assert len({item.parent_chunk_id for item in expanded}) == 6
+    assert all(item.prompt_text == item.citation.excerpt for item in fitted[6:])
+
+
+def test_table_answer_expansion_surfaces_adjacent_children_as_separate_citations() -> None:
+    db = make_session()
+    add_document(db)
+    db.add_all(
+        [
+            chunk(
+                "table-parent",
+                "Complete oversized table parent",
+                chunk_role="parent",
+                block_type="table",
+            ),
+            chunk(
+                "table-prev",
+                "Table 2\n| Method | F1 |\n| Baseline | 80.0 |",
+                parent_chunk_id="table-parent",
+                block_type="table",
+                ordinal=1,
+                next_chunk_id="table-hit",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+            chunk(
+                "table-hit",
+                "Table 2\n| Method | F1 |\n| SAC-KG | 91.2 |",
+                parent_chunk_id="table-parent",
+                block_type="table",
+                ordinal=2,
+                previous_chunk_id="table-prev",
+                next_chunk_id="table-next",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 1}],
+            ),
+            chunk(
+                "table-next",
+                "Table 2\n| Method | F1 |\n| Ablation | 87.4 |",
+                parent_chunk_id="table-parent",
+                block_type="table",
+                ordinal=3,
+                previous_chunk_id="table-hit",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 2}],
+            ),
+        ]
+    )
+    db.commit()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 10_000
+    service._retrieval_token_counter = lambda text: len(text.split())
+    hit = db.get(DocumentChunk, "table-hit")
+    context = service._expand_child_hit(
+        hit,
+        question="What are the Table 2 F1 results?",
+        score=10.0,
+        page_fields={},
+        evidence_kind="table",
+    )
+
+    fitted = service._fit_contexts_to_token_budget(
+        [context],
+        question="What are the Table 2 F1 results?",
+    )
+
+    assert [item.citation.chunk_id for item in fitted] == [
+        "table-hit",
+        "table-prev",
+        "table-next",
+    ]
+    assert [item.citation.excerpt for item in fitted] == [
+        hit.text,
+        db.get(DocumentChunk, "table-prev").text,
+        db.get(DocumentChunk, "table-next").text,
+    ]
+    assert [item.citation.source_spans[0]["row_index"] for item in fitted] == [1, 0, 2]
+
+
+def test_table_sibling_aggregation_is_scoped_by_table_id_and_parse_version() -> None:
+    db = make_session()
+    add_document(db, active_parse_version="staged-v")
+    db.add_all(
+        [
+            chunk(
+                "table-2-hit",
+                "Table 2\n| Method | F1 |\n| SAC-KG | 91.2 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 1}],
+            ),
+            chunk(
+                "table-2-sibling",
+                "Table 2\n| Method | F1 |\n| Baseline | 80.0 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+            chunk(
+                "table-3-sibling",
+                "Table 3\n| Method | F1 |\n| Other | 70.0 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 2, "table_id": "table-3", "row_index": 0}],
+            ),
+            chunk(
+                "table-2-old-version",
+                "Table 2\n| Method | F1 |\n| Old | 60.0 |",
+                parse_version="old-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+        ]
+    )
+    db.commit()
+
+    service = service_for(db)
+    contexts = service._search_source_chunks(
+        "What are the Table 2 F1 results?", "p1", ["d1"], limit=1
+    )
+
+    assert {item.citation.chunk_id for item in contexts} == {
+        "table-2-hit",
+        "table-2-sibling",
+    }
+    assert all(item.citation.table_id == "table-2" for item in contexts)
+    assert all(item.citation.parse_version == "staged-v" for item in contexts)
+
+
+def test_canonical_table_context_attaches_complete_facts_to_row_citations() -> None:
+    db = make_session()
+    add_document(db, active_parse_version="staged-v")
+    db.add_all(
+        [
+            chunk(
+                "table-2-hit",
+                "Table 2\n| Method | F1 |\n| SAC-KG | 91.2 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 1}],
+            ),
+            chunk(
+                "table-2-sibling",
+                "Table 2\n| Method | F1 |\n| Baseline | 80.0 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+        ]
+    )
+    db.commit()
+
+    contexts = service_for(db)._search_source_chunks(
+        "What are the Table 2 F1 results?", "p1", ["d1"], limit=1
+    )
+
+    assert contexts
+    assert all(context.table_context is not None for context in contexts)
+    facts = {fact.value for context in contexts for fact in context.table_facts}
+    assert facts == {"91.2", "80.0"}
+    assert {item.citation.chunk_id for item in contexts} == {
+        "table-2-hit",
+        "table-2-sibling",
+    }
+
+
+def test_canonical_table_prompt_keeps_complete_child_text_without_character_window() -> None:
+    db = make_session()
+    service = service_for(db)
+    table_text = (
+        "Table 9\n| Method | F1 |\n| --- | --- |\n"
+        + "\n".join(f"| Model-{index} | {index}.0 |" for index in range(500))
+    )
+    context = RetrievedContext(
+        citation=Citation(
+            score=1.0,
+            excerpt=table_text,
+            parse_version="canonical-v1",
+            block_type="table",
+        ),
+        prompt_text=table_text,
+        score=1.0,
+        evidence_kind="table",
+    )
+
+    rendered = service._prompt_context_text("What are the Table 9 F1 results?", context)
+
+    assert rendered == table_text
+    assert "Model-499" in rendered
+
+
+def test_table_sibling_expansion_obeys_token_budget_without_truncating_child() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 10
+    service._retrieval_token_counter = lambda text: len(text.split())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(score=3.0, chunk_id="table-hit", excerpt="Table 2 hit"),
+            prompt_text="Table 2 hit",
+            score=3.0,
+            evidence_kind="table",
+        ),
+        RetrievedContext(
+            citation=Citation(score=2.0, chunk_id="table-long", excerpt=" ".join(["long"] * 20)),
+            prompt_text=" ".join(["long"] * 20),
+            score=2.0,
+            evidence_kind="table",
+        ),
+        RetrievedContext(
+            citation=Citation(score=1.0, chunk_id="table-next", excerpt="Table 2 next"),
+            prompt_text="Table 2 next",
+            score=1.0,
+            evidence_kind="table",
+        ),
+    ]
+
+    fitted = service._fit_contexts_to_token_budget(
+        contexts, question="What are the Table 2 F1 results?"
+    )
+
+    assert [item.citation.chunk_id for item in fitted] == ["table-hit", "table-next"]
+    assert all(item.prompt_text == item.citation.excerpt for item in fitted)
+
+
+def test_table_candidate_assembly_includes_same_table_sibling_rows() -> None:
+    db = make_session()
+    add_document(db)
+    db.add_all(
+        [
+            chunk(
+                "table-parent-assembly",
+                "Complete Table 2 parent",
+                chunk_role="parent",
+                block_type="table",
+                ordinal=0,
+            ),
+            chunk(
+                "table-row-a",
+                "Table 2\n| Method | F1 |\n| --- | --- |\n| Baseline | 80.0 |",
+                parent_chunk_id="table-parent-assembly",
+                block_type="table",
+                ordinal=1,
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+            chunk(
+                "table-row-b",
+                "Table 2\n| Method | F1 |\n| --- | --- |\n| SAC-KG | 91.2 |",
+                parent_chunk_id="table-parent-assembly",
+                block_type="table",
+                ordinal=2,
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 1}],
+            ),
+            chunk(
+                "table-row-c",
+                "Table 2\n| Method | F1 |\n| --- | --- |\n| Ablation | 87.4 |",
+                parent_chunk_id="table-parent-assembly",
+                block_type="table",
+                ordinal=3,
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 2}],
+            ),
+        ]
+    )
+    db.commit()
+    service = service_for(db)
+    hit = db.get(DocumentChunk, "table-row-b")
+
+    contexts = service._expand_source_candidates(
+        [(hit, 10.0, "table")],
+        question="What are all Table 2 F1 results?",
+        project_id="p1",
+    )
+
+    assert [item.citation.chunk_id for item in contexts] == [
+        "table-row-b",
+        "table-row-a",
+        "table-row-c",
+    ]
+    assert [item.citation.excerpt for item in contexts] == [
+        db.get(DocumentChunk, chunk_id).text
+        for chunk_id in ("table-row-b", "table-row-a", "table-row-c")
+    ]
+    assert all(item.citation.table_id == "table-2" for item in contexts)
+    assert all(item.citation.parse_version == "canonical-v1" for item in contexts)
+    assert all(item.citation.source_spans for item in contexts)
+
+
+def test_table_candidate_assembly_covers_requested_tables_in_one_question() -> None:
+    db = make_session()
+    add_document(db)
+    db.add_all(
+        [
+            chunk(
+                "table-one-row",
+                "Table 1\n| Dataset | F1 |\n| --- | --- |\n| OIE2016 | 91.2 |",
+                block_type="table",
+                ordinal=1,
+                source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": 0}],
+            ),
+            chunk(
+                "table-two-row",
+                "Table 2\n| Dataset | F1 |\n| --- | --- |\n| NYT | 88.4 |",
+                block_type="table",
+                ordinal=2,
+                source_spans=[{"page_index": 2, "table_id": "table-2", "row_index": 0}],
+            ),
+        ]
+    )
+    db.commit()
+    service = service_for(db)
+    first_hit = db.get(DocumentChunk, "table-one-row")
+
+    contexts = service._expand_source_candidates(
+        [(first_hit, 10.0, "table")],
+        question="Compare Table 1 OIE2016 with Table 2 NYT F1 results.",
+        project_id="p1",
+    )
+
+    assert {item.citation.table_id for item in contexts} == {"table-1", "table-2"}
+    assert {item.citation.chunk_id for item in contexts} == {"table-one-row", "table-two-row"}
+
+
+def test_table_shadow_assembly_keeps_staged_siblings_and_active_pointer() -> None:
+    db = make_session()
+    document = add_document(db, active_parse_version="active-v")
+    db.add_all(
+        [
+            chunk(
+                "active-table-row",
+                "Table 2\n| Method | F1 |\n| --- | --- |\n| Active | 80.0 |",
+                parse_version="active-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+            chunk(
+                "staged-table-row",
+                "Table 2\n| Method | F1 |\n| --- | --- |\n| Staged | 91.2 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 1, "table_id": "table-2", "row_index": 0}],
+            ),
+        ]
+    )
+    db.commit()
+    service = QueryService(db, parse_version_map={document.id: "staged-v"})
+    service.ollama = NoVectorOllama()
+    staged_hit = db.get(DocumentChunk, "staged-table-row")
+
+    contexts = service._expand_source_candidates(
+        [(staged_hit, 10.0, "table")],
+        question="What is Table 2 F1?",
+        project_id="p1",
+    )
+
+    assert [item.citation.chunk_id for item in contexts] == ["staged-table-row"]
+    assert all("Active" not in item.citation.excerpt for item in contexts)
+    assert db.get(Document, document.id).active_parse_version == "active-v"
+
+
+def test_canonical_table_prompt_preserves_complete_evidence_without_character_window() -> None:
+    evidence = "Table 9\n| Dataset | Value |\n| --- | --- |\n" + "\n".join(
+        f"| Dataset-{index} | {index}.123 |" for index in range(180)
+    )
+    context = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="table-long-child",
+            parse_version="canonical-v1",
+            block_type="table",
+            table_id="table-9",
+            score=1.0,
+            excerpt=evidence,
+        ),
+        prompt_text=evidence,
+        score=1.0,
+        evidence_kind="table",
+    )
+
+    rendered = QueryService._prompt_context_text("What are Table 9 values?", context)
+
+    assert rendered == evidence
+    assert rendered.endswith("| Dataset-179 | 179.123 |")
+
+
+def test_answer_prompt_deduplicates_parent_overlap_without_changing_citations() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 10_000
+    service._retrieval_token_counter = lambda text: len(text.split())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                score=2.0,
+                chunk_id="child-a",
+                document_id="d1",
+                block_type="narrative",
+                excerpt="first exact child",
+            ),
+            prompt_text="alpha beta shared one two",
+            context_text="alpha beta shared one two",
+            score=2.0,
+            parent_chunk_id="parent-a",
+        ),
+        RetrievedContext(
+            citation=Citation(
+                score=1.0,
+                chunk_id="child-b",
+                document_id="d1",
+                block_type="narrative",
+                excerpt="shared one two gamma delta",
+            ),
+            prompt_text="shared one two gamma delta",
+            context_text="shared one two gamma delta",
+            score=1.0,
+            parent_chunk_id="parent-b",
+        ),
+    ]
+
+    fitted = service._fit_contexts_to_token_budget(
+        contexts,
+        question="ordinary question",
+    )
+
+    assert [item.citation.chunk_id for item in fitted] == ["child-a", "child-b"]
+    assert fitted[1].prompt_text == "gamma delta"
+    assert fitted[1].citation.excerpt == "shared one two gamma delta"
+    rendered = "\n\n".join(
+        service._prompt_context_text("ordinary question", item) for item in fitted
+    )
+    assert rendered.count("shared one two") == 1
+    assert "gamma delta" in rendered
+
+
+def test_answer_prompt_deduplicates_cjk_overlap_with_real_token_counter() -> None:
+    db = make_session()
+    service = service_for(db)
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 10_000
+    service._retrieval_token_counter = lambda text: len(text)
+    overlap = "实验结果显示该方法在全部数据集上稳定提升"
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                score=2.0,
+                chunk_id="cjk-a",
+                document_id="d1",
+                block_type="narrative",
+                excerpt=f"前一分块{overlap}",
+            ),
+            prompt_text=f"前一分块{overlap}",
+            context_text=f"前一分块{overlap}",
+            score=2.0,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                score=1.0,
+                chunk_id="cjk-b",
+                document_id="d1",
+                block_type="narrative",
+                excerpt=f"{overlap}并验证了鲁棒性",
+            ),
+            prompt_text=f"{overlap}并验证了鲁棒性",
+            context_text=f"{overlap}并验证了鲁棒性",
+            score=1.0,
+        ),
+    ]
+
+    fitted = service._fit_contexts_to_token_budget(
+        contexts,
+        question="该方法的实验结果如何？",
+    )
+    rendered = "\n\n".join(
+        service._prompt_context_text("该方法的实验结果如何？", item)
+        for item in fitted
+    )
+
+    assert rendered.count(overlap) == 1
+    assert fitted[1].citation.excerpt == f"{overlap}并验证了鲁棒性"
+
+
+
+def test_answer_budget_fails_when_strict_tokenizer_snapshot_is_unavailable() -> None:
+    def unavailable(_name: str):
+        raise OSError("pinned tokenizer snapshot missing")
+
+    db = make_session()
+    service = service_for(db)
+    service._retrieval_token_counter = StructuredEvidenceBuilder(
+        tokenizer_name="Qwen/Qwen3-Embedding-4B",
+        tokenizer_loader=unavailable,
+        strict_tokenizer=True,
+    ).estimate_tokens
+    context = RetrievedContext(
+        citation=Citation(score=1.0, excerpt="matched child"),
+        prompt_text="complete parent evidence",
+        score=1.0,
+        parent_chunk_id="parent-1",
+    )
+
+    with pytest.raises(RuntimeError, match="cannot use a fallback token count"):
+        service._fit_contexts_to_token_budget(
+            [context],
+            question="ordinary question",
+        )
 
 
 def test_active_child_condition_is_strict_for_canonical_and_nullable_for_legacy() -> None:

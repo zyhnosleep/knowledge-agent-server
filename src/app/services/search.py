@@ -1,3 +1,20 @@
+"""RAG 检索与问答核心服务（QueryService）。
+
+这是整个检索层的心脏。职责包括：
+1. **文档路由（paper routing）**：根据查询与 PaperProfile 匹配相关文档。
+2. **上下文召回**：从向量库 + 文档画像召回相关证据上下文。
+3. **草稿答案生成**：用 Ollama 生成答案，或对表格/科学证据走确定性提取。
+4. **引用管理与修复**：选择、支持性校验、重排、重定位引用索引。
+5. **验证**：高风险问题调用外部验证器。
+6. **source summary chunk** 生成与文档画像联动。
+
+对外暴露两个主要接口：
+- answer(): 完整问答（检索 + 生成 + 验证 + 引用修复）。
+- retrieve_evidence(): 只检索，返回 EvidencePack（供 Agent 使用）。
+
+检索数据来自 document_chunks（parent/child 角色），路由数据来自 PaperProfile。
+"""
+
 from __future__ import annotations
 
 import json
@@ -25,6 +42,13 @@ from app.services.paper_profile import (
     source_fields_for_document,
 )
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
+from app.services.table_evidence import (
+    CanonicalTableChunk,
+    TableContext,
+    TableFact,
+    assemble_table_context,
+    extract_table_facts,
+)
 from app.services.table_normalization import normalize_table_text
 from app.services.structured_evidence import StructuredEvidenceBuilder
 from app.services.vector_store import get_vector_store
@@ -33,16 +57,27 @@ settings = get_settings()
 MIN_CONTEXT_SCORE = 2.5
 CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
+# Canonical table Children are independent citation units.  A table question
+# may need more than the ordinary eight prose contexts (for example when it
+# names several tables), but the exact retrieval-token budget remains the
+# final bound on what reaches the answer prompt.
+CANONICAL_TABLE_CONTEXT_LIMIT = 24
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
 QUERY_GENERATION_TIMEOUT_SECONDS = 45
 DRAFT_CONTEXT_TOKEN_BUDGET = 6000
 NEIGHBOR_EXPANSION_TOKEN_BUDGET = 900
+# Keep ordinary narrative prompts from expanding every retrieved Child to its
+# full Parent.  Canonical table Children are excluded because each row is an
+# independent, lossless evidence unit and must remain available to the answer.
+MAX_COMPLETE_PARENT_CONTEXTS = 6
 _RETRIEVAL_TOKEN_PROVIDER = StructuredEvidenceBuilder()
 
 
 @dataclass
 class RetrievedContext:
+    """检索命中的一条上下文，包含引用信息与拼接后的提示文本。"""
+
     citation: Citation
     prompt_text: str
     score: float
@@ -50,6 +85,8 @@ class RetrievedContext:
     context_text: str = ""
     parent_chunk_id: str | None = None
     neighbor_text: str = ""
+    table_context: TableContext | None = None
+    table_facts: tuple[TableFact, ...] = ()
 
 
 @dataclass
@@ -57,6 +94,8 @@ class RetrievedContext:
 
 @dataclass
 class PaperMatch:
+    """查询与某篇文档的路由匹配结果，带匹配分与锁定标记。"""
+
     document: Document
     score: float
     exact_alias: bool = False
@@ -66,6 +105,8 @@ class PaperMatch:
 
 @dataclass
 class ExtractedMetric:
+    """从表格上下文提取出的指标：数据集 + 数值映射。"""
+
     context_index: int
     table_label: str | None
     dataset: str
@@ -261,8 +302,19 @@ class QueryService:
         re.IGNORECASE,
     )
 
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        *,
+        parse_version_map: dict[str, str] | None = None,
+    ) -> None:
+        """初始化 QueryService。
+
+        parse_version_map 把 document_id 映射到要使用的解析版本，
+        用于在路由/画像分析时从对应版本的 chunk 重建源文本。
+        """
         self.db = db
+        self.parse_version_map = parse_version_map
         self.ollama = OllamaClient()
         self.verifier = ExternalVerifier()
         self.DRAFT_CONTEXT_TOKEN_BUDGET = DRAFT_CONTEXT_TOKEN_BUDGET
@@ -276,6 +328,7 @@ class QueryService:
         save_answer: bool = True,
         document_id: str | None = None,
     ) -> QueryResponse:
+        """执行一次完整 RAG 问答（检索 + 生成 + 验证 + 引用修复）。"""
         return self._answer_rag_first(
             project_slug, question, save_answer=save_answer, document_id=document_id
         )
@@ -287,12 +340,11 @@ class QueryService:
         limit: int = 15,
         document_id: str | None = None,
     ) -> "EvidencePack":
-        """Retrieve-only RAG: return an EvidencePack without drafting an answer.
+        """只检索、不生成答案的 RAG 接口，返回 EvidencePack。
 
-        Reuses the same routing and context selection as ``answer()`` but
-        does **not** call the LLM, verify, or persist a ``QuestionAnswer``.
-        When *document_id* is provided, retrieval is scoped to that document
-        and never falls back to project-wide sources.
+        复用与 ``answer()`` 相同的路由与上下文选择逻辑，但**不**调用
+        LLM、不验证、不持久化 QuestionAnswer。当提供 *document_id* 时，
+        检索被限定在单篇文档内，不 fallback 到整个项目。
         """
         from app.schemas.agent import EvidenceItem, EvidencePack
 
@@ -403,6 +455,17 @@ class QueryService:
         save_answer: bool = True,
         document_id: str | None = None,
     ) -> QueryResponse:
+        """RAG 优先的完整问答主流程。
+
+        流程：
+        1. 路由论文 → 构建上下文；
+        2. 无上下文时直接生成提示性答案；
+        3. 尝试确定性表格答案，否则用 LLM 生成草稿；
+        4. 高风险问题做外部验证；
+        5. 规范化引用、选择/校验引用索引、修复数值/表格缺失答案；
+        6. 可选追加缺失的支持性证据术语；
+        7. 组装 QueryResponse（必要时持久化 QuestionAnswer）。
+        """
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
         if project is None:
             raise ValueError(f"Project '{project_slug}' not found")
@@ -524,15 +587,21 @@ class QueryService:
         for document in documents:
             profile = paper_profile_data(document)
             profile_text = paper_profile_text(document)
-            profile_terms = self._tokenize(profile_text)
-            raw_terms = self._tokenize(document.raw_text or "")
+            shadow_text = self._shadow_document_text(document)
+            route_profile_text = "\n".join(
+                part for part in (profile_text, shadow_text) if part
+            )
+            profile_terms = self._tokenize(route_profile_text)
+            raw_terms = self._tokenize(
+                "\n".join(part for part in (document.raw_text or "", shadow_text) if part)
+            )
             title_terms = self._tokenize(document.title)
             alias_values = [str(item) for item in profile.get("aliases") or []]
             key_values = [str(item) for item in profile.get("key_terms") or []]
             alias_terms = self._tokenize(" ".join(alias_values))
             key_terms = self._tokenize(" ".join(key_values))
             exact_alias = self._question_has_exact_alias(question, alias_values)
-            selector_text = self._paper_route_text(document, profile_text)
+            selector_text = self._paper_route_text(document, route_profile_text)
             selector_hits = [
                 selector
                 for selector in scientific_selectors
@@ -540,7 +609,7 @@ class QueryService:
             ]
             introduced_selector_count = self._introduced_selector_count(
                 primary_selectors or scientific_selectors,
-                document.raw_text or "",
+                "\n".join(part for part in (document.raw_text or "", shadow_text) if part),
             )
             identity_text = self._paper_identity_route_text(document, profile)
             primary_selector_hits = [
@@ -652,6 +721,24 @@ class QueryService:
             )
             if part
         )
+
+    def _shadow_document_text(self, document: Document) -> str:
+        """Return staged child text used only for shadow-paper routing."""
+        version_key = (self.parse_version_map or {}).get(document.id)
+        if not version_key:
+            return ""
+        rows = self.db.scalars(
+            select(DocumentChunk.text)
+            .where(
+                DocumentChunk.document_id == document.id,
+                DocumentChunk.parse_version == str(version_key),
+                DocumentChunk.chunk_role == "child",
+                DocumentChunk.block_type.is_not(None),
+                DocumentChunk.block_type != "reference",
+            )
+            .order_by(DocumentChunk.ordinal)
+        ).all()
+        return "\n".join(str(text).strip() for text in rows if str(text or "").strip())
 
     @staticmethod
     def _paper_identity_route_text(document: Document, profile: dict | None = None) -> str:
@@ -1052,7 +1139,7 @@ class QueryService:
             .join(DocumentChunk.document)
             .where(
                 DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
                 DocumentChunk.document_id.in_(document_ids),
             )
             .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
@@ -1111,7 +1198,7 @@ class QueryService:
             .join(DocumentChunk.document)
             .where(
                 DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
                 DocumentChunk.document_id.in_(document_ids),
             )
             .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
@@ -1195,7 +1282,7 @@ class QueryService:
             .join(DocumentChunk.document)
             .where(
                 DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
                 DocumentChunk.document_id.in_(document_ids),
             )
             .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
@@ -1269,7 +1356,7 @@ class QueryService:
             .join(DocumentChunk.document)
             .where(
                 DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
                 DocumentChunk.document_id.in_(document_ids),
             )
             .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
@@ -1377,7 +1464,7 @@ class QueryService:
             .join(DocumentChunk.document)
             .where(
                 DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
                 DocumentChunk.document_id.in_(document_ids),
             )
             .order_by(DocumentChunk.document_id, DocumentChunk.ordinal)
@@ -1746,7 +1833,7 @@ class QueryService:
             return []
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
             DocumentChunk.document.has(project_id=project_id, status=DocumentStatus.ready.value),
-            *self._active_child_chunk_conditions(),
+            *self._selected_child_chunk_conditions(),
             DocumentChunk.document_id.in_(document_ids),
         )
         chunks = self.db.scalars(statement).all()
@@ -1856,7 +1943,7 @@ class QueryService:
                 Claim.evidence_chunk_id.is_not(None),
                 Document.project_id == project_id,
                 Document.status == DocumentStatus.ready.value,
-                *self._active_child_chunk_conditions(),
+                *self._selected_child_chunk_conditions(),
             )
         )
         rows = self.db.execute(statement).all()
@@ -1921,12 +2008,15 @@ class QueryService:
         question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
+        vector_store = get_vector_store(self.db)
+        vector_search_kwargs = {
+            "limit": max(limit * 20, 50),
+            "document_ids": document_ids or None,
+        }
+        if self.parse_version_map:
+            vector_search_kwargs["parse_version_map"] = self.parse_version_map
         vector_hits = (
-            get_vector_store(self.db).search(
-                question_vector,
-                limit=max(limit * 20, 50),
-                document_ids=document_ids or None,
-            )
+            vector_store.search(question_vector, **vector_search_kwargs)
             if question_vector
             else []
         )
@@ -1937,7 +2027,7 @@ class QueryService:
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
-            *self._active_child_chunk_conditions(),
+            *self._selected_child_chunk_conditions(),
         )
         if document_ids:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
@@ -2027,7 +2117,12 @@ class QueryService:
             project_id,
             sorted({chunk.document_id for chunk, _score, _kind in candidates}),
         )
-        return [
+        expanded_candidates = self._expand_table_candidates(
+            candidates,
+            question=question,
+            project_id=project_id,
+        )
+        contexts = [
             self._expand_child_hit(
                 chunk,
                 question=question,
@@ -2036,8 +2131,178 @@ class QueryService:
                 evidence_kind=evidence_kind,
                 related_chunks=related_chunks,
             )
-            for chunk, score, evidence_kind in candidates
+            for chunk, score, evidence_kind in expanded_candidates
         ]
+        return self._attach_complete_table_evidence(
+            contexts,
+            expanded_candidates,
+            question=question,
+        )
+
+    def _attach_complete_table_evidence(
+        self,
+        contexts: list[RetrievedContext],
+        candidates: list[tuple[DocumentChunk, float, str | None]],
+        *,
+        question: str,
+    ) -> list[RetrievedContext]:
+        """Attach lossless table data while retaining one citation per Child."""
+
+        if not (self._is_table_query(question) or self._is_metric_query(question)):
+            return contexts
+        grouped: dict[tuple[str, str, str], list[CanonicalTableChunk]] = {}
+        for chunk, _score, evidence_kind in candidates:
+            if chunk.block_type != "table" or evidence_kind != "table":
+                continue
+            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
+            parse_version = str(chunk.parse_version or "")
+            if not table_id or not parse_version or parse_version == "legacy":
+                continue
+            key = (chunk.document_id, parse_version, table_id)
+            grouped.setdefault(key, []).append(
+                CanonicalTableChunk(
+                    chunk_id=chunk.id,
+                    document_id=chunk.document_id,
+                    parse_version=parse_version,
+                    table_id=table_id,
+                    ordinal=int(chunk.ordinal or 0),
+                    text=chunk.text,
+                    page_label=chunk.page_label,
+                    source_spans=tuple(chunk.source_spans or ()),
+                )
+            )
+        if not grouped:
+            return contexts
+
+        assembled: dict[tuple[str, str, str], tuple[TableContext, tuple[TableFact, ...]]] = {}
+        for key, chunks in grouped.items():
+            try:
+                table = assemble_table_context(chunks)
+            except ValueError:
+                continue
+            assembled[key] = (table, tuple(extract_table_facts(question, table)))
+
+        enriched: list[RetrievedContext] = []
+        for context in contexts:
+            citation = context.citation
+            key = (
+                str(citation.document_id or ""),
+                str(citation.parse_version or ""),
+                str(citation.table_id or ""),
+            )
+            table_data = assembled.get(key)
+            if table_data is None:
+                enriched.append(context)
+                continue
+            table, facts = table_data
+            enriched.append(replace(context, table_context=table, table_facts=facts))
+        return enriched
+
+    def _expand_table_candidates(
+        self,
+        candidates: list[tuple[DocumentChunk, float, str | None]],
+        *,
+        question: str,
+        project_id: str,
+    ) -> list[tuple[DocumentChunk, float, str | None]]:
+        """Expand canonical table hits to sibling row Children without merging citations.
+
+        A table Child is intentionally a small embedding unit, so a vector hit
+        on one row is not evidence that the other rows were included.  Query
+        time expansion loads only the same document/parse version and table
+        identity.  Explicitly named additional tables are admitted when their
+        own table/dataset terms match the question.  Every returned tuple still
+        points to one original Child; the caller creates one citation per tuple.
+        """
+        table_hits = [
+            (chunk, score, evidence_kind)
+            for chunk, score, evidence_kind in candidates
+            if chunk.block_type == "table" and evidence_kind == "table"
+        ]
+        if not table_hits:
+            return candidates
+
+        document_ids = sorted({chunk.document_id for chunk, _score, _kind in table_hits})
+        statement = select(DocumentChunk).join(DocumentChunk.document).where(
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+            DocumentChunk.document_id.in_(document_ids),
+            DocumentChunk.chunk_role == "child",
+            DocumentChunk.block_type == "table",
+            *self._selected_child_chunk_conditions(),
+        )
+        table_chunks = self.db.scalars(statement).all()
+        chunks_by_table: dict[tuple[str, str, str], list[DocumentChunk]] = {}
+        for chunk in table_chunks:
+            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
+            if not table_id:
+                continue
+            chunks_by_table.setdefault(
+                (chunk.document_id, str(chunk.parse_version), table_id),
+                [],
+            ).append(chunk)
+        for siblings in chunks_by_table.values():
+            siblings.sort(key=lambda item: (item.ordinal, item.id))
+
+        expanded: list[tuple[DocumentChunk, float, str | None]] = []
+        seen_ids: set[str] = set()
+
+        def append(
+            chunk: DocumentChunk,
+            score: float,
+            evidence_kind: str | None,
+        ) -> None:
+            if chunk.id in seen_ids:
+                return
+            seen_ids.add(chunk.id)
+            expanded.append((chunk, score, evidence_kind))
+
+        for chunk, score, evidence_kind in candidates:
+            append(chunk, score, evidence_kind)
+            if chunk.block_type != "table" or evidence_kind != "table":
+                continue
+            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
+            if not table_id:
+                continue
+            siblings = chunks_by_table.get(
+                (chunk.document_id, str(chunk.parse_version), table_id),
+                [],
+            )
+            for sibling in siblings:
+                if sibling.id == chunk.id:
+                    continue
+                # Keep the original hit first while making sibling ordering
+                # deterministic.  The tiny decrement cannot change a normal
+                # cross-table score ordering.
+                sibling_score = score - 0.000001 * (abs(sibling.ordinal - chunk.ordinal) + 1)
+                append(sibling, sibling_score, "table")
+
+        # A question can name several tables while only one of them appears in
+        # the top vector hits.  Include matching Children from the same mapped
+        # documents, but never pull an unrelated table merely because it shares
+        # a page or parent.
+        explicit_table_terms = [
+            self._normalize_selector(anchor)
+            for anchor in self._query_priority_anchors(question)["figure_table"]
+            if self._normalize_selector(anchor)
+        ]
+        max_score = max(score for _chunk, score, _kind in table_hits)
+        for chunk in table_chunks:
+            if chunk.id in seen_ids:
+                continue
+            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
+            if not table_id:
+                continue
+            text_key = self._normalize_selector(chunk.text)
+            explicit_match = bool(
+                explicit_table_terms
+                and any(term in text_key for term in explicit_table_terms)
+            )
+            if not explicit_match and not self._table_block_matches_query(question, chunk.text):
+                continue
+            append(chunk, max_score - 0.5, "table")
+
+        return expanded
 
     @staticmethod
     def _active_child_chunk_condition(
@@ -2076,6 +2341,39 @@ class QueryService:
     def _active_child_chunk_conditions(cls):
         return (cls._active_child_chunk_condition(),)
 
+    def _selected_child_chunk_conditions(self):
+        """Return child filters for active documents plus any shadow versions.
+
+        Acceptance runs can evaluate a staged parse version without changing
+        ``Document.active_parse_version``.  The vector store already applies
+        the same map to semantic hits; SQL/lexical retrieval and finalization
+        must use the identical selection rule.
+        """
+        if not self.parse_version_map:
+            return self._active_child_chunk_conditions()
+
+        mapped_document_ids = tuple(
+            str(document_id)
+            for document_id in self.parse_version_map
+            if str(document_id).strip()
+        )
+        mapped_conditions = [
+            and_(
+                Document.id == str(document_id),
+                DocumentChunk.parse_version == str(version_key),
+                DocumentChunk.chunk_role == "child",
+                DocumentChunk.block_type.is_not(None),
+                DocumentChunk.block_type != "reference",
+            )
+            for document_id, version_key in self.parse_version_map.items()
+            if str(document_id).strip() and str(version_key).strip()
+        ]
+        unmapped_condition = and_(
+            ~Document.id.in_(mapped_document_ids),
+            self._active_child_chunk_condition(),
+        )
+        return (or_(*mapped_conditions, unmapped_condition),)
+
     def _expand_child_hit(
         self,
         chunk: DocumentChunk,
@@ -2101,7 +2399,11 @@ class QueryService:
         prompt_parts = [
             chunk.text.strip() if chunk.block_type == "table" else context_text
         ]
-        if chunk.text.strip() and chunk.text.strip() not in context_text:
+        if (
+            chunk.text.strip()
+            and chunk.block_type != "table"
+            and chunk.text.strip() not in context_text
+        ):
             prompt_parts.append(f"Matched child:\n{chunk.text.strip()}")
         neighbor_text = self._neighbor_context_text(
             chunk,
@@ -2141,6 +2443,12 @@ class QueryService:
         *,
         related_chunks: dict[str, DocumentChunk] | None = None,
     ) -> str:
+        # Canonical table Children are already expanded by ``table_id``.  Their
+        # previous/next links often point to another row (or a repeated header),
+        # so adding neighbor text duplicates table evidence and burns the
+        # answer token budget.
+        if chunk.block_type == "table":
+            return ""
         if not (
             self._is_document_overview_query(question)
             or self._is_cross_paper_query(question)
@@ -2199,14 +2507,127 @@ class QueryService:
             self._retrieval_token_counter = counter
         return int(counter(text))
 
+    def _expand_table_contexts_for_budget(
+        self,
+        contexts: list[RetrievedContext],
+        *,
+        question: str,
+    ) -> list[RetrievedContext]:
+        """Add same-table canonical Children before the answer budget is fitted.
+
+        ``retrieve_evidence`` normally receives the expanded list from
+        ``_search_source_chunks``.  This second, idempotent expansion keeps the
+        answer path safe when a caller supplies one already-expanded context
+        (and preserves the exact Child citations in either path).
+        """
+        if not (self._is_table_query(question) or self._is_metric_query(question)):
+            return contexts
+        expanded = list(contexts)
+        seen_ids = {
+            context.citation.chunk_id
+            for context in contexts
+            if context.citation.chunk_id
+        }
+        for context in contexts:
+            citation = context.citation
+            if citation.block_type != "table" or citation.parse_version in {None, "legacy"}:
+                continue
+            chunk = self.db.get(DocumentChunk, citation.chunk_id) if citation.chunk_id else None
+            if chunk is None or chunk.block_type != "table":
+                continue
+            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
+            if not table_id:
+                continue
+            statement = select(DocumentChunk).join(DocumentChunk.document).where(
+                Document.project_id == chunk.document.project_id,
+                Document.status == DocumentStatus.ready.value,
+                DocumentChunk.document_id == chunk.document_id,
+                DocumentChunk.parse_version == chunk.parse_version,
+                DocumentChunk.chunk_role == "child",
+                DocumentChunk.block_type == "table",
+                *self._selected_child_chunk_conditions(),
+            )
+            siblings = self.db.scalars(statement).all()
+            siblings = [
+                sibling
+                for sibling in siblings
+                if self._canonical_chunk_identifiers(sibling).get("table_id") == table_id
+            ]
+            siblings.sort(key=lambda item: (item.ordinal, item.id))
+            related_chunks = {sibling.id: sibling for sibling in siblings}
+            related_chunks[chunk.id] = chunk
+            for sibling in siblings:
+                if sibling.id in seen_ids:
+                    continue
+                sibling_score = context.score - 0.000001 * (
+                    abs(sibling.ordinal - chunk.ordinal) + 1
+                )
+                sibling_context = self._expand_child_hit(
+                    sibling,
+                    question=question,
+                    score=sibling_score,
+                    page_fields={
+                        key: value
+                        for key, value in {
+                            "page_slug": citation.page_slug,
+                            "page_title": citation.page_title,
+                            "page_kind": citation.page_kind,
+                        }.items()
+                        if value is not None
+                    },
+                    evidence_kind="table",
+                    related_chunks=related_chunks,
+                )
+                expanded.append(sibling_context)
+                seen_ids.add(sibling.id)
+        return expanded
+
     def _fit_contexts_to_token_budget(
         self,
         contexts: list[RetrievedContext],
         *,
         question: str,
     ) -> list[RetrievedContext]:
+        contexts = self._expand_table_contexts_for_budget(contexts, question=question)
+        if self._is_table_query(question) or self._is_metric_query(question):
+            # A table Child is a lossless row-level evidence unit.  Put table
+            # rows ahead of narrative context before applying the hard prompt
+            # budget; otherwise an unrelated high-scoring paragraph can consume
+            # the budget and hide the requested sibling row.  Within tables,
+            # prefer rows that contain the question's anchors while preserving
+            # retrieval score as the deterministic tie-breaker.
+            query_terms = self._tokenize(question)
+            figure_table_terms = {
+                self._normalize_selector(term)
+                for term in self._query_priority_anchors(question)["figure_table"]
+            }
+            dataset_terms = {
+                self._normalize_selector(term)
+                for term in self._query_priority_anchors(question)["dataset"]
+            }
+
+            def table_priority(context: RetrievedContext) -> tuple[int, int, float]:
+                text = self._context_evidence_text(context)
+                normalized = self._normalize_selector(text)
+                anchor_hits = sum(
+                    1
+                    for term in (*figure_table_terms, *dataset_terms)
+                    if term and term in normalized
+                )
+                overlap = len(query_terms & self._tokenize(text))
+                return anchor_hits, overlap, context.score
+
+            table_contexts = [
+                context
+                for context in contexts
+                if context.citation.block_type == "table"
+                or self._context_evidence_kind(context) == "table"
+            ]
+            other_contexts = [context for context in contexts if context not in table_contexts]
+            contexts = sorted(table_contexts, key=table_priority, reverse=True) + other_contexts
         budget = int(self.DRAFT_CONTEXT_TOKEN_BUDGET)
         selected: list[RetrievedContext] = []
+        expanded_parent_ids: set[str] = set()
 
         def representation(values: list[RetrievedContext]) -> str:
             return "\n\n".join(
@@ -2215,12 +2636,34 @@ class QueryService:
             )
 
         for context in contexts:
-            candidate = [*selected, context]
+            is_table_child = context.citation.block_type == "table"
+            parent_id = context.parent_chunk_id or context.citation.parent_chunk_id
+            can_expand_parent = (
+                is_table_child
+                or not parent_id
+                or parent_id in expanded_parent_ids
+                or len(expanded_parent_ids) < MAX_COMPLETE_PARENT_CONTEXTS
+            )
+            candidate_context = context
+            if can_expand_parent and not is_table_child:
+                deduplicated_prompt = self._remove_prompt_overlap(
+                    context.prompt_text,
+                    [item.prompt_text for item in selected],
+                )
+                if deduplicated_prompt and deduplicated_prompt != context.prompt_text:
+                    candidate_context = replace(
+                        context,
+                        prompt_text=deduplicated_prompt,
+                    )
+            candidate = [*selected, candidate_context]
             if (
-                context.prompt_text.strip()
+                can_expand_parent
+                and candidate_context.prompt_text.strip()
                 and self._count_retrieval_tokens(representation(candidate)) <= budget
             ):
-                selected.append(context)
+                selected.append(candidate_context)
+                if parent_id and not is_table_child:
+                    expanded_parent_ids.add(parent_id)
                 continue
             excerpt = context.citation.excerpt.strip()
             if not excerpt:
@@ -2238,6 +2681,49 @@ class QueryService:
             ):
                 selected.append(fallback)
         return selected
+
+    @classmethod
+    def _remove_prompt_overlap(cls, text: str, previous_texts: list[str]) -> str:
+        """Remove a repeated suffix/prefix while leaving citation text intact.
+
+        Semantic Child overlap is useful for retrieval but redundant in the
+        answer prompt.  Word-boundary matching handles prose; character
+        matching handles CJK text where tokenization may not insert spaces.
+        Only a substantive overlap is removed, and an all-overlap context is
+        left unchanged so evidence is never silently erased.
+        """
+        current = (text or "").strip()
+        if not current:
+            return current
+        best_overlap = ""
+        current_tokens = current.split()
+        for previous in previous_texts:
+            prior = (previous or "").strip()
+            if not prior:
+                continue
+            prior_tokens = prior.split()
+            if len(current_tokens) >= 4 and len(prior_tokens) >= 3:
+                max_tokens = min(len(current_tokens) - 1, len(prior_tokens))
+                for count in range(max_tokens, 2, -1):
+                    overlap = " ".join(current_tokens[:count])
+                    if " ".join(prior_tokens).endswith(overlap):
+                        if len(overlap) > len(best_overlap):
+                            best_overlap = overlap
+                        break
+                continue
+            # CJK and other unspaced scripts need character-prefix matching.
+            max_chars = min(len(current) - 1, len(prior))
+            for size in range(max_chars, 7, -1):
+                overlap = current[:size]
+                if prior.endswith(overlap):
+                    if size > len(best_overlap):
+                        best_overlap = overlap
+                    break
+        if not best_overlap or len(best_overlap) >= len(current):
+            return current
+        if current.startswith(best_overlap):
+            return current[len(best_overlap):].lstrip()
+        return current
 
     @staticmethod
     def _vector_distance_score(distance: float) -> float:
@@ -2467,7 +2953,7 @@ class QueryService:
             fallback_text = "\n".join(
                 [
                     "## 回答",
-                    "根据当前检索到的原文证据，暂时返回可核查的证据片段；以下内容均来自返回的 citation。",
+                    "[?????LLM ???????????????????????????]",
                     "",
                     context_text[:1400],
                 ]
@@ -2476,7 +2962,7 @@ class QueryService:
             fallback_text = "\n".join(
                 [
                     "## Answer",
-                    "The answer below is based on the currently retrieved source evidence. Please verify against the cited materials when needed.",
+                    "[System notice: LLM generation temporarily failed. The following is raw retrieval evidence for reference only, not a final answer.]",
                     "",
                     context_text[:1400],
                 ]
@@ -2953,7 +3439,14 @@ class QueryService:
             if any(metric in text.lower() for metric in ("f1", "auc", "precision", "recall", "score")):
                 score += 3.0
             scored.append((score, index))
-        return [index for _, index in sorted(scored, reverse=True)[:5]]
+        canonical_table_context = any(
+            context.citation.block_type == "table"
+            and context.citation.parse_version not in {None, "legacy"}
+            for _score, index in scored
+            if 0 <= index < len(contexts)
+        )
+        limit = CANONICAL_TABLE_CONTEXT_LIMIT if canonical_table_context else 5
+        return [index for _, index in sorted(scored, reverse=True)[:limit]]
 
     @staticmethod
     def _context_has_table_data(text: str) -> bool:
@@ -3469,20 +3962,36 @@ class QueryService:
     @classmethod
     def _prompt_context_text(cls, question: str, context: RetrievedContext) -> str:
         evidence = cls._context_evidence_text(context)
-        max_chars = 2400 if (cls._is_table_query(question) or cls._is_metric_query(question)) else 1600
-        if len(evidence) <= max_chars:
-            return evidence
-        return cls._window_text(evidence, cls._tokenize(question), max_chars=max_chars, question=question)
+        # Character windows were the source of silent evidence loss: a large
+        # Parent could omit the paragraph containing the answer, and a table
+        # Child could omit the requested numeric row.  The exact retrieval
+        # tokenizer in _fit_contexts_to_token_budget is now the sole prompt
+        # size gate, so every selected context remains lossless.
+        return evidence
 
     @staticmethod
     def _context_evidence_text(context: RetrievedContext) -> str:
         parts: list[str] = []
         citation = getattr(context, "citation", None)
         excerpt = getattr(citation, "excerpt", "")
-        for text in (getattr(context, "prompt_text", ""), excerpt):
-            clean = (text or "").strip()
-            if clean and clean not in parts:
-                parts.append(clean)
+        prompt = (getattr(context, "prompt_text", "") or "").strip()
+        excerpt = (excerpt or "").strip()
+        if prompt:
+            parts.append(prompt)
+        if excerpt:
+            if not prompt:
+                parts.append(excerpt)
+            else:
+                prompt_key = re.sub(r"\s+", " ", prompt)
+                excerpt_key = re.sub(r"\s+", " ", excerpt)
+                # A Child excerpt already contained in the Parent, or a
+                # residual suffix left after overlap removal, adds no prompt
+                # evidence.  Keep it in Citation.excerpt unchanged.
+                if (
+                    excerpt_key not in prompt_key
+                    and not excerpt_key.endswith(prompt_key)
+                ):
+                    parts.append(excerpt)
         return "\n\n".join(parts)
 
     @classmethod
@@ -4467,6 +4976,16 @@ class QueryService:
         *,
         question: str = "",
     ) -> list[RetrievedContext]:
+        canonical_table_query = (
+            self._is_table_query(question) or self._is_metric_query(question)
+        ) and any(
+            self._context_evidence_kind(context) == "table"
+            and context.citation.parse_version not in {None, "legacy"}
+            for context in contexts
+        )
+        context_limit = (
+            CANONICAL_TABLE_CONTEXT_LIMIT if canonical_table_query else MAX_CONTEXTS
+        )
         expanded_contexts: list[RetrievedContext] = []
         for context in contexts:
             chunk_id = context.citation.chunk_id
@@ -4475,8 +4994,16 @@ class QueryService:
                 expanded_contexts.append(context)
                 continue
             document = chunk.document
+            expected_parse_version = (
+                self.parse_version_map.get(
+                    chunk.document_id,
+                    document.active_parse_version,
+                )
+                if self.parse_version_map
+                else document.active_parse_version
+            )
             if (
-                document.active_parse_version != chunk.parse_version
+                expected_parse_version != chunk.parse_version
                 or chunk.chunk_role != "child"
                 or chunk.block_type == "reference"
             ):
@@ -4507,19 +5034,31 @@ class QueryService:
         for context in sorted_contexts:
             citation = context.citation
             normalized_excerpt = re.sub(r"\s+", " ", citation.excerpt.strip())[:180]
-            key = f"{citation.page_slug or citation.document_id}:{citation.page_label}:{normalized_excerpt}"
+            if self._context_evidence_kind(context) == "table":
+                # Canonical table Children intentionally share a long table
+                # preamble.  A prefix-based key therefore collapses distinct
+                # rows (and drops requested numeric values).  Stable chunk/table
+                # identity is the correct dedupe boundary for structured rows.
+                table_identity = citation.chunk_id or citation.table_id or normalized_excerpt
+                key = f"{citation.page_slug or citation.document_id}:{citation.page_label}:table:{table_identity}"
+            else:
+                key = f"{citation.page_slug or citation.document_id}:{citation.page_label}:{normalized_excerpt}"
             if key in seen_keys:
                 continue
             if citation.page_slug:
                 current_count = page_counts.get(citation.page_slug, 0)
-                per_page_limit = len(sorted_contexts) if self._context_evidence_kind(context) == "profile-term" else 5
+                per_page_limit = (
+                    len(sorted_contexts)
+                    if self._context_evidence_kind(context) == "profile-term"
+                    else context_limit
+                )
                 if current_count >= per_page_limit:
                     continue
                 page_counts[citation.page_slug] = current_count + 1
             deduped.append(context)
             seen_keys.add(key)
 
-        if len(deduped) <= MAX_CONTEXTS:
+        if len(deduped) <= context_limit:
             return deduped
 
         required = self._required_evidence_contexts(deduped)
@@ -4569,20 +5108,20 @@ class QueryService:
                     continue
                 finalized.append(context)
                 covered_anchor_keys.update(anchor_keys)
-                if len(finalized) >= MAX_CONTEXTS:
+                if len(finalized) >= context_limit:
                     break
         for context in sorted_contexts:
             if context not in deduped or context in finalized:
                 continue
-            if len(finalized) >= MAX_CONTEXTS:
+            if len(finalized) >= context_limit:
                 break
             remaining_required = [item for item in required if item not in finalized]
-            open_slots_after_pick = MAX_CONTEXTS - len(finalized) - 1
+            open_slots_after_pick = context_limit - len(finalized) - 1
             if context not in required and len(remaining_required) > open_slots_after_pick:
                 continue
             finalized.append(context)
         for context in required:
-            if context not in finalized and len(finalized) < MAX_CONTEXTS:
+            if context not in finalized and len(finalized) < context_limit:
                 finalized.append(context)
         return finalized
 
