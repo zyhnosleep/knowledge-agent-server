@@ -9,6 +9,22 @@ from app.services.ai import QueryAnswerPayload, VerificationPayload
 from app.services.search import MAX_CONTEXTS, ExtractedMetric, PaperMatch, QueryService, RetrievedContext, settings
 from app.schemas.common import Citation
 from app.services.table_normalization import normalize_table_text
+from app.services.table_evidence import (
+    CanonicalTableChunk,
+    assemble_table_context,
+    extract_table_facts,
+)
+
+
+@pytest.fixture(autouse=True)
+def deterministic_retrieval_token_counter(monkeypatch) -> None:
+    from app.services import search as search_module
+
+    monkeypatch.setattr(
+        search_module._RETRIEVAL_TOKEN_PROVIDER,
+        "estimate_tokens",
+        lambda text: max(1, len(text.split())),
+    )
 
 
 class FakeOllama:
@@ -160,7 +176,7 @@ def test_draft_answer_omits_index_overview_when_contexts_exist() -> None:
     assert "OPLS4 evidence" in fake_ollama.last_prompt
 
 
-def test_draft_answer_windows_long_contexts_around_question_terms() -> None:
+def test_draft_answer_preserves_complete_long_contexts() -> None:
     db = make_session()
     service = QueryService(db)
     fake_ollama = FakeOllama()
@@ -178,10 +194,12 @@ def test_draft_answer_windows_long_contexts_around_question_terms() -> None:
     service._draft_answer("ff19SB 涓轰粈涔堟帹鑽愬拰 OPC water model 涓€璧蜂娇鐢紵", None, contexts)
 
     assert "ff19SB uses OPC water model" in fake_ollama.last_prompt
-    assert len(fake_ollama.last_prompt) < 5000
+    assert long_prefix.strip() in fake_ollama.last_prompt
+    assert long_suffix.strip() in fake_ollama.last_prompt
+    assert len(fake_ollama.last_prompt) > 20_000
 
 
-def test_prompt_context_text_preserves_table_citation_excerpt() -> None:
+def test_prompt_context_text_preserves_complete_table_and_citation_excerpt() -> None:
     long_prompt = "Table 1 unrelated filler\n" + ("| A | B |\n| --- | --- |\n| x | y |\n" * 200)
     excerpt = "Table 5\n| Model | F1 |\n| --- | --- |\n| SAC-KG | 88.8 |"
     context = RetrievedContext(
@@ -194,7 +212,8 @@ def test_prompt_context_text_preserves_table_citation_excerpt() -> None:
 
     assert "Table 5" in prompt_text
     assert "88.8" in prompt_text
-    assert len(prompt_text) <= 2400
+    assert prompt_text.startswith(long_prompt)
+    assert len(prompt_text) > 2400
 
 
 def test_query_service_saves_query_page_when_requested() -> None:
@@ -1850,6 +1869,217 @@ def test_finalize_contexts_keeps_more_same_source_evidence() -> None:
     assert [context.citation.chunk_id for context in finalized] == ["c0", "c1", "c2", "c3", "c4"]
 
 
+def test_finalize_contexts_keeps_same_source_rows_for_table_query() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"table-c{index}",
+                page_slug="sources/demo",
+                page_title="Demo",
+                page_kind="source_summary",
+                score=10 - index,
+                page_label=str(index),
+                excerpt=(
+                    "| System | Value |\n"
+                    "| --- | --- |\n"
+                    f"| row {index} | {index}.0 |"
+                ),
+            ),
+            prompt_text=(
+                "| System | Value |\n"
+                "| --- | --- |\n"
+                f"| row {index} | {index}.0 |"
+            ),
+            score=10 - index,
+            evidence_kind="table",
+        )
+        for index in range(6)
+    ]
+
+    finalized = service._finalize_contexts(
+        contexts,
+        question="What experimental values are reported in Table 2?",
+    )
+
+    assert [context.citation.chunk_id for context in finalized] == [
+        "table-c0",
+        "table-c1",
+        "table-c2",
+        "table-c3",
+        "table-c4",
+        "table-c5",
+    ]
+
+
+def test_finalize_contexts_preserves_table_rows_with_identical_long_prefixes() -> None:
+    """Rows sharing a table preamble must not collapse into one citation."""
+    service = QueryService(make_session())
+    prefix = "Table S3 amino-acid pKa values and model parameters. " + ("header " * 35)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"table-s3-c{index}",
+                page_slug="sources/ff14sb",
+                page_title="ff14SB",
+                page_kind="source_summary",
+                score=20 - index,
+                page_label="12",
+                parse_version="canonical-v3",
+                block_type="table",
+                table_id="table-s3",
+                excerpt=f"{prefix}\n| Asp | {value} |",
+            ),
+            prompt_text=f"{prefix}\n| Asp | {value} |",
+            score=20 - index,
+            evidence_kind="table",
+        )
+        for index, value in enumerate(("2.5 / 0.9", "3.1 / 1.2", "4.0 / 1.8"))
+    ]
+
+    finalized = service._finalize_contexts(
+        contexts,
+        question="What values are reported for Asp in Table S3?",
+    )
+
+    assert [context.citation.chunk_id for context in finalized] == [
+        "table-s3-c0",
+        "table-s3-c1",
+        "table-s3-c2",
+    ]
+
+
+def test_fit_contexts_prioritizes_requested_table_rows_over_unrelated_context() -> None:
+    """A table query keeps matching rows before unrelated prose consumes budget."""
+    service = QueryService(make_session())
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 180
+    unrelated = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="narrative",
+            page_slug="sources/ff14sb",
+            page_title="ff14SB",
+            page_kind="source_summary",
+            score=100,
+            parse_version="canonical-v3",
+            excerpt="unrelated narrative " * 80,
+        ),
+        prompt_text="unrelated narrative " * 80,
+        score=100,
+    )
+    table_rows = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"table-s3-row-{index}",
+                page_slug="sources/ff14sb",
+                page_title="ff14SB",
+                page_kind="source_summary",
+                score=10 - index,
+                parse_version="canonical-v3",
+                block_type="table",
+                table_id="table-s3",
+                excerpt=f"Table S3 | row {index} | Asp {value}",
+            ),
+            prompt_text=f"Table S3 | row {index} | Asp {value}",
+            score=10 - index,
+            evidence_kind="table",
+        )
+        for index, value in enumerate(("2.5 / 0.9", "3.1 / 1.2"))
+    ]
+
+    selected = service._fit_contexts_to_token_budget(
+        [unrelated, *table_rows],
+        question="What values are reported for Asp in Table S3?",
+    )
+
+    selected_ids = [context.citation.chunk_id for context in selected]
+    assert "table-s3-row-0" in selected_ids
+    assert selected_ids[0] == "table-s3-row-0"
+
+
+def test_expand_child_hit_does_not_duplicate_table_child_in_parent_context() -> None:
+    """A table child already emitted as the primary prompt must appear once."""
+    service = QueryService(make_session())
+    parent = DocumentChunk(
+        id="table-parent",
+        document_id="d1",
+        parse_version="canonical-v3",
+        chunk_role="parent",
+        block_type="table",
+        ordinal=1,
+        text="Table S3 amino-acid pKa values and model parameters.",
+    )
+    child = DocumentChunk(
+        id="table-child",
+        document_id="d1",
+        parse_version="canonical-v3",
+        parent_chunk_id=parent.id,
+        chunk_role="child",
+        block_type="table",
+        ordinal=2,
+        text="| Asp | 2.5 / 0.9 |",
+        source_spans=[{"table_id": "table-s3"}],
+    )
+    child.parent = parent
+
+    context = service._expand_child_hit(
+        child,
+        question="What values are reported for Asp in Table S3?",
+        score=10,
+        page_fields={},
+        evidence_kind="table",
+    )
+
+    assert context.prompt_text.count(child.text) == 1
+    assert "Matched child:" not in context.prompt_text
+
+
+def test_expand_child_hit_does_not_add_neighbor_context_to_table_child() -> None:
+    """Table rows are expanded by table identity, not adjacent chunk links."""
+    service = QueryService(make_session())
+    child = DocumentChunk(
+        id="table-child-current",
+        document_id="d1",
+        parse_version="canonical-v3",
+        chunk_role="child",
+        block_type="table",
+        ordinal=2,
+        previous_chunk_id="table-child-previous",
+        next_chunk_id="table-child-next",
+        text="| Asp | 2.5 / 0.9 |",
+        source_spans=[{"table_id": "table-s3"}],
+    )
+    previous = DocumentChunk(
+        id="table-child-previous",
+        document_id="d1",
+        parse_version="canonical-v3",
+        chunk_role="child",
+        block_type="table",
+        ordinal=1,
+        text="| Ala | 3.1 / 1.2 |",
+    )
+    following = DocumentChunk(
+        id="table-child-next",
+        document_id="d1",
+        parse_version="canonical-v3",
+        chunk_role="child",
+        block_type="table",
+        ordinal=3,
+        text="| Gly | 4.0 / 1.8 |",
+    )
+
+    neighbor_text = service._neighbor_context_text(
+        child,
+        "Compare the values in Table S3.",
+        related_chunks={previous.id: previous, following.id: following},
+    )
+
+    assert neighbor_text == ""
+
+
 def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -3222,6 +3452,58 @@ def test_answer_contains_extracted_metrics_requires_values_not_metric_names_only
         "Table 4 reports PubMedQA Accuracy 84.9 / F1 79.6 and BioASQ Accuracy 75.2 / F1 71.3.",
         metrics,
     )
+
+
+def test_deterministic_table_answer_reports_all_extracted_arbitrary_columns() -> None:
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-7-row",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-7",
+                ordinal=1,
+                text=(
+                    "Table 7\n| Model | Asp | C6 | exptl |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| OPLS5 | 21.0 | 8.95 | 95.3 |"
+                ),
+            )
+        ]
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-7-row",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=table.markdown,
+            ),
+            prompt_text="| OPLS5 | 21.0 | 8.95 | 95.3 |",
+            score=50,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=tuple(
+                extract_table_facts(
+                    "What are the OPLS5 Asp, C6, and exptl values in Table 7?",
+                    table,
+                )
+            ),
+        )
+    ]
+
+    answer = service._deterministic_table_answer_if_supported(
+        "What are the OPLS5 Asp, C6, and exptl values in Table 7?",
+        contexts,
+        "normal",
+    )
+
+    assert answer is not None
+    assert all(value in answer.answer_markdown for value in ("21.0", "8.95", "95.3"))
 
 
 def test_metric_query_without_extracted_metrics_does_not_return_generic_table_snippet() -> None:
@@ -4749,6 +5031,209 @@ def test_table_normalization_repairs_mineru_spaced_lj_parameter_labels() -> None
 
     assert "C6 (" in normalized
     assert "C12 (" in normalized
+
+
+def test_table_answer_prefers_requested_rg_rows_over_same_label_simulation_conditions() -> None:
+    service = QueryService(make_session())
+    question = (
+        "According to Table 2, what experimental and simulated Rg values are "
+        "reported for Abeta40 and ACTR by CHARMM36IDPSFF?"
+    )
+    tables = [
+        (
+            "Simulation conditions for ACTR.\n"
+            "| System | Length | Temperature |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 71 | 300 |"
+        ),
+        (
+            "Simulation conditions for ACTR replicate 1.\n"
+            "| System | Steps | Temperature |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 100 | 300 |"
+        ),
+        (
+            "Simulation conditions for ACTR replicate 2.\n"
+            "| System | Steps | Temperature |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 200 | 300 |"
+        ),
+        (
+            "Simulation conditions for ACTR replicate 3.\n"
+            "| System | Steps | Temperature |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 300 | 300 |"
+        ),
+        (
+            "Simulation conditions for ACTR replicate 4.\n"
+            "| System | Steps | Temperature |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 400 | 300 |"
+        ),
+        (
+            "Table 2. Average radius of gyration Rg.\n"
+            "| System | Experimental Rg | C36IDPSFF Rg |\n"
+            "| --- | --- | --- |\n"
+            "| Abeta40 | 12.0 | 11.53 |"
+        ),
+        (
+            "Table 2. Average radius of gyration Rg.\n"
+            "| System | Experimental Rg | C36IDPSFF Rg |\n"
+            "| --- | --- | --- |\n"
+            "| ACTR | 25.00 | 13.07 |"
+        ),
+    ]
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36idpsff",
+                page_title="CHARMM36IDPSFF",
+                page_kind="source_summary",
+                score=100 - index if index < 5 else 1,
+                excerpt=table,
+            ),
+            prompt_text=table,
+            score=100 - index if index < 5 else 1,
+            evidence_kind="table",
+        )
+        for index, table in enumerate(tables)
+    ]
+
+    answer = service._deterministic_table_answer_if_supported(question, contexts, "normal")
+
+    assert answer is not None
+    assert "Abeta40" in answer.answer_markdown
+    assert "12.0" in answer.answer_markdown
+    assert "11.53" in answer.answer_markdown
+    assert "ACTR" in answer.answer_markdown
+    assert "25.00" in answer.answer_markdown
+    assert "13.07" in answer.answer_markdown
+
+
+def test_generic_table_answer_covers_each_requested_opls5_table_facet() -> None:
+    service = QueryService(make_session())
+    question = (
+        "For OPLS5, what improvements over OPLS4 are reported for aromatic HFE, "
+        "salt-bridge pKa shift, GLU pKa, and binding RMSE?"
+    )
+    tables = [
+        (
+            "Table 4. Salt-bridge pKa shift.\n"
+            "| System | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| acetate-guanidinium A | -0.26 | -0.14 |\n"
+            "| acetate-guanidinium B | -0.30 | -0.16 |\n"
+            "| acetate-guanidinium C | -0.28 | -0.15 |\n"
+            "| acetate-guanidinium D | -0.24 | -0.13 |"
+        ),
+        (
+            "Table 5. GLU pKa errors.\n"
+            "| Set | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| GLU-A | 0.70 | 0.61 |\n"
+            "| GLU-B | 0.74 | 0.63 |\n"
+            "| GLU-C | 0.72 | 0.62 |\n"
+            "| GLU-D | 0.68 | 0.60 |"
+        ),
+        (
+            "Table 2. Aromatic molecule HFE errors.\n"
+            "| Metric | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| aromatic HFE RMSE | 0.76 | 0.46 |"
+        ),
+        (
+            "Table 7. Relative binding free-energy RMSE.\n"
+            "| Metric | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| binding RMSE | 1.18 | 1.12 |"
+        ),
+    ]
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=10 - index,
+                excerpt=table,
+            ),
+            prompt_text=table,
+            score=10 - index,
+            evidence_kind="table",
+        )
+        for index, table in enumerate(tables)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question,
+        contexts,
+        list(range(len(contexts))),
+        "normal",
+    )
+
+    assert answer is not None
+    for expected in (
+        "Table 2",
+        "0.76",
+        "0.46",
+        "Table 4",
+        "-0.26",
+        "-0.14",
+        "Table 5",
+        "0.70",
+        "0.61",
+        "Table 7",
+        "1.18",
+        "1.12",
+    ):
+        assert expected in answer.answer_markdown
+
+
+def test_finalize_table_contexts_retains_each_requested_multitable_facet() -> None:
+    service = QueryService(make_session())
+    question = (
+        "For OPLS5, what improvements over OPLS4 are reported for aromatic HFE, "
+        "salt-bridge pKa shift, GLU pKa, and binding RMSE?"
+    )
+    distractors = [
+        (
+            f"Table {20 + index}. General OPLS5 validation.\n"
+            "| System | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            f"| generic-{index} | {9 + index}.0 | {8 + index}.0 |"
+        )
+        for index in range(8)
+    ]
+    requested = [
+        "Table 2. Aromatic HFE.\n| Metric | OPLS4 | OPLS5 |\n| --- | --- | --- |\n| HFE RMSE | 0.76 | 0.46 |",
+        "Table 4. Salt-bridge pKa shift.\n| System | OPLS4 | OPLS5 |\n| --- | --- | --- |\n| salt bridge | -0.26 | -0.14 |",
+        "Table 5. GLU pKa.\n| Residue | OPLS4 | OPLS5 |\n| --- | --- | --- |\n| GLU | 0.70 | 0.61 |",
+        "Table 7. Binding RMSE.\n| Metric | OPLS4 | OPLS5 |\n| --- | --- | --- |\n| binding RMSE | 1.18 | 1.12 |",
+    ]
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=100 - index,
+                excerpt=table,
+            ),
+            prompt_text=table,
+            score=100 - index,
+            evidence_kind="table",
+        )
+        for index, table in enumerate([*distractors, *requested])
+    ]
+
+    finalized = service._finalize_contexts(contexts, question=question)
+    evidence = "\n".join(item.citation.excerpt for item in finalized)
+
+    assert len(finalized) == MAX_CONTEXTS
+    assert "Table 2." in evidence
+    assert "Table 4." in evidence
+    assert "Table 5." in evidence
+    assert "Table 7." in evidence
 
 
 def test_supported_term_note_appends_ff19sb_parameterization_anchors() -> None:

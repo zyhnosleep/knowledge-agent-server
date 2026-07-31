@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.agent_model_router import InferenceTarget
-from app.services.agent_synthesizer import AgentSynthesizer
+from app.services.agent_synthesizer import AgentSynthesizer, SynthesisPayload
 
 
 class FakeOllamaClient:
@@ -96,6 +96,71 @@ def test_synthesize_local_returns_structured_ollama_answer(monkeypatch) -> None:
     assert result["provider"] == "local"
     assert result["model"] == "qwen3.5:9b"
     assert result["answer_markdown"] == "Entropy measures the number of accessible states [0]."
+
+
+def test_synthesize_ollama_provider_dispatches_to_ollama_synthesis(monkeypatch) -> None:
+    """An explicit ``ollama`` provider must not fall through to external/fallback."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+    calls: list[dict] = []
+
+    def fake_ollama_synthesize(self, **kwargs):
+        calls.append(kwargs)
+        return {
+            "answer_markdown": "Synthesized by Ollama [0].",
+            "cited_indexes": [0],
+            "warnings": [],
+            "confidence": 0.9,
+            "provider": "ollama",
+            "model": "qwen3.5:9b-synthesis",
+        }
+
+    monkeypatch.setattr(AgentSynthesizer, "_ollama_synthesize", fake_ollama_synthesize)
+    syn = AgentSynthesizer()
+    result = syn.synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert calls and calls[0]["query"] == "What is entropy?"
+    assert result["provider"] == "ollama"
+    assert result["model"] == "qwen3.5:9b-synthesis"
+    assert result["model"] != "local-fallback"
+
+
+def test_synthesize_ollama_provider_uses_injected_client_and_structured_model(monkeypatch) -> None:
+    """The explicit provider uses the configured Ollama synthesis client."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    class FakeStructuredOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def generate_structured(self, schema, **kwargs):
+            self.calls.append({"schema": schema, **kwargs})
+            return SynthesisPayload(
+                answer_markdown="Synthesized by Ollama [0].",
+                cited_indexes=[0],
+                warnings=[],
+                confidence=0.9,
+            )
+
+    ollama = FakeStructuredOllama()
+    result = AgentSynthesizer(ollama_client=ollama).synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert result["provider"] == "ollama"
+    assert result["answer_markdown"] == "Synthesized by Ollama [0]."
+    assert ollama.calls and ollama.calls[0]["model"] == "qwen3.5:9b-synthesis"
 
 
 def test_synthesize_generation_target_calls_9b_once_as_plain_markdown(monkeypatch) -> None:
@@ -354,6 +419,13 @@ def _fake_settings_local():
     s.external_api_model = "gpt-4o-mini"
     s.external_api_base_url = "https://api.openai.com/v1"
     s.external_api_timeout = 90
+    return s
+
+
+def _fake_settings_ollama():
+    s = _fake_settings_local()
+    s.agent_synthesis_provider = "ollama"
+    s.ollama_synthesis_model = "qwen3.5:9b-synthesis"
     return s
 
 
@@ -1060,6 +1132,28 @@ def test_format_evidence_pack_section_empty_inputs() -> None:
     assert AgentSynthesizer._format_evidence_pack_section(
         {"status": "ok", "items": [{"excerpt": "", "evidence_kind": "source_chunk"}]}
     ) == ""
+
+
+def test_table_facts_bypass_generic_excerpt_cap() -> None:
+    evidence_pack = {
+        "status": "ok",
+        "items": [{"index": 0, "evidence_kind": "table", "excerpt": "short"}],
+        "table_facts": [
+            {
+                "table_id": "table-7",
+                "row_label": "OPLS5",
+                "column": "C6",
+                "value": "8.95",
+            }
+        ],
+    }
+
+    prompt = AgentSynthesizer._format_table_facts_section(evidence_pack)
+
+    assert "table-7" in prompt
+    assert "OPLS5" in prompt
+    assert "C6" in prompt
+    assert "8.95" in prompt
 
 
 def test_retry_uses_same_evidence_pack_format(monkeypatch) -> None:

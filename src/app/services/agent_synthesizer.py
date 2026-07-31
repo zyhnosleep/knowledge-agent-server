@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+"""
+Agent Synthesizer：基于检索证据生成最终答案。
+
+为什么需要这个模块？
+RAG（检索增强生成）返回的答案通常只是“把检索到的片段拼接/改写”，存在以下问题：
+1. 可能重复、啰嗦、语言不一致；
+2. 可能遗漏关键证据（尤其是数值、指标、对比类信息）；
+3. 引用格式不统一，难以追踪；
+4. 没有根据 query route（如 evidence_required、table_or_metric）做针对性整合。
+
+AgentSynthesizer 的职责：
+- 接收 RAG 初稿、引用片段、evidence_pack；
+- 让模型“综合”而非“拼接”证据，生成简洁、 grounded、带引用的最终答案；
+- 支持本地 Ollama 和外部 API 两种 provider；
+- 对 evidence-heavy 的 route，检测是否遗漏关键证据锚点，必要时 retry；
+- 失败时安全回退到 RAG 初稿。
+"""
+
 import json
 import logging
 import re
@@ -10,11 +28,37 @@ from typing import Any
 
 import httpx
 
+from pydantic import BaseModel, Field
+
 from app.core.config import get_settings
 from app.services.ai import OllamaClient
 from app.services.agent_model_router import InferenceTarget
 
 logger = logging.getLogger(__name__)
+import logging
+import re
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+import httpx
+
+from pydantic import BaseModel, Field
+
+from app.core.config import get_settings
+from app.services.ai import OllamaClient
+from app.services.agent_model_router import InferenceTarget
+
+logger = logging.getLogger(__name__)
+
+
+class SynthesisPayload(BaseModel):
+    """Response shape for evidence synthesis."""
+    answer_markdown: str
+    cited_indexes: list[int] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
 
 
 class AgentSynthesizer:
@@ -28,18 +72,20 @@ class AgentSynthesizer:
     (not concatenate paragraphs) and to cite only from provided citations.
     """
 
-    VALID_PROVIDERS = {"auto", "external_api", "local"}
+    # 合法的 synthesis provider：auto 会根据配置自动选择。
+    VALID_PROVIDERS = {"auto", "external_api", "local", "ollama"}
 
-    # Bounds for evidence-pack prompt section (Phase 3)
+    # evidence_pack 在 prompt 中的上限：最多 10 条，每条摘录最多 300 字符。
     MAX_EVIDENCE_PACK_ITEMS = 10
     MAX_EXCERPT_CHARS = 300
+    MAX_TABLE_FACTS = 128
 
     def __init__(self, ollama_client: OllamaClient | None = None) -> None:
         self._settings = get_settings()
         self._ollama = ollama_client
 
     # ------------------------------------------------------------------
-    # public API
+    # 公开 API
     # ------------------------------------------------------------------
 
     def synthesize(
@@ -55,10 +101,10 @@ class AgentSynthesizer:
     ) -> dict[str, Any]:
         """Synthesize a final answer from RAG evidence.
 
-        Optionally accepts ``evidence_pack`` (a dict with ``status`` and
-        ``items`` keys) from the retrieve step.  The local fallback path
-        ignores it; the external path includes evidence item excerpts in
-        the prompt when available.
+        根据配置选择 provider：
+        - local：使用本地 Ollama 重新综合生成。
+        - external_api：调用外部 API 进行综合。
+        - auto：外部 API 可用且有 key 时优先外部，否则回退 local。
 
         Returns a dict with at least:
         ``answer_markdown``, ``cited_indexes``, ``warnings``,
@@ -75,6 +121,16 @@ class AgentSynthesizer:
                 citations=citations,
                 evidence_pack=evidence_pack,
                 target=target or self._default_target(),
+            )
+
+        if provider == "ollama":
+            return self._ollama_synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
             )
 
         # external_api path
@@ -100,7 +156,10 @@ class AgentSynthesizer:
         event_sink: Callable[[str, dict[str, Any]], None],
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Stream local Ollama deltas while assembling the normal result shape."""
+        """流式生成版本：本地 Ollama 逐 token 返回，同时组装标准结果结构。
+
+        如果当前 provider 不是 local，则退回到非流式 synthesize()。
+        """
         resolved_target = target or self._default_target()
         if self._resolve_provider() != "local":
             result = self.synthesize(
@@ -190,11 +249,11 @@ class AgentSynthesizer:
         return result
 
     # ------------------------------------------------------------------
-    # helpers
+    # 辅助方法
     # ------------------------------------------------------------------
 
     def _resolve_provider(self) -> str:
-        """Determine which provider to use based on settings."""
+        """根据 settings 决定使用哪个 provider。"""
         configured = self._settings.agent_synthesis_provider
         if configured not in self.VALID_PROVIDERS:
             logger.warning(
@@ -206,10 +265,16 @@ class AgentSynthesizer:
         if configured == "local":
             return "local"
 
+        if configured == "ollama":
+            return "ollama"
+
         if configured == "external_api":
             return "external_api"
 
-        # "auto": use external API only if enabled and key is set
+        # "auto": prefer external API when available, otherwise use the
+        # existing local Ollama generation path.  The explicit ``ollama``
+        # provider is reserved for structured synthesis via
+        # ``_ollama_synthesize``.
         if self._settings.external_api_enabled and bool(self._settings.external_api_key):
             return "external_api"
         return "local"
@@ -217,7 +282,10 @@ class AgentSynthesizer:
     def _local_fallback(
         self, rag_answer: str, citations: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Deterministic local fallback: keep the RAG answer as-is."""
+        """安全回退：当本地/外部综合失败或没有证据时，直接返回 RAG 原答案。
+
+        这不是“agent 再生成一遍”的路径，而是兜底，确保用户始终有答案可看。
+        """
         return {
             "answer_markdown": rag_answer,
             "cited_indexes": list(range(len(citations))),
@@ -238,7 +306,7 @@ class AgentSynthesizer:
         evidence_pack: dict[str, Any] | None = None,
         target: InferenceTarget,
     ) -> dict[str, Any]:
-        """Synthesize a cited answer with the configured local Ollama model."""
+        """使用本地 Ollama 模型对证据进行综合，生成带引用的最终答案。"""
         if not citations and not (evidence_pack or {}).get("items"):
             return self._local_fallback(rag_answer, citations)
 
@@ -303,6 +371,14 @@ class AgentSynthesizer:
         citations: list[dict[str, Any]],
         evidence_pack: dict[str, Any] | None,
     ) -> list[dict[str, str]]:
+        """构建本地 Ollama 的 system + user prompt。
+
+        Prompt 设计要点：
+        1. 明确告诉模型“综合证据，而不是重复 RAG 草稿”。
+        2. 强制使用与问题相同的语言（中文问题用中文回答）。
+        3. 只能引用提供的 [index] 引用，不能编造事实。
+        4. evidence_pack 里的标签是检索元数据，不是引用索引，避免误引用。
+        """
         evidence_parts: list[str] = []
         for index, citation in enumerate(citations):
             excerpt = str(citation.get("excerpt") or "").strip()
@@ -462,6 +538,114 @@ class AgentSynthesizer:
             suffix = f"\n  … ({total - emitted} more items omitted)"
         return header + "\n" + "\n".join(lines) + suffix
 
+    @staticmethod
+    def _format_table_facts_section(
+        evidence_pack: dict[str, Any] | None,
+    ) -> str:
+        """Render exact table facts without the generic excerpt cap."""
+
+        if not evidence_pack or not evidence_pack.get("table_facts"):
+            return ""
+        facts = evidence_pack.get("table_facts")
+        if not isinstance(facts, list):
+            return ""
+        lines: list[str] = []
+        for fact in facts[: AgentSynthesizer.MAX_TABLE_FACTS]:
+            if not isinstance(fact, dict):
+                continue
+            value = str(fact.get("value") or "").strip()
+            if not value:
+                continue
+            lines.append(
+                "  table={table} row={row} column={column} value={value}".format(
+                    table=fact.get("table_id", "?"),
+                    row=fact.get("row_label", "?"),
+                    column=fact.get("column", "?"),
+                    value=value,
+                )
+            )
+        if not lines:
+            return ""
+        return (
+            "Canonical table facts (exact source values; preserve every value):\n"
+            + "\n".join(lines)
+        )
+
+    def _ollama_synthesize(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize evidence using local Ollama."""
+        model = self._settings.ollama_synthesis_model or self._settings.ollama_generation_model
+        client = self._ollama or OllamaClient(
+            base_url=self._settings.ollama_generation_base_url,
+            embedding_base_url=self._settings.ollama_embedding_base_url,
+        )
+
+        evidence_parts: list[str] = []
+        for i, c in enumerate(citations):
+            excerpt = c.get("excerpt", "")
+            title = c.get("page_title") or c.get("document_id", "")
+            if excerpt:
+                evidence_parts.append(f"[{i}] {title}: {excerpt}")
+        evidence_text = "\n\n".join(evidence_parts) if evidence_parts else "(no evidence)"
+        table_facts_text = self._format_table_facts_section(evidence_pack)
+
+        system_prompt = (
+            "You are an evidence synthesis assistant. Your task is to synthesize "
+            "a final answer from the provided RAG answer and evidence excerpts. "
+            "You MUST synthesize - do NOT simply concatenate paragraphs. "
+            "Only cite sources that are present in the provided evidence."
+        )
+
+        user_prompt = (
+            f"Original query: {query}\n"
+            f"Route type: {route}\n"
+            f"Conversation context: {conversation_summary or '(none)'}\n\n"
+            f"RAG answer: {rag_answer}\n\n"
+            f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
+            + (f"{table_facts_text}\n\n" if table_facts_text else "")
+            + "Synthesize a final answer from the above evidence. "
+            "Return a JSON object with: answer_markdown, cited_indexes, warnings, confidence."
+        )
+
+        try:
+            result = client.generate_structured(
+                SynthesisPayload,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+            )
+        except Exception as exc:
+            logger.warning("Ollama synthesis failed: %s", exc)
+            fallback = self._local_fallback(rag_answer, citations)
+            fallback["warnings"].append(
+                f"Ollama synthesis failed ({exc}); using local fallback."
+            )
+            return fallback
+
+        max_idx = len(citations)
+        sanitized = [
+            i for i in result.cited_indexes
+            if isinstance(i, int) and 0 <= i < max_idx
+        ]
+
+        return {
+            "answer_markdown": result.answer_markdown,
+            "cited_indexes": sanitized,
+            "warnings": list(result.warnings),
+            "confidence": float(result.confidence),
+            "provider": "ollama",
+            "model": model,
+        }
+
+
     def _external_synthesize(
         self,
         *,
@@ -472,10 +656,7 @@ class AgentSynthesizer:
         citations: list[dict[str, Any]],
         evidence_pack: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call the external API for evidence synthesis.
-
-        On failure, returns a fallback result with a warning — never crashes.
-        """
+        """调用外部 API 进行综合；失败时安全回退，绝不抛异常。"""
         if not self._settings.external_api_enabled or not bool(self._settings.external_api_key):
             result = self._local_fallback(rag_answer, citations)
             result["warnings"].append(
@@ -495,6 +676,7 @@ class AgentSynthesizer:
 
         # Include bounded evidence pack section when available
         evidence_pack_text = self._format_evidence_pack_section(evidence_pack)
+        table_facts_text = self._format_table_facts_section(evidence_pack)
 
         system_prompt = (
             "You are an evidence synthesis assistant. Your task is to synthesize "
@@ -513,6 +695,7 @@ class AgentSynthesizer:
             f"RAG answer: {rag_answer}\n\n"
             f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
             + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + (f"{table_facts_text}\n\n" if table_facts_text else "")
             + "Synthesize a final answer from the above evidence. "
             "Return only a JSON object."
         )
@@ -586,7 +769,9 @@ class AgentSynthesizer:
                     "fallback was available."
                 )
 
-        # ---- bounded coverage retry (Phase 3) ----
+        # ---- 覆盖度重试（Phase 3） ----
+        # 对 evidence-heavy 的 route，如果首次综合遗漏了关键证据锚点，
+        # 则用显式锚点列表再次调用 API，要求模型把这些证据包含进去。
         if answer_markdown and self._should_retry_for_coverage(
             route=route,
             evidence_pack=evidence_pack,
@@ -621,7 +806,7 @@ class AgentSynthesizer:
         }
 
     # ------------------------------------------------------------------
-    # coverage retry helpers (Phase 3)
+    # 覆盖度重试辅助方法（Phase 3）
     # ------------------------------------------------------------------
 
     @staticmethod

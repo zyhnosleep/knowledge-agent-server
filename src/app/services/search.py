@@ -346,7 +346,7 @@ class QueryService:
         LLM、不验证、不持久化 QuestionAnswer。当提供 *document_id* 时，
         检索被限定在单篇文档内，不 fallback 到整个项目。
         """
-        from app.schemas.agent import EvidenceItem, EvidencePack
+        from app.schemas.agent import EvidenceItem, EvidencePack, TableFactEvidence
 
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
         if project is None:
@@ -365,6 +365,8 @@ class QueryService:
             if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
         items: list[EvidenceItem] = []
+        table_facts: list[TableFactEvidence] = []
+        seen_table_facts: set[tuple[str, str, str, int, str, str]] = set()
         for idx, ctx in enumerate(contexts[:limit]):
             evidence_kind = self._context_evidence_kind(ctx)
             source_stage = self._determine_source_stage(ctx)
@@ -394,8 +396,32 @@ class QueryService:
                     support_hint=support_hint,
                 )
             )
+            for fact in ctx.table_facts:
+                key = (
+                    fact.document_id,
+                    fact.parse_version,
+                    fact.table_id,
+                    fact.row_index,
+                    fact.column,
+                    fact.value,
+                )
+                if key in seen_table_facts:
+                    continue
+                seen_table_facts.add(key)
+                table_facts.append(
+                    TableFactEvidence(
+                        table_id=fact.table_id,
+                        document_id=fact.document_id,
+                        parse_version=fact.parse_version,
+                        row_label=fact.row_label,
+                        column=fact.column,
+                        value=fact.value,
+                        row_index=fact.row_index,
+                        source_chunk_ids=list(fact.source_chunk_ids),
+                    )
+                )
         status = "ok" if items else "empty"
-        return EvidencePack(status=status, items=items)
+        return EvidencePack(status=status, items=items, table_facts=table_facts)
 
     def _validate_document_scope(
         self, project_id: str, document_id: str | None
@@ -3902,6 +3928,10 @@ class QueryService:
         row_selectors = self._question_row_selectors(question)
         results: list[ExtractedMetric] = []
         for index in table_indexes:
+            fact_metrics = self._table_fact_metrics(contexts[index], index)
+            if fact_metrics:
+                results.extend(fact_metrics)
+                continue
             text = self._context_table_evidence_text(contexts[index])
             table_label = self._extract_table_label(text)
             requested = self._requested_datasets_for_table(question, text)
@@ -3937,6 +3967,26 @@ class QueryService:
                 break
         return ordered
 
+    @staticmethod
+    def _table_fact_metrics(
+        context: RetrievedContext,
+        context_index: int,
+    ) -> list[ExtractedMetric]:
+        """Convert complete table facts into the existing answer metric shape."""
+
+        if not context.table_facts:
+            return []
+        grouped: dict[str, dict[str, str]] = {}
+        for fact in context.table_facts:
+            row_label = fact.row_label or "Table row"
+            grouped.setdefault(row_label, {})[fact.column] = fact.value
+        table_label = context.table_context.label if context.table_context else None
+        return [
+            ExtractedMetric(context_index, table_label, row_label, values)
+            for row_label, values in grouped.items()
+            if values
+        ]
+
     @classmethod
     def _requested_datasets_for_contexts(
         cls,
@@ -3957,6 +4007,8 @@ class QueryService:
 
     @staticmethod
     def _context_table_evidence_text(context: RetrievedContext) -> str:
+        if context.table_context is not None and context.table_context.markdown.strip():
+            return context.table_context.markdown
         return QueryService._context_evidence_text(context)
 
     @classmethod

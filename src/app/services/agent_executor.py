@@ -1,5 +1,27 @@
 from __future__ import annotations
 
+"""
+Agent Executor：单轮 Agent 查询的编排器。
+
+整个执行流程是确定性的、有界的循环，不是自由 LLM ReAct：
+1. route      — 用 PolicyRouter 分类查询意图
+2. plan       — 仅 complex_multi_hop 路由生成可审计计划
+3. retrieve   — 调用 rag.retrieve_evidence 获取证据包
+4. rag.answer — 调用 RAG 生成草稿答案
+5. synthesize — 调用 answer.synthesize 综合终稿
+6. verify     — 调用 answer.verify 质量检查
+7. retry      — 若验证建议重试且路由允许，最多再调一次 rag.answer
+8. finalize   — 组装 AgentQueryResponse，持久化 trace
+
+关键约束：
+- max_steps：严格限制 trace 步数；
+- max_tool_calls：严格限制工具调用次数；
+- timeout_seconds：总超时限制；
+- needs_clarification 路由直接返回，不走 RAG。
+
+所有工具调用都通过 ToolRegistry，AgentExecutor 本身不直接访问 RAG 内部。
+"""
+
 import logging
 import threading
 import time
@@ -37,7 +59,11 @@ settings = get_settings()
 
 
 class _EventStepList(list[AgentStep]):
-    """List that forwards completed trace steps to a live event sink."""
+    """带事件转发的 AgentStep 列表。
+
+    每次 append 一个 step 时，自动通过 event_sink 推送 "route" 或 "step" 事件，
+    供前端/日志实时展示执行进度。
+    """
 
     def __init__(self, event_sink: Callable[[str, dict[str, Any]], None] | None):
         super().__init__()
@@ -97,10 +123,10 @@ class AgentExecutor:
     # ------------------------------------------------------------------
 
     def execute(self, request: AgentQueryRequest) -> AgentQueryResponse:
-        """Run the agent loop and return a structured response.
+        """执行单轮 Agent 查询并返回结构化响应。
 
-        ``max_steps`` is a strict trace boundary — no step is appended
-        when ``len(steps) >= constraints.max_steps``.
+        流程中的所有步骤都受到 constraints.max_steps 限制；
+        当 len(steps) >= max_steps 时，不再追加新 step，直接截断返回。
         """
         request_id = str(uuid4())
         session_id = request.session_id or f"sess_{uuid4().hex[:12]}"
@@ -111,7 +137,7 @@ class AgentExecutor:
         t_start = time.monotonic()
         max_steps_hit = False
 
-        # ---- touch conversation session TTL ----
+        # ---- 会话维护：更新 TTL、清理过期会话 ----
         self._memory.touch_session(
             session_id,
             project_slug=request.project_slug,
@@ -120,18 +146,17 @@ class AgentExecutor:
         )
         self._memory.purge_expired_sessions()
 
-        # ---- record user turn ----
+        # ---- 记录用户本轮输入 ----
         self._memory.add_turn(
             session_id, role="user", content=request.query, step_type="user_query"
         )
         self._compact_if_needed(session_id, constraints)
-        # Release SQLite's write lock before retrieval and model calls, which
-        # may take much longer than the initial conversation bookkeeping.
+        # 在长时间检索和模型调用前提交会话写入，释放 SQLite 写锁。
         self._commit_progress()
 
         try:
             # ==============================================================
-            # Step 0: route
+            # Step 0: 路由 — 决定查询类型和后续策略
             # ==============================================================
             route_t0 = time.monotonic()
             route = PolicyRouter().route(request.query)
@@ -157,7 +182,7 @@ class AgentExecutor:
             max_steps_hit = len(steps) >= constraints.max_steps
 
             # ==============================================================
-            # Step 0.5: plan (complex_multi_hop only)
+            # Step 0.5: 计划 — 仅 complex_multi_hop 路由生成受控计划
             # ==============================================================
             if route.route == "complex_multi_hop" and not max_steps_hit:
                 plan = ComplexPlan(
@@ -206,7 +231,7 @@ class AgentExecutor:
                 steps.append(plan_step)
                 max_steps_hit = len(steps) >= constraints.max_steps
 
-            # ---- needs_clarification: return early ----
+            # ---- needs_clarification：无需 RAG，直接返回澄清提示 ----
             if route.route == "needs_clarification":
                 warnings.append(
                     f"Query needs clarification: {route.reason}. "
@@ -276,9 +301,9 @@ class AgentExecutor:
                 )
 
             # ==============================================================
-            # Normal routes: retrieve → rag.answer → synthesize → verify
+            # 常规路由：检索 → RAG 草稿 → 综合 → 验证 →（可选）重试
             # ==============================================================
-            # Stop early if step budget already exhausted
+            # 如果 step budget 已耗尽，直接截断返回
             if max_steps_hit:
                 status = self._finalize_truncated(
                     steps, usage, warnings, route, constraints,
@@ -319,7 +344,7 @@ class AgentExecutor:
                     "Answered only from temporary attachments scoped to this session."
                 )
             else:
-                # ---- rag.retrieve_evidence (v4) ----
+                # ---- 从项目知识库检索证据（v4） ----
                 evidence_pack = self._run_retrieve_evidence(
                     request.project_slug,
                     retrieval_query,
@@ -330,7 +355,7 @@ class AgentExecutor:
                     session_id,
                 )
 
-                # ---- session-scoped temporary attachments ----
+                # ---- 合并当前会话的临时附件证据 ----
                 if session_attachment_pack is None:
                     session_attachment_pack = self._run_retrieve_session_attachments(
                         request.project_slug,
@@ -345,6 +370,7 @@ class AgentExecutor:
                 )
 
                 self._commit_progress()
+                # ---- 调用 RAG 生成草稿答案 ----
                 answer_text, citations, tool_calls_used = self._run_rag_answer(
                     request.project_slug,
                     retrieval_query,
@@ -359,7 +385,7 @@ class AgentExecutor:
                 if attachment_citations:
                     citations = self._merge_citations(citations, attachment_citations)
 
-                # ---- detect insufficient evidence ----
+                # ---- 检测证据不足 ----
                 _evidence_insufficient = bool(
                     answer_text and _INSUFFICIENT_EVIDENCE_RE.search(answer_text)
                 )
@@ -379,7 +405,7 @@ class AgentExecutor:
                         "the target documents."
                     )
 
-            # ---- answer.synthesize (v3) ----
+            # ---- answer.synthesize：把 RAG 草稿综合为终稿 ----
             synth_provider = "local"
             synth_model = "local-fallback"
             if not max_steps_hit and not attachment_only:
@@ -404,12 +430,12 @@ class AgentExecutor:
                     synth_warnings = synth_data.get("warnings", [])
                     if isinstance(synth_warnings, list):
                         warnings.extend(synth_warnings)
-                    # Sanitize citations against synthesis cited_indexes
+                    # 根据综合结果过滤引用：只保留被明确引用的 citation
                     cited_indexes = synth_data.get("cited_indexes", [])
                     if isinstance(cited_indexes, list) and cited_indexes:
                         citations = [c for i, c in enumerate(citations) if i in cited_indexes]
 
-            # ---- answer.verify ----
+            # ---- answer.verify：质量验证 ----
             verify_result = self._run_verify(
                 request.query,
                 answer_text,
@@ -428,7 +454,7 @@ class AgentExecutor:
                 if isinstance(verify_warnings, list):
                     warnings.extend(verify_warnings)
 
-            # ---- retry (at most one additional rag.answer) ----
+            # ---- 重试：验证建议重试且路由允许时，最多再调一次 rag.answer ----
             retry_recommended = (
                 verify_result["ok"]
                 and verify_result.get("result", {}).get("retry_recommended", False)
@@ -457,7 +483,7 @@ class AgentExecutor:
                         citations = retry_citations
                     warnings.append("Retry performed after verification warning")
 
-            # ---- check max_steps ----
+            # ---- 检查 max_steps 是否耗尽 ----
             hit_limit = len(steps) >= constraints.max_steps
             if hit_limit:
                 warnings.append(
@@ -466,7 +492,7 @@ class AgentExecutor:
                 )
 
             # ==============================================================
-            # Finalize (only if step budget remains)
+            # Finalize：组装最终响应
             # ==============================================================
             if not hit_limit:
                 step_id = len(steps)
@@ -552,6 +578,7 @@ class AgentExecutor:
             )
 
         except Exception as exc:
+            # ---- 执行异常：记录错误 trace 并返回 error 状态 ----
             logger.exception("AgentExecutor.execute failed")
             if len(steps) < constraints.max_steps:
                 steps.append(
@@ -603,11 +630,11 @@ class AgentExecutor:
             )
 
     # ------------------------------------------------------------------
-    # helpers
+    # 辅助方法
     # ------------------------------------------------------------------
 
     def _commit_progress(self) -> None:
-        """Persist short bookkeeping writes before a potentially long step."""
+        """在可能耗时较长的步骤前提交数据库事务，释放写锁。"""
         try:
             self._db.commit()
         except Exception:
@@ -616,7 +643,7 @@ class AgentExecutor:
 
     @staticmethod
     def _is_attachment_only_query(query: str) -> bool:
-        """Return whether a query explicitly limits evidence to attachments."""
+        """判断用户是否明确要求只使用当前会话的临时附件作答。"""
         normalized = " ".join(query.lower().split())
         has_attachment = any(
             term in normalized
@@ -654,7 +681,7 @@ class AgentExecutor:
         t_start: float,
         request: AgentQueryRequest,
     ) -> AgentQueryResponse:
-        """Build a response when the step budget was exhausted early."""
+        """当 step budget 在早期就耗尽时，返回截断的响应。"""
         warnings.append(
             f"Reached max_steps limit ({constraints.max_steps}). "
             "Trace truncated — no tool calls were made."
@@ -733,10 +760,9 @@ class AgentExecutor:
         usage: AgentUsage,
         session_id: str,
     ) -> dict[str, Any] | None:
-        """Call rag.retrieve_evidence, record step, return evidence pack dict.
+        """调用 rag.retrieve_evidence 工具，记录 step，返回 evidence pack。
 
-        Returns ``None`` when the tool is not registered or limits are hit.
-        The returned dict has keys: ``status``, ``items`` (list of dicts).
+        如果工具未注册、或已达到 max_tool_calls / max_steps 限制，返回 None。
         """
         # Skip if tool is not registered (backward compatibility)
         try:
@@ -843,10 +869,9 @@ class AgentExecutor:
         usage: AgentUsage,
         session_id: str,
     ) -> tuple[str, list[Citation], int]:
-        """Call rag.answer, record step, return (answer_text, citations, tool_calls_used).
+        """调用 rag.answer 工具，记录 step，返回 (答案文本, 引用列表, 实际工具调用数)。
 
-        Returns (\"\", [], 0) when ``max_tool_calls`` or ``max_steps``
-        would be violated.
+        如果受 max_tool_calls / max_steps 限制，返回 ("", [], 0)。
         """
         # Enforce limits
         if usage.tool_calls >= constraints.max_tool_calls:
@@ -939,11 +964,10 @@ class AgentExecutor:
         usage: AgentUsage,
         tool_calls_so_far: int,
     ) -> dict[str, Any]:
-        """Call answer.verify, record step, return tool result dict.
+        """调用 answer.verify 工具，记录 step，返回工具结果。
 
-        Returns a no-op dict when ``max_tool_calls`` or ``max_steps``
-        would be violated.  Only increments ``usage.tool_calls`` when a
-        step is actually appended.
+        如果受限制，返回 no-op 结果（不触发重试）。
+        验证工具会返回 retry_recommended，决定是否进入后续重试逻辑。
         """
         # Enforce limits
         if usage.tool_calls >= constraints.max_tool_calls:
@@ -1032,12 +1056,10 @@ class AgentExecutor:
         evidence_pack: dict[str, Any] | None = None,
         target: InferenceTarget | None = None,
     ) -> dict[str, Any]:
-        """Call answer.synthesize, record step, return tool result dict.
+        """调用 answer.synthesize 工具，记录 step，返回工具结果。
 
-        Returns a no-op dict when ``max_tool_calls`` or ``max_steps``
-        would be violated.  When *evidence_pack* is provided, it is
-        passed through to the synthesis tool and compact evidence-aware
-        metadata is recorded on the step.
+        如果受 max_tool_calls / max_steps 限制，返回 no-op 结果（保持原答案）。
+        会把 evidence_pack 和 conversation_summary 传给综合工具。
         """
         # Enforce limits
         if usage.tool_calls >= constraints.max_tool_calls:
@@ -1203,7 +1225,12 @@ class AgentExecutor:
             return ""
 
     def _contextualize_retrieval_query(self, session_id: str, query: str) -> str:
-        """Turn short referential follow-ups into self-contained RAG queries."""
+        """把简短的指代性追问扩展为自包含的 RAG 查询。
+
+        例如用户先问“这篇文章的方法是什么”，再问“它的准确率呢？”；
+        第二个 query 很短且包含“它”，需要把前一个问题拼接进去，
+        否则 RAG 检索不到上下文。
+        """
         normalized = query.strip()
         follow_up_markers = (
             "详细",
@@ -1311,8 +1338,11 @@ class AgentExecutor:
         """
         base = dict(base_pack) if base_pack else {"status": "empty", "items": []}
         items = list(base.get("items", []))
+        table_facts = list(base.get("table_facts", []))
         if session_pack and session_pack.get("items"):
             items.extend(session_pack["items"])
+        if session_pack and session_pack.get("table_facts"):
+            table_facts.extend(session_pack["table_facts"])
         # Renumber indexes deterministically.
         for idx, item in enumerate(items, start=1):
             item["index"] = idx
@@ -1325,7 +1355,7 @@ class AgentExecutor:
             status = "ok"
         if status == "project_not_found" and items:
             status = "ok"
-        return {"status": status, "items": items}
+        return {"status": status, "items": items, "table_facts": table_facts}
 
     @staticmethod
     def _session_attachment_citations(
@@ -1415,7 +1445,7 @@ class AgentExecutor:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 characters per token."""
+    """粗略估算 token 数：按每 4 个字符 1 个 token 计算。"""
     if not text:
         return 0
     return max(1, len(text) // 4)
