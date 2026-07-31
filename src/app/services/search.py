@@ -3457,11 +3457,19 @@ class QueryService:
                 if facet.lower() in text.lower():
                     score += 6.0
             for anchor in self._query_priority_anchors(question)["figure_table"]:
-                if anchor.lower() in text.lower():
-                    score += 8.0
+                if self._selector_matches_text(anchor, text, text_key):
+                    # An explicitly named table/figure is a hard relevance
+                    # signal: it must outrank an unrelated high-score table.
+                    score += 100.0
             for anchor in self._query_priority_anchors(question)["dataset"]:
                 if anchor.lower() in text.lower():
                     score += 8.0
+            for term in self._extract_generic_table_terms(question):
+                if self._selector_matches_text(term, text, text_key):
+                    score += self._generic_table_term_weight(term) * 3.0
+            for selector in self._question_row_selectors(question):
+                if self._selector_matches_text(selector, text, text_key):
+                    score += 6.0
             if any(metric in text.lower() for metric in ("f1", "auc", "precision", "recall", "score")):
                 score += 3.0
             scored.append((score, index))
@@ -3653,6 +3661,7 @@ class QueryService:
     ) -> QueryAnswerPayload | None:
         citations: list[int] = []
         parts: list[str] = []
+        rows_by_context: list[tuple[int, str, list[dict[str, str]]]] = []
         for index in table_indexes:
             text = self._context_table_evidence_text(contexts[index])
             rows = self._generic_table_value_rows(question, text)
@@ -3661,19 +3670,31 @@ class QueryService:
             if index not in citations:
                 citations.append(index)
             table_label = self._extract_table_label(text)
-            for row in rows[:8]:
-                if len(parts) >= 8:
+            rows_by_context.append((index, table_label, rows))
+            continue
+        if rows_by_context:
+            selected_rows: list[tuple[str, dict[str, str]]] = []
+            row_offset = 0
+            while len(selected_rows) < 8:
+                added = False
+                for _index, table_label, rows in rows_by_context:
+                    if row_offset >= len(rows) or len(selected_rows) >= 8:
+                        continue
+                    selected_rows.append((table_label, rows[row_offset]))
+                    added = True
+                if not added:
                     break
+                row_offset += 1
+            for table_label, row in selected_rows:
                 prefix = f"{table_label} " if table_label else ""
                 label = " - ".join(item for item in (row.get("group"), row.get("property")) if item)
                 values = row.get("values", "")
-                if label and values:
-                    if self._is_chinese_question(question):
-                        parts.append(f"{prefix}对于 {label}，各列对应的表格数值为：{values}".strip())
-                    else:
-                        parts.append(f"{prefix}{label}: {values}".strip())
-            if len(parts) >= 8:
-                break
+                if not label or not values:
+                    continue
+                if self._is_chinese_question(question):
+                    parts.append(f"{prefix}对于 {label}，各列对应的表格数值为：{values}".strip())
+                else:
+                    parts.append(f"{prefix}{label}: {values}".strip())
         if not parts:
             return None
         citation_marker = f" [{citations[0]}]" if citations else ""
@@ -5077,9 +5098,33 @@ class QueryService:
                     evidence_kind=context.evidence_kind,
                 )
             )
-        sorted_contexts = sorted(
-            expanded_contexts, key=lambda item: item.score, reverse=True
-        )
+        table_query = self._is_table_query(question) or self._is_metric_query(question)
+
+        def context_sort_key(context: RetrievedContext) -> tuple[float, float]:
+            """Prioritize explicitly requested table facets before raw score.
+
+            A lexical/vector hit from an unrelated high-scoring table must not
+            displace a lower-scoring table that the question names directly.
+            The raw retrieval score remains the deterministic tie-breaker.
+            """
+
+            if not table_query:
+                return (0.0, context.score)
+            text = self._context_table_evidence_text(context)
+            text_key = self._normalize_selector(text)
+            relevance = 0.0
+            for anchor in self._query_priority_anchors(question)["figure_table"]:
+                if self._selector_matches_text(anchor, text, text_key):
+                    relevance += 100.0
+            for term in self._extract_generic_table_terms(question):
+                if self._selector_matches_text(term, text, text_key):
+                    relevance += self._generic_table_term_weight(term) * 3.0
+            for selector in self._question_row_selectors(question):
+                if self._selector_matches_text(selector, text, text_key):
+                    relevance += 6.0
+            return (relevance, context.score)
+
+        sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
         deduped: list[RetrievedContext] = []
         seen_keys: set[str] = set()
         page_counts: dict[str, int] = {}
@@ -5103,6 +5148,8 @@ class QueryService:
                     len(sorted_contexts)
                     if self._context_evidence_kind(context) == "profile-term"
                     else context_limit
+                    if table_query
+                    else min(5, context_limit)
                 )
                 if current_count >= per_page_limit:
                     continue
