@@ -17,6 +17,7 @@ from app.core.config import get_settings
 
 def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
@@ -97,6 +98,7 @@ def _configure_sqlite_engine(target_engine: Engine) -> None:
     if not event.contains(target_engine, "connect", _enable_sqlite_foreign_keys):
         event.listen(target_engine, "connect", _enable_sqlite_foreign_keys)
     with target_engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
         connection.commit()
 
