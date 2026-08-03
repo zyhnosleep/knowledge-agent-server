@@ -5125,7 +5125,7 @@ class QueryService:
             evidence_priority = (
                 1.0 if self._context_evidence_kind(context) == "table" else 0.0
             )
-            return (evidence_priority, relevance, context.score)
+            return (relevance, evidence_priority, context.score)
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
         deduped: list[RetrievedContext] = []

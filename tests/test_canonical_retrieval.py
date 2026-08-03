@@ -1191,6 +1191,56 @@ def test_table_query_does_not_let_profile_table_mentions_outrank_table_children(
     assert finalized[0].citation.chunk_id.startswith("adversarial-table-row-")
 
 
+def test_metric_table_query_preserves_explicit_figure_anchor() -> None:
+    db = make_session()
+    add_document(db)
+    table_chunks = [
+        chunk(
+            f"figure-metric-table-{index}",
+            "Table 1\n| Model | Accuracy |\n| --- | --- |\n"
+            f"| Model-{index} | {index}.0 |",
+            block_type="table",
+            ordinal=index,
+            source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": index}],
+        )
+        for index in range(24)
+    ]
+    figure_chunk = chunk(
+        "figure-metric-target",
+        "Figure 2 shows accuracy across the evaluation settings.",
+        block_type="figure",
+        ordinal=100,
+        source_spans=[{"page_index": 2, "figure_id": "figure-2"}],
+    )
+    db.add_all([*table_chunks, figure_chunk])
+    db.commit()
+    service = service_for(db)
+    question = "What does Figure 2 show about accuracy?"
+    contexts = [
+        *[
+            service._expand_child_hit(
+                item,
+                question=question,
+                score=10.0 - item.ordinal,
+                page_fields={},
+                evidence_kind="table",
+            )
+            for item in table_chunks
+        ],
+        service._expand_child_hit(
+            figure_chunk,
+            question=question,
+            score=100.0,
+            page_fields={},
+            evidence_kind="figure",
+        ),
+    ]
+
+    finalized = service._finalize_contexts(contexts, question=question)
+
+    assert finalized[0].citation.chunk_id == "figure-metric-target"
+
+
 def test_canonical_table_prompt_keeps_complete_child_text_without_character_window() -> None:
     db = make_session()
     service = service_for(db)
