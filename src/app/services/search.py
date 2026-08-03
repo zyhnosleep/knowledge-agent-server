@@ -5100,7 +5100,7 @@ class QueryService:
             )
         table_query = self._is_table_query(question) or self._is_metric_query(question)
 
-        def context_sort_key(context: RetrievedContext) -> tuple[float, float]:
+        def context_sort_key(context: RetrievedContext) -> tuple[float, float, float]:
             """Prioritize explicitly requested table facets before raw score.
 
             A lexical/vector hit from an unrelated high-scoring table must not
@@ -5109,7 +5109,7 @@ class QueryService:
             """
 
             if not table_query:
-                return (0.0, context.score)
+                return (0.0, 0.0, context.score)
             text = self._context_table_evidence_text(context)
             text_key = self._normalize_selector(text)
             relevance = 0.0
@@ -5122,7 +5122,10 @@ class QueryService:
             for selector in self._question_row_selectors(question):
                 if self._selector_matches_text(selector, text, text_key):
                     relevance += 6.0
-            return (relevance, context.score)
+            evidence_priority = (
+                1.0 if self._context_evidence_kind(context) == "table" else 0.0
+            )
+            return (evidence_priority, relevance, context.score)
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
         deduped: list[RetrievedContext] = []
@@ -5161,7 +5164,7 @@ class QueryService:
             return deduped
 
         required = self._required_evidence_contexts(deduped)
-        if table_query:
+        if canonical_table_query:
             # A table query must spend the bounded context window on the
             # requested table rows first.  Profile-term evidence is useful
             # for narrative/scientific questions, but making it mandatory
@@ -5173,7 +5176,7 @@ class QueryService:
                 if self._context_evidence_kind(context) != "profile-term"
             ]
         finalized: list[RetrievedContext] = []
-        if not table_query and any(
+        if not canonical_table_query and any(
             self._context_evidence_kind(context) == "profile-term" for context in deduped
         ):
             high_value_anchor_keys = {

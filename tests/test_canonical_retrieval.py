@@ -20,6 +20,7 @@ from app.services.canonical_models import (
     SourceSpan,
 )
 from app.services.pipeline import IngestionPipeline
+from app.services.paper_profile import ensure_paper_profile
 from app.services.semantic_chunking import SemanticChunker
 from app.services.search import QueryService, RetrievedContext
 from app.services.structured_evidence import StructuredEvidenceBuilder
@@ -1069,6 +1070,125 @@ def test_table_query_prioritizes_all_table_children_before_profile_terms() -> No
     assert {item.citation.chunk_id for item in finalized} == {
         f"table-row-{index}" for index in range(24)
     }
+
+
+def test_metric_query_without_canonical_table_keeps_profile_priority() -> None:
+    service = service_for(make_session())
+    generic_contexts = [
+        RetrievedContext(
+            citation=Citation(
+                chunk_id=f"generic-{index}",
+                score=100.0 - index,
+                excerpt=f"Generic RMSE narrative evidence {index}.",
+            ),
+            prompt_text=f"Generic RMSE narrative evidence {index}.",
+            score=100.0 - index,
+        )
+        for index in range(9)
+    ]
+    profile_context = RetrievedContext(
+        citation=Citation(
+            chunk_id="profile-sparta",
+            score=0.1,
+            excerpt="SPARTA profile evidence for the paper.",
+        ),
+        prompt_text="SPARTA profile evidence for the paper.",
+        score=0.1,
+        evidence_kind="profile-term",
+    )
+
+    finalized = service._finalize_contexts(
+        [*generic_contexts, profile_context],
+        question="What is the RMSE formula?",
+    )
+
+    assert len(finalized) == 8
+    assert any(item.citation.chunk_id == "profile-sparta" for item in finalized)
+
+
+def test_retrieve_evidence_keeps_canonical_table_children_ahead_of_profile_terms() -> None:
+    db = make_session()
+    document = add_document(db)
+    document.raw_text = "SPARTA"
+    ensure_paper_profile(document)
+    table_chunks = [
+        chunk(
+            f"retrieval-table-row-{index}",
+            "Table 1\n| Model | Value |\n| --- | --- |\n"
+            f"| Model-{index} | {index}.0 |",
+            block_type="table",
+            ordinal=index,
+            source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": index}],
+        )
+        for index in range(25)
+    ]
+    profile_chunk = chunk(
+        "retrieval-profile-sparta",
+        "SPARTA profile evidence outside the requested table.",
+        ordinal=100,
+    )
+    db.add_all([*table_chunks, profile_chunk])
+    db.commit()
+
+    evidence = service_for(db).retrieve_evidence(
+        "project",
+        "What are the Table 1 model values?",
+        limit=10,
+        document_id=document.id,
+    )
+
+    assert evidence.status == "ok"
+    assert len(evidence.items) == 10
+    assert all(item.evidence_kind == "table" for item in evidence.items)
+    assert all(item.chunk_id.startswith("retrieval-table-row-") for item in evidence.items)
+
+
+def test_table_query_does_not_let_profile_table_mentions_outrank_table_children() -> None:
+    db = make_session()
+    add_document(db)
+    table_chunks = [
+        chunk(
+            f"adversarial-table-row-{index}",
+            "Table 1\n| Model | Value |\n| --- | --- |\n"
+            f"| Model-{index} | {index}.0 |",
+            block_type="table",
+            ordinal=index,
+            source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": index}],
+        )
+        for index in range(25)
+    ]
+    profile_chunk = chunk(
+        "adversarial-profile-table-mention",
+        "Table 1 model values profile summary for SPARTA.",
+        ordinal=100,
+    )
+    db.add_all([*table_chunks, profile_chunk])
+    db.commit()
+    service = service_for(db)
+    question = "What are the Table 1 model values?"
+    contexts = [
+        *[
+            service._expand_child_hit(
+                item,
+                question=question,
+                score=10.0 - item.ordinal,
+                page_fields={},
+                evidence_kind="table",
+            )
+            for item in table_chunks
+        ],
+        service._expand_child_hit(
+            profile_chunk,
+            question=question,
+            score=100.0,
+            page_fields={},
+            evidence_kind="profile-term",
+        ),
+    ]
+
+    finalized = service._finalize_contexts(contexts, question=question)
+
+    assert finalized[0].citation.chunk_id.startswith("adversarial-table-row-")
 
 
 def test_canonical_table_prompt_keeps_complete_child_text_without_character_window() -> None:
