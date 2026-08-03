@@ -1241,6 +1241,58 @@ def test_metric_table_query_preserves_explicit_figure_anchor() -> None:
     assert finalized[0].citation.chunk_id == "figure-metric-target"
 
 
+def test_table_query_keeps_profile_summary_below_requested_table_rows() -> None:
+    db = make_session()
+    add_document(db)
+    table_chunks = [
+        chunk(
+            f"profile-priority-table-{index}",
+            "Table 1\n| System | AlphaL probability |\n| --- | --- |\n"
+            f"| System-{index} | {index}.0 |",
+            block_type="table",
+            ordinal=index,
+            source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": index}],
+        )
+        for index in range(25)
+    ]
+    profile_chunk = chunk(
+        "profile-priority-summary",
+        "Table 1 compares RS peptide, FG-nucleoporin peptide, and HEWL19 "
+        "alphaL probability values in the C36m summary.",
+        ordinal=100,
+    )
+    db.add_all([*table_chunks, profile_chunk])
+    db.commit()
+    service = service_for(db)
+    question = (
+        "What are the Table 1 alphaL probability values for RS peptide, "
+        "FG-nucleoporin peptide, and HEWL19?"
+    )
+    contexts = [
+        *[
+            service._expand_child_hit(
+                item,
+                question=question,
+                score=10.0 - item.ordinal,
+                page_fields={},
+                evidence_kind="table",
+            )
+            for item in table_chunks
+        ],
+        service._expand_child_hit(
+            profile_chunk,
+            question=question,
+            score=100.0,
+            page_fields={},
+            evidence_kind="profile-term",
+        ),
+    ]
+
+    finalized = service._finalize_contexts(contexts, question=question)
+
+    assert finalized[0].citation.chunk_id.startswith("profile-priority-table-")
+
+
 def test_canonical_table_prompt_keeps_complete_child_text_without_character_window() -> None:
     db = make_session()
     service = service_for(db)

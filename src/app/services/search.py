@@ -5100,7 +5100,7 @@ class QueryService:
             )
         table_query = self._is_table_query(question) or self._is_metric_query(question)
 
-        def context_sort_key(context: RetrievedContext) -> tuple[float, float, float]:
+        def context_sort_key(context: RetrievedContext) -> tuple[float, float, float, float]:
             """Prioritize explicitly requested table facets before raw score.
 
             A lexical/vector hit from an unrelated high-scoring table must not
@@ -5109,7 +5109,7 @@ class QueryService:
             """
 
             if not table_query:
-                return (0.0, 0.0, context.score)
+                return (0.0, 0.0, 0.0, context.score)
             text = self._context_table_evidence_text(context)
             text_key = self._normalize_selector(text)
             relevance = 0.0
@@ -5125,7 +5125,32 @@ class QueryService:
             evidence_priority = (
                 1.0 if self._context_evidence_kind(context) == "table" else 0.0
             )
-            return (relevance, evidence_priority, context.score)
+            evidence_kind = self._context_evidence_kind(context)
+            figure_anchor_match = any(
+                anchor.lower().startswith(("figure", "fig."))
+                and self._selector_matches_text(anchor, text, text_key)
+                for anchor in self._query_priority_anchors(question)["figure_table"]
+            )
+            table_anchor_match = any(
+                anchor.lower().startswith("table")
+                and self._selector_matches_text(anchor, text, text_key)
+                for anchor in self._query_priority_anchors(question)["figure_table"]
+            )
+            formula_query = bool(
+                re.search(r"\b(?:formula|equation|eq\.)\b", question, re.IGNORECASE)
+                or "公式" in question
+            )
+            if evidence_kind == "figure" and figure_anchor_match:
+                structure_priority = 4.0
+            elif evidence_kind == "formula" and formula_query:
+                structure_priority = 4.0
+            elif evidence_kind == "table" and table_anchor_match:
+                structure_priority = 3.0
+            elif evidence_kind == "table":
+                structure_priority = 2.0
+            else:
+                structure_priority = 0.0
+            return (structure_priority, relevance, evidence_priority, context.score)
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
         deduped: list[RetrievedContext] = []
