@@ -1013,6 +1013,64 @@ def test_canonical_table_context_attaches_complete_facts_to_row_citations() -> N
     }
 
 
+def test_table_query_prioritizes_all_table_children_before_profile_terms() -> None:
+    db = make_session()
+    add_document(db)
+    table_chunks = [
+        chunk(
+            f"table-row-{index}",
+            f"Table 1 | Model-{index} | {index}.0",
+            block_type="table",
+            ordinal=index,
+            source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": index}],
+        )
+        for index in range(25)
+    ]
+    profile_chunks = [
+        chunk(
+            f"profile-{index}",
+            f"Profile evidence {index} includes SPARTA and QM-MM",
+            block_type="narrative",
+            ordinal=10 + index,
+        )
+        for index in range(2)
+    ]
+    db.add_all([*table_chunks, *profile_chunks])
+    db.commit()
+    service = service_for(db)
+    question = "What are the Table 1 model values?"
+    contexts = [
+        *[
+            service._expand_child_hit(
+                item,
+                question=question,
+                score=10.0 - item.ordinal,
+                page_fields={},
+                evidence_kind="table",
+            )
+            for item in table_chunks
+        ],
+        *[
+            service._expand_child_hit(
+                item,
+                question=question,
+                score=50.0 - item.ordinal,
+                page_fields={},
+                evidence_kind="profile-term",
+            )
+            for item in profile_chunks
+        ],
+    ]
+
+    finalized = service._finalize_contexts(contexts, question=question)
+
+    assert len(finalized) == 24
+    assert all(item.citation.chunk_id.startswith("table-row-") for item in finalized)
+    assert {item.citation.chunk_id for item in finalized} == {
+        f"table-row-{index}" for index in range(24)
+    }
+
+
 def test_canonical_table_prompt_keeps_complete_child_text_without_character_window() -> None:
     db = make_session()
     service = service_for(db)

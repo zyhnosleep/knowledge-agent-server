@@ -5161,8 +5161,21 @@ class QueryService:
             return deduped
 
         required = self._required_evidence_contexts(deduped)
+        if table_query:
+            # A table query must spend the bounded context window on the
+            # requested table rows first.  Profile-term evidence is useful
+            # for narrative/scientific questions, but making it mandatory
+            # here can evict the final canonical Child and lose a requested
+            # value when ``retrieve_evidence(limit=10)`` trims the result.
+            required = [
+                context
+                for context in required
+                if self._context_evidence_kind(context) != "profile-term"
+            ]
         finalized: list[RetrievedContext] = []
-        if any(self._context_evidence_kind(context) == "profile-term" for context in deduped):
+        if not table_query and any(
+            self._context_evidence_kind(context) == "profile-term" for context in deduped
+        ):
             high_value_anchor_keys = {
                 self._normalize_selector(label)
                 for label in (
