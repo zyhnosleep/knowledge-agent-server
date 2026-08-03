@@ -439,7 +439,9 @@ def test_synthesize_accepts_optional_evidence_pack(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.services.agent_synthesizer.get_settings", _fake_settings_local
     )
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(
+        ollama_client=FakeOllamaClient(error=RuntimeError("Ollama unavailable"))
+    )
     evidence_pack = {
         "status": "ok",
         "items": [
@@ -471,7 +473,9 @@ def test_synthesize_local_fallback_identical_with_evidence_pack(monkeypatch) -> 
     monkeypatch.setattr(
         "app.services.agent_synthesizer.get_settings", _fake_settings_local
     )
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(
+        ollama_client=FakeOllamaClient(error=RuntimeError("Ollama unavailable"))
+    )
 
     kwargs = {
         "query": "What is entropy?",
@@ -812,7 +816,9 @@ def test_coverage_retry_skipped_on_local_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.services.agent_synthesizer.get_settings", _fake_settings_local
     )
-    syn = AgentSynthesizer()
+    syn = AgentSynthesizer(
+        ollama_client=FakeOllamaClient(error=RuntimeError("Ollama unavailable"))
+    )
     result = syn.synthesize(
         query="What technique?",
         route="evidence_required",
