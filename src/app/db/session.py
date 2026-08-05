@@ -1,3 +1,17 @@
+"""数据库引擎与会话管理。
+
+本模块负责：
+1. 创建 SQLAlchemy engine 与 sessionmaker（支持 SQLite / PostgreSQL）。
+2. SQLite 专用：启用 WAL 模式和外键约束。
+3. 初始化数据库表（create_all + 轻量迁移）。
+4. SQLite 的兼容性迁移：为旧表补充缺失列、重建 document_chunks schema、
+   回填 parse_version、建立索引与唯一约束。
+
+主要入口：
+- get_db(): FastAPI 依赖，提供每请求一个 session。
+- init_db(): 应用启动时初始化数据库结构。
+"""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +30,7 @@ from app.core.config import get_settings
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    """SQLite 连接建立时启用 WAL 与外键约束。"""
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
@@ -24,6 +39,7 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
 
 settings = get_settings()
 
+# SQLite 需要允许跨线程使用并加长锁等待，PostgreSQL 不需要特殊参数。
 connect_args = (
     {"check_same_thread": False, "timeout": 30}
     if settings.database_url.startswith("sqlite")
@@ -32,10 +48,12 @@ connect_args = (
 engine = create_engine(settings.database_url, future=True, connect_args=connect_args)
 if settings.database_url.startswith("sqlite"):
     event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+# 每请求会话工厂：关闭 autoflush/autocommit，显式提交。
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
 
+# document_chunks 表中必须为 NOT NULL 的列（用于 schema 重建校验）。
 _REQUIRED_CHUNK_COLUMNS = {
     "parse_version",
     "chunk_role",
@@ -46,11 +64,13 @@ _REQUIRED_CHUNK_COLUMNS = {
     "embedding_text",
     "token_count",
 }
+# chunk 自引用外键的约束名与 ondelete 行为。
 _CHUNK_SELF_FOREIGN_KEYS = {
     "parent_chunk_id": ("fk_document_chunks_parent_chunk_id", "CASCADE"),
     "previous_chunk_id": ("fk_document_chunks_previous_chunk_id", "SET NULL"),
     "next_chunk_id": ("fk_document_chunks_next_chunk_id", "SET NULL"),
 }
+# 用于检查自引用外键是否有悬空引用（孤儿行）的 SQL。
 _CHUNK_SELF_REFERENCE_CHECKS = (
     (
         "parent_chunk_id",
@@ -77,6 +97,7 @@ _CHUNK_SELF_REFERENCE_CHECKS = (
 
 
 def get_db() -> Generator[Session, None, None]:
+    """FastAPI 依赖：每个请求创建一个数据库 session，请求结束自动关闭。"""
     db = SessionLocal()
     try:
         yield db
@@ -85,6 +106,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
+    """初始化数据库：建表，并对 SQLite 执行兼容性迁移。"""
     from app.models import records  # noqa: F401
 
     if settings.database_url.startswith("sqlite"):
@@ -95,6 +117,7 @@ def init_db() -> None:
 
 
 def _configure_sqlite_engine(target_engine: Engine) -> None:
+    """确保 SQLite engine 开启 WAL 与外键。"""
     if not event.contains(target_engine, "connect", _enable_sqlite_foreign_keys):
         event.listen(target_engine, "connect", _enable_sqlite_foreign_keys)
     with target_engine.connect() as connection:
@@ -104,6 +127,7 @@ def _configure_sqlite_engine(target_engine: Engine) -> None:
 
 
 def _ensure_sqlite_columns() -> None:
+    """为 SQLite 旧表补充缺失列（轻量迁移）。"""
     if not settings.database_url.startswith("sqlite"):
         return
     columns = (
@@ -155,6 +179,7 @@ def _ensure_sqlite_columns() -> None:
 
 
 def _ensure_sqlite_chunk_schema() -> None:
+    """校验 document_chunks 的必填列与外键，必要时重建表。"""
     if not settings.database_url.startswith("sqlite"):
         return
     with engine.connect() as connection:
@@ -195,6 +220,7 @@ def _ensure_sqlite_chunk_schema() -> None:
 def _rebuild_sqlite_chunk_schema(
     columns: dict[str, dict], missing_foreign_keys: set[str]
 ) -> None:
+    """重建 document_chunks 表：把必填列改为 NOT NULL、补上缺失外键。"""
     with engine.connect() as connection:
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
         connection.commit()
@@ -230,6 +256,7 @@ def _rebuild_sqlite_chunk_schema(
 
 
 def _check_sqlite_chunk_self_references(connection) -> None:
+    """检查自引用外键是否有孤儿行。"""
     orphaned_columns = [
         column_name
         for column_name, statement in _CHUNK_SELF_REFERENCE_CHECKS
@@ -244,6 +271,7 @@ def _check_sqlite_chunk_self_references(connection) -> None:
 
 
 def _check_sqlite_chunk_foreign_keys(connection) -> None:
+    """使用 PRAGMA 检查外键完整性。"""
     violations = connection.exec_driver_sql(
         "PRAGMA foreign_key_check(document_chunks)"
     ).all()
@@ -252,6 +280,7 @@ def _check_sqlite_chunk_foreign_keys(connection) -> None:
 
 
 def _backfill_sqlite_parse_versions() -> None:
+    """把旧 chunk 数据回填为 legacy 解析版本。"""
     if not settings.database_url.startswith("sqlite"):
         return
     empty_json = json.dumps([])
@@ -304,6 +333,7 @@ def _backfill_sqlite_parse_versions() -> None:
 
 
 def _ensure_sqlite_indexes() -> None:
+    """为常用查询建立索引。"""
     if not settings.database_url.startswith("sqlite"):
         return
     statements = (
@@ -332,6 +362,7 @@ def _ensure_sqlite_indexes() -> None:
 
 
 def _ensure_sqlite_unique_indexes() -> None:
+    """建立唯一索引（entities 的 project+name 唯一）。"""
     if not settings.database_url.startswith("sqlite"):
         return
     statements = (

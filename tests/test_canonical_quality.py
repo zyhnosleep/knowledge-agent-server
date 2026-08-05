@@ -6,6 +6,7 @@ import pytest
 
 from app.services import canonical_adapters, parser
 from app.services.canonical_adapters import PDFCanonicalAdapter
+from app.services.canonical_artifacts import CanonicalArtifactStore
 from app.services.canonical_models import (
     CanonicalAsset,
     CanonicalBlock,
@@ -314,6 +315,43 @@ def test_table_gate_accepts_complete_rowspan_and_colspan_inventory() -> None:
     assert CanonicalQualityGate._invalid_table_reasons(table) == []
 
 
+@pytest.mark.parametrize(
+    "source_html",
+    [
+        """<table>
+          <tr><td rowspan="2">AA</td><td colspan="3">Scores</td></tr>
+          <tr><td>mean</td><td>min</td><td>max</td></tr>
+          <tr><td>Arg</td><td>1.2</td><td>0.0</td><td>4.8</td></tr>
+          <tr><td></td><td colspan="2">Repeated header</td></tr>
+        </table>""",
+        """<table>
+          <tr><td colspan="3">Force field</td></tr>
+          <tr><td>Term</td><td>ff99SB</td><td>mod1</td></tr>
+          <tr><td>V1</td><td>-0.45</td><td>-0.70</td></tr>
+          <tr><td colspan="5">a. Phase shift of -60 degrees</td></tr>
+        </table>""",
+    ],
+)
+def test_html_canonicalizer_fills_ragged_span_grid_coordinates(
+    source_html: str,
+) -> None:
+    cells, headers, rows = CanonicalArtifactStore._canonical_table_from_html(
+        source_html
+    )
+    markdown = CanonicalQualityGate._table_markdown(headers, rows)
+    table = CanonicalTable(
+        table_id="ragged-span-table",
+        headers=headers,
+        rows=rows,
+        cells=cells,
+        source_html=source_html,
+        source_markdown=markdown,
+        normalized_markdown=markdown,
+    )
+
+    assert CanonicalQualityGate._invalid_table_reasons(table) == []
+
+
 def test_table_gate_reports_short_rows_without_raising() -> None:
     table = CanonicalTable(
         table_id="short-row",
@@ -434,6 +472,40 @@ def test_plain_pdf_abstract_stops_at_common_section_heading(
     assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
         "Source abstract sentence one.\nSource abstract sentence two."
     )
+
+
+def test_plain_pdf_abstract_can_follow_title_and_authors_in_same_candidate() -> None:
+    raw_page = (
+        "Paper title\nAuthor One, Author Two\nAbstract\n"
+        "Source abstract sentence.\n1 Introduction\nIntroduction body."
+    )
+
+    assert canonical_adapters._extract_explicit_abstract([raw_page]) == (
+        "Source abstract sentence."
+    )
+
+
+def test_pdf_audit_hydrates_missing_abstract_without_replacing_mineru_blocks() -> None:
+    document = _document(_block("MinerU body"))
+    document.parser_source = "mineru"
+    document.abstract = None
+    original_blocks = document.blocks
+
+    canonical_adapters._attach_pdf_audit(
+        document,
+        page_count=1,
+        page_texts=[
+            "Paper title\nAuthor One, Author Two\nAbstract\n"
+            "Source abstract sentence.\nIntroduction\nIntroduction body."
+        ],
+        text_layer_warnings=[],
+        attempts=["mineru:success"],
+        primary_parser="mineru",
+    )
+
+    assert document.abstract == "Source abstract sentence."
+    assert document.parser_source == "mineru"
+    assert document.blocks is original_blocks
 
 
 def test_plain_pdf_abstract_keeps_introduction_word_inside_body_sentence() -> None:
@@ -609,6 +681,189 @@ def test_pdf_uses_mineru_when_text_layer_extraction_raises(
     assert result.quality.accepted is True
 
 
+def test_pdf_keeps_mineru_and_supplements_only_missing_text_layer_pages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    mineru = _document(
+        _block("MinerU page one", page=0),
+        expected_page_count=2,
+        parsed_page_indices=[0],
+    )
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 2)
+    monkeypatch.setattr(
+        parser,
+        "_extract_pdf_text_layer",
+        lambda _path: (["MinerU page one", "Recovered page two"], 2),
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(parser.settings, "document_intelligence_enabled", False)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert result.parser_source == "mineru"
+    assert result.metadata["parsed_page_indices"] == [0, 1]
+    assert result.metadata["fallback_pages"] == [2]
+    assert [
+        block.text
+        for block in result.blocks
+        if block.parser_source == "pypdf_text_layer"
+    ] == ["Recovered page two"]
+    assert result.metadata["primary_parser"] == "mineru"
+    assert result.quality.accepted is True
+
+
+def test_pdf_recovers_contiguous_page_omission_even_above_ninety_percent_coverage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    prefix = "Shared experimental background remains present in MinerU. " * 20
+    omitted = (
+        "The omitted passage reports a distinct calibration protocol with "
+        "temperature controls, replicate counts, and uncertainty estimates."
+    )
+    suffix = "Shared conclusions and limitations remain present in MinerU. " * 20
+    source_page = prefix + omitted + suffix
+    mineru = _document(
+        _block(prefix + suffix, page=0),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(
+        parser, "_extract_pdf_text_layer", lambda _path: ([source_page], 1)
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(parser.settings, "document_intelligence_enabled", False)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    recovered = [
+        block
+        for block in result.blocks
+        if block.metadata.get("source") == "pdf_text_recovery"
+    ]
+    assert [block.text for block in recovered] == [omitted]
+    assert recovered[0].parser_source == "pypdf_text_layer"
+    assert recovered[0].metadata["fallback_reason"] == "mineru_text_omission"
+    assert recovered[0].metadata["page_coverage_ratio"] >= 0.90
+    assert recovered[0].metadata["largest_unmatched_normalized_chars"] >= 80
+    assert recovered[0].metadata["source_char_start"] == len(prefix)
+    assert recovered[0].metadata["source_char_end"] == len(prefix) + len(omitted)
+    assert result.metadata["text_layer_recovery_page_indices"] == [0]
+    assert result.metadata["primary_parser"] == "mineru"
+
+
+def test_pdf_page_recovery_ignores_repeated_headers_footers_and_dehyphenation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    header = "Downloaded journal header with institutional access metadata. " * 2
+    footer = "Publisher footer, copyright notice, and persistent identifier. " * 2
+    page_bodies = [
+        "A multi-\nscale method evaluates the first benchmark.",
+        "The same multi-\nscale method evaluates the second benchmark.",
+    ]
+    page_texts = [
+        f"{header}\n{body}\n{footer}" for body in page_bodies
+    ]
+    mineru = _document(
+        _block("A multiscale method evaluates the first benchmark.", page=0),
+        _block(
+            "The same multiscale method evaluates the second benchmark.",
+            order=1,
+            page=1,
+        ),
+        expected_page_count=2,
+        parsed_page_indices=[0, 1],
+    )
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 2)
+    monkeypatch.setattr(
+        parser, "_extract_pdf_text_layer", lambda _path: (page_texts, 2)
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(parser.settings, "document_intelligence_enabled", False)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert not any(
+        block.metadata.get("source") == "pdf_text_recovery"
+        for block in result.blocks
+    )
+    assert result.metadata["text_layer_recovery_page_indices"] == []
+
+
+def test_pdf_page_recovery_ignores_formula_encoding_noise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    prefix = "The derivation uses the following conservation identity. "
+    formula_noise = "x 2 + y 2 = z 2 ; a i = b i / c i ; " * 4
+    suffix = "The resulting estimator is evaluated on all benchmarks."
+    mineru = _document(
+        _block(prefix + " $$x^2 + y^2 = z^2$$ " + suffix, page=0),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(
+        parser,
+        "_extract_pdf_text_layer",
+        lambda _path: ([prefix + formula_noise + suffix], 1),
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(parser.settings, "document_intelligence_enabled", False)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert not any(
+        block.metadata.get("source") == "pdf_text_recovery"
+        for block in result.blocks
+    )
+    assert result.metadata["text_layer_recovery_page_indices"] == []
+
+
+def test_pdf_page_audit_warns_when_coverage_is_below_ninety_percent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "low-coverage.pdf"
+    pdf_path.write_bytes(b"%PDF placeholder")
+    matched_parts = [f"Matched passage {index} remains available. " for index in range(8)]
+    omitted_parts = [
+        f"Omitted note {index} has calibration detail but stays below threshold. "
+        for index in range(8)
+    ]
+    source_page = "".join(
+        matched + omitted for matched, omitted in zip(matched_parts, omitted_parts)
+    )
+    mineru = _document(
+        _block("".join(matched_parts), page=0),
+        expected_page_count=1,
+        parsed_page_indices=[0],
+    )
+
+    monkeypatch.setattr(parser, "_validate_pdf_basic", lambda _path: 1)
+    monkeypatch.setattr(
+        parser, "_extract_pdf_text_layer", lambda _path: ([source_page], 1)
+    )
+    monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
+    monkeypatch.setattr(parser.settings, "document_intelligence_enabled", False)
+
+    result = PDFCanonicalAdapter().parse(pdf_path)
+
+    assert result.metadata["text_layer_page_coverage"][0]["coverage_ratio"] < 0.90
+    assert result.metadata["text_layer_low_coverage_page_indices"] == [0]
+    assert any("below 0.90" in warning for warning in result.warnings)
+
+
 def test_pdf_repairable_issue_calls_document_intelligence_only_for_scoped_pages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -639,7 +894,7 @@ def test_pdf_repairable_issue_calls_document_intelligence_only_for_scoped_pages(
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nRecovered source abstract", "Introduction source", ""], 3),
+        lambda _path: (["Abstract", "Introduction", ""], 3),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
 
@@ -702,7 +957,7 @@ def test_pdf_targeted_repair_failure_does_not_escalate_to_full_document_intellig
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nSource abstract"], 1),
+        lambda _path: (["Abstract"], 1),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
 
@@ -748,7 +1003,7 @@ def test_pdf_incomplete_targeted_repair_preserves_mineru_without_full_fallback(
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nSource abstract", "Second-page source"], 2),
+        lambda _path: (["Abstract", "Introduction"], 2),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
 
@@ -1285,7 +1540,7 @@ def test_abstract_repair_without_explicit_abstract_preserves_mineru_source(
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nSource abstract"], 1),
+        lambda _path: (["Abstract"], 1),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
 
@@ -1385,7 +1640,7 @@ def test_abstract_targeted_repair_preserves_all_mineru_narrative(
     monkeypatch.setattr(
         parser,
         "_extract_pdf_text_layer",
-        lambda _path: (["Abstract\nSource abstract", "Body"], 2),
+        lambda _path: (["Abstract", "Introduction"], 2),
     )
     monkeypatch.setattr(canonical_adapters, "run_mineru", lambda *_args: mineru)
     monkeypatch.setattr(

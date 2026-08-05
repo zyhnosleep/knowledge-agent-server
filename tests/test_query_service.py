@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -6,11 +8,20 @@ from app.db.session import Base
 from app.models.records import Claim, Document, DocumentChunk, Project, QuestionAnswer
 from app.schemas.common import QueryResponse
 from app.services.ai import QueryAnswerPayload, VerificationPayload
-from app.services.search import MAX_CONTEXTS, ExtractedMetric, PaperMatch, QueryService, RetrievedContext, settings
+from app.services.search import (
+    CANONICAL_TABLE_CONTEXT_LIMIT,
+    MAX_CONTEXTS,
+    ExtractedMetric,
+    PaperMatch,
+    QueryService,
+    RetrievedContext,
+    settings,
+)
 from app.schemas.common import Citation
 from app.services.table_normalization import normalize_table_text
 from app.services.table_evidence import (
     CanonicalTableChunk,
+    TableFact,
     assemble_table_context,
     extract_table_facts,
 )
@@ -76,6 +87,23 @@ class CountingFakeOllama(FakeOllama):
 class ExplodingOllama(FakeOllama):
     def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
         raise AssertionError("LLM should not be required for deterministic scientific evidence answers")
+
+
+class TransientThenSuccessOllama(FakeOllama):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.generate_calls = 0
+
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        self.generate_calls += 1
+        if self.generate_calls <= self.failures:
+            raise TimeoutError("temporary Ollama timeout")
+        return QueryAnswerPayload(
+            answer_markdown="Recovered answer from Ollama.",
+            citations=[0],
+            risk_level="normal",
+        )
 
 
 def make_session() -> Session:
@@ -174,6 +202,50 @@ def test_draft_answer_omits_index_overview_when_contexts_exist() -> None:
     assert "Index overview" not in fake_ollama.last_prompt
     assert "OPLS5 and CHARMM36" not in fake_ollama.last_prompt
     assert "OPLS4 evidence" in fake_ollama.last_prompt
+
+
+def test_draft_answer_retries_two_transient_ollama_failures(monkeypatch) -> None:
+    from app.services import search as search_module
+
+    service = QueryService(make_session())
+    fake_ollama = TransientThenSuccessOllama(failures=2)
+    service.ollama = fake_ollama
+    monkeypatch.setattr(search_module.time, "sleep", lambda _seconds: None)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/general", page_title="General", page_kind="source_summary", score=1, excerpt="The study discusses a general method."),
+            prompt_text="The study discusses a general method.",
+            score=1,
+        )
+    ]
+
+    answer = service._draft_answer("What does the study discuss?", None, contexts)
+
+    assert fake_ollama.generate_calls == 3
+    assert answer.answer_markdown == "Recovered answer from Ollama."
+    assert "System notice" not in answer.answer_markdown
+
+
+def test_draft_answer_marks_fallback_after_three_transient_ollama_failures(monkeypatch) -> None:
+    from app.services import search as search_module
+
+    service = QueryService(make_session())
+    fake_ollama = TransientThenSuccessOllama(failures=3)
+    service.ollama = fake_ollama
+    monkeypatch.setattr(search_module.time, "sleep", lambda _seconds: None)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/general", page_title="General", page_kind="source_summary", score=1, excerpt="The study discusses a general method."),
+            prompt_text="The study discusses a general method.",
+            score=1,
+        )
+    ]
+
+    answer = service._draft_answer("What does the study discuss?", None, contexts)
+
+    assert fake_ollama.generate_calls == 3
+    assert "System notice: LLM generation temporarily failed" in answer.answer_markdown
+    assert answer.citations == [0]
 
 
 def test_draft_answer_preserves_complete_long_contexts() -> None:
@@ -962,6 +1034,60 @@ def test_rag_contexts_add_supplemental_profile_term_evidence() -> None:
     assert any(context.citation.chunk_id == "cmap" for context in contexts)
 
 
+def test_profile_term_supplement_preserves_source_chunk_citation_metadata() -> None:
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="Profile Paper",
+        file_name="profile.pdf",
+        sha256="profile",
+        raw_path="raw/profile.pdf",
+        status="ready",
+        active_parse_version="canonical-v1",
+    )
+    source_spans = [
+        {
+            "page_index": 2,
+            "page_label": "3",
+            "normalized_bbox": [0.1, 0.2, 0.8, 0.4],
+        }
+    ]
+    complete_text = "SPARTA source evidence " + ("detail " * 80) + "END-MARKER"
+    profile_chunk = DocumentChunk(
+        id="profile-source",
+        document_id="d1",
+        parse_version="canonical-v1",
+        chunk_role="child",
+        block_type="narrative",
+        ordinal=1,
+        text=complete_text,
+        page_label="3",
+        source_spans=source_spans,
+        embedding=None,
+    )
+    db.add_all([project, document, profile_chunk])
+    db.commit()
+
+    contexts = QueryService(db)._supplement_profile_term_contexts(
+        "p1",
+        ["d1"],
+        [],
+        ["SPARTA"],
+        limit=1,
+    )
+
+    assert len(contexts) == 1
+    citation = contexts[0].citation
+    assert citation.chunk_id == profile_chunk.id
+    assert citation.block_type == "narrative"
+    assert citation.parse_version == "canonical-v1"
+    assert citation.source_spans == source_spans
+    assert citation.excerpt == complete_text
+    assert citation.excerpt.endswith("END-MARKER")
+
+
 def test_rag_contexts_keep_scientific_phrase_supplements() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -1019,6 +1145,73 @@ def test_rag_contexts_keep_scientific_phrase_supplements() -> None:
     constraints = service._build_answer_constraints("ff14SB 的 mechanism 是什么？", contexts)
     assert "covalent relaxation" in constraints
     assert "steric clashes" in constraints
+
+
+def test_canonical_table_queries_request_the_bounded_multi_table_window(monkeypatch) -> None:
+    """Multi-table answers must not discard a requested table before grouping."""
+
+    service = QueryService(make_session())
+    document = Document(
+        id="opls5",
+        project_id="p1",
+        title="OPLS5",
+        file_name="opls5.pdf",
+        sha256="opls5",
+        raw_path="raw/opls5.pdf",
+        raw_text="OPLS5 force-field validation.",
+        status="ready",
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="opls5",
+                chunk_id=f"table-4-{index}",
+                table_id="table-4",
+                parse_version="canonical-v4",
+                block_type="table",
+                page_slug="sources/opls5",
+                score=100 - index,
+                excerpt="Table 4 | metric | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| value | 1 | 2 |",
+            ),
+            prompt_text="Table 4 | metric | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| value | 1 | 2 |",
+            score=100 - index,
+            evidence_kind="table",
+        )
+        for index in range(MAX_CONTEXTS)
+    ]
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                document_id="opls5",
+                chunk_id="table-7-tail",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                page_slug="sources/opls5",
+                score=1,
+                excerpt="Table 7 | binding RMSE | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| total | 1.18 | 1.12 |",
+            ),
+            prompt_text="Table 7 | binding RMSE | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| total | 1.18 | 1.12 |",
+            score=1,
+            evidence_kind="table",
+        )
+    )
+    requested_limits: list[int] = []
+
+    def fake_search(_question, _project_id, _document_ids, *, limit=MAX_CONTEXTS):
+        requested_limits.append(limit)
+        return contexts
+
+    monkeypatch.setattr(service, "_search_document_table_contexts", fake_search)
+
+    result = service._build_rag_contexts(
+        "OPLS5 Table 4 and Table 7 metrics",
+        "p1",
+        [PaperMatch(document=document, score=20, locked=True)],
+    )
+
+    assert requested_limits == [CANONICAL_TABLE_CONTEXT_LIMIT]
+    assert any(context.citation.table_id == "table-7" for context in result)
 
 
 def test_scientific_anchor_contexts_match_latex_spaced_terms() -> None:
@@ -1494,6 +1687,87 @@ def test_finalize_contexts_prioritizes_high_value_scientific_anchors() -> None:
 def test_pka_bias_mechanism_is_not_metric_query() -> None:
     assert not QueryService._is_metric_query("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？")
     assert QueryService._is_metric_query("OPLS4 的 pKa 和 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？")
+
+
+def test_table_citation_indexes_keeps_all_canonical_table_contexts() -> None:
+    """Canonical multi-table metric queries must not be capped at five rows."""
+    db = make_session()
+    service = QueryService(db)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"table-{index}",
+                table_id=f"table-{index}",
+                parse_version="canonical-v4-test",
+                block_type="table",
+                page_slug="sources/opls4",
+                score=100 - index,
+                page_label=str(index),
+                excerpt=(
+                    (
+                        "Table 8 sigma-hole OPLS3e OPLS4 RMS error\n"
+                        "| metric | OPLS3e | OPLS4 |\n"
+                        "| --- | ---: | ---: |\n"
+                        "| RMS error | 1.08 | 0.40 |"
+                    )
+                    if index < 5
+                    else (
+                        "Table 5 pKa OPLS3e OPLS4 RMS error\n"
+                        "| metric | OPLS3e | OPLS4 |\n"
+                        "| --- | ---: | ---: |\n"
+                        "| RMS error | 2.0 | 1.2 |\n"
+                        "| improvement | 1.4 | 0.1 |"
+                    )
+                ),
+            ),
+            prompt_text=(
+                (
+                    "Table 8 sigma-hole OPLS3e OPLS4 RMS error\n"
+                    "| metric | OPLS3e | OPLS4 |\n"
+                    "| --- | ---: | ---: |\n"
+                    "| RMS error | 1.08 | 0.40 |"
+                )
+                if index < 5
+                else (
+                    "Table 5 pKa OPLS3e OPLS4 RMS error\n"
+                    "| metric | OPLS3e | OPLS4 |\n"
+                    "| --- | ---: | ---: |\n"
+                    "| RMS error | 2.0 | 1.2 |\n"
+                    "| improvement | 1.4 | 0.1 |"
+                )
+            ),
+            score=100 - index,
+            evidence_kind="table",
+        )
+        for index in range(6)
+    ]
+    # Keep a non-canonical trailing context so the regression catches code
+    # that accidentally inspects the loop's stale ``context`` variable.
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="prose-tail",
+                parse_version="canonical-v4-test",
+                block_type="paragraph",
+                page_slug="sources/opls4",
+                score=1,
+                excerpt="The paper discusses the comparison in prose.",
+            ),
+            prompt_text="The paper discusses the comparison in prose.",
+            score=1,
+            evidence_kind="prose",
+        )
+    )
+
+    indexes = service._table_citation_indexes(
+        "OPLS4 pKa sigma-hole OPLS3e OPLS4 error improvement",
+        contexts,
+    )
+
+    assert 5 in indexes
+    assert len(indexes) == 6
 
 
 def test_supported_term_note_uses_citation_identity_and_anchor_terms() -> None:
@@ -3185,6 +3459,619 @@ def test_repair_unsupported_numeric_answer_uses_supported_pairs_without_name_err
     assert repaired.citations == [0]
 
 
+def _repair_table_evidence_contexts() -> list[RetrievedContext]:
+    """Canonical table context used by the missing-table repair tests."""
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-7-row",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-7",
+                ordinal=1,
+                text=(
+                    "Table 7\n| Model | Asp | C6 | exptl |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| OPLS5 | 21.0 | 8.95 | 95.3 |"
+                ),
+            )
+        ]
+    )
+    question = "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?"
+    return [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-7-row",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=tuple(extract_table_facts(question, table)),
+        )
+    ]
+
+
+def test_generic_table_value_rows_keep_greek_gamma_surface_tension_row() -> None:
+    """Chinese surface-tension aliases must retain a canonical γ row."""
+    question = "TIP4P-D 在水模型参数表中相对 TIP3P 的 C6、偶极矩和表面张力数值是什么？"
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="water-table",
+                document_id="water-doc",
+                parse_version="canonical-v4",
+                table_id="table-1",
+                ordinal=0,
+                text=(
+                    "Table 1\n"
+                    "| Property | TIP4P-D | TIP3P |\n"
+                    "| --- | --- | --- |\n"
+                    "| C6 | 900 | 595 |\n"
+                    "| μ | 2.403 | 2.35 |\n"
+                    "| γ | 71.2 | 47.8 |"
+                ),
+            )
+        ]
+    )
+    facts = tuple(extract_table_facts(question, table))
+
+    rows = QueryService._generic_table_value_rows(
+        question,
+        table.markdown,
+        table_context=table,
+        table_facts=facts,
+        table_identity=(table.document_id, table.parse_version, table.table_id),
+    )
+    rendered = " ".join(row["values"] for row in rows)
+
+    assert "71.2" in rendered
+    assert "47.8" in rendered
+
+
+def test_repair_missing_table_answer_injects_canonical_fact_inventory() -> None:
+    """The repair prompt must expose the selected tables' canonical facts verbatim."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    prompt = fake_ollama.last_prompt
+    assert "Canonical fact inventory" in prompt
+    assert "table_id=table-7" in prompt
+    assert "row_label=OPLS5" in prompt
+    assert "column=Asp" in prompt
+    assert "value=21.0" in prompt
+    assert "column=C6" in prompt
+    assert "value=8.95" in prompt
+    assert "column=exptl" in prompt
+    assert "value=95.3" in prompt
+
+
+def test_repair_missing_table_answer_rejects_model_number_missing_from_evidence() -> None:
+    """A model-only 999.0 must never reach the final answer when evidence has only 21.0."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "The OPLS5 Asp value is 21.0, C6 is 8.95, exptl is 95.3, "
+            "and the bonus metric is 999.0 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "999.0" not in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+    assert repaired.citations == [0]
+
+
+def test_repair_missing_table_answer_rejects_answer_without_requested_metric_values() -> None:
+    """A repaired answer that still omits the requested metric values must fall back."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="The table evidence discusses the OPLS5 model in Table 7 [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "discusses the OPLS5 model" not in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_rejects_out_of_scope_citations() -> None:
+    """A repaired answer with only out-of-scope citations must fall back."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="The OPLS5 Asp is 21.0, C6 is 8.95, and exptl is 95.3 [5].",
+        citations=[5],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert 5 not in repaired.citations
+    assert "21.0" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_removes_out_of_scope_citation_from_valid_answer() -> None:
+    """Out-of-scope indexes are dropped while valid table citations are kept."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="The OPLS5 Asp is 21.0, C6 is 8.95, and exptl is 95.3 [0].",
+        citations=[0, 5],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert repaired.citations == [0]
+    assert "21.0" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_accepts_valid_repair() -> None:
+    """A repair that supplies every requested metric from the evidence is accepted."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "The table evidence reports OPLS5 Asp 21.0, C6 8.95, and exptl 95.3 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "21.0" in repaired.answer_markdown
+    assert repaired.citations == [0]
+    assert "999.0" not in repaired.answer_markdown
+
+
+def _multi_table_repair_contexts() -> list[RetrievedContext]:
+    """Two canonical table contexts: table-6 (loss) and table-7 (Asp/C6/exptl)."""
+    question = "What are the metric values Asp, C6, and exptl for OPLS5 in the tables?"
+    table_a = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-6-row",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-6",
+                ordinal=0,
+                text="Table 6\n| Model | loss |\n| --- | --- |\n| OPLS5 | 0.123 |",
+            )
+        ]
+    )
+    table_b = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-7-row",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-7",
+                ordinal=1,
+                text=(
+                    "Table 7\n| Model | Asp | C6 | exptl |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| OPLS5 | 21.0 | 8.95 | 95.3 |"
+                ),
+            )
+        ]
+    )
+    return [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-6-row",
+                table_id="table-6",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=table_a.markdown,
+            ),
+            prompt_text=table_a.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=table_a,
+            table_facts=tuple(extract_table_facts(question, table_a)),
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-7-row",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=table_b.markdown,
+            ),
+            prompt_text=table_b.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=table_b,
+            table_facts=tuple(extract_table_facts(question, table_b)),
+        ),
+    ]
+
+
+def test_number_supported_by_evidence_rejects_substring_collisions() -> None:
+    """Numeric evidence matching must reject substring collisions like 1.0 in 21.0."""
+    service = QueryService(make_session())
+    assert service._number_supported_by_evidence("1.0", "Asp 21.0") is False
+    assert service._number_supported_by_evidence("1.0", "Asp 1.0 C6") is True
+    assert service._number_supported_by_evidence("74.7", "OIE2016 F1 74.7 AUC") is True
+    assert service._number_supported_by_evidence("74.7%", "OIE2016 F1 74.7%") is True
+    assert service._number_supported_by_evidence("1.5", "-1.5") is True
+    assert service._number_supported_by_evidence("8.95", "8.956") is False
+    assert service._number_supported_by_evidence("60", "160") is False
+    assert service._number_supported_by_evidence("60", "6 0") is True
+
+
+def test_unsupported_answer_numbers_rejects_substring_collisions() -> None:
+    service = QueryService(make_session())
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/sac-kg",
+                page_title="SAC-KG",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="Table 5: Asp 21.0 C6 8.95",
+            ),
+            prompt_text="Table 5: Asp 21.0 C6 8.95",
+            score=10.0,
+        )
+    ]
+
+    unsupported = service._unsupported_answer_numbers("Asp 1.0, C6 8.95", contexts, [0])
+
+    assert "1.0" in unsupported
+    assert "8.95" not in unsupported
+
+
+def test_repair_unsupported_numeric_answer_rejects_substring_collision() -> None:
+    """A draft number that only matches via substring must be repaired away."""
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="Only C6 8.95 is present in the evidence.",
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/sac-kg",
+                page_title="SAC-KG",
+                page_kind="source_summary",
+                score=10.0,
+                excerpt="Table 5: Asp 21.0 C6 8.95",
+            ),
+            prompt_text="Table 5: Asp 21.0 C6 8.95",
+            score=10.0,
+        )
+    ]
+    draft = QueryAnswerPayload(
+        answer_markdown="Asp is 1.0 and C6 is 8.95.",
+        citations=[0],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_unsupported_numeric_answer(
+        "What are the Asp and C6 values?",
+        None,
+        contexts,
+        draft,
+        [0],
+    )
+
+    assert "1.0" in fake_ollama.last_prompt
+    assert "Only C6 8.95" in repaired.answer_markdown
+    assert repaired.citations == [0]
+
+
+def test_repair_missing_table_answer_rejects_profile_term_number_leak() -> None:
+    """A profile-term context elsewhere must not make an unsupported table number pass."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "The OPLS5 Asp value is 21.0, C6 is 8.95, exptl is 95.3, "
+            "and the bonus metric is 999.0 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5 profile",
+                page_kind="source_summary",
+                score=5.0,
+                excerpt="The OPLS5 profile records a bonus metric of 999.0.",
+            ),
+            prompt_text="",
+            score=5.0,
+            evidence_kind="profile-term",
+        )
+    )
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "999.0" not in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_rejects_complete_draft_with_profile_number() -> None:
+    """A complete initial table draft with a profile-only number must fall back."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "The OPLS5 Asp value is 21.0, C6 is 8.95, exptl is 95.3, "
+            "and the bonus metric is 999.0 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5 profile",
+                page_kind="source_summary",
+                score=5.0,
+                excerpt="The OPLS5 profile records a bonus metric of 999.0.",
+            ),
+            prompt_text="",
+            score=5.0,
+            evidence_kind="profile-term",
+        )
+    )
+    draft = QueryAnswerPayload(
+        answer_markdown=(
+            "The OPLS5 Asp is 21.0, C6 is 8.95, exptl is 95.3, "
+            "and the bonus metric is 999.0 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "999.0" not in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+    assert "8.95" in repaired.answer_markdown
+    assert "95.3" in repaired.answer_markdown
+    assert repaired.citations == [0]
+
+
+def test_repair_missing_table_answer_accepts_supported_complete_draft() -> None:
+    """A complete initial table draft whose numbers are all cited stays accepted."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="The OPLS5 Asp is 21.0, C6 is 8.95, exptl is 95.3 [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The OPLS5 Asp is 21.0, C6 is 8.95, exptl is 95.3 [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert repaired.answer_markdown == draft.answer_markdown
+    assert repaired.citations == [0]
+
+
+def test_repair_missing_table_answer_still_claims_missing_falls_back() -> None:
+    """A repaired answer that still claims the requested data is missing must fall back."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown="The requested table values are not present in the provided context [0].",
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _repair_table_evidence_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the OPLS5 metric values Asp, C6, and exptl in Table 7?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "not present in the provided context" not in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_rejects_value_supported_only_by_other_table() -> None:
+    """A multi-table repair citing table A but reporting only table B's value falls back."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "OPLS5 loss is 0.123, Asp is 21.0, C6 is 8.95, and exptl is 95.3 in Table 7 [0]."
+        ),
+        citations=[0],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _multi_table_repair_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the metric values Asp, C6, and exptl for OPLS5 in the tables?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert repaired.answer_markdown != fake_ollama.payload.answer_markdown
+    assert "The table evidence contains the requested metrics" in repaired.answer_markdown
+
+
+def test_repair_missing_table_answer_accepts_multi_table_citation_set() -> None:
+    """Citing every table that directly supports a value keeps the repair."""
+    service = QueryService(make_session())
+    fake_ollama = FakeOllama()
+    fake_ollama.payload = QueryAnswerPayload(
+        answer_markdown=(
+            "OPLS5 loss is 0.123 in Table 6 and Asp is 21.0, C6 is 8.95, "
+            "exptl is 95.3 in Table 7 [0, 1]."
+        ),
+        citations=[0, 1],
+        risk_level="normal",
+    )
+    service.ollama = fake_ollama
+    contexts = _multi_table_repair_contexts()
+    draft = QueryAnswerPayload(
+        answer_markdown="The requested table values are missing from the context.",
+        citations=[],
+        risk_level="normal",
+    )
+
+    repaired = service._repair_missing_table_answer(
+        "What are the metric values Asp, C6, and exptl for OPLS5 in the tables?",
+        None,
+        contexts,
+        draft,
+    )
+
+    assert "0.123" in repaired.answer_markdown
+    assert "21.0" in repaired.answer_markdown
+    assert repaired.citations == [0, 1]
+
+
 def test_choose_citation_indexes_unions_payload_inferred_and_facets() -> None:
     db = make_session()
     service = QueryService(db)
@@ -3454,6 +4341,216 @@ def test_answer_contains_extracted_metrics_requires_values_not_metric_names_only
     )
 
 
+def test_table_fact_metrics_keeps_repeated_hierarchical_rows_distinct() -> None:
+    """Row labels repeated under a blank parent must not overwrite each other.
+
+    ``_table_fact_metrics`` converts table facts into the deterministic answer
+    shape.  Two different source rows sharing the label ``C36m`` (after the
+    parent System cell is blank) must remain two separate metrics instead of
+    collapsing into one overwritten row.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="v1",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 1: alpha L conformational sampling.\n"
+                    "| System | Simulation | alpha_u probability (%) | alpha_L propensity Max. (%) | alpha_L propensity Max. length |\n"
+                    "| --- | --- | --- | --- | --- |\n"
+                    "| HEWL19 peptide | C36 | 11 ± 7 | 12 ± 2 | 8 aa |\n"
+                    "|  | C36m | 3 ± 2 | 5.6 ± 0.5 | 4 aa |\n"
+                    "| RS peptide | C36 | 80 ± 2 | 41 ± 1 | 17 aa |\n"
+                    "|  | C36m | 1.8 ± 0.5 | 5.5 ± 0.2 | 5 aa |"
+                ),
+            )
+        ]
+    )
+    facts = tuple(
+        extract_table_facts("RS peptide 和 HEWL19 的 alpha L probability 数值？", table)
+    )
+    context = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="c1",
+            table_id="t1",
+            parse_version="v1",
+            block_type="table",
+            score=50,
+            excerpt=table.markdown,
+        ),
+        prompt_text=table.markdown,
+        score=50,
+        evidence_kind="table",
+        table_context=table,
+        table_facts=facts,
+    )
+
+    metrics = service._table_fact_metrics(context, 0)
+
+    datasets = [metric.dataset for metric in metrics]
+    assert datasets.count("HEWL19 peptide / C36m") == 1
+    assert datasets.count("RS peptide / C36m") == 1
+    assert datasets.count("RS peptide / C36") == 1
+    assert {value for metric in metrics for value in metric.values.values()} >= {
+        "3 ± 2",
+        "1.8 ± 0.5",
+    }
+
+
+def test_metric_extraction_retains_later_requested_rows_across_tables() -> None:
+    """Metric extraction must not globally stop after the first eight results.
+
+    The first table already yields eight rows; a requested row in a later
+    table must still survive instead of being truncated by a global cap.
+    """
+    service = QueryService(make_session())
+
+    def build_table(table_id: str, rows: list[tuple[str, str, str]]) -> tuple[object, object]:
+        lines = [
+            f"Table {table_id}: metrics.",
+            "| Model | Alpha | Beta |",
+            "| --- | --- | --- |",
+        ]
+        for model, alpha, beta in rows:
+            lines.append(f"| {model} | {alpha} | {beta} |")
+        table = assemble_table_context(
+            [
+                CanonicalTableChunk(
+                    chunk_id=f"{table_id}-c",
+                    document_id="d1",
+                    parse_version="v1",
+                    table_id=table_id,
+                    ordinal=0,
+                    text="\n".join(lines),
+                )
+            ]
+        )
+        return table, table
+
+    first_rows = [(f"Model {i}", f"{i}.0", f"{i}.5") for i in range(8)]
+    first_table, _ = build_table("A", first_rows)
+    second_table, _ = build_table("B", [("Target", "21.0", "95.3")])
+
+    question = "What are the Target Alpha and Beta values in Table B?"
+    first_facts = tuple(extract_table_facts(question, first_table))
+    second_facts = tuple(extract_table_facts(question, second_table))
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="A-c",
+                table_id="A",
+                parse_version="v1",
+                block_type="table",
+                score=50,
+                excerpt=first_table.markdown,
+            ),
+            prompt_text=first_table.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=first_table,
+            table_facts=first_facts,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="B-c",
+                table_id="B",
+                parse_version="v1",
+                block_type="table",
+                score=50,
+                excerpt=second_table.markdown,
+            ),
+            prompt_text=second_table.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=second_table,
+            table_facts=second_facts,
+        ),
+    ]
+
+    metrics = service._extract_requested_metric_values(question, contexts, [0, 1])
+
+    target = [metric for metric in metrics if metric.dataset == "Target"]
+    assert target, "later requested table row must survive metric extraction"
+    assert target[0].values.get("Alpha") == "21.0"
+    assert target[0].values.get("Beta") == "95.3"
+
+
+def test_normalize_selector_matches_latex_and_unicode_chi_forms() -> None:
+    """Equivalent rendered scientific identifiers must normalize identically.
+
+    ``\\mathbb { \\chi } _ { 1 }`` (LaTeX), ``\\chi _ { 1 }`` and the unicode
+    ``χ1`` all denote chi-1 and must collapse to the same selector key.
+    """
+    assert QueryService._normalize_selector(r"\mathbb { \chi } _ { 1 }") == "chi1"
+    assert QueryService._normalize_selector(r"\chi _ { 1 }") == "chi1"
+    assert QueryService._normalize_selector("χ1") == "chi1"
+    assert QueryService._normalize_selector(r"\alpha _ { \mathrm { L } }") == "alphal"
+
+
+def test_shared_selector_normalizer_covers_wrapped_latex_anchors() -> None:
+    for wrapper in ("mathbb", "mathrm", "mathbf", "mathsf", "text"):
+        assert QueryService._normalize_selector(
+            rf"\{wrapper} {{ \chi }} _ {{ 2 }}"
+        ) == "chi2"
+    assert QueryService._scientific_anchor_labels_in_text(
+        r"Late \text { \alpha _ { \mathrm { L } } } and "
+        r"\mathbf { \chi } _ { 1 } plus \mathsf { \chi } _ { 2 }."
+    ) == ["alphaL", "\u03c71", "\u03c72"]
+
+
+def test_scientific_anchor_excerpt_locates_wrapped_latex_anchor() -> None:
+    text = "Earlier context. " * 120 + r"Late evidence \mathbb { \chi } _ { 1 } = 60."
+
+    excerpt = QueryService._scientific_anchor_excerpt_window(
+        text,
+        ["chi1"],
+        max_chars=300,
+    )
+
+    assert r"\mathbb { \chi } _ { 1 }" in excerpt
+
+
+def test_supported_term_note_adds_idp_when_evidence_spells_out_the_phrase() -> None:
+    """A requested acronym must not be dropped when the evidence spells it out.
+
+    The ff99sb-disp overview question requires ``IDP``, but the retrieved
+    evidence renders the full phrase "intrinsically disordered proteins".
+    The deterministic evidence answer must still surface the acronym.
+    """
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/ff99sb-disp",
+                page_title="ff99sb-disp",
+                page_kind="source_summary",
+                score=10,
+                excerpt=(
+                    "Water models typically underestimate London dispersion, which may explain "
+                    "why standard water models fail for intrinsically disordered proteins."
+                ),
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = QueryService._append_missing_supported_question_terms(
+        "ff99sb-disp/TIP4P-D 认为标准水模型对 IDP 模拟失败的根本原因是什么？",
+        "已有证据说明相关机制。",
+        contexts,
+    )
+
+    assert "IDP" in answer
+
+
 def test_deterministic_table_answer_reports_all_extracted_arbitrary_columns() -> None:
     service = QueryService(make_session())
     table = assemble_table_context(
@@ -3504,6 +4601,153 @@ def test_deterministic_table_answer_reports_all_extracted_arbitrary_columns() ->
 
     assert answer is not None
     assert all(value in answer.answer_markdown for value in ("21.0", "8.95", "95.3"))
+
+
+def test_long_canonical_table_tail_row_fact_is_discoverable_from_structured_rows() -> None:
+    service = QueryService(make_session())
+    lines = ["Table 7", "| Model | Asp | C6 | exptl |", "| --- | --- | --- | --- |"]
+    for i in range(80):
+        lines.append(f"| Protein {chr(65 + i % 26)}{i} | {i}.0 | {i}.5 | {i}.9 |")
+    lines.append("| Protein Z | 21.0 | 8.95 | 95.3 |")
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-7-tail",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-7",
+                ordinal=1,
+                text="\n".join(lines),
+            )
+        ]
+    )
+    question = "What is the Protein Z Asp and exptl value in Table 7?"
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-7-tail",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=tuple(extract_table_facts(question, table)),
+        )
+    ]
+
+    answer = service._deterministic_table_answer_if_supported(question, contexts, "normal")
+
+    assert answer is not None
+    assert "Protein Z" in answer.answer_markdown
+    assert "21.0" in answer.answer_markdown
+    assert "95.3" in answer.answer_markdown
+
+
+def test_unrelated_enriched_canonical_table_does_not_leak_into_deterministic_answer() -> None:
+    service = QueryService(make_session())
+    question = "What is the Protein Z Asp and exptl value in Table 7?"
+    requested_lines = ["Table 7", "| Model | Asp | C6 | exptl |", "| --- | --- | --- | --- |"]
+    for i in range(80):
+        requested_lines.append(f"| Protein {chr(65 + i % 26)}{i} | {i}.0 | {i}.5 | {i}.9 |")
+    requested_lines.append("| Protein Z | 21.0 | 8.95 | 95.3 |")
+    requested_table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-7-tail",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-7",
+                ordinal=1,
+                text="\n".join(requested_lines),
+            )
+        ]
+    )
+    unrelated_lines = (
+        "Table 3 | System | HFE |\n"
+        "| --- | --- |\n"
+        "| Acetate | -10.5 |\n"
+        "| Guanidine | -11.9 |\n"
+        "| NMA | -9.8 |\n"
+        "| Butane | -8.1 |"
+    )
+    unrelated_table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="table-3-hfe",
+                document_id="d1",
+                parse_version="canonical-v4",
+                table_id="table-3",
+                ordinal=1,
+                text=unrelated_lines,
+            )
+        ]
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-3-hfe",
+                table_id="table-3",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=30,
+                excerpt=unrelated_table.markdown,
+            ),
+            prompt_text=unrelated_table.markdown,
+            score=30,
+            evidence_kind="table",
+            table_context=unrelated_table,
+            table_facts=tuple(extract_table_facts(question, unrelated_table)),
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-7-tail",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=50,
+                excerpt=requested_table.markdown,
+            ),
+            prompt_text=requested_table.markdown,
+            score=50,
+            evidence_kind="table",
+            table_context=requested_table,
+            table_facts=tuple(extract_table_facts(question, requested_table)),
+        ),
+    ]
+
+    assert not QueryService._table_allows_fallback_rows(question, unrelated_table.markdown)
+
+    answer = service._deterministic_table_answer_if_supported(question, contexts, "normal")
+
+    assert answer is not None
+    assert "Protein Z" in answer.answer_markdown
+    assert "21.0" in answer.answer_markdown
+    assert "95.3" in answer.answer_markdown
+    assert "Table 3" not in answer.answer_markdown
+    assert "-10.5" not in answer.answer_markdown
+    assert answer.citations == [1]
+
+
+def test_table_citation_excerpt_never_ends_on_a_half_table_row() -> None:
+    lines = ["Table 7", "| Model | Asp | C6 | exptl |", "| --- | --- | --- | --- |"]
+    for i in range(80):
+        lines.append(f"| Protein {chr(65 + i % 26)}{i} | {i}.0 | {i}.5 | {i}.9 |")
+    table = "\n".join(lines)
+
+    excerpt = QueryService._table_citation_excerpt(table, "Protein Asp values?", max_chars=900)
+
+    assert excerpt
+    last_line = excerpt.strip().splitlines()[-1]
+    if last_line.strip().startswith("|"):
+        assert last_line.strip().endswith("|"), f"citation excerpt ended on a half row: {last_line!r}"
 
 
 def test_metric_query_without_extracted_metrics_does_not_return_generic_table_snippet() -> None:
@@ -4107,6 +5351,634 @@ def test_generic_table_answer_keeps_late_binding_table_when_earlier_tables_have_
     assert "Table 7" in answer.answer_markdown
     assert "1.18" in answer.answer_markdown
     assert "1.12" in answer.answer_markdown
+
+
+def test_generic_table_answer_keeps_explicit_rows_across_duplicate_contexts() -> None:
+    """A question naming several rows keeps every requested row.
+
+    A canonical table is retrieved through several row-level contexts that
+    carry the same assembled facts.  The highest-scoring row must not consume
+    the whole bounded row budget before a second explicitly requested row is
+    reached.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 1: Rg values.\n"
+                    "| Systems | Exp. | C36IDPSFF |\n"
+                    "| --- | --- | --- |\n"
+                    "| ACTR (71 aa) | 25.00 ± 1.00 ^60 | 13.07 ± 0.09 |\n"
+                    "| Aβ40 (40 aa) | 12.0 ± 1.3 ^a | 11.53 ± 0.13 |"
+                ),
+            )
+        ]
+    )
+    question = "C36IDPSFF 中 Aβ40 和 ACTR 的 Rg 值分别是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    assert {fact.row_label for fact in facts} == {
+        "ACTR (71 aa) / 25.00 ± 1.00 ^60",
+        "Aβ40 (40 aa) / 12.0 ± 1.3 ^a",
+    }
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"row-{index}",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0 - index,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0 - index,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        )
+        for index in range(8)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, list(range(len(contexts))), "normal"
+    )
+
+    assert answer is not None
+    assert "13.07 ± 0.09" in answer.answer_markdown
+    assert "11.53 ± 0.13" in answer.answer_markdown
+    assert answer.answer_markdown.count("13.07 ± 0.09") == 1
+    assert answer.answer_markdown.count("11.53 ± 0.13") == 1
+
+
+def test_generic_table_answer_does_not_repeat_rows_from_duplicate_contexts() -> None:
+    """Duplicate row-level contexts for one canonical table do not repeat rows.
+
+    The bounded row budget is spent on distinct rows, never on a second copy
+    of the same canonical row from another row-level context.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 1: Rg values.\n"
+                    "| Systems | Exp. | C36IDPSFF |\n"
+                    "| --- | --- | --- |\n"
+                    "| ACTR (71 aa) | 25.00 ± 1.00 ^60 | 13.07 ± 0.09 |\n"
+                    "| Aβ40 (40 aa) | 12.0 ± 1.3 ^a | 11.53 ± 0.13 |"
+                ),
+            )
+        ]
+    )
+    question = "C36IDPSFF 中 Aβ40 和 ACTR 的 Rg 值分别是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"row-{index}",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0 - index,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0 - index,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        )
+        for index in range(4)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, list(range(len(contexts))), "normal"
+    )
+
+    assert answer is not None
+    assert answer.answer_markdown.count("各列对应的表格数值为") == 2
+    assert answer.answer_markdown.count("13.07 ± 0.09") == 1
+    assert answer.answer_markdown.count("11.53 ± 0.13") == 1
+
+
+def test_generic_table_answer_keeps_requested_tables_after_cross_context_dedup() -> None:
+    """Deduplicating one table's duplicate contexts keeps later tables visible.
+
+    A multi-row table retrieved through many row-level contexts must not push
+    an independently requested table, or its own tail rows, out of the bounded
+    answer budget.
+    """
+    service = QueryService(make_session())
+
+    def build(table_id: str, markdown: str) -> object:
+        return assemble_table_context(
+            [
+                CanonicalTableChunk(
+                    chunk_id=f"{table_id}-c",
+                    document_id="d1",
+                    parse_version="canonical-v4-xyz",
+                    table_id=table_id,
+                    ordinal=0,
+                    text=markdown,
+                )
+            ]
+        )
+
+    table_a = build(
+        "table-5",
+        (
+            "Table 5. OPLS4 model metric comparison.\n"
+            "| Property | OPLS3e | OPLS4 |\n"
+            "| --- | --- | --- |\n"
+            "| Dipole moment | 2.0 | 1.2 |\n"
+            "| Surface tension | 1.4 | 0.1 |\n"
+            "| Heat capacity | 0.9 | 0.8 |\n"
+            "| RMS error | 1.08 | 0.40 |"
+        ),
+    )
+    table_b = build(
+        "table-8",
+        (
+            "Table 8. Relative Interaction Energy.\n"
+            "| interaction partner | OPLS3e | OPLS4 |\n"
+            "| --- | --- | --- |\n"
+            "| NMA oxygen | -0.99 | -1.94 |"
+        ),
+    )
+    question = "OPLS4 的 Table 5 和 Table 8 相比 OPLS3e 有哪些数值？"
+    facts_a = tuple(extract_table_facts(question, table_a))
+    facts_b = tuple(extract_table_facts(question, table_b))
+    assert {fact.row_label for fact in facts_a} >= {"Dipole moment", "RMS error"}
+    assert {fact.row_label for fact in facts_b} == {"NMA oxygen"}
+
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"a-{index}",
+                table_id="table-5",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0 - index,
+                excerpt=table_a.markdown,
+            ),
+            prompt_text=table_a.markdown,
+            score=50.0 - index,
+            evidence_kind="table",
+            table_context=table_a,
+            table_facts=facts_a,
+        )
+        for index in range(6)
+    ]
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="b-0",
+                table_id="table-8",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=10.0,
+                excerpt=table_b.markdown,
+            ),
+            prompt_text=table_b.markdown,
+            score=10.0,
+            evidence_kind="table",
+            table_context=table_b,
+            table_facts=facts_b,
+        )
+    )
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, list(range(len(contexts))), "normal"
+    )
+
+    assert answer is not None
+    for expected in ("2.0", "1.4", "0.9", "1.08", "-0.99", "-1.94"):
+        assert expected in answer.answer_markdown, f"missing {expected}"
+    assert answer.answer_markdown.count("2.0") == 1
+    assert answer.answer_markdown.count("1.08") == 1
+    assert answer.answer_markdown.count("-0.99") == 1
+
+
+def test_generic_table_answer_keeps_tail_row_fact_after_context_dedup() -> None:
+    """A tail-row fact stays visible when the same table repeats as contexts."""
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 2. Model results.\n"
+                    "| Model | F1 |\n"
+                    "| --- | --- |\n"
+                    "| Baseline | 80.0 |\n"
+                    "| Strong baseline | 88.4 |\n"
+                    "| Candidate | 95.3 |"
+                ),
+            )
+        ]
+    )
+    question = "Table 2 中 Candidate 模型的 F1 是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    assert facts and all(fact.row_label == "Candidate" for fact in facts)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"row-{index}",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0 - index,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0 - index,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        )
+        for index in range(4)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, list(range(len(contexts))), "normal"
+    )
+
+    assert answer is not None
+    assert "95.3" in answer.answer_markdown
+    assert answer.answer_markdown.count("各列对应的表格数值为") == 1
+
+
+def test_generic_table_answer_dedups_mixed_full_and_citation_only_canonical_contexts() -> None:
+    """A full ``TableContext``/facts context and a citation-only canonical
+    cell-text context for the same table must not repeat the same row.
+
+    One canonical table can reach the generic answer both as an assembled
+    ``TableContext``/facts representation and as a citation-only context whose
+    only evidence is the table's cell text.  Both representations must
+    resolve to the same row key so the same row appears once and distinct
+    requested rows remain present.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 1: Rg values.\n"
+                    "| Systems | Exp. | C36IDPSFF |\n"
+                    "| --- | --- | --- |\n"
+                    "| ACTR (71 aa) | 25.00 ± 1.00 ^60 | 13.07 ± 0.09 |\n"
+                    "| Aβ40 (40 aa) | 12.0 ± 1.3 ^a | 11.53 ± 0.13 |"
+                ),
+            )
+        ]
+    )
+    question = "C36IDPSFF 中 Aβ40 和 ACTR 的 Rg 值分别是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="full-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="cite-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=40.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=40.0,
+            evidence_kind="table",
+        ),
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, [0, 1], "normal"
+    )
+
+    assert answer is not None
+    assert "13.07 ± 0.09" in answer.answer_markdown
+    assert "11.53 ± 0.13" in answer.answer_markdown
+    assert answer.answer_markdown.count("13.07 ± 0.09") == 1
+    assert answer.answer_markdown.count("11.53 ± 0.13") == 1
+
+
+def test_generic_table_answer_dedups_hierarchical_non_numeric_property_mixed_contexts() -> None:
+    """A non-numeric property cell and differing selected value columns must
+    not split one canonical hierarchical row into two answer rows.
+
+    The facts path and the citation-only cell-text path expose different
+    value columns for the same canonical row (facts keeps only the
+    question-selected ``RMSD`` column, while the cell path keeps every numeric
+    column), and the cell path carries the non-numeric ``helix`` property cell
+    while the facts path carries none.  Both representations must still
+    resolve to the same canonical row key so the row is emitted once and the
+    bounded row budget is not consumed by a duplicate.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 1: Secondary structure populations.\n"
+                    "| System | Conformation | RMSD | Energy |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| ACTR (71 aa) | helix | 3.0 | 3.2 |\n"
+                    "| ACTR (71 aa) | coil | 4.1 | 4.4 |"
+                ),
+            )
+        ]
+    )
+    question = "ACTR 的 helix 的 rmsd 值是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    assert facts and all(fact.column == "RMSD" for fact in facts)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="full-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="cite-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=40.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=40.0,
+            evidence_kind="table",
+        ),
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, [0, 1], "normal"
+    )
+
+    assert answer is not None
+    assert "3.0" in answer.answer_markdown
+    assert answer.answer_markdown.count("3.0") == 1
+
+
+def test_generic_table_answer_dedups_byte_identical_legacy_contexts() -> None:
+    """Repeated byte-identical legacy table evidence must not repeat rows.
+
+    Legacy text tables have no stable canonical table identity.  Identical
+    legacy contexts for the same table must collapse into one row group so
+    the bounded row budget is spent on distinct rows, not on duplicate copies
+    of the same rows from repeated contexts.
+    """
+    service = QueryService(make_session())
+    table_markdown = (
+        "Table 5. OPLS4 model metric comparison.\n"
+        "| Property | OPLS3e | OPLS4 |\n"
+        "| --- | --- | --- |\n"
+        "| Dipole moment | 2.0 | 1.2 |\n"
+        "| Surface tension | 1.4 | 0.1 |\n"
+        "| Heat capacity | 0.9 | 0.8 |\n"
+        "| RMS error | 1.08 | 0.40 |"
+    )
+    question = "OPLS4 相比 OPLS3e 有哪些数值？"
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=f"legacy-{index}",
+                table_id="legacy-t1",
+                parse_version="legacy",
+                block_type="table",
+                score=50.0 - index,
+                excerpt=table_markdown,
+            ),
+            prompt_text=table_markdown,
+            score=50.0 - index,
+            evidence_kind="table",
+        )
+        for index in range(4)
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, list(range(len(contexts))), "normal"
+    )
+
+    assert answer is not None
+    for expected in ("Dipole moment", "Surface tension", "Heat capacity", "RMS error"):
+        assert expected in answer.answer_markdown
+    for expected in ("2.0", "1.4", "0.9", "1.08"):
+        assert answer.answer_markdown.count(expected) == 1
+
+
+def test_generic_table_answer_dedups_mixed_hierarchical_row_with_non_numeric_property() -> None:
+    """One canonical hierarchical row must not repeat across full-facts and
+    citation-only representations when its property cell is non-numeric and
+    the two paths select different value columns.
+
+    The facts path emits only question-matched value columns with an empty
+    property component (``V1 3.0``), while the citation-only cell path emits
+    all numeric columns and keeps the non-numeric property cell (``V1 3.0,
+    V2 3.2`` with property ``Rg``).  Both representations share the same
+    canonical table identity, row position, and leading row label, so the row
+    key must collide and the answer must emit that row once.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 2: Rg values across force fields.\n"
+                    "| System | Property | V1 | V2 |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| ACTR (71 aa) | Rg | 3.0 | 3.2 |\n"
+                    "| Ab40 (40 aa) | Rg | 4.0 | 4.2 |"
+                ),
+            )
+        ]
+    )
+    question = "ACTR 的 Rg 值在 V1 中是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="full-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="cite-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=40.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=40.0,
+            evidence_kind="table",
+        ),
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, [0, 1], "normal"
+    )
+
+    assert answer is not None
+    assert "3.0" in answer.answer_markdown
+    assert answer.answer_markdown.count("3.0") == 1
+
+
+def test_generic_table_answer_keeps_repeated_hierarchical_labels_across_mixed_contexts() -> None:
+    """Distinct repeated hierarchical labels stay distinct when one canonical
+    table mixes full-facts and citation-only representations.
+
+    ``Protein B`` appears at two different canonical row positions (``C36m``
+    and ``C36IDPSFF``).  Row keys include the canonical row position, so the
+    two rows remain separate while the duplicated representation of the
+    requested ``Protein B / C36IDPSFF`` row collapses to one answer row.
+    """
+    service = QueryService(make_session())
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="c1",
+                document_id="d1",
+                parse_version="canonical-v4-xyz",
+                table_id="t1",
+                ordinal=0,
+                text=(
+                    "Table 9: Rg values.\n"
+                    "| System | Model | Rg |\n"
+                    "| --- | --- | --- |\n"
+                    "| Protein A | C36m | 11.1 |\n"
+                    "| Protein A | C36IDPSFF | 12.2 |\n"
+                    "| Protein B | C36m | 13.3 |\n"
+                    "| Protein B | C36IDPSFF | 14.9 |"
+                ),
+            )
+        ]
+    )
+    question = "Protein B 的 C36IDPSFF Rg 是多少？"
+    facts = tuple(extract_table_facts(question, table))
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="full-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=50.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=50.0,
+            evidence_kind="table",
+            table_context=table,
+            table_facts=facts,
+        ),
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="cite-row-0",
+                table_id="t1",
+                parse_version="canonical-v4-xyz",
+                block_type="table",
+                score=40.0,
+                excerpt=table.markdown,
+            ),
+            prompt_text=table.markdown,
+            score=40.0,
+            evidence_kind="table",
+        ),
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        question, contexts, [0, 1], "normal"
+    )
+
+    assert answer is not None
+    for value in ("11.1", "12.2", "13.3", "14.9"):
+        assert value in answer.answer_markdown
+        assert answer.answer_markdown.count(value) == 1
+    # The requested Protein B / C36IDPSFF row appears once, not once per
+    # representation, while the sibling Protein B / C36m row stays distinct
+    # (13.3 and 14.9 are both present exactly once).
+    assert "Protein B / C36IDPSFF" in answer.answer_markdown
 
 
 def test_rag_table_query_returns_structured_tables_before_profile_terms() -> None:
@@ -5189,6 +7061,252 @@ def test_generic_table_answer_covers_each_requested_opls5_table_facet() -> None:
         assert expected in answer.answer_markdown
 
 
+def test_metric_extraction_parses_each_table_in_fact_bearing_context() -> None:
+    """A fact-bearing context must not hide a second table in its excerpt."""
+    service = QueryService(make_session())
+    first_table = (
+        "Table 5. Benchmark metrics.\n"
+        "| Dataset | F1 |\n"
+        "| --- | --- |\n"
+        "| BioASQ | 71.3 |"
+    )
+    second_table = (
+        "Table 8. Benchmark metrics.\n"
+        "| Dataset | F1 |\n"
+        "| --- | --- |\n"
+        "| PubMedQA | 79.6 |"
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/bench",
+                page_title="Benchmark",
+                page_kind="source_summary",
+                score=10,
+                excerpt=first_table + "\n\n" + second_table,
+            ),
+            prompt_text=first_table + "\n\n" + second_table,
+            score=10,
+            table_facts=(
+                TableFact(
+                    table_id="table-5",
+                    document_id="bench",
+                    parse_version="v1",
+                    row_label="BioASQ",
+                    column="F1",
+                    value="71.3",
+                    row_index=0,
+                    source_chunk_ids=("chunk-5",),
+                ),
+            ),
+        )
+    ]
+
+    metrics = service._extract_requested_metric_values(
+        "What are the F1 values for BioASQ and PubMedQA?",
+        contexts,
+        [0],
+    )
+
+    values = {metric.dataset.casefold(): metric.values for metric in metrics}
+    assert values["bioasq"] == {"F1": "71.3"}
+    assert values["pubmedqa"] == {"F1": "79.6"}
+
+
+def test_metric_extraction_retains_opls5_requested_values_and_drops_unrelated_tables() -> None:
+    """The OPLS5 table question keeps every requested table fact and no unrelated table.
+
+    Row labels are not dataset names: ``Acetate-guanidinium``, ``GLU``,
+    ``RMS error`` and the perturbation classes of Table 7 only become metrics
+    through the canonical fact path.  The metric extractor must retain the
+    requested Table 2/4/5/7 rows -- including the experimental ``Exp.`` column
+    that ``extract_table_facts`` drops -- while preventing the co-retrieved
+    Table 3 (interaction energy), Table 6 (ESP RMSE) and Table 8 (FEP+ binding
+    free energy) facts from leaking into the answer.
+    """
+    service = QueryService(make_session())
+    question = (
+        "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa "
+        "和 binding RMSE 相比 OPLS4 有哪些数值改善？"
+    )
+    tables = [
+        (
+            "Table 2. Hydration free energies for small aromatic molecules.\n"
+            "| Compound | Exp. | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| RMS error |  | 0.76 | 0.46 |"
+        ),
+        (
+            "Table 4. Acetate pKa shift.\n"
+            "| System | Exp. | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Acetate-guanidinium | -0.136 | -0.26 | -0.14 |"
+        ),
+        (
+            "Table 5. pKa sets.\n"
+            "| Amino acid | Number | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| GLU | 44 | 0.70 | 0.61 |"
+        ),
+        (
+            "Table 7. Root mean square errors for relative binding free energy results.\n"
+            "| PerturbationClass | No.cmpds | OPLS4 |  | OPLS5 |  |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |\n"
+            "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |"
+        ),
+        (
+            "Table 3. Interaction energy comparison.\n"
+            "| Group | CCSD(T)/CBS | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Acetate | -10.5 | -11.3 | -10.5 |\n"
+            "| Guanidine | -11.9 | -11.2 | -11.2 |"
+        ),
+        (
+            "Table 6. OPLS4 and OPLS5 model performance (RMSE) comparison of electrostatic potential.\n"
+            "|  | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| No externalfield | 16.6 | 2.9 |"
+        ),
+        (
+            "Table 8. Binding free energy results for FEP+ perturbations near metal-organic complexes.\n"
+            "| Exp. | OPLS4 | OPLS5 |\n"
+            "| --- | --- | --- |\n"
+            "| 3.1 | -0.6 ± 0.2 | 1.4 ± 0.1 |"
+        ),
+    ]
+    contexts: list[RetrievedContext] = []
+    for index, markdown in enumerate(tables):
+        table = assemble_table_context(
+            [
+                CanonicalTableChunk(
+                    chunk_id=f"opls5-c{index}",
+                    document_id="opls5",
+                    parse_version="v1",
+                    table_id=f"t{index}",
+                    ordinal=0,
+                    text=markdown,
+                )
+            ]
+        )
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    document_id="opls5",
+                    chunk_id=f"opls5-c{index}",
+                    table_id=f"t{index}",
+                    parse_version="v1",
+                    block_type="table",
+                    score=50 - index,
+                    excerpt=table.markdown,
+                ),
+                prompt_text=table.markdown,
+                score=50 - index,
+                evidence_kind="table",
+                table_context=table,
+                table_facts=tuple(extract_table_facts(question, table)),
+            )
+        )
+
+    metrics = service._extract_requested_metric_values(question, contexts, list(range(len(contexts))))
+
+    surviving = {metric.table_label: metric for metric in metrics}
+    values = {
+        metric.dataset.casefold(): metric.values
+        for metric in metrics
+    }
+    # Table 4 must keep the experimental reference value ``-0.136`` alongside
+    # the OPLS4/OPLS5 model columns.
+    assert values["acetate-guanidinium"]["Exp."] == "-0.136"
+    assert values["acetate-guanidinium"]["OPLS4"] == "-0.26"
+    assert values["acetate-guanidinium"]["OPLS5"] == "-0.14"
+    assert values["glu"] == {"OPLS4": "0.70", "OPLS5": "0.61"}
+    assert values["rms error"] == {"OPLS4": "0.76", "OPLS5": "0.46"}
+    assert values["waterdisplacement"]["OPLS4"] == "1.12"
+    assert values["heterocyclefocused"]["OPLS4"] == "1.18"
+    # Unrelated tables must not leak into the extracted metrics.
+    assert "Table 3" not in surviving
+    assert "Table 6" not in surviving
+    assert "Table 8" not in surviving
+    # Every required fact value survives extraction somewhere.
+    answer_values = {
+        item
+        for metric in metrics
+        for item in [metric.dataset, *metric.values.values()]
+    }
+    for required in ("0.76", "0.46", "-0.136", "-0.14", "GLU", "0.70", "0.61", "1.18", "1.12"):
+        assert required in answer_values
+
+
+def test_generic_table_answer_keeps_tail_rows_of_long_binding_table() -> None:
+    service = QueryService(make_session())
+    rows = [
+        f"| filler-{index} | {index}.0 | {index + 0.5:.1f} |"
+        for index in range(10)
+    ]
+    rows.extend(
+        [
+            "| HeterocycleFocused | 1.18 | 1.19 |",
+            "| WaterDisplacement | 1.12 | 1.13 |",
+        ]
+    )
+    table = (
+        "Table 7. Relative binding free-energy RMSE.\n"
+        "| PerturbationClass | OPLS4 | OPLS5 |\n"
+        "| --- | --- | --- |\n"
+        + "\n".join(rows)
+    )
+    table_context = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id="opls5-table-7",
+                document_id="opls5",
+                parse_version="v1",
+                table_id="table-7",
+                ordinal=0,
+                text=table,
+            )
+        ]
+    )
+    table_facts = tuple(
+        extract_table_facts(
+            "For OPLS5, what binding RMSE improvements over OPLS4 are reported in Table 7?",
+            table_context,
+        )
+    )
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=10,
+                excerpt=table,
+                block_type="table",
+                table_id="table-7",
+                document_id="opls5",
+                parse_version="v1",
+            ),
+            prompt_text=table,
+            score=10,
+            evidence_kind="table",
+            table_context=table_context,
+            table_facts=table_facts,
+        )
+    ]
+
+    answer = service._deterministic_generic_table_answer(
+        "For OPLS5, what binding RMSE improvements over OPLS4 are reported in Table 7?",
+        contexts,
+        [0],
+        "normal",
+    )
+
+    assert answer is not None
+    assert "1.18" in answer.answer_markdown
+    assert "1.12" in answer.answer_markdown
+
+
 def test_finalize_table_contexts_retains_each_requested_multitable_facet() -> None:
     service = QueryService(make_session())
     question = (
@@ -6109,3 +8227,393 @@ def test_retrieve_evidence_honors_document_scope() -> None:
 
     empty_pack = service.retrieve_evidence("demo", "beta", document_id="d-a")
     assert empty_pack.status == "empty"
+
+
+def _canonical_context(
+    markdown: str,
+    document_id: str,
+    table_id: str,
+    chunk_id: str,
+    *,
+    question: str,
+    score: int = 50,
+) -> RetrievedContext:
+    """Build a canonical table ``RetrievedContext`` with assembled facts."""
+    table = assemble_table_context(
+        [
+            CanonicalTableChunk(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                parse_version="canonical-v4",
+                table_id=table_id,
+                ordinal=0,
+                text=markdown,
+            )
+        ]
+    )
+    facts = tuple(extract_table_facts(question, table))
+    return RetrievedContext(
+        citation=Citation(
+            document_id=document_id,
+            chunk_id=chunk_id,
+            table_id=table_id,
+            parse_version="canonical-v4",
+            block_type="table",
+            score=score,
+            excerpt=table.markdown,
+        ),
+        # The raw chunk text (with the original LaTeX) is what a retrieval
+        # context would carry as ``prompt_text``; the assembled table markdown
+        # is re-serialised and can lose Greek/label surfaces.
+        prompt_text=markdown,
+        score=score,
+        evidence_kind="table",
+        table_context=table,
+        table_facts=facts,
+    )
+
+
+def test_water_table_surface_tension_row_reaches_deterministic_answer() -> None:
+    """The surface-tension row of a LaTeX water-model table reaches the answer.
+
+    The canonical water-model table stores every property row as a separate
+    Child whose label is LaTeX-wrapped (``\\gamma \\ ( mN m^-1 )``).  The
+    question asks for C6, dipole moment and surface tension, so the requested
+    property rows are selected by the model columns (TIP3P / TIP4P-D) even when
+    the row label itself is not parseable.  ``71.2`` (TIP4P-D) and ``47.8``
+    (TIP3P) must appear in the deterministic answer, not only in a citation.
+    """
+    service = QueryService(make_session())
+    question = "TIP4P-D 在水模型参数表中相对 TIP3P 的 C6、偶极矩和表面张力数值是什么？"
+    rows = [
+        (r"$\\mu \\ ( D )$", "2.95", "2.35", "2.35", "2.32", "2.305", "2.403"),
+        (r"$\\gamma \\ ( \\mathrm { m N \\ m ^ { - 1 } } )$", "71.7", "47.8", "58.4", "59.2", "63.3", "71.2"),
+        (r"$C _ { 6 } \\ ( k c a l \\ m o l ^ { - 1 } \\ A ^ { 6 } )$", "900", "595", "618", "621", "630", "597"),
+    ]
+    table_md = (
+        "Table 1. Parameters and Physical Properties of Selected Commonly Used Water Models and TIP4P-D\n"
+        "|  | Expt | TIP3P | SPC/E | TIP4P-EW | TIP4P/2005 | TIP4P-D |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        + "\n".join("| " + " | ".join(row) + " |" for row in rows)
+    )
+    context = _canonical_context(
+        table_md,
+        "ff99sb-disp",
+        "table-1",
+        "disp-table-1",
+        question=question,
+    )
+
+    answer = service._deterministic_generic_table_answer(question, [context], [0], "normal")
+
+    assert answer is not None
+    assert "71.2" in answer.answer_markdown
+    assert "47.8" in answer.answer_markdown
+    assert "2.403" in answer.answer_markdown
+    assert "2.35" in answer.answer_markdown
+    assert "Table 1" in answer.answer_markdown
+
+
+def test_ildn_theta0_and_greek_aliases_surface_in_deterministic_answer() -> None:
+    """The human-readable ``theta`` surface and Greek torsion anchors survive.
+
+    Table I of ff99SB-ILDN stores its ``theta0`` column header as LaTeX
+    ``$\\theta _ { 0 }$`` which the table pipeline reduces to ``0``.  The
+    deterministic answer must still expose the human-readable ``theta`` label
+    and the ``chi1``/``chi2`` torsion anchors requested by the question.
+    """
+    service = QueryService(make_session())
+    question = "ff99SB-ILDN 的 Table I 列出了哪些残基/角度的修改参数？theta0 的设置是什么？"
+    table_md = (
+        "Table I Table I List of Modified Parameters for the \\mathbb { \\chi } _ { 1 } "
+        "and \\chi _ { 2 } Torsion Potentials in Selected Amino Acids of the Amber ff99SB Force Field\n"
+        "| Res. | Angle | $\\\\theta _ { 0 }$ | $\\\\mathsf { k } _ { 1 }$ | k _ { 2 } |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| lle | N - C ^ { \\\\alpha } - C ^ { \\\\beta } - C ^ { \\\\gamma 2 } | 0.0 |  | 0.195 -0.846 |\n"
+        "| Leu | C - C ^ { \\\\alpha } - C ^ { \\\\beta } - C ^ { \\\\gamma } | 0.0 |  | 0.014 -0.108 |"
+    )
+    context = _canonical_context(
+        table_md,
+        "ff99sb-ildn",
+        "table-I",
+        "ildn-table-I",
+        question=question,
+    )
+
+    answer = service._deterministic_generic_table_answer(question, [context], [0], "normal")
+
+    assert answer is not None
+    assert "theta" in answer.answer_markdown
+    assert "0.0" in answer.answer_markdown
+    assert "Ile" in answer.answer_markdown
+    assert "Leu" in answer.answer_markdown
+    assert "χ1" in answer.answer_markdown
+    assert "χ2" in answer.answer_markdown
+
+
+def test_opls4_metric_extraction_retains_chi_subcolumn_values() -> None:
+    """OPLS4 Table 5 chi-split MSE sub-columns reach the metric answer.
+
+    ``extract_table_facts`` keeps only the ``RMS error``/``MSE`` columns of
+    Table 5, so the per-residue ``MSE(chil = 180)`` values (``1.4`` for OPLS3e
+    and ``0.1`` for OPLS4) are dropped.  The answer layer must supplement the
+    complete structured row so the required chi-subcolumn values survive
+    alongside the Table 8 sigma-hole RMS error values.
+    """
+    service = QueryService(make_session())
+    question = "OPLS4 的 pKa 和 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？"
+    table5 = (
+        "Table 5. Errors (kcal/mol) over the asp/glu pK \\mathsf { s e t }\n"
+        "| model | RMS error | MSE | $\\\\mathrm { M S E } \\\\ \\\\mathrm { ( c h i l } = 60 \\\\ \\\\mathrm { ) }$ | "
+        "$\\\\mathbf { M S E } \\\\ \\\\left( \\\\mathrm { c h i l } \\\\ = \\\\ 180 \\\\right)$ |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| OPLS3e | $2.0 \\\\pm 0.2$ | $+ 0.8 \\\\pm 0.2$ | $+ 0.5 \\\\pm 0.4$ | $+ 1.4 \\\\pm 0.3$ |\n"
+        "| OPLS4 | $1.2 \\\\pm 0.1$ | $+ 0.2 \\\\pm 0.1$ | $+ 0.3 \\\\pm 0.2$ | $+ 0.1 \\\\pm 0.2$ |"
+    )
+    table8 = (
+        "Table 8. Relative Interaction Energy between Sigma-Hole and Head-on Directions (kcal/mol)\n"
+        "| interaction partner | CCSD(T)/CBS | OPLS3e | OPLS4 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| RMS error |  | 1.08 | 0.40 |"
+    )
+    ctx5 = _canonical_context(table5, "opls4", "table-5", "opls4-table-5", question=question, score=60)
+    ctx8 = _canonical_context(table8, "opls4", "table-8", "opls4-table-8", question=question, score=50)
+
+    metrics = service._extract_requested_metric_values(question, [ctx8, ctx5], [0, 1])
+    answer = service._deterministic_table_answer(question, [ctx8, ctx5], [0, 1], "normal")
+
+    assert answer is not None
+    for required in ("Table 5", "Table 8", "2.0", "1.2", "1.4", "0.1", "1.08", "0.40"):
+        assert required in answer.answer_markdown, f"{required!r} missing from {answer.answer_markdown!r}"
+    # The chi sub-column values must reach the deterministic metric answer.
+    assert any("1.4" in str(value) for metric in metrics for value in metric.values.values())
+    assert any("0.1" in str(value) for metric in metrics for value in metric.values.values())
+
+
+def _opls5_row_level_canonical_contexts(
+    question: str,
+    tables: list[tuple[str, str, int, str]],
+) -> list[RetrievedContext]:
+    """Build one canonical row Child context per table row.
+
+    Real retrieval emits one ``DocumentChunk`` per table row, so a canonical
+    table arrives as several contexts whose ``Citation.excerpt`` carries only
+    the single row, while ``table_context`` / ``table_facts`` carry the
+    complete assembled table.
+    """
+    contexts: list[RetrievedContext] = []
+    for table_id, chunk_prefix, base_score, markdown in tables:
+        table = assemble_table_context(
+            [
+                CanonicalTableChunk(
+                    chunk_id=f"{chunk_prefix}-c",
+                    document_id="opls5",
+                    parse_version="canonical-v4",
+                    table_id=table_id,
+                    ordinal=0,
+                    text=markdown,
+                )
+            ]
+        )
+        facts = tuple(extract_table_facts(question, table))
+        row_lines = [
+            line
+            for line in markdown.splitlines()
+            if line.strip().startswith("|") and "|" in line.strip()[1:]
+        ]
+        for index, line in enumerate(row_lines):
+            contexts.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id="opls5",
+                        chunk_id=f"{chunk_prefix}-row-{index}",
+                        table_id=table_id,
+                        parse_version="canonical-v4",
+                        block_type="table",
+                        page_slug="sources/opls5",
+                        page_title="OPLS5",
+                        page_kind="source_summary",
+                        score=base_score - index * 0.5,
+                        excerpt=line,
+                    ),
+                    prompt_text=line,
+                    score=base_score - index * 0.5,
+                    evidence_kind="table",
+                    table_context=table,
+                    table_facts=facts,
+                )
+            )
+    return contexts
+
+
+def test_opls5_metric_answer_retains_tail_table7_binding_rmse_values() -> None:
+    """The public answer() path keeps the Table 7 binding-RMSE citation.
+
+    The live Table 7 uses Edgewise/Pairwise sub-columns under the OPLS4/OPLS5
+    model headers.  Retrieval carries the complete Table 7 canonical facts as
+    one citation per row, and each row ``Citation.excerpt`` is only the single
+    row line.  The final answer must retain the tail perturbation-class values
+    -- including ``1.18`` (HeterocycleFocused OPLS4 Edgewise) and ``1.12``
+    (WaterDisplacement OPLS4 Edgewise) -- alongside the other requested tables,
+    and the same-source-page citation cap must keep the Table 7 citation
+    instead of collapsing to the two highest-scoring rows.
+    """
+    service = QueryService(make_session())
+    question = (
+        "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa "
+        "和 binding RMSE 相比 OPLS4 有哪些数值改善？"
+    )
+    tables = [
+        (
+            "table-2", "opls5-table-2", 90,
+            "Table 2. Hydration free energies for small aromatic molecules.\n"
+            "| Compound | Exp. | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| RMS error |  | 0.76 | 0.46 |",
+        ),
+        (
+            "table-4", "opls5-table-4", 80,
+            "Table 4. Acetate pKa shift.\n"
+            "| System | Exp. | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n"
+            "| Acetate-guanidinium | -0.136 | -0.26 | -0.14 |",
+        ),
+        (
+            "table-5", "opls5-table-5", 70,
+            "Table 5. pKa sets.\n"
+            "| Amino acid | Number | OPLS4 | OPLS5 |\n| --- | --- | --- | --- |\n| GLU | 44 | 0.70 | 0.61 |",
+        ),
+        (
+            "table-7", "opls5-table-7", 60,
+            "Table 7. Root mean square errors for relative binding free energy results.\n"
+            "| PerturbationClass | No.cmpds | OPLS4 |  | OPLS5 |  |\n"
+            "|  |  | Edgewise | Pairwise | Edgewise | Pairwise |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |\n"
+            "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+            "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |\n"
+            "| ChargeChange | 53 | 1.17 | 1.18 | 1.16 | 1.17 |\n"
+            "| Merck | 238 | 1.18 | 1.37 | 1.17 | 1.38 |\n"
+            "| Fragments | 79 | 0.94 | 1.08 | 0.91 | 1.02 |\n"
+            "| JanssenBACE1 | 74 | 1.15 | 1.17 | 1.16 | 1.19 |\n"
+            "| MCS docking | 49 | 1.56 | 1.38 | 1.25 | 1.34 |\n"
+            "| Scaffoldhopping | 21 | 0.79 | 0.75 | 0.75 | 0.83 |\n"
+            "| Macrocycles | 58 | 1.09 | 1.30 | 1.12 | 1.41 |\n"
+            "| Misc | 79 | 0.96 | 1.22 | 0.93 | 1.14 |",
+        ),
+    ]
+    contexts = _opls5_row_level_canonical_contexts(question, tables)
+    db = service.db
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+    fake_ollama = CountingFakeOllama()
+    service.ollama = fake_ollama
+    service.verifier = FakeVerifier()
+    service._route_papers = lambda question, project_id, document_id=None, limit=3: [
+        PaperMatch(document=Document(id="opls5", project_id="p1", title="OPLS5"), score=20, locked=True)
+    ]
+    service._build_rag_contexts = lambda question, project_id, paper_matches, document_ids=None: contexts
+    service._search_source_chunks = lambda question, project_id, document_ids, limit=5: []
+
+    response = service.answer("demo", question, save_answer=False)
+
+    assert fake_ollama.generate_calls == 0
+    for required in (
+        "Table 2", "0.76", "0.46", "Table 4", "-0.136", "-0.14",
+        "Table 5", "GLU", "0.70", "0.61", "Table 7", "1.18", "1.12",
+    ):
+        assert required in response.answer_markdown, f"{required!r} missing from {response.answer_markdown!r}"
+    assert response.citations
+    assert any(citation.table_id == "table-7" for citation in response.citations)
+    assert not re.search(r"\[\d+\]", response.answer_markdown) or all(
+        int(match) < len(response.citations)
+        for match in re.findall(r"\[(\d+)\]", response.answer_markdown)
+    )
+
+
+def test_table_citation_indexes_preserves_low_scored_requested_table() -> None:
+    """复现 6B：多表查询中必须保留低分的请求表。
+
+    旧实现按全局 top-24 选择，OPLS5 Table 7 的 binding-RMSE 行（score 56.9）
+    全部被更高分的 filler 行挤掉。按 canonical table identity 分组后，每张
+    已出现的表至少保留一个携带完整 table facts 的 chunk。
+    """
+    service = QueryService(make_session())
+    question = (
+        "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa "
+        "和 binding RMSE 相比 OPLS4 有哪些数值改善？"
+    )
+    table7 = (
+        "table-7", "opls5-table-7", 56.9,
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 Edgewise | OPLS4 Pairwise | OPLS5 Edgewise | OPLS5 Pairwise |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |\n"
+        "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+        "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |\n"
+        "| ChargeChange | 53 | 1.17 | 1.18 | 1.16 | 1.17 |\n"
+        "| Merck | 238 | 1.18 | 1.37 | 1.17 | 1.38 |\n"
+        "| Fragments | 79 | 0.94 | 1.08 | 0.91 | 1.02 |\n"
+        "| JanssenBACE1 | 74 | 1.15 | 1.17 | 1.16 | 1.19 |\n"
+        "| MCS docking | 49 | 1.56 | 1.38 | 1.25 | 1.34 |\n"
+        "| Scaffoldhopping | 21 | 0.79 | 0.75 | 0.75 | 0.83 |\n"
+        "| Macrocycles | 58 | 1.09 | 1.30 | 1.12 | 1.41 |\n"
+        "| Misc | 79 | 0.96 | 1.22 | 0.93 | 1.14 |",
+    )
+    # 高分 filler 表：每行一个 chunk，数量超过 CANONICAL_TABLE_CONTEXT_LIMIT（24），
+    # 用于复现旧的全局截断。
+    filler_tables = [
+        (
+            f"table-filler-{index}", f"opls5-filler-{index}", 100.0 - index,
+            f"Table {index + 10}. Filler metric table.\n"
+            "| Row | OPLS4 | OPLS5 |\n| --- | --- | --- |\n"
+            + "\n".join(f"| item-{row} | 0.{row:02d} | 0.{row + 1:02d} |" for row in range(1, 14)),
+        )
+        for index in range(3)
+    ]
+    tables = [table7, *filler_tables]
+    contexts = _opls5_row_level_canonical_contexts(question, tables)
+    table7_chunks = [c for c in contexts if c.citation.table_id == "table-7"]
+    assert len(table7_chunks) >= 11  # 前置条件：Table 7 有 11 行。
+
+    indexes = service._table_citation_indexes(question, contexts)
+
+    # 旧的全局 top-24 会让 Table 7（score 56.9）落在 filler 之后而被丢弃。
+    # 分组选择应为每张已出现的表至少保留一个 chunk。
+    assert any(contexts[index].citation.table_id == "table-7" for index in indexes)
+    # 保底逻辑不能突破硬性 context limit。
+    assert len(indexes) <= CANONICAL_TABLE_CONTEXT_LIMIT
+
+
+def test_table_citation_indexes_separates_same_table_id_across_documents() -> None:
+    """不同文档中的同名表必须被视为不同的表。"""
+    service = QueryService(make_session())
+    question = "Compare the Table 7 metrics reported for OPLS4 and OPLS5."
+
+    def make_context(document_id: str, score: float, value: str) -> RetrievedContext:
+        table_text = (
+            "Table 7 OPLS4 OPLS5 metrics\n"
+            "| Model | RMSE |\n"
+            "| --- | ---: |\n"
+            f"| OPLS5 | {value} |"
+        )
+        return RetrievedContext(
+            citation=Citation(
+                document_id=document_id,
+                chunk_id=f"{document_id}-table-7",
+                table_id="table-7",
+                parse_version="canonical-v4",
+                block_type="table",
+                score=score,
+                excerpt=table_text,
+            ),
+            prompt_text=table_text,
+            score=score,
+            evidence_kind="table",
+        )
+
+    contexts = [
+        make_context("opls4", 90.0, "1.10"),
+        make_context("opls5", 80.0, "1.18"),
+    ]
+
+    indexes = service._table_citation_indexes(question, contexts)
+
+    assert indexes[:2] == [0, 1]

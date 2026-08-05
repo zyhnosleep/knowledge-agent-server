@@ -375,13 +375,38 @@ def test_manifest_document_section_persists_non_transient_fields(
     manifest = json.loads((staging / "manifest.json").read_text("utf-8"))
 
     activated = _activation_document(canonical_document)
-    assert manifest["document"] == {
-        "title": canonical_document.title,
-        "abstract": canonical_document.abstract,
-        "keywords": canonical_document.keywords,
-        "outline": [item.model_dump(mode="json") for item in canonical_document.outline],
-        "metadata": activated.metadata,
+    assert set(manifest["document"]) == {
+        "title",
+        "abstract",
+        "keywords",
+        "outline",
+        "metadata",
+        "typed_inventory",
     }
+    assert manifest["document"]["title"] == canonical_document.title
+    assert manifest["document"]["abstract"] == canonical_document.abstract
+    assert manifest["document"]["keywords"] == canonical_document.keywords
+    assert manifest["document"]["outline"] == [
+        item.model_dump(mode="json") for item in canonical_document.outline
+    ]
+    assert manifest["document"]["metadata"] == activated.metadata
+    typed_inventory = manifest["document"]["typed_inventory"]
+    assert typed_inventory["document_id"] == "doc-1"
+    assert typed_inventory["version"] == "canonical-v1-abcd"
+    assert typed_inventory["tables"] == [
+        {
+            "table_id": "table-1",
+            "row_count": 1,
+            "source_block_ids": [],
+            "child_ids": [],
+            "child_count": 0,
+            "parent_ids": [],
+            "row_indices": [],
+        }
+    ]
+    assert typed_inventory["figure_ids"] == sorted(figure.figure_id for figure in canonical_document.figures)
+    assert typed_inventory["formula_ids"] == sorted(formula.formula_id for formula in canonical_document.formulas)
+    assert typed_inventory["orphan_structured_chunks"] == []
 
 
 @pytest.mark.parametrize(

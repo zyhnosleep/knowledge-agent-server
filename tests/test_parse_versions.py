@@ -218,6 +218,114 @@ def test_activate_updates_pointer_and_version_in_one_uncommitted_transaction(
     assert db.in_transaction()
 
 
+def test_batch_activate_validates_every_version_before_switching_any_pointer(
+    db: Session, document: Document
+) -> None:
+    second = Document(
+        id="document-2",
+        project_id=document.project_id,
+        title="Second Paper",
+        file_name="second.pdf",
+        sha256="def",
+        raw_path="raw/second.pdf",
+        active_parse_version="old-2",
+    )
+    document.active_parse_version = "old-1"
+    db.add(second)
+    db.add_all(
+        [
+            DocumentParseVersion(
+                document_id=document.id,
+                version_key="old-1",
+                artifact_dir="parsed/document-1/old-1",
+                status="active",
+            ),
+            DocumentParseVersion(
+                document_id=document.id,
+                version_key="new-1",
+                artifact_dir="parsed/document-1/new-1",
+                status="ready_to_activate",
+            ),
+            DocumentParseVersion(
+                document_id=second.id,
+                version_key="old-2",
+                artifact_dir="parsed/document-2/old-2",
+                status="active",
+            ),
+            DocumentParseVersion(
+                document_id=second.id,
+                version_key="new-2",
+                artifact_dir="parsed/document-2/new-2",
+                status="embedding",
+            ),
+        ]
+    )
+    db.commit()
+
+    with pytest.raises(ValueError, match="new-2.*ready_to_activate"):
+        ParseVersionService(db).batch_activate(
+            {document.id: "new-1", second.id: "new-2"}
+        )
+
+    db.expire_all()
+    assert db.get(Document, document.id).active_parse_version == "old-1"
+    assert db.get(Document, second.id).active_parse_version == "old-2"
+    versions = {
+        (item.document_id, item.version_key): item.status
+        for item in db.scalars(select(DocumentParseVersion))
+    }
+    assert versions[(document.id, "old-1")] == "active"
+    assert versions[(document.id, "new-1")] == "ready_to_activate"
+    assert versions[(second.id, "old-2")] == "active"
+    assert versions[(second.id, "new-2")] == "embedding"
+
+
+def test_batch_activate_switches_all_documents_in_one_uncommitted_transaction(
+    db: Session, document: Document
+) -> None:
+    second = Document(
+        id="document-2",
+        project_id=document.project_id,
+        title="Second Paper",
+        file_name="second.pdf",
+        sha256="def",
+        raw_path="raw/second.pdf",
+        active_parse_version="old-2",
+    )
+    document.active_parse_version = "old-1"
+    db.add(second)
+    for document_id, old_key, new_key in (
+        (document.id, "old-1", "new-1"),
+        (second.id, "old-2", "new-2"),
+    ):
+        db.add_all(
+            [
+                DocumentParseVersion(
+                    document_id=document_id,
+                    version_key=old_key,
+                    artifact_dir=f"parsed/{document_id}/{old_key}",
+                    status="active",
+                ),
+                DocumentParseVersion(
+                    document_id=document_id,
+                    version_key=new_key,
+                    artifact_dir=f"parsed/{document_id}/{new_key}",
+                    status="ready_to_activate",
+                ),
+            ]
+        )
+    db.commit()
+
+    activated = ParseVersionService(db).batch_activate(
+        {document.id: "new-1", second.id: "new-2"}
+    )
+
+    assert [item.version_key for item in activated] == ["new-1", "new-2"]
+    assert db.get(Document, document.id).active_parse_version == "new-1"
+    assert db.get(Document, second.id).active_parse_version == "new-2"
+    assert db.in_transaction()
+
+
 def test_activate_accepts_valid_unflushed_transition_from_locked_database_state(
     db: Session, document: Document
 ) -> None:

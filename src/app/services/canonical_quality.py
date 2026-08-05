@@ -1,3 +1,25 @@
+"""Canonical 质量门（Canonical Quality Gate）。
+
+对解析后的 CanonicalDocument 执行确定性的、只依赖来源内容的验证。
+质量门会检查一系列规则，例如页面是否完整、阅读顺序是否连续、表格是否
+有效、资源路径是否安全等，并生成 CanonicalQualityReport。
+
+严重程度与扣分：
+- info:     0.0 分扣分
+- warning:  0.05 分扣分
+- error:    0.15 分扣分
+- fatal:    0.35 分扣分
+
+评估结果状态：
+- accepted: 没有 fatal/error，且没有可修复问题。
+- accepted_with_warnings: 只有 warning/info。
+- validation_failed: 存在可修复（repairable）问题。
+- rejected: 存在 fatal 问题。
+
+主要入口：
+- CanonicalQualityGate().evaluate(document): 评估文档并返回质量报告。
+"""
+
 from __future__ import annotations
 
 import re
@@ -14,16 +36,27 @@ from app.services.canonical_models import (
 )
 
 
+# 不同严重程度对质量分数的扣分量。
 _SEVERITY_PENALTIES = {
     "info": 0.0,
     "warning": 0.05,
     "error": 0.15,
     "fatal": 0.35,
 }
+
+
 class CanonicalQualityGate:
-    """Apply deterministic, source-only validation to a canonical document."""
+    """对 CanonicalDocument 执行确定性验证并生成质量报告。"""
 
     def evaluate(self, document: CanonicalDocument) -> CanonicalQualityReport:
+        """评估文档，返回 CanonicalQualityReport 并写入 document.quality。
+
+        评估步骤：
+        1. 依次执行页面、内容、阅读顺序、资源、摘要、表格清单、表格、图片、公式检查。
+        2. 根据最严重的问题决定 accepted / status。
+        3. 收集需要回退（fallback）修复的页面。
+        4. 计算 0..1 之间的质量分数。
+        """
         issues: list[CanonicalQualityIssue] = []
         issues.extend(self._page_issues(document))
         issues.extend(self._content_issues(document))
@@ -78,8 +111,12 @@ class CanonicalQualityGate:
         document.quality = report
         return document.quality
 
+    # ------------------------------------------------------------------
+    # 1. 页面级别检查
+    # ------------------------------------------------------------------
     @staticmethod
     def _page_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """检查预期页面是否都被解析到了。"""
         expected = document.metadata.get("expected_page_count")
         explicit_pages = document.metadata.get("parsed_page_indices")
         if not isinstance(expected, int) or expected <= 0 or not isinstance(explicit_pages, list):
@@ -101,8 +138,12 @@ class CanonicalQualityGate:
             )
         ]
 
+    # ------------------------------------------------------------------
+    # 2. 内容检查
+    # ------------------------------------------------------------------
     @staticmethod
     def _content_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """检查文档中是否至少有一个可检索的非空内容块。"""
         if any(block.retrievable and block.text.strip() for block in document.blocks):
             return []
         return [
@@ -113,8 +154,12 @@ class CanonicalQualityGate:
             )
         ]
 
+    # ------------------------------------------------------------------
+    # 3. 阅读顺序检查
+    # ------------------------------------------------------------------
     @staticmethod
     def _reading_order_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """检查 block 的 reading_order 必须是 0..N-1 且不重复。"""
         actual = [block.reading_order for block in document.blocks]
         expected = list(range(len(document.blocks)))
         if actual == expected:
@@ -129,8 +174,12 @@ class CanonicalQualityGate:
             )
         ]
 
+    # ------------------------------------------------------------------
+    # 4. 资源路径安全检查
+    # ------------------------------------------------------------------
     @classmethod
     def _asset_issues(cls, document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """检查 asset 路径是否安全（相对路径、以 assets/ 开头、无 ..）。"""
         invalid: list[str] = []
         for asset in document.assets:
             if not cls._valid_asset_path(asset.path):
@@ -155,6 +204,7 @@ class CanonicalQualityGate:
 
     @staticmethod
     def _valid_asset_path(value: str) -> bool:
+        """判断 asset 路径是否安全：相对路径、以 assets/ 开头、不含 ..。"""
         normalized = value.replace("\\", "/")
         path = PurePosixPath(normalized)
         return bool(
@@ -165,8 +215,12 @@ class CanonicalQualityGate:
             and ".." not in path.parts
         )
 
+    # ------------------------------------------------------------------
+    # 5. 摘要检查
+    # ------------------------------------------------------------------
     @staticmethod
     def _abstract_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """如果原文第 1-2 页有显式摘要，但 canonical abstract 缺失，则报错。"""
         if document.abstract and document.abstract.strip():
             return []
         page_texts = document.metadata.get("text_layer_pages")
@@ -188,8 +242,12 @@ class CanonicalQualityGate:
             )
         ]
 
+    # ------------------------------------------------------------------
+    # 6. 表格有效性检查
+    # ------------------------------------------------------------------
     @classmethod
     def _table_issues(cls, document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """检查每个 CanonicalTable 的结构是否自洽。"""
         issues: list[CanonicalQualityIssue] = []
         for table in document.tables:
             reasons = cls._invalid_table_reasons(table)
@@ -228,6 +286,7 @@ class CanonicalQualityGate:
 
     @staticmethod
     def _table_locator(table: CanonicalTable) -> dict[str, object]:
+        """提取表格的来源定位信息，用于问题报告。"""
         span = next(iter(table.source_spans), None)
         if span is None:
             return {}
@@ -248,10 +307,14 @@ class CanonicalQualityGate:
             if value is not None
         }
 
+    # ------------------------------------------------------------------
+    # 7. 表格清单检查（ID 唯一性、内容去重、引用一致性）
+    # ------------------------------------------------------------------
     @staticmethod
     def _table_inventory_issues(
         document: CanonicalDocument,
     ) -> list[CanonicalQualityIssue]:
+        """检查表格 ID 唯一性、内容重复、block 引用是否合法。"""
         by_id: dict[str, list[CanonicalTable]] = {}
         for table in document.tables:
             by_id.setdefault(table.table_id, []).append(table)
@@ -339,8 +402,20 @@ class CanonicalQualityGate:
                 )
         return issues
 
+    # ------------------------------------------------------------------
+    # 8. 单表结构校验：返回所有不通过的理由
+    # ------------------------------------------------------------------
     @staticmethod
     def _invalid_table_reasons(table: CanonicalTable) -> list[str]:
+        """检查单个表格的结构一致性，返回问题代码列表。
+
+        检查项包括：
+        - header_missing / data_rows_missing
+        - row_width_mismatch
+        - cells 缺失、重复坐标、越界、重叠、值不一致
+        - normalized_markdown / source_markdown / source_html 与结构化数据不一致
+        - 跨页合并表格的源 markdown/html 段是否匹配
+        """
         reasons: list[str] = []
 
         def add(reason: str) -> None:
@@ -444,11 +519,10 @@ class CanonicalQualityGate:
             try:
                 from app.services.canonical_artifacts import CanonicalArtifactStore
 
-                html_cells = CanonicalArtifactStore._table_cells_from_html(
-                    table.source_html
-                )
-                html_headers, html_rows = CanonicalArtifactStore._table_grid_from_cells(
-                    html_cells
+                html_cells, html_headers, html_rows = (
+                    CanonicalArtifactStore._canonical_table_from_html(
+                        table.source_html
+                    )
                 )
             except (TypeError, ValueError):
                 add("source_html_invalid")
@@ -465,10 +539,14 @@ class CanonicalQualityGate:
                     add("source_html_cell_mismatch")
         return reasons
 
+    # ------------------------------------------------------------------
+    # 跨页表格段校验辅助方法
+    # ------------------------------------------------------------------
     @classmethod
     def _source_markdown_segments_match(
         cls, table: CanonicalTable, markdowns: list[object]
     ) -> bool:
+        """校验跨页合并表格的各 markdown 段拼接后是否与表格行一致。"""
         grids: list[tuple[list[str], list[list[str]]]] = []
         for markdown in markdowns:
             if not isinstance(markdown, str):
@@ -483,6 +561,7 @@ class CanonicalQualityGate:
     def _source_html_segments_match(
         cls, table: CanonicalTable, htmls: list[object]
     ) -> bool:
+        """校验跨页合并表格的各 HTML 段内容与单元格签名是否匹配。"""
         from app.services.canonical_artifacts import CanonicalArtifactStore
 
         cell_segments = table.metadata.get("source_cell_segments")
@@ -493,8 +572,10 @@ class CanonicalQualityGate:
             if not isinstance(source_html, str):
                 return False
             try:
-                cells = CanonicalArtifactStore._table_cells_from_html(source_html)
-                grids.append(CanonicalArtifactStore._table_grid_from_cells(cells))
+                cells, headers, rows = (
+                    CanonicalArtifactStore._canonical_table_from_html(source_html)
+                )
+                grids.append((headers, rows))
                 expected_cells = [
                     CanonicalCell.model_validate(item) for item in cell_segments[index]
                 ]
@@ -511,6 +592,7 @@ class CanonicalQualityGate:
         headers: list[str],
         grids: list[tuple[list[str], list[list[str]]]],
     ) -> list[list[str]] | None:
+        """把多个表格段的行拼接起来，要求每段表头一致。"""
         combined: list[list[str]] = []
         for segment_headers, segment_rows in grids:
             if segment_headers != headers:
@@ -523,6 +605,7 @@ class CanonicalQualityGate:
 
     @staticmethod
     def _cell_signature(cell: CanonicalCell) -> tuple[object, ...]:
+        """生成单元格签名，用于比较两个单元格列表是否等价。"""
         return (
             cell.row_index,
             cell.column_index,
@@ -532,8 +615,12 @@ class CanonicalQualityGate:
             cell.text,
         )
 
+    # ------------------------------------------------------------------
+    # Markdown 表格解析与渲染辅助方法
+    # ------------------------------------------------------------------
     @staticmethod
     def _table_markdown(headers: list[str], rows: list[list[str]]) -> str:
+        """根据 headers 和 rows 渲染规范化 Markdown 表格。"""
         def escape(value: str) -> str:
             return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
 
@@ -557,6 +644,7 @@ class CanonicalQualityGate:
     def _markdown_table_data(
         markdown: str,
     ) -> tuple[list[str], list[list[str]]] | None:
+        """从 Markdown 表格文本解析出 headers 和 rows。"""
         def split_row(value: str) -> list[str]:
             def pipe_is_escaped(index: int) -> bool:
                 backslashes = 0
@@ -613,8 +701,12 @@ class CanonicalQualityGate:
             return headers, rows
         return None
 
+    # ------------------------------------------------------------------
+    # 9. 图片与公式检查（warning 级别）
+    # ------------------------------------------------------------------
     @staticmethod
     def _figure_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """对缺少标题的图片发出警告。"""
         return [
             CanonicalQualityIssue(
                 code="figure_caption_missing",
@@ -633,6 +725,7 @@ class CanonicalQualityGate:
 
     @staticmethod
     def _formula_issues(document: CanonicalDocument) -> list[CanonicalQualityIssue]:
+        """对未完成可选分析的公式发出警告。"""
         return [
             CanonicalQualityIssue(
                 code="formula_analysis_missing",
@@ -649,8 +742,12 @@ class CanonicalQualityGate:
             if formula.analysis_status != "complete"
         ]
 
+    # ------------------------------------------------------------------
+    # 工具方法：解析 repair_scope 字符串为页面列表
+    # ------------------------------------------------------------------
     @staticmethod
     def _scope_pages(scope: str) -> list[int]:
+        """把 repair_scope（page:N 或 pages:M-N）解析为 1-based 页面列表。"""
         single = re.fullmatch(r"page:(\d+)", scope)
         if single:
             return [int(single.group(1))]

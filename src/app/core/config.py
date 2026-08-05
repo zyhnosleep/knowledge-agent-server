@@ -1,3 +1,22 @@
+﻿"""应用配置：集中管理所有环境变量（.env 文件）并做校验。
+
+`Settings` 继承自 pydantic-settings 的 BaseSettings，每个字段都从同名
+环境变量读取（通过 alias 指定），未配置时使用默认值。
+
+主要分组：
+- 应用基本信息与数据库；
+- 语义分块（semantic chunking）参数；
+- Ollama 生成/嵌入模型与上下文长度；
+- 上下文化（contextualization）参数；
+- PDF 解析（MinerU / Document Intelligence）；
+- 外部 API（synthesis 备选 provider）；
+- MinIO 对象存储；
+- Agent 执行约束与合成 provider；
+- 认证（Feishu OAuth / session cookie）。
+
+通过 `get_settings()`（带 lru_cache）获取单例配置实例。
+"""
+
 from __future__ import annotations
 
 import os
@@ -9,23 +28,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _default_mineru_bin() -> str:
+    """根据操作系统返回 MinerU 可执行文件的默认路径。"""
     scripts_dir = "Scripts" if os.name == "nt" else "bin"
     executable = "mineru.exe" if os.name == "nt" else "mineru"
     return str(Path(".venv") / scripts_dir / executable)
 
 
 class Settings(BaseSettings):
+    """所有应用配置。每个字段通过 alias 映射到同名环境变量。"""
+
+    # 忽略 .env 中未声明的额外变量。
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # ---- 应用基本信息 ----
     app_name: str = Field(default="Knowledge Agent", alias="APP_NAME")
     app_env: str = Field(default="development", alias="APP_ENV")
     app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
     app_port: int = Field(default=8000, alias="APP_PORT")
 
+    # ---- 数据库与任务队列 ----
     database_url: str = Field(default="sqlite:///./data/app.db", alias="DATABASE_URL")
     redis_url: str | None = Field(default=None, alias="REDIS_URL")
     queue_job_timeout: int = Field(default=9000, alias="QUEUE_JOB_TIMEOUT")
 
+    # ---- 数据目录 ----
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     raw_dir: Path = Field(default=Path("./data/raw"), alias="RAW_DIR")
     cache_dir: Path = Field(default=Path("./data/cache"), alias="CACHE_DIR")
@@ -33,7 +59,7 @@ class Settings(BaseSettings):
         default=Path("./data/parsed"), alias="CANONICAL_ARTIFACTS_DIR"
     )
     canonical_pipeline_version: str = Field(
-        default="canonical-v1", alias="CANONICAL_PIPELINE_VERSION"
+        default="canonical-v4", alias="CANONICAL_PIPELINE_VERSION"
     )
     max_upload_bytes: int = Field(default=50 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
 
@@ -68,13 +94,43 @@ class Settings(BaseSettings):
     semantic_tokenizer_name: str = Field(
         default="Qwen/Qwen3-Embedding-4B", alias="SEMANTIC_TOKENIZER_NAME"
     )
+    semantic_tokenizer_revision: str = Field(
+        default="5cf2132abc99cad020ac570b19d031efec650f2b",
+        alias="SEMANTIC_TOKENIZER_REVISION",
+    )
+    semantic_tokenizer_local_path: Path | None = Field(
+        default=None, alias="SEMANTIC_TOKENIZER_LOCAL_PATH"
+    )
 
+    # ---- 默认项目与检索开关 ----
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")
     query_mode: str = Field(default="rag", alias="QUERY_MODE")
     sac_kg_enabled: bool = Field(default=True, alias="SAC_KG_ENABLED")
     vector_store_enabled: bool = Field(default=True, alias="VECTOR_STORE_ENABLED")
     vector_store_backend: str = Field(default="sqlite-vec", alias="VECTOR_STORE_BACKEND")
+
+    # ---- Ollama 生成/嵌入模型 ----
+    ollama_generation_base_url: str = Field(
+        default="http://localhost:11435", alias="OLLAMA_GENERATION_BASE_URL"
+    )
+    ollama_generation_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_GENERATION_MODEL")
+    ollama_embedding_base_url: str = Field(
+        default="http://localhost:11435", alias="OLLAMA_EMBEDDING_BASE_URL"
+    )
+    ollama_generation_context_length: int = Field(
+        default=32768, gt=0, alias="OLLAMA_GENERATION_CONTEXT_LENGTH"
+    )
+    ollama_generation_parallelism: int = Field(
+        default=1, gt=0, alias="OLLAMA_GENERATION_PARALLELISM"
+    )
+    ollama_batch_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_BATCH_MODEL")
+    ollama_embedding_model: str = Field(default="qwen3-embedding:4b", alias="OLLAMA_EMBEDDING_MODEL")
+    ollama_embedding_dimensions: int = Field(default=2560, alias="OLLAMA_EMBEDDING_DIMENSIONS")
+    ollama_vision_model: str | None = Field(default=None, alias="OLLAMA_VISION_MODEL")
+    ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
+    ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")
+    ollama_synthesis_model: str | None = Field(default=None, alias="OLLAMA_SYNTHESIS_MODEL")
 
     ollama_generation_base_url: str = Field(
         default="http://localhost:11435", alias="OLLAMA_GENERATION_BASE_URL"
@@ -95,6 +151,7 @@ class Settings(BaseSettings):
     ollama_vision_model: str | None = Field(default=None, alias="OLLAMA_VISION_MODEL")
     ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
     ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")
+    ollama_synthesis_model: str | None = Field(default=None, alias="OLLAMA_SYNTHESIS_MODEL")
 
     contextualization_enabled: bool = Field(default=True, alias="CONTEXTUALIZATION_ENABLED")
     contextualization_base_url: str = Field(
@@ -117,6 +174,7 @@ class Settings(BaseSettings):
         default="context-v1", alias="CONTEXTUALIZATION_PROMPT_VERSION"
     )
 
+    # ---- PDF 解析（MinerU / Document Intelligence / OCR） ----
     document_intelligence_enabled: bool = Field(default=True, alias="DOCUMENT_INTELLIGENCE_ENABLED")
     pdf_render_dpi: int = Field(default=160, alias="PDF_RENDER_DPI")
     ocr_fallback_enabled: bool = Field(default=False, alias="OCR_FALLBACK_ENABLED")
@@ -131,12 +189,14 @@ class Settings(BaseSettings):
     formula_analysis_model: str = Field(default="qwen3.5:9b", alias="FORMULA_ANALYSIS_MODEL")
     maintenance_mode_enabled: bool = Field(default=False, alias="MAINTENANCE_MODE_ENABLED")
 
+    # ---- 外部 API（Agent 综合的备选 provider） ----
     external_api_enabled: bool = Field(default=False, alias="EXTERNAL_API_ENABLED")
     external_api_base_url: str = Field(default="https://api.openai.com/v1", alias="EXTERNAL_API_BASE_URL")
     external_api_key: str | None = Field(default=None, alias="EXTERNAL_API_KEY")
     external_api_model: str = Field(default="gpt-4o-mini", alias="EXTERNAL_API_MODEL")
     external_api_timeout: int = Field(default=90, alias="EXTERNAL_API_TIMEOUT")
 
+    # ---- MinIO 对象存储（可选） ----
     minio_enabled: bool = Field(default=False, alias="MINIO_ENABLED")
     minio_endpoint: str = Field(default="localhost:9000", alias="MINIO_ENDPOINT")
     minio_access_key: str = Field(default="minioadmin", alias="MINIO_ACCESS_KEY")
@@ -144,6 +204,7 @@ class Settings(BaseSettings):
     minio_bucket: str = Field(default="knowledge-agent", alias="MINIO_BUCKET")
     minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
 
+    # ---- Agent 执行约束与合成 ----
     agent_enabled: bool = Field(default=True, alias="AGENT_ENABLED")
     agent_max_steps: int = Field(default=8, alias="AGENT_MAX_STEPS")
     agent_max_tool_calls: int = Field(default=5, alias="AGENT_MAX_TOOL_CALLS")
@@ -158,7 +219,7 @@ class Settings(BaseSettings):
 
     quality_reports_dir: Path = Field(default=Path("./tmp"), alias="QUALITY_REPORTS_DIR")
 
-    # Authentication -------------------------------------------------------
+    # ---- 认证（Feishu OAuth + session cookie） ----
     auth_enabled: bool = Field(default=False, alias="AUTH_ENABLED")
     auth_session_secret: str | None = Field(default=None, alias="AUTH_SESSION_SECRET")
     auth_session_cookie_name: str = Field(default="nri_session", alias="AUTH_SESSION_COOKIE_NAME")
@@ -188,6 +249,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_semantic_token_limits(self) -> Settings:
+        """校验语义分块的 token 上下限：min <= target <= max，且 overlap < min。"""
         if not (
             self.semantic_parent_min_tokens
             <= self.semantic_parent_target_tokens
@@ -209,6 +271,7 @@ class Settings(BaseSettings):
 
     @property
     def parent_token_limits(self) -> tuple[int, int, int]:
+        """父块（parent chunk）的 (min, target, max) token 限制。"""
         return (
             self.semantic_parent_min_tokens,
             self.semantic_parent_target_tokens,
@@ -217,6 +280,7 @@ class Settings(BaseSettings):
 
     @property
     def child_token_limits(self) -> tuple[int, int, int]:
+        """子块（child chunk）的 (min, target, max) token 限制。"""
         return (
             self.semantic_child_min_tokens,
             self.semantic_child_target_tokens,
@@ -230,6 +294,7 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """返回全局单例配置，并确保基础数据目录存在。"""
     settings = Settings()
     for path in (settings.data_dir, settings.raw_dir, settings.cache_dir):
         path.mkdir(parents=True, exist_ok=True)

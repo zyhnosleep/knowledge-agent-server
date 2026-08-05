@@ -1143,6 +1143,51 @@ def test_retrieve_evidence_keeps_canonical_table_children_ahead_of_profile_terms
     assert all(item.chunk_id.startswith("retrieval-table-row-") for item in evidence.items)
 
 
+def test_shadow_table_retrieval_bypasses_legacy_table_metadata_and_exposes_facts() -> None:
+    db = make_session()
+    document = add_document(db, active_parse_version=None)
+    document.metadata_json = {
+        "document_intelligence": {
+            "tables": [
+                {
+                    "page_label": "1",
+                    "markdown": (
+                        "Table 5\n| Model | pKa |\n| --- | --- |\n"
+                        "| OPLS4 | -0.26 |"
+                    ),
+                }
+            ]
+        }
+    }
+    db.add_all(
+        [
+            chunk(
+                "staged-table-row",
+                "Table 5\n| Model | pKa |\n| --- | --- |\n| OPLS5 | -0.14 |",
+                parse_version="staged-v",
+                block_type="table",
+                source_spans=[{"page_index": 2, "page_label": "3", "table_id": "table-5"}],
+            ),
+        ]
+    )
+    db.commit()
+
+    evidence = QueryService(
+        db,
+        parse_version_map={document.id: "staged-v"},
+    ).retrieve_evidence(
+        "project",
+        "What is the OPLS5 pKa value in Table 5?",
+        limit=5,
+        document_id=document.id,
+    )
+
+    assert evidence.items
+    assert all(item.parse_version == "staged-v" for item in evidence.items)
+    assert any(fact.value == "-0.14" for fact in evidence.table_facts)
+    assert all("-0.26" not in item.excerpt for item in evidence.items)
+
+
 def test_table_query_does_not_let_profile_table_mentions_outrank_table_children() -> None:
     db = make_session()
     add_document(db)
@@ -1447,6 +1492,156 @@ def test_table_candidate_assembly_covers_requested_tables_in_one_question() -> N
 
     assert {item.citation.table_id for item in contexts} == {"table-1", "table-2"}
     assert {item.citation.chunk_id for item in contexts} == {"table-one-row", "table-two-row"}
+
+
+def test_table_candidate_assembly_matches_requested_table_group_across_children() -> None:
+    db = make_session()
+    add_document(db)
+    db.add_all(
+        [
+            chunk(
+                "table-one-hit",
+                "Table 1\n| molecule | energy |\n| --- | --- |\n| butane | 6.04 |",
+                block_type="table",
+                ordinal=1,
+                source_spans=[{"page_index": 1, "table_id": "table-1", "row_index": 0}],
+            ),
+            chunk(
+                "table-seven-header",
+                "Table 7\n| molecule | Hvap |",
+                block_type="table",
+                ordinal=2,
+                source_spans=[{"page_index": 2, "table_id": "table-7", "row_index": 0}],
+            ),
+            chunk(
+                "table-seven-row",
+                "| methanol | 8.95 |",
+                block_type="table",
+                ordinal=3,
+                source_spans=[{"page_index": 2, "table_id": "table-7", "row_index": 1}],
+            ),
+        ]
+    )
+    db.commit()
+    service = service_for(db)
+    hit = db.get(DocumentChunk, "table-one-hit")
+
+    contexts = service._expand_source_candidates(
+        [(hit, 10.0, "table")],
+        question="How do butane energy and methanol Hvap compare?",
+        project_id="p1",
+    )
+
+    assert {item.citation.table_id for item in contexts} == {"table-1", "table-7"}
+    assert "table-seven-row" in {item.citation.chunk_id for item in contexts}
+
+
+def test_finalized_table_contexts_reserve_one_child_per_requested_table_group() -> None:
+    db = make_session()
+    add_document(db)
+    service = service_for(db)
+    contexts: list[RetrievedContext] = []
+    for index in range(10):
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id=f"table-one-{index}",
+                    parse_version="canonical-v1",
+                    block_type="table",
+                    table_id="table-1",
+                    score=100.0 - index,
+                    excerpt=f"Table 1 | butane | methanol | Hvap | energy | {index}",
+                ),
+                prompt_text=f"Table 1 | butane | methanol | Hvap | energy | {index}",
+                score=100.0 - index,
+                evidence_kind="table",
+            )
+        )
+    contexts.append(
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="table-seven-methanol",
+                parse_version="canonical-v1",
+                block_type="table",
+                table_id="table-7",
+                score=1.0,
+                excerpt="Table 7 | methanol | Hvap | 8.95",
+            ),
+            prompt_text="Table 7 | methanol | Hvap | 8.95",
+            score=1.0,
+            evidence_kind="table",
+        )
+    )
+
+    finalized = service._finalize_contexts(
+        contexts,
+        question="How do butane energy and methanol Hvap compare?",
+    )
+
+    assert any(item.citation.table_id == "table-7" for item in finalized[:10])
+
+
+def test_finalized_table_reservation_uses_entity_and_metric_group_matches() -> None:
+    db = make_session()
+    add_document(db)
+    service = service_for(db)
+    contexts: list[RetrievedContext] = []
+    # An unrelated interaction-energy table has many high-scoring rows and
+    # would otherwise crowd out the requested HFE/pKa/binding tables.
+    for index in range(12):
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id=f"table-three-{index}",
+                    parse_version="canonical-v1",
+                    block_type="table",
+                    table_id="table-3",
+                    score=100.0 - index,
+                    excerpt="Table 3 | interaction energy | OPLS5",
+                ),
+                prompt_text="Table 3 | interaction energy | OPLS5",
+                score=100.0 - index,
+                evidence_kind="table",
+            )
+        )
+    for table_id, text in (
+        ("table-2", "Table 2 | hydration free energies | aromatic | 0.76 | 0.46"),
+        ("table-5", "Table 5 | pKa | GLU | 0.70 | 0.61"),
+        ("table-7", "Table 7 | relative binding free energy | RMSE | 1.18 | 1.12"),
+    ):
+        contexts.append(
+            RetrievedContext(
+                citation=Citation(
+                    document_id="d1",
+                    chunk_id=f"{table_id}-row",
+                    parse_version="canonical-v1",
+                    block_type="table",
+                    table_id=table_id,
+                    score=1.0,
+                    excerpt=text,
+                ),
+                prompt_text=text,
+                score=1.0,
+                evidence_kind="table",
+            )
+        )
+
+    finalized = service._finalize_contexts(
+        contexts,
+        question="OPLS5 HFE, GLU pKa and binding RMSE compared with OPLS4",
+    )
+
+    assert {item.citation.table_id for item in finalized[:10]} >= {
+        "table-2",
+        "table-5",
+        "table-7",
+    }
+    assert "table-3" not in {
+        item.citation.table_id for item in finalized[:3]
+    }
 
 
 def test_table_shadow_assembly_keeps_staged_siblings_and_active_pointer() -> None:

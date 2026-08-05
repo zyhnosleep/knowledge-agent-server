@@ -409,6 +409,354 @@ def test_html_table_to_markdown_expands_colspan_and_rowspan() -> None:
     assert "| SAC-KG ChatGPT | 74.7 | 73.2 | 88.8 | 87.3 |" in markdown
 
 
+def test_html_table_to_markdown_preserves_formula_pipes_inside_one_cell() -> None:
+    from app.services.canonical_quality import CanonicalQualityGate
+
+    html = r"""
+    <table>
+      <tr><td>Setting</td><td>$\| \nabla E \| / E_h$</td></tr>
+      <tr><td>Crude</td><td>$1 \times 10^{-2}$</td></tr>
+    </table>
+    """
+
+    markdown = parser._html_table_to_markdown(html)
+
+    assert CanonicalQualityGate._markdown_table_data(markdown) == (
+        ["Setting", r"$\| \nabla E \| / E_h$"],
+        [["Crude", r"$1 \times 10^{-2}$"]],
+    )
+
+
+def test_mineru_html_table_is_retained_and_canonicalized_from_source_grid(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+    from app.services.structured_evidence import TableValidator
+
+    source_html = r"""<table>
+      <tr><td>Constraint</td><td>Potential</td></tr>
+      <tr><td>Angle</td><td>$V(\theta)=\frac{1}{2}k\left|r\right|^2$</td></tr>
+        </table>"""
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=[
+            {
+                "type": "table",
+                "table_caption": ["TABLE III. Constraint potentials."],
+                "table_body": source_html,
+                "page_idx": 0,
+            }
+        ],
+        page_count=1,
+    )
+
+    parsed_table = parsed.metadata["document_intelligence"]["tables"][0]
+    assert parsed_table["source_html"] == source_html
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path,
+        parsed,
+        "mineru",
+        1,
+    )
+    table = canonical.tables[0]
+
+    assert table.caption == "TABLE III. Constraint potentials."
+    assert table.headers == ["Constraint", "Potential"]
+    assert table.rows == [["Angle", r"$V(\theta)=\frac{1}{2}k\left|r\right|^2$"]]
+    assert table.source_html == source_html
+    assert all(cell.source_spans for cell in table.cells)
+    assert TableValidator().validate(table).accepted is True
+
+
+def test_mineru_html_table_repairs_fragmented_numbers_without_losing_formula(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+
+    source_html = r"""<table>
+      <tr><td>System</td><td>Exp.</td><td>Expression</td></tr>
+      <tr><td>Aβ40</td><td>$1 2 . 0 \pm 1 . 3$</td><td>$V(\theta)=\frac{1}{2}k$</td></tr>
+    </table>"""
+    pdf_path = tmp_path / "fragmented-numbers.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=[
+            {"type": "table", "table_body": source_html, "page_idx": 0}
+        ],
+        page_count=1,
+    )
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path,
+        parsed,
+        "mineru",
+        1,
+    )
+
+    assert canonical.tables[0].rows == [
+        ["Aβ40", r"$12.0 \pm 1.3$", r"$V(\theta)=\frac{1}{2}k$"],
+    ]
+
+
+def test_mineru_structured_appendix_after_references_is_retrievable(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+    from app.services.semantic_chunking import SemanticChunker
+
+    pdf_path = tmp_path / "author-manuscript.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=[
+            {"type": "title", "text": "References", "page_idx": 0},
+            {
+                "type": "paragraph",
+                "text": "1. Example A and Example B, Journal 2024, 1, 1-10.",
+                "page_idx": 0,
+            },
+            {
+                "type": "table",
+                "table_caption": ["Table 2. Supporting measurements."],
+                "table_body": (
+                    "<table><tr><td>System</td><td>Value</td></tr>"
+                    "<tr><td>ACTR</td><td>13.07</td></tr></table>"
+                ),
+                "page_idx": 1,
+            },
+        ],
+        page_count=2,
+    )
+    table_markdown = parsed.metadata["document_intelligence"]["tables"][0][
+        "markdown"
+    ]
+    parsed.chunks = [
+        parser.ParsedChunk(
+            ordinal=0,
+            text="### References",
+            heading="mineru-page-1-title",
+            page_label="1",
+        ),
+        parser.ParsedChunk(
+            ordinal=1,
+            text="1. Example A and Example B, Journal 2024, 1, 1-10.",
+            heading="mineru-page-1-paragraph",
+            page_label="1",
+        ),
+        parser.ParsedChunk(
+            ordinal=2,
+            text=table_markdown,
+            heading="mineru-page-2-table",
+            page_label="2",
+        ),
+    ]
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path,
+        parsed,
+        "mineru",
+        2,
+    )
+
+    reference = next(
+        block for block in canonical.blocks if "Example A" in block.text
+    )
+    table = next(block for block in canonical.blocks if block.block_type == "table")
+    assert reference.retrievable is False
+    assert table.retrievable is True
+    assert table.section_path != ["References"]
+
+    chunks = SemanticChunker(
+        lambda texts: [[1.0, 0.0] for _text in texts],
+        lambda text: len(text.split()),
+    ).build(canonical)
+    assert any(
+        chunk.chunk_role == "child" and chunk.block_type == "table"
+        for chunk in chunks
+    )
+
+
+def test_mineru_v2_nested_table_content_survives_canonical_validation(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+    from app.services.structured_evidence import TableValidator
+
+    table_iii_html = r"""<table>
+      <tr><td>Constraint</td><td>Potential</td></tr>
+      <tr><td>Angle</td><td>$V(\theta)=\frac{1}{2}k\left|r\right|^2$</td></tr>
+    </table>"""
+    table_iv_html = r"""<table>
+      <tr><td>Setting</td><td>$\Delta E_{conv}/E_h$</td><td>$\|\nabla E\|/E_h a^{-1}$</td><td>Max. Cycles</td></tr>
+      <tr><td>Crude</td><td>$5\times10^{-4}$</td><td>$1\times10^{-2}$</td><td>$N_{at}$</td></tr>
+      <tr><td>Extreme</td><td>$5\times10^{-8}$</td><td>$5\times10^{-5}$</td><td>$20N_{at}$</td></tr>
+    </table>"""
+    payload = [
+        [],
+        [
+            {
+                "type": "table",
+                "content": {
+                    "table_caption": [
+                        {"type": "text", "content": "TABLE III. Constraint "},
+                        {"type": "equation_inline", "content": "V(r)"},
+                        {"type": "text", "content": " potentials."},
+                    ],
+                    "table_footnote": [
+                        {"type": "text", "content": "Distances are in angstrom."}
+                    ],
+                    "html": table_iii_html,
+                    "image_source": {"path": "images/table-iii.jpg"},
+                },
+                "bbox": [69, 119, 486, 279],
+            },
+            {
+                "type": "table",
+                "content": {
+                    "table_caption": [
+                        {"type": "text", "content": "TABLE IV. Optimization using "},
+                        {"type": "equation_inline", "content": "E _ { \\mathfrak { h } }"},
+                        {"type": "text", "content": " thresholds."},
+                    ],
+                    "table_footnote": [],
+                    "html": table_iv_html,
+                    "image_source": {"path": "images/table-iv.jpg"},
+                },
+                "bbox": [510, 738, 929, 871],
+            },
+        ],
+    ]
+    content_list = parser._normalize_mineru_content_list(payload)
+    pdf_path = tmp_path / "nested-v2.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=content_list,
+        page_count=2,
+        output_dir=tmp_path,
+        content_list_path=tmp_path / "paper_content_list_v2.json",
+    )
+    parsed_tables = parsed.metadata["document_intelligence"]["tables"]
+
+    assert [table["source_html"] for table in parsed_tables] == [
+        table_iii_html,
+        table_iv_html,
+    ]
+    assert parsed_tables[0]["markdown"].startswith(
+        "TABLE III. Constraint V(r) potentials."
+    )
+    assert parsed_tables[0]["footnotes"] == ["Distances are in angstrom."]
+    assert parsed_tables[0]["image_path"] == "images/table-iii.jpg"
+    assert parsed_tables[0]["bbox"] == [69, 119, 486, 279]
+    assert all(table["page_label"] == "2" for table in parsed_tables)
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path, parsed, "mineru", 2
+    )
+    table_iii, table_iv = canonical.tables
+
+    assert table_iii.caption == "TABLE III. Constraint V(r) potentials."
+    assert table_iii.footnotes == ["Distances are in angstrom."]
+    assert table_iii.headers == ["Constraint", "Potential"]
+    assert table_iii.rows == [
+        ["Angle", r"$V(\theta)=\frac{1}{2}k\left|r\right|^2$"]
+    ]
+    assert table_iii.source_spans[0].bbox == (69.0, 119.0, 486.0, 279.0)
+    assert table_iv.headers == [
+        "Setting",
+        r"$\Delta E_{conv}/E_h$",
+        r"$\|\nabla E\|/E_h a^{-1}$",
+        "Max. Cycles",
+    ]
+    assert table_iv.rows[-1] == [
+        "Extreme",
+        r"$5\times10^{-8}$",
+        r"$5\times10^{-5}$",
+        r"$20N_{at}$",
+    ]
+    assert all(TableValidator().validate(table).accepted for table in canonical.tables)
+
+
+def test_mineru_html_table_spans_use_one_canonical_markdown_grid(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+    from app.services.canonical_quality import CanonicalQualityGate
+    from app.services.structured_evidence import TableValidator
+
+    source_html = """<table>
+      <tr><td>Method</td><td colspan="2">Scores</td></tr>
+      <tr><td rowspan="2">Base</td><td>80</td><td>90</td></tr>
+      <tr><td>81</td><td>91</td></tr>
+    </table>"""
+    pdf_path = tmp_path / "spans.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=[
+            {
+                "type": "table",
+                "table_caption": ["TABLE IV. Span-aware results."],
+                "table_body": source_html,
+                "page_idx": 0,
+            }
+        ],
+        page_count=1,
+    )
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path, parsed, "mineru", 1
+    )
+    table = canonical.tables[0]
+
+    assert table.headers == ["Method", "Scores", ""]
+    assert table.rows == [["Base", "80", "90"], ["", "81", "91"]]
+    assert CanonicalQualityGate._markdown_table_data(table.source_markdown or "") == (
+        table.headers,
+        table.rows,
+    )
+    assert table.metadata["parser_source_markdown"] != table.source_markdown
+    assert "rowspan" in (table.source_html or "")
+    assert TableValidator().validate(table).accepted is True
+    assert CanonicalQualityGate._invalid_table_reasons(table) == []
+
+
+def test_mineru_html_table_always_uses_first_logical_row_as_header(
+    tmp_path: Path,
+) -> None:
+    from app.services import canonical_adapters
+    from app.services.structured_evidence import TableValidator
+
+    source_html = """<table>
+      <tr><td>Dataset</td><td>Score</td></tr>
+      <tr><th>OIE2016</th><th>74.7</th></tr>
+    </table>"""
+    pdf_path = tmp_path / "mixed-header.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+    parsed = parser._mineru_content_to_parsed_doc(
+        path=pdf_path,
+        content_list=[
+            {"type": "table", "table_body": source_html, "page_idx": 0}
+        ],
+        page_count=1,
+    )
+
+    canonical = canonical_adapters._parsed_pdf_to_canonical(
+        pdf_path, parsed, "mineru", 1
+    )
+    table = canonical.tables[0]
+
+    assert table.headers == ["Dataset", "Score"]
+    assert table.rows == [["OIE2016", "74.7"]]
+    assert all(cell.is_header for cell in table.cells if cell.row_index == 0)
+    assert TableValidator().validate(table).accepted is True
+
+
 def test_mineru_content_to_parsed_doc_normalizes_latex_table_cells(tmp_path) -> None:
     content_list = [
         {

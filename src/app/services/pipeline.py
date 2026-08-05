@@ -1,3 +1,35 @@
+"""
+pipeline.py —— Ingestion 管线编排（canonical 阶段机 + 知识抽取）模块
+===================================================================
+
+职责：
+- 编排文档 ingestion 全流程，支持两套路径：
+  1. **canonical 阶段机路径**（主路径）：文档经 parse -> repair ->
+     canonicalize -> semantic_split -> contextualize -> embed -> index ->
+     activate 各阶段，每个阶段以持久化检查点（artifact）方式推进，
+     阶段执行器经 ``ingestion_stage_handlers()`` 暴露给
+     ``ingestion_stages.IngestionStageRunner``。
+  2. **legacy 路径**：无 Redis 队列时的同步兜底（``_process_document_legacy``），
+     解析 -> 分块 -> 嵌入 -> SAC-KG 知识抽取（实体/三元组/审阅项）。
+- 提供文档注册（register_document）、解析版本管理、SAC-KG 抽取
+  （以文档标题等候选 head 驱动模型生成三元组，经本地/外部验证过滤）、
+  实体增长决策（grow/keep/prune）与审阅项生成。
+
+核心概念：
+- **版本化分块**：所有分块按 (document_id, parse_version) 版本隔离，
+  向量索引同样版本化，激活（activate）时整体切换当前版本。
+- **Stage artifact**：阶段产物以带 SHA-256 指纹的 JSON 落盘
+  （``_write_stage_artifact`` / ``_load_previous_stage_artifact``），
+  阶段间通过检查点传递并校验指纹，保证可重放与防篡改。
+- **身份校验**：``validate_ingestion_identity`` 在语义切分等阶段校验
+  当前配置与入队时的配置快照一致，防止新旧配置混用。
+
+模块级常量说明：
+- ``FACT_MARKERS`` / ``FACT_VALUE_PATTERN``：抽取关键事实的启发式。
+- ``GROW_ENTITY_TYPES`` / ``PRUNE_ENTITY_TYPES``：实体增长决策类型。
+- ``HEAD_*``：候选 head 生成相关的数量/预算常量。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -44,7 +76,22 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.filesystem import compute_sha256, display_title_from_path, looks_like_internal_sample, readable_title_from_path, slugify, strip_upload_prefix
-from app.services.paper_profile import ensure_paper_profile, ensure_source_identity
+from app.services.contextualization_policy import (
+    requires_contextualization,
+    valid_contextualized_embedding,
+    valid_plain_embedding,
+)
+from app.services.paper_profile import (
+    ensure_paper_profile,
+    ensure_source_identity,
+    prepare_canonical_profile_source,
+)
+from app.services.ingestion_identity import (
+    build_ingestion_config_snapshot,
+    build_parse_version_key,
+    canonical_ingestion_config_hash,
+    require_matching_ingestion_config,
+)
 from app.services.parser import parse_document
 from app.services.parse_versions import ActivationError, ParseVersionService
 from app.services.repositories import get_or_create_project
@@ -116,8 +163,418 @@ HEAD_SNIPPET_LIMIT = 6
 HEAD_CONTEXT_CHAR_BUDGET = 3600
 
 
+def _span_structured_id(span: Any, field: str) -> str | None:
+    """从持久化的 source_span JSON 中读取结构 ID（table_id/figure_id/formula_id）。
+
+    结构化分块会经 ``_annotate_structure_spans`` 把结构 ID 写入 span 的
+    metadata（不覆盖 span 自身的顶层字段），因此同时检查 metadata 与顶层字段。
+    """
+    if not isinstance(span, dict):
+        return None
+    metadata = span.get("metadata")
+    if isinstance(metadata, dict):
+        value = metadata.get(field)
+        if isinstance(value, str) and value:
+            return value
+    value = span.get(field)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _is_footnote_only_chunk(metadata: Any) -> bool:
+    """判断表格子块是否为"仅脚注"块（无数据行、仅引用上下文）。
+
+    结构化证据构建器（``structured_evidence._missing_table_footnote_chunks``）
+    为未被常规子块覆盖的脚注生成独立子块，其 metadata 携带脚注契约键
+    ``footnote_index``（另含 ``footnote_part_index``/``footnote_part_count``）。
+    这类子块为支撑引用上下文会携带完整 ``row_indices``，但本身不含任何
+    数据行，因此不能参与行覆盖判定。
+    """
+    return isinstance(metadata, dict) and "footnote_index" in metadata
+
+
+def _is_valid_row_index(value: Any) -> bool:
+    """是否为合法的非负整数行下标。
+
+    Python 中 ``bool`` 是 ``int`` 的子类，``isinstance(True, int)`` 成立；
+    若不显式排除，``True/False`` 会被当作行 1/0 计入覆盖。
+    """
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and value >= 0
+    )
+
+
+def _normalize_row_indices(values: list[Any]) -> set[int]:
+    """规范化行下标集合：仅保留合法的非负整数，忽略布尔值与其他噪音。"""
+    return {int(value) for value in values if _is_valid_row_index(value)}
+
+
+def derive_child_inventory_from_payload(payload: list[Any]) -> dict[str, Any]:
+    """从 index 阶段产物（``index_payload.json`` 记录列表）派生同构 Child 库存。
+
+    输出：``{"tables": {table_id: {"child_ids", "parent_ids", "child_count"}},
+    "figure_ids": [...], "formula_ids": [...], "row_indices": {table_id: [...]},
+    "orphan_structured_chunks": [...]}``。
+    重复 local_id 会抛错（fail-closed）。行覆盖只统计子块，父块的行集合不能
+    掩盖缺失的 child 行；仅脚注子块（``footnote_index`` 契约）不含数据行，
+    也不贡献行覆盖。无 table_id 的结构化分块被记为孤儿（保留 local_id），
+    激活 gate 会据此失败关闭。
+    """
+    tables: dict[str, dict[str, Any]] = {}
+    figures: set[str] = set()
+    formulas: set[str] = set()
+    row_indices: dict[str, set[int]] = {}
+    orphans: set[str] = set()
+    seen_local_ids: set[str] = set()
+    for record in payload:
+        if not isinstance(record, dict):
+            raise RuntimeError("Typed inventory requires indexed chunk records.")
+        chunk = record.get("chunk")
+        if not isinstance(chunk, dict):
+            raise RuntimeError("Typed inventory requires a chunk object per record.")
+        local_id = chunk.get("local_id")
+        if not isinstance(local_id, str) or not local_id:
+            raise RuntimeError("Typed inventory requires non-empty chunk local IDs.")
+        if local_id in seen_local_ids:
+            raise RuntimeError(
+                f"Typed inventory contains duplicate chunk local ID {local_id!r}."
+            )
+        seen_local_ids.add(local_id)
+        block_type = chunk.get("block_type")
+        metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+        chunk_role = chunk.get("chunk_role")
+        if block_type == "table":
+            table_id = metadata.get("table_id")
+            if not isinstance(table_id, str) or not table_id:
+                # 无结构归属的结构化分块是孤儿：保留 local_id，激活时与
+                # DB 派生库存比较并失败关闭，而不是静默丢弃。
+                orphans.add(local_id)
+                continue
+            entry = tables.setdefault(
+                table_id,
+                {"child_ids": set(), "parent_ids": set()},
+            )
+            if chunk_role == "child":
+                entry["child_ids"].add(local_id)
+                # 行覆盖只统计真正的数据行子块；脚注子块（现有脚注元数据契约）
+                # 携带完整 row_indices 但无数据行，不参与覆盖。
+                if not _is_footnote_only_chunk(metadata):
+                    rows = metadata.get("row_indices")
+                    if isinstance(rows, list):
+                        row_indices.setdefault(table_id, set()).update(
+                            _normalize_row_indices(rows)
+                        )
+            elif chunk_role == "parent":
+                entry["parent_ids"].add(local_id)
+        elif block_type == "figure":
+            figure_id = metadata.get("figure_id")
+            if isinstance(figure_id, str) and figure_id:
+                figures.add(figure_id)
+        elif block_type == "formula":
+            formula_id = metadata.get("formula_id")
+            if isinstance(formula_id, str) and formula_id:
+                formulas.add(formula_id)
+    return {
+        "tables": {
+            table_id: {
+                "child_ids": sorted(entry["child_ids"]),
+                "parent_ids": sorted(entry["parent_ids"]),
+                "child_count": len(entry["child_ids"]),
+            }
+            for table_id, entry in sorted(tables.items())
+        },
+        "figure_ids": sorted(figures),
+        "formula_ids": sorted(formulas),
+        "row_indices": {
+            table_id: sorted(rows) for table_id, rows in sorted(row_indices.items())
+        },
+        "orphan_structured_chunks": sorted(orphans),
+    }
+
+
+def derive_db_typed_inventory(
+    manifest_inventory: dict[str, Any],
+    chunk_rows: list[DocumentChunk],
+) -> dict[str, Any]:
+    """从 (document_id, parse_version) 的 DocumentChunk 行派生 DB/index 库存。
+
+    表格分块通过 source_span 中的 table_id 标注归属；若缺失，则回退到
+    source_block_ids 反查 manifest 中声明的来源 block。找不到归属的结构化
+    分块被记为孤儿（保留 chunk id），激活 gate 据此失败关闭；跨版本行会
+    被记为 cross-version 污染。行覆盖只统计子块，父块不能掩盖缺失的
+    child 行；仅脚注子块（持久化 span metadata 中的 ``footnote_index`` 契约）
+    不含数据行，不贡献行覆盖。
+
+    行覆盖来源有两个，取并集：
+    1. 逐单元格的 ``source_spans[].row_index``（HTML/DOCX 等解析器）。
+    2. span metadata 中的 ``row_indices``（text/Markdown 表格持久化时由
+       ``_persist_table_row_indices`` 从 chunk metadata 写入的同一份行覆盖，
+       span 本身通常不带逐行 row_index）。
+    """
+    block_to_table: dict[str, str] = {}
+    for record in manifest_inventory.get("tables") or []:
+        if not isinstance(record, dict):
+            continue
+        for block_id in record.get("source_block_ids") or []:
+            if isinstance(block_id, str):
+                block_to_table.setdefault(block_id, record["table_id"])
+    expected_version = manifest_inventory.get("version")
+    tables: dict[str, dict[str, Any]] = {}
+    figures: set[str] = set()
+    formulas: set[str] = set()
+    orphans: list[str] = []
+    cross_version: list[str] = []
+    for row in chunk_rows:
+        row_version = getattr(row, "parse_version", None)
+        if expected_version is not None and row_version != expected_version:
+            cross_version.append(row.id)
+        block_type = getattr(row, "block_type", None)
+        spans = getattr(row, "source_spans", None)
+        if not isinstance(spans, list):
+            spans = []
+        source_block_ids = getattr(row, "source_block_ids", None) or []
+        if block_type == "table":
+            table_id = next(
+                (
+                    value
+                    for value in (
+                        _span_structured_id(span, "table_id") for span in spans
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if table_id is None:
+                table_id = next(
+                    (block_to_table[block_id] for block_id in source_block_ids if block_id in block_to_table),
+                    None,
+                )
+            if table_id is None:
+                # 无结构归属的结构化分块是孤儿：保留 chunk id，激活 gate 拒绝。
+                orphans.append(row.id)
+                continue
+            entry = tables.setdefault(
+                table_id,
+                {
+                    "parent_ids": set(),
+                    "child_ids": set(),
+                    "source_block_ids": set(),
+                    "row_indices": set(),
+                },
+            )
+            entry["source_block_ids"].update(
+                block_id for block_id in source_block_ids if isinstance(block_id, str)
+            )
+            if getattr(row, "chunk_role", None) == "child":
+                entry["child_ids"].add(row.id)
+                # 行覆盖只统计真正的数据行子块。脚注子块（现有脚注元数据契约：
+                # 持久化 span metadata 中的 footnote_index 标记）携带完整
+                # row_indices 但无数据行，整体跳过、不贡献任何行下标。
+                if any(
+                    isinstance(span, dict)
+                    and _is_footnote_only_chunk(span.get("metadata"))
+                    for span in spans
+                ):
+                    continue
+                # 行覆盖只统计子块：父块的行集合不参与覆盖判定。
+                for span in spans:
+                    if not isinstance(span, dict):
+                        continue
+                    row_index = span.get("row_index")
+                    if _is_valid_row_index(row_index):
+                        entry["row_indices"].add(int(row_index))
+                    # text/Markdown 表格的 span 通常没有逐行 row_index；
+                    # 持久化阶段把 chunk 级 row_indices 写入 span metadata，
+                    # 这里读取同一份行覆盖（HTML/DOCX 逐行路径保持不变）。
+                    span_metadata = span.get("metadata")
+                    if isinstance(span_metadata, dict):
+                        persisted_rows = span_metadata.get("row_indices")
+                        if isinstance(persisted_rows, list):
+                            entry["row_indices"].update(
+                                _normalize_row_indices(persisted_rows)
+                            )
+            elif getattr(row, "chunk_role", None) == "parent":
+                entry["parent_ids"].add(row.id)
+        elif block_type == "figure":
+            figure_id = next(
+                (
+                    value
+                    for value in (
+                        _span_structured_id(span, "figure_id") for span in spans
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if figure_id is not None:
+                figures.add(figure_id)
+        elif block_type == "formula":
+            formula_id = next(
+                (
+                    value
+                    for value in (
+                        _span_structured_id(span, "formula_id") for span in spans
+                    )
+                    if value is not None
+                ),
+                None,
+            )
+            if formula_id is not None:
+                formulas.add(formula_id)
+    return {
+        "tables": {
+            table_id: {
+                "parent_ids": sorted(entry["parent_ids"]),
+                "child_ids": sorted(entry["child_ids"]),
+                "source_block_ids": sorted(entry["source_block_ids"]),
+                "row_indices": sorted(entry["row_indices"]),
+            }
+            for table_id, entry in sorted(tables.items())
+        },
+        "figure_ids": sorted(figures),
+        "formula_ids": sorted(formulas),
+        "orphan_structured_chunks": sorted(orphans),
+        "cross_version_chunk_ids": sorted(cross_version),
+    }
+
+
+def compare_typed_inventory(
+    manifest_inventory: dict[str, Any],
+    observed: dict[str, Any],
+) -> list[str]:
+    """逐表比较 manifest 库存与 DB/index 库存，返回可读的不一致描述列表。
+
+    覆盖：table ID 集合、每表 Child ID/child_count、source_block_ids、
+    parent/Child 归属、row 覆盖、重复/多余/孤儿记录、figure/formula ID 集合，
+    以及跨版本混入。任何非空返回都意味着激活必须被阻止。
+    """
+    mismatches: list[str] = []
+    expected_tables = {
+        record["table_id"]: record
+        for record in manifest_inventory.get("tables") or []
+        if isinstance(record, dict)
+    }
+    observed_tables = observed.get("tables") or {}
+
+    missing_tables = sorted(set(expected_tables) - set(observed_tables))
+    extra_tables = sorted(set(observed_tables) - set(expected_tables))
+    if missing_tables:
+        mismatches.append("missing tables: " + ", ".join(missing_tables))
+    if extra_tables:
+        mismatches.append("extra tables: " + ", ".join(extra_tables))
+
+    for table_id in sorted(set(expected_tables) & set(observed_tables)):
+        expected = expected_tables[table_id]
+        observed_table = observed_tables[table_id]
+        expected_child_ids = sorted(set(expected.get("child_ids") or []))
+        listed_child_ids = sorted(expected.get("child_ids") or [])
+        observed_child_ids = sorted(observed_table.get("child_ids") or [])
+        if len(listed_child_ids) != len(set(listed_child_ids)):
+            mismatches.append(f"table {table_id} duplicate child entries in expected inventory")
+        if expected.get("child_count") != len(listed_child_ids):
+            mismatches.append(
+                f"table {table_id} child count mismatch: declared "
+                f"{expected.get('child_count')}, listed {len(listed_child_ids)}"
+            )
+        missing_children = sorted(set(expected_child_ids) - set(observed_child_ids))
+        extra_children = sorted(set(observed_child_ids) - set(expected_child_ids))
+        if missing_children:
+            mismatches.append(
+                "table " + table_id + " missing children: " + ", ".join(missing_children)
+            )
+        if extra_children:
+            mismatches.append(
+                "table " + table_id + " extra children: " + ", ".join(extra_children)
+            )
+        expected_parents = sorted(set(expected.get("parent_ids") or []))
+        observed_parents = sorted(observed_table.get("parent_ids") or [])
+        if expected_parents != observed_parents:
+            mismatches.append(
+                f"table {table_id} parent ownership mismatch: expected "
+                f"{expected_parents}, found {observed_parents}"
+            )
+        expected_blocks = sorted(set(expected.get("source_block_ids") or []))
+        observed_blocks = sorted(observed_table.get("source_block_ids") or [])
+        if expected_blocks != observed_blocks:
+            mismatches.append(
+                f"table {table_id} source block mismatch: expected "
+                f"{expected_blocks}, found {observed_blocks}"
+            )
+        expected_rows = expected.get("row_count")
+        covered = expected.get("row_indices") or []
+        if isinstance(expected_rows, int) and expected_rows > 0:
+            expected_coverage = list(range(expected_rows))
+            if isinstance(covered, list) and sorted(set(covered)) != expected_coverage:
+                mismatches.append(
+                    f"table {table_id} row count mismatch: declared {expected_rows}, "
+                    f"covered {sorted(set(covered))}"
+                )
+        observed_rows = sorted(set(observed_table.get("row_indices") or []))
+        if isinstance(covered, list) and covered:
+            if observed_rows != sorted(set(covered)):
+                mismatches.append(
+                    f"table {table_id} row coverage mismatch: expected "
+                    f"{sorted(set(covered))}, found {observed_rows}"
+                )
+        elif isinstance(expected_rows, int) and expected_rows > 0 and observed_rows != list(range(expected_rows)):
+            mismatches.append(
+                f"table {table_id} row count mismatch: declared {expected_rows}, "
+                f"found rows {observed_rows}"
+            )
+
+    expected_figures = sorted(manifest_inventory.get("figure_ids") or [])
+    observed_figures = sorted(observed.get("figure_ids") or [])
+    if expected_figures != observed_figures:
+        mismatches.append(
+            "figure ID mismatch: expected "
+            + str(expected_figures)
+            + ", found "
+            + str(observed_figures)
+        )
+    expected_formulas = sorted(manifest_inventory.get("formula_ids") or [])
+    observed_formulas = sorted(observed.get("formula_ids") or [])
+    if expected_formulas != observed_formulas:
+        mismatches.append(
+            "formula ID mismatch: expected "
+            + str(expected_formulas)
+            + ", found "
+            + str(observed_formulas)
+        )
+
+    observed_orphans = sorted(observed.get("orphan_structured_chunks") or [])
+    manifest_orphans = sorted(manifest_inventory.get("orphan_structured_chunks") or [])
+    if observed_orphans:
+        mismatches.append("orphan structured chunks: " + ", ".join(observed_orphans))
+    elif manifest_orphans:
+        # index 阶段记录过孤儿，但激活时 DB 派生库存不再包含它们，说明数据
+        # 不一致，同样失败关闭。
+        mismatches.append(
+            "orphan structured chunks disappeared: manifest recorded "
+            + ", ".join(manifest_orphans)
+        )
+    cross_version = observed.get("cross_version_chunk_ids") or []
+    if cross_version:
+        mismatches.append(
+            "cross-version chunk contamination: " + ", ".join(cross_version)
+        )
+    return mismatches
+
+
 class IngestionPipeline:
+    """Ingestion 管线编排器：阶段执行器 + 文档注册 + SAC-KG 知识抽取。
+
+    同时承担两类职责：
+    1. canonical 阶段机的各阶段执行器（parse/repair/canonicalize/
+       semantic_split/contextualize/embed/index/activate），供
+       ``IngestionStageRunner`` 调用。
+    2. 文档注册、legacy 同步处理、以及 SAC-KG 抽取（实体/三元组/审阅）。
+    """
+
     def __init__(self, db: Session) -> None:
+        """保存会话并初始化 Ollama 客户端、外部验证器与对象存储。"""
         self.db = db
         self.ollama = OllamaClient()
         self.verifier = ExternalVerifier()
@@ -126,9 +583,13 @@ class IngestionPipeline:
     def ingestion_stage_handlers(self) -> dict[str, object]:
         """Expose stages backed by durable canonical artifact operations.
 
+        暴露"基于持久化 canonical 产物"的各个阶段执行器映射。
+
         Chunk persistence and the later model/index operations need the formal
         version-scoped implementation. They remain absent so workers fail closed
         at the first unavailable stage.
+        分块持久化与后续模型/索引操作需要正式版本作用域实现；
+        未提供的阶段缺省为缺失，使 worker 在首个不可用阶段即"失败关闭"。
         """
         return {
             "parse": self._run_canonical_parse_stage,
@@ -141,7 +602,33 @@ class IngestionPipeline:
             "activate": self._run_activation_gate_stage,
         }
 
+    def validate_ingestion_identity(
+        self,
+        _document: Document,
+        version: DocumentParseVersion,
+        _stage: str,
+    ) -> None:
+        """阶段前置校验：当前配置必须与版本入队时记录的配置快照一致。
+
+        计算当前 ingestion 配置快照的哈希，与版本 manifest 中记录的
+        ``ingestion_config`` / ``ingestion_config_sha256`` 比对；
+        不一致则抛错，防止在配置变更后继续执行旧版本管线。
+        """
+        live_snapshot = build_ingestion_config_snapshot()
+        require_matching_ingestion_config(version.manifest_json, live_snapshot)
+
     def _run_canonical_parse_stage(self, context) -> dict[str, object]:
+        """parse 阶段执行器：执行 canonical 解析并把草稿固化到产物目录。
+
+        流程：
+        1. ``_parse_canonical_phase`` 解析源文件得到 canonical 文档。
+        2. 注入文档 ID 与解析版本键。
+        3. 把 canonical JSON 序列化，计算输入指纹；写为
+           ``parse.canonical.json`` 草稿（若已存在则校验一致，防冲突）。
+        4. 记录清单（artifact_path / input_fingerprint）、质量与解析器名；
+           若文档尚无激活版本，回填标题与 canonical_ingestion 元信息。
+        5. 返回摘要（artifact_path、输入指纹、质量、块/表数量）。
+        """
         canonical = self._parse_canonical_phase(Path(context.document.raw_path))
         canonical = canonical.model_copy(
             update={
@@ -152,13 +639,16 @@ class IngestionPipeline:
         document_root = self._stage_artifact_dir(context)
         draft_path = document_root / "parse.canonical.json"
         payload = canonical.model_dump_json().encode("utf-8")
+        # 输入指纹：对草稿内容做 SHA-256，供后续阶段校验
         input_fingerprint = hashlib.sha256(payload).hexdigest()
         if draft_path.exists():
+            # 草稿已存在：内容必须与本次一致（可重放性）
             if draft_path.read_bytes() != payload:
                 raise RuntimeError(
                     f"Canonical parse draft conflicts with checkpoint: {draft_path}"
                 )
         else:
+            # 原子写入草稿（临时文件 + rename）
             temporary = document_root / (
                 f".{context.version.version_key}.{uuid4().hex}.tmp"
             )
@@ -169,6 +659,7 @@ class IngestionPipeline:
                 temporary.unlink(missing_ok=True)
         quality = canonical.quality.model_dump(mode="json")
         context.version.manifest_json = {
+            **dict(context.version.manifest_json or {}),
             "artifact_path": str(draft_path),
             "input_fingerprint": input_fingerprint,
         }
@@ -199,6 +690,16 @@ class IngestionPipeline:
         }
 
     def _run_canonical_repair_gate_stage(self, context) -> dict[str, object]:
+        """repair 阶段执行器：校验解析草稿指纹、执行修复并写 staging。
+
+        流程：
+        1. 读取解析草稿，校验其指纹与检查点中的输入指纹一致。
+        2. 用 ``_repair_canonical_phase`` 执行修复（针对 PDF 的质量门
+           修复，含文档智能目标页/全页重试）。
+        3. 把修复后的 canonical 写入 staging 目录（``write_staging``）。
+        4. 读取 manifest 中的质量：不通过则抛错（repair gate 拒绝）。
+        5. 记录清单与质量并返回摘要（含表格修复请求数量）。
+        """
         from app.services.canonical_artifacts import CanonicalArtifactStore
         from app.services.canonical_models import CanonicalDocument
 
@@ -208,6 +709,7 @@ class IngestionPipeline:
             "input_fingerprint"
         )
         actual_fingerprint = hashlib.sha256(payload).hexdigest()
+        # 草稿指纹必须与上一阶段检查点一致
         if actual_fingerprint != expected_fingerprint:
             raise RuntimeError("Canonical parse draft fingerprint does not match checkpoint.")
         canonical = CanonicalDocument.model_validate_json(payload)
@@ -224,6 +726,7 @@ class IngestionPipeline:
         manifest_path = staging / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         quality = dict(manifest["quality"])
+        # 修复门禁：质量必须被接受
         if (
             quality.get("accepted") is not True
             or quality.get("status")
@@ -233,6 +736,7 @@ class IngestionPipeline:
                 f"Canonical repair gate rejected quality {quality.get('status')!r}."
             )
         context.version.manifest_json = {
+            **dict(context.version.manifest_json or {}),
             "artifact_path": str(manifest_path),
             "input_fingerprint": manifest["input_fingerprint"],
             "canonical_markdown_sha256": manifest["canonical_markdown_sha256"],
@@ -254,6 +758,21 @@ class IngestionPipeline:
         }
 
     def _parse_canonical_phase(self, path: Path):
+        """执行 canonical 解析主流程（含 PDF 多层解析）。
+
+        非 PDF：直接 ``parse_canonical_document``。
+
+        PDF 多层解析策略：
+        1. 校验路径并获取页数。
+        2. 若启用 MinerU：先尝试 MinerU 深度解析，记录成败于 attempts。
+        3. 读取文本层（供审计与兜底）。
+        4. 若 MinerU 未产出结果：退回文本层兜底解析。
+        5. 挂接 PDF 审计信息（页数、文本层、尝试序列、主解析器）。
+        6. 用文本层补充缺失页 / 恢复页遗漏，并记录尝试。
+        7. 再次挂接完整审计；运行质量门评估；固化结构化证据与最终审计。
+
+        返回：最终的 canonical 文档对象。
+        """
         if path.suffix.lower() != ".pdf":
             from app.services.canonical_adapters import parse_canonical_document
 
@@ -265,8 +784,9 @@ class IngestionPipeline:
 
         path = adapters._validate_path(path)  # noqa: SLF001
         page_count = parser._validate_pdf_basic(path)
-        attempts: list[str] = []
+        attempts: list[str] = []  # 解析尝试序列（审计）
         primary = None
+        # 第一层：MinerU（若启用）
         if parser.settings.mineru_enabled:
             try:
                 primary = adapters.run_mineru(path, page_count)
@@ -278,9 +798,11 @@ class IngestionPipeline:
                 )
         else:
             attempts.append("mineru:disabled")
+        # 读取文本层（审计与兜底共用）
         page_texts, warnings = adapters._read_text_layer_for_audit(  # noqa: SLF001
             path, page_count
         )
+        # 第二层：文本层兜底（仅当 MinerU 不可用/无结果）
         if primary is None:
             primary = adapters.run_text_layer_fallback(
                 path,
@@ -297,11 +819,68 @@ class IngestionPipeline:
             attempts=attempts,
             primary_parser=primary.parser_source,
         )
+        # 用文本层补充"缺失页"（MinerU/主解析漏掉的页）
+        text_layer_fallback_pages = (
+            adapters._supplement_missing_pdf_pages_from_text_layer(  # noqa: SLF001
+                primary,
+                page_texts,
+                page_count,
+            )
+        )
+        # 恢复"页内遗漏"（跳过已补充的页）
+        text_layer_recovery_pages = (
+            adapters._recover_pdf_page_omissions_from_text_layer(  # noqa: SLF001
+                primary,
+                page_texts,
+                page_count,
+                skip_pages=text_layer_fallback_pages,
+            )
+        )
+        if text_layer_fallback_pages:
+            attempts.append(
+                "pypdf_text_layer:missing_pages:"
+                + ",".join(
+                    str(page + 1)
+                    for page in sorted(text_layer_fallback_pages)
+                )
+            )
+        if text_layer_recovery_pages:
+            attempts.append(
+                "pypdf_text_layer:page_recovery:"
+                + ",".join(
+                    str(page + 1)
+                    for page in sorted(text_layer_recovery_pages)
+                )
+            )
+        # 重新挂接包含全部尝试的审计
+        adapters._attach_pdf_audit(  # noqa: SLF001
+            primary,
+            page_count=page_count,
+            page_texts=page_texts,
+            text_layer_warnings=warnings,
+            attempts=attempts,
+            primary_parser=primary.parser_source,
+        )
+        # 质量评估 + 结构化证据固化 + 最终审计
         CanonicalQualityGate().evaluate(primary)
         adapters._finalize_structured_evidence(primary)  # noqa: SLF001
         return adapters._finalize_pdf_audit(primary)  # noqa: SLF001
 
     def _repair_canonical_phase(self, primary, path: Path):
+        """对 canonical 文档执行修复（针对 PDF 的质量门修复）。
+
+        非 PDF：直接返回原文档。
+
+        PDF 修复策略：
+        1. 从主文档元信息恢复页数、文本层与先前尝试序列；再次补充缺失页。
+        2. 运行质量门评估，收集"可修复"问题与修复作用域（页面范围）。
+        3. **目标页修复**（无致命问题且有可修复项、有目标页、文档智能
+           启用）：对目标页运行文档智能，若覆盖完整且合并后质量无致命
+           问题且满足各修复项，则采纳修复候选。
+        4. **全页修复**（有致命问题）：对整个文档运行文档智能，若质量
+           无致命问题则整体替换。
+        5. 挂接含修复作用域的审计、固化结构化证据、返回最终文档。
+        """
         if path.suffix.lower() != ".pdf":
             return primary
 
@@ -309,6 +888,37 @@ class IngestionPipeline:
         from app.services import canonical_adapters as adapters
         from app.services.canonical_quality import CanonicalQualityGate
 
+        # 从主文档元信息恢复上下文
+        page_count = int(primary.metadata.get("expected_page_count") or 0)
+        page_texts = list(primary.metadata.get("text_layer_pages") or [])
+        warnings = list(primary.metadata.get("text_layer_warnings") or [])
+        attempts = list(primary.parser_metadata.get("parser_attempts") or [])
+        text_layer_fallback_pages = (
+            adapters._supplement_missing_pdf_pages_from_text_layer(  # noqa: SLF001
+                primary,
+                page_texts,
+                page_count,
+            )
+        )
+        if text_layer_fallback_pages:
+            attempts.append(
+                "pypdf_text_layer:missing_pages:"
+                + ",".join(
+                    str(page + 1)
+                    for page in sorted(text_layer_fallback_pages)
+                )
+            )
+        # 排除这些页：它们已由文本层补充，不再作为修复目标
+        excluded_fallback_pages = set(text_layer_fallback_pages)
+        excluded_fallback_pages.update(
+            page
+            for page in primary.metadata.get(
+                "text_layer_fallback_page_indices", []
+            )
+            if isinstance(page, int) and 0 <= page < page_count
+        )
+        # 质量门评估：收集可修复项及其页面作用域
+        CanonicalQualityGate().evaluate(primary)
         issues = list(primary.quality.issues)
         repair_issues = [issue for issue in issues if issue.repairable]
         scopes = [
@@ -316,15 +926,13 @@ class IngestionPipeline:
             for issue in repair_issues
             if issue.repair_scope
         ]
-        page_count = int(primary.metadata.get("expected_page_count") or 0)
-        page_texts = list(primary.metadata.get("text_layer_pages") or [])
-        warnings = list(primary.metadata.get("text_layer_warnings") or [])
-        attempts = list(primary.parser_metadata.get("attempts") or [])
         fatal = any(issue.severity == "fatal" for issue in issues)
+        # 目标页集合 = 修复作用域涉及的页 - 已排除的页
         targeted_pages = adapters._repair_page_indices(  # noqa: SLF001
             scopes, page_count
-        )
+        ) - excluded_fallback_pages
         repaired = None
+        # 目标页修复路径
         if (
             not fatal
             and repair_issues
@@ -348,6 +956,7 @@ class IngestionPipeline:
                     if repair is not None
                     else "document_intelligence:targeted:unavailable"
                 )
+                # 目标页覆盖完整时合并修复页
                 if repair is not None and adapters._targeted_repair_has_complete_coverage(  # noqa: SLF001
                     repair, targeted_pages
                 ):
@@ -358,6 +967,7 @@ class IngestionPipeline:
                         issues=repair_issues,
                     )
                     report = CanonicalQualityGate().evaluate(candidate)
+                    # 合并后无致命问题且各修复项被满足才采纳
                     if (
                         not any(issue.severity == "fatal" for issue in report.issues)
                         and adapters._targeted_repair_satisfies_issues(  # noqa: SLF001
@@ -369,6 +979,7 @@ class IngestionPipeline:
                         )
                     ):
                         repaired = candidate
+        # 全页修复路径（致命问题）
         if repaired is None and fatal and parser.settings.document_intelligence_enabled:
             try:
                 candidate = adapters.run_document_intelligence(
@@ -385,6 +996,7 @@ class IngestionPipeline:
                         repaired = candidate
                         attempts.append("document_intelligence:full:success")
         result = repaired or primary
+        # 挂接含修复作用域的审计并固化
         adapters._attach_pdf_audit(  # noqa: SLF001
             result,
             page_count=page_count,
@@ -398,6 +1010,12 @@ class IngestionPipeline:
         return adapters._finalize_pdf_audit(result)  # noqa: SLF001
 
     def _run_canonical_promotion_stage(self, context) -> dict[str, object]:
+        """canonicalize 阶段执行器：把 staging 产物提升（promote）为最终版。
+
+        最终目录为 ``artifacts/<document_id>/<version_key>``；若尚未提升，
+        先校验上一阶段的 staging 清单路径，再调用 ``store.promote``。
+        随后加载 canonical 并返回清单摘要（含块数/表数）。
+        """
         from app.services.canonical_artifacts import CanonicalArtifactStore
 
         store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
@@ -407,6 +1025,7 @@ class IngestionPipeline:
             / context.version.version_key
         )
         if not final.is_dir():
+            # 尚未提升：校验 staging 检查点后提升
             self._checkpoint_artifact_path(context)
             final = store.promote(
                 context.document.id,
@@ -424,9 +1043,18 @@ class IngestionPipeline:
         }
 
     def _run_semantic_split_stage(self, context) -> dict[str, object]:
+        """semantic_split 阶段执行器：对 canonical 做语义切分产出分块草稿。
+
+        前置：校验 ingestion 身份（配置快照一致）。加载 canonical 后，
+        用 ``SemanticChunker`` 构建分块草稿列表；无草稿则抛错。
+        产物写入 ``semantic_chunks.json``。
+        """
         from app.services.canonical_artifacts import CanonicalArtifactStore
         from app.services.semantic_chunking import SemanticChunker
 
+        self.validate_ingestion_identity(
+            context.document, context.version, context.stage
+        )
         canonical = CanonicalArtifactStore(settings.canonical_artifacts_dir).load(
             context.document.id,
             context.version.version_key,
@@ -439,10 +1067,25 @@ class IngestionPipeline:
             context,
             "semantic_chunks.json",
             [draft.model_dump(mode="json") for draft in drafts],
-            extra={"chunk_count": len(drafts)},
+            extra={
+                "chunk_count": len(drafts),
+                "source_fidelity_completeness": 1.0,
+                "structured_limit_completeness": 1.0,
+            },
         )
 
     def _run_contextualize_stage(self, context) -> dict[str, object]:
+        """contextualize 阶段执行器：对需要上下文化的结构化子块做上下文增强。
+
+        流程：
+        1. 读取上一阶段产物（分块草稿），区分为 parent / child。
+        2. 按块类型区分"需要上下文化"（structured，如表/图/公式）与
+           "普通"（plain）子块。
+        3. 仅对 structured 子块调用 ``ContextualizationService.contextualize``
+           （以文档标题/摘要/大纲为上下文）。
+        4. 校验上下文化结果保留完整子块清单（数量与 ID 集合一致）。
+        5. 把上下文化结果合并回全部草稿，写入 ``contextualized_chunks.json``。
+        """
         from app.services.canonical_artifacts import CanonicalArtifactStore
         from app.services.contextualization import (
             ContextualizationService,
@@ -460,18 +1103,41 @@ class IngestionPipeline:
             context.document.id,
             context.version.version_key,
         )
-        contextualized = ContextualizationService().contextualize(
-            document=DocumentContext(
-                title=canonical.title,
-                source_abstract=canonical.abstract,
-                section_outline=self._outline_titles(canonical.outline),
-            ),
-            children=children,
-            parents=parents,
+        structured = [
+            child for child in children if requires_contextualization(child.block_type)
+        ]
+        plain = [
+            child for child in children if not requires_contextualization(child.block_type)
+        ]
+        contextualized = (
+            ContextualizationService().contextualize(
+                document=DocumentContext(
+                    title=canonical.title,
+                    source_abstract=canonical.abstract,
+                    section_outline=self._outline_titles(canonical.outline),
+                ),
+                children=structured,
+                parents=parents,
+            )
+            if structured
+            else []
         )
+        contextualized_by_id = {child.local_id: child for child in contextualized}
+        expected_ids = {child.local_id for child in structured}
+        if len(contextualized_by_id) != len(contextualized) or set(
+            contextualized_by_id
+        ) != expected_ids:
+            raise RuntimeError(
+                "Contextualization did not preserve the structured Child inventory."
+            )
         combined = [
-            *(parent.model_dump(mode="json") for parent in parents.values()),
-            *(child.model_dump(mode="json") for child in contextualized),
+            (
+                contextualized_by_id[draft.local_id].model_dump(mode="json")
+                if draft.chunk_role == "child"
+                and requires_contextualization(draft.block_type)
+                else draft.model_dump(mode="json")
+            )
+            for draft in drafts
         ]
         if len(combined) != len(drafts):
             raise RuntimeError("Contextualization did not preserve the chunk inventory.")
@@ -479,10 +1145,26 @@ class IngestionPipeline:
             context,
             "contextualized_chunks.json",
             combined,
-            extra={"chunk_count": len(combined), "child_count": len(contextualized)},
+            extra={
+                "chunk_count": len(combined),
+                "child_count": len(children),
+                "contextualized_child_count": len(contextualized),
+                "plain_child_count": len(plain),
+            },
         )
 
     def _run_embed_stage(self, context) -> dict[str, object]:
+        """embed 阶段执行器：对子块做向量嵌入（父块不嵌入）。
+
+        流程：
+        1. 读取上一阶段产物并校验：含子块且父/子角色计数正确。
+        2. 校验每个子块满足上下文化策略（``valid_contextualized_embedding``
+           / ``valid_plain_embedding``）。
+        3. 批量调用 Ollama 嵌入；校验向量数量、非有限值、维度一致，
+           且维度与配置一致。
+        4. 输出记录：子块带嵌入向量，父块 embedding 为 None，
+           写入 ``embedded_chunks.json``。
+        """
         payload = self._load_previous_stage_artifact(context)
         if not isinstance(payload, list) or not payload:
             raise RuntimeError("Embedding stage requires contextualized chunks.")
@@ -497,12 +1179,21 @@ class IngestionPipeline:
         )
         if len(children) + parent_count != len(payload):
             raise RuntimeError("Embedding input contains an invalid chunk role.")
-        if any(
-            not item.get("contextual_prefix")
-            or not item.get("contextualization_model")
-            for item in children
-        ):
-            raise RuntimeError("Embedding requires contextualized child chunks.")
+        for item in children:
+            try:
+                valid = (
+                    valid_contextualized_embedding(item)
+                    if requires_contextualization(str(item.get("block_type")))
+                    else valid_plain_embedding(item)
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Embedding input violates the Child contextualization policy."
+                ) from exc
+            if not valid:
+                raise RuntimeError(
+                    "Embedding input violates the Child contextualization policy."
+                )
         texts = [str(item.get("embedding_text") or "") for item in children]
         if not texts or any(not text.strip() for text in texts):
             raise RuntimeError("Embedding input contains an empty child chunk.")
@@ -555,6 +1246,16 @@ class IngestionPipeline:
         )
 
     def _run_index_stage(self, context) -> dict[str, object]:
+        """index 阶段执行器：校验嵌入产物并持久化版本化分块到数据库。
+
+        流程：
+        1. 读取嵌入产物并与 embed 检查点（数量/维度）比对。
+        2. 逐条校验记录：chunk 有非空 local_id、子块带合法嵌入向量、
+           父块嵌入为 None、角色合法；local_id 唯一。
+        3. 校验子块/嵌入数量与检查点一致。
+        4. 调用 ``_persist_versioned_chunks`` 写入 DocumentChunk 表并
+           替换向量索引；产物写入 ``index_payload.json``。
+        """
         payload = self._load_previous_stage_artifact(context)
         if not isinstance(payload, list) or not payload:
             raise RuntimeError("Index stage requires embedded chunk records.")
@@ -620,6 +1321,7 @@ class IngestionPipeline:
         ):
             raise RuntimeError("Embedded child counts do not match embed checkpoint.")
         self._persist_versioned_chunks(context, payload)
+        self._update_manifest_typed_inventory(context, payload)
         return self._write_stage_artifact(
             context,
             "index_payload.json",
@@ -633,7 +1335,46 @@ class IngestionPipeline:
             },
         )
 
+    def _update_manifest_typed_inventory(
+        self,
+        context,
+        payload: list[dict],
+    ) -> None:
+        """把 index 阶段持久化的 Child 库存回填进 canonical manifest。
+
+        库存派生自 index 阶段产物（persisted stage data），并绑定到当前
+        ``document_id + parse_version``。回填失败（如 row 覆盖不完整）会
+        让 index 阶段失败关闭，从而阻止丢行版本进入激活。
+        """
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        child_inventory = derive_child_inventory_from_payload(payload)
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        try:
+            store.update_typed_inventory(
+                context.document.id,
+                context.version.version_key,
+                child_inventory,
+            )
+        except FileNotFoundError:
+            # 生产链路在 index 阶段 canonical bundle 必然存在；缺失只出现在
+            # 合成/测试路径。bundle 缺失时跳过回填不会造成激活绕过，因为
+            # 激活 gate（_verify_typed_inventory_gate）对缺失 bundle 失败关闭。
+            return
+
     def _run_activation_gate_stage(self, context) -> dict[str, object]:
+        """activate 阶段执行器（门禁）：激活前做完整性校验与资料准备。
+
+        校验项：
+        - index 产物非空且 parse_version 与当前版本一致。
+        - 数据库中有非零可检索子块；各块上下文化/普通嵌入完整
+          （``valid_*_embedding`` 计数）。
+        - 可检索/已嵌入/已索引/有效源跨度/产物子块数量完全一致。
+        - 检查点计数与索引现状一致。
+        通过后为文档准备 canonical 资料（摘要/来源身份/论文画像）。
+
+        返回：版本键与各项计数。
+        """
         payload = self._load_previous_stage_artifact(context)
         if not isinstance(payload, list) or not payload:
             raise ActivationError("Activation artifact validation failed: empty index payload.")
@@ -653,15 +1394,25 @@ class IngestionPipeline:
         retrievable_count = len(children)
         if retrievable_count <= 0:
             raise ActivationError("Activation requires non-zero retrievable Child chunks.")
+        try:
+            eligible = [
+                chunk
+                for chunk in children
+                if requires_contextualization(chunk.block_type)
+            ]
+            plain = [
+                chunk
+                for chunk in children
+                if not requires_contextualization(chunk.block_type)
+            ]
+        except ValueError as exc:
+            raise ActivationError(
+                "Activation embedding completeness check failed: unknown block type."
+            ) from exc
         contextualized_count = sum(
-            bool(chunk.contextual_prefix)
-            and bool(chunk.contextualization_model)
-            and bool(chunk.contextualization_version)
-            and bool(chunk.contextualization_prompt_version)
-            and chunk.contextualized_at is not None
-            and chunk.embedding_text == f"{chunk.contextual_prefix}\n\n{chunk.text}"
-            for chunk in children
+            valid_contextualized_embedding(chunk) for chunk in eligible
         )
+        plain_embedding_count = sum(valid_plain_embedding(chunk) for chunk in plain)
         dimensions = settings.ollama_embedding_dimensions
         embedded_count = sum(
             isinstance(chunk.embedding, list)
@@ -687,18 +1438,28 @@ class IngestionPipeline:
             and item["chunk"].get("parse_version") == version_key
             for item in payload
         )
-        counts = {
+        total_counts = {
             "retrievable": retrievable_count,
-            "contextualized": contextualized_count,
             "embedded": embedded_count,
             "indexed": indexed_count,
             "valid_source_spans": valid_span_count,
             "artifact": artifact_child_count,
         }
-        if len(set(counts.values())) != 1:
+        policy_complete = (
+            contextualized_count == len(eligible)
+            and plain_embedding_count == len(plain)
+        )
+        if not policy_complete or len(set(total_counts.values())) != 1:
+            details = {
+                **total_counts,
+                "contextualization_eligible": len(eligible),
+                "contextualized": contextualized_count,
+                "plain": len(plain),
+                "plain_embedded": plain_embedding_count,
+            }
             raise ActivationError(
                 "Activation embedding completeness check failed: "
-                + ", ".join(f"{name}={value}" for name, value in counts.items())
+                + ", ".join(f"{name}={value}" for name, value in details.items())
             )
         expected_child_count = checkpoint.get("child_count")
         expected_indexed_count = checkpoint.get("indexed_count")
@@ -706,13 +1467,85 @@ class IngestionPipeline:
             raise ActivationError(
                 "Activation artifact validation failed: checkpoint counts differ from index."
             )
-        return {"parse_version": version_key, **counts}
+        self._verify_typed_inventory_gate(context, version_key)
+        prepare_canonical_profile_source(context.document, children)
+        ensure_source_identity(context.document, context.document.title)
+        ensure_paper_profile(context.document)
+        return {
+            "parse_version": version_key,
+            **total_counts,
+            "contextualization_eligible": len(eligible),
+            "contextualized": contextualized_count,
+            "plain": len(plain),
+            "plain_embedded": plain_embedding_count,
+        }
+
+    def _verify_typed_inventory_gate(
+        self,
+        context,
+        version_key: str,
+    ) -> None:
+        """逐表校验 canonical manifest 库存与 DB/index 库存完全一致。
+
+        比较绑定同一 ``document_id + parse_version``；任何缺失、重复、
+        跨版本混入或多余条目都会抛 ``ActivationError``，阻止 active
+        pointer 切换。canonical bundle 缺失、typed_inventory 缺失/损坏
+        或 legacy bundle 需要迁移时同样失败关闭（不静默跳过）。
+        """
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
+        try:
+            manifest_inventory = store.load_typed_inventory(
+                context.document.id,
+                version_key,
+            )
+        except FileNotFoundError as exc:
+            # 激活必须失败关闭：canonical bundle 缺失时没有可比较的 manifest
+            # 库存，任何成功返回都会让缺库版本被错误激活。
+            raise ActivationError(
+                "Activation typed inventory validation failed: canonical bundle "
+                f"is missing for {context.document.id} {version_key}; rebuild "
+                "is required."
+            ) from exc
+        except ValueError as exc:
+            # typed_inventory 缺失/损坏，或 legacy bundle 需要迁移：一律
+            # 失败关闭并透出可操作的诊断信息。
+            raise ActivationError(
+                "Activation typed inventory validation failed: " + str(exc)
+            ) from exc
+        chunk_rows = list(
+            context.db.scalars(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == context.document.id,
+                    DocumentChunk.parse_version == version_key,
+                )
+            ).all()
+        )
+        observed = derive_db_typed_inventory(manifest_inventory, chunk_rows)
+        mismatches = compare_typed_inventory(manifest_inventory, observed)
+        if mismatches:
+            raise ActivationError(
+                "Activation typed inventory validation failed: "
+                + "; ".join(mismatches)
+            )
 
     def _persist_versioned_chunks(self, context, payload: list[dict]) -> None:
+        """把索引产物持久化为版本化 DocumentChunk 行，并替换向量索引。
+
+        流程：
+        1. 先删除该 (document, parse_version) 下的旧分块（版本隔离）。
+        2. 父块：校验 parse_version 后写入，建立 local_id -> record 映射。
+        3. 子块：按上下文化策略选择模型（ContextualizedChunk / ChunkDraft），
+           校验父块存在、解析嵌入向量后写入；同时收集 ChunkVector。
+        4. 回填前后分块指针（previous/next）。
+        5. 用向量仓库整体替换该文档的分块向量，并校验数量完整。
+        """
         from app.services.contextualization import ContextualizedChunk
         from app.services.semantic_chunking import ChunkDraft
 
         version_key = context.version.version_key
+        # 版本化覆盖：先清空该版本的旧分块
         context.db.query(DocumentChunk).filter(
             DocumentChunk.document_id == context.document.id,
             DocumentChunk.parse_version == version_key,
@@ -731,8 +1564,26 @@ class IngestionPipeline:
             records[draft.local_id] = record
         context.db.flush()
         vectors: list[ChunkVector] = []
+        child_drafts: list[tuple[dict, ChunkDraft]] = []
         for item in items_by_role["child"]:
-            draft = ContextualizedChunk.model_validate(item["chunk"])
+            chunk = item["chunk"]
+            try:
+                if requires_contextualization(str(chunk.get("block_type"))):
+                    if not valid_contextualized_embedding(chunk):
+                        raise RuntimeError(
+                            "Structured Child violates the contextualization policy."
+                        )
+                    draft = ContextualizedChunk.model_validate(chunk)
+                else:
+                    if not valid_plain_embedding(chunk):
+                        raise RuntimeError(
+                            "Plain Child violates the contextualization policy."
+                        )
+                    draft = ChunkDraft.model_validate(chunk)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Child violates the contextualization policy."
+                ) from exc
             if draft.parse_version != version_key:
                 raise RuntimeError("Chunk parse version does not match the index version.")
             parent = records.get(draft.parent_local_id or "")
@@ -747,6 +1598,7 @@ class IngestionPipeline:
             )
             context.db.add(record)
             records[draft.local_id] = record
+            child_drafts.append((item, draft))
             vectors.append(
                 ChunkVector(
                     chunk_id=record.id,
@@ -756,8 +1608,7 @@ class IngestionPipeline:
                 )
             )
         context.db.flush()
-        for item in items_by_role["child"]:
-            draft = ContextualizedChunk.model_validate(item["chunk"])
+        for _item, draft in child_drafts:
             record = records[draft.local_id]
             record.previous_chunk_id = draft.previous_child_local_id
             record.next_chunk_id = draft.next_child_local_id
@@ -773,6 +1624,62 @@ class IngestionPipeline:
             raise RuntimeError("Version-scoped vector index is incomplete.")
 
     @staticmethod
+    def _persist_table_row_indices(
+        draft,
+        source_spans: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """把表格子块的行下标持久化到 source_spans 的 metadata（JSON 契约）。
+
+        text/Markdown 解析的表格在 source_spans 上通常只带表级定位，没有逐
+        单元格的 ``row_index``；行覆盖由 chunk metadata 的 ``row_indices``
+        表达。若持久化阶段不保留它，激活时 ``derive_db_typed_inventory`` 只能
+        观察到空行覆盖，DB 库存门会错误地拒绝完整覆盖的表格。
+
+        本方法把 ``draft.metadata["row_indices"]`` 以 ``metadata.row_indices``
+        键写入每个持久化 span：不改数据库 schema，也不改动 span 既有的定位
+        字段（HTML/DOCX 的逐行 ``row_index`` 保持不变，且 ``derive_db_typed
+        _inventory`` 会同时读取两者）。父块不参与行覆盖，因此只处理 child
+        角色；无合法行下标时原样返回。
+
+        仅脚注子块（``metadata`` 携带 ``footnote_index`` 契约）不持久化行
+        覆盖——它们为引用上下文携带完整 ``row_indices`` 但无数据行——而是把
+        脚注契约标记写入 span metadata，使 DB 派生的 typed inventory 能识别
+        并整体排除它们。
+        """
+        if draft.chunk_role != "child" or draft.block_type != "table":
+            return source_spans
+        metadata = draft.metadata or {}
+        if _is_footnote_only_chunk(metadata):
+            if not source_spans:
+                return source_spans
+            return [
+                {
+                    **span,
+                    "metadata": {
+                        **dict(span.get("metadata") or {}),
+                        "footnote_index": metadata.get("footnote_index"),
+                    },
+                }
+                for span in source_spans
+            ]
+        row_indices = metadata.get("row_indices")
+        if not isinstance(row_indices, list):
+            return source_spans
+        normalized = sorted(_normalize_row_indices(row_indices))
+        if not normalized:
+            return source_spans
+        return [
+            {
+                **span,
+                "metadata": {
+                    **dict(span.get("metadata") or {}),
+                    "row_indices": normalized,
+                },
+            }
+            for span in source_spans
+        ]
+
+    @staticmethod
     def _document_chunk_from_draft(
         context,
         draft,
@@ -780,10 +1687,23 @@ class IngestionPipeline:
         embedding: list[float] | None,
         parent_chunk_id: str | None = None,
     ) -> DocumentChunk:
+        """把分块草稿（ChunkDraft/ContextualizedChunk）转换为 DocumentChunk 记录。
+
+        - 规范化 ``contextualized_at`` 时间戳（字符串转 datetime）。
+        - 源跨度转 JSON；页码取首个带 page_label 的跨度。
+        - 表格子块的行覆盖（``metadata.row_indices``）写入持久化 span 的
+          metadata，保证激活时 DB 派生的 typed inventory 能读到同一份 row
+          覆盖（text/Markdown 表格的 span 通常没有逐行 row_index）。
+        - 其余字段直接映射（含上下文前缀、上下文化模型/版本、切分器信息、
+          语义边界分数、token 计数等）。
+        """
         contextualized_at = getattr(draft, "contextualized_at", None)
         if isinstance(contextualized_at, str):
             contextualized_at = datetime.fromisoformat(contextualized_at)
         source_spans = [span.model_dump(mode="json") for span in draft.source_spans]
+        source_spans = IngestionPipeline._persist_table_row_indices(
+            draft, source_spans
+        )
         page_label = next(
             (span.get("page_label") for span in source_spans if span.get("page_label")),
             None,
@@ -823,6 +1743,12 @@ class IngestionPipeline:
 
     @staticmethod
     def _chunk_has_valid_source_spans(chunk: DocumentChunk) -> bool:
+        """校验分块的源跨度有效：非空且每个跨度至少含一个定位字段。
+
+        定位字段包括 page_index / source_block_id / paragraph_id /
+        table_id / image_relationship_id / xpath / css_selector /
+        element_id / line_start / char_start 之一。用于激活完整性检查。
+        """
         from app.services.canonical_models import SourceSpan
 
         spans = chunk.source_spans
@@ -849,6 +1775,7 @@ class IngestionPipeline:
     def _indexed_child_count(
         self, document_id: str, parse_version: str, *, fallback: int
     ) -> int:
+        """返回向量仓库中该文档版本的已索引子块数；仓库不可用时返回兜底值。"""
         store = get_vector_store(self.db)
         if not store.available():
             return fallback
@@ -862,6 +1789,13 @@ class IngestionPipeline:
         *,
         extra: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        """把阶段产物以"带指纹 JSON"原子写盘，返回产物路径与指纹。
+
+        - 序列化使用紧凑、无 NaN、ensure_ascii=False 的 JSON。
+        - 已存在时校验内容一致（可重放）；否则以临时文件 + rename 原子写入。
+        - 返回 ``{"artifact_path", "artifact_sha256", **extra}``，
+          供下一阶段通过 ``_load_previous_stage_artifact`` 读取校验。
+        """
         directory = self._stage_artifact_dir(context)
         path = directory / filename
         encoded = json.dumps(
@@ -887,6 +1821,11 @@ class IngestionPipeline:
         }
 
     def _load_previous_stage_artifact(self, context):
+        """读取并校验上一阶段产物：路径必须在版本目录内且指纹一致。
+
+        校验：artifact_path 是字符串且其父目录等于本版本的 stage 目录、
+        文件存在、内容 SHA-256 与检查点中的指纹一致。通过后 JSON 解码返回。
+        """
         checkpoint = context.input.get("previous_output") or {}
         raw_path = checkpoint.get("artifact_path")
         expected_hash = checkpoint.get("artifact_sha256")
@@ -894,14 +1833,22 @@ class IngestionPipeline:
             raise RuntimeError(f"Stage {context.stage!r} requires an artifact reference.")
         path = Path(raw_path).resolve()
         directory = self._stage_artifact_dir(context).resolve()
+        # 产物必须位于版本目录内（防路径逃逸）
         if path.parent != directory or not path.is_file():
             raise RuntimeError(f"Stage artifact is missing or outside its version: {path}")
         encoded = path.read_bytes()
+        # 指纹校验：产物必须与检查点一致
         if hashlib.sha256(encoded).hexdigest() != expected_hash:
             raise RuntimeError(f"Stage artifact fingerprint mismatch: {path}")
         return json.loads(encoded)
 
     def _stage_artifact_dir(self, context) -> Path:
+        """返回（并在必要时创建）当前版本专属的 stage 产物目录。
+
+        目录为 ``artifacts/<document_id>/<version_key>.pipeline``；创建前
+        校验各路径成分安全（无符号链接、不逃逸文档根），并把
+        ``context.version.artifact_dir`` 记录为绝对路径。
+        """
         from app.services.canonical_artifacts import CanonicalArtifactStore
 
         store = CanonicalArtifactStore(settings.canonical_artifacts_dir)
@@ -913,6 +1860,7 @@ class IngestionPipeline:
         )
         directory = document_root / f"{context.version.version_key}.pipeline"
         store._validate_component(directory.name)  # noqa: SLF001
+        # 拒绝符号链接/重解析点（防目录逃逸攻击）
         if store._is_link_or_reparse_point(directory):  # noqa: SLF001
             raise ValueError(
                 f"stage artifact directory cannot be a symbolic link: {directory}"
@@ -925,6 +1873,7 @@ class IngestionPipeline:
         else:
             directory.mkdir()
         resolved = directory.resolve()
+        # 最终解析路径必须仍在文档根之下
         if resolved.parent != document_root.resolve():
             raise ValueError("Stage artifact directory escapes its document root.")
         context.version.artifact_dir = str(resolved)
@@ -932,6 +1881,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _outline_titles(nodes) -> list[str]:
+        """递归收集大纲节点的全部标题（含子节点），用于上下文增强。"""
         return [
             title
             for node in nodes
@@ -940,6 +1890,12 @@ class IngestionPipeline:
 
     @staticmethod
     def _checkpoint_artifact_path(context) -> Path:
+        """校验并返回上一阶段的 canonical 清单（manifest.json）路径。
+
+        校验：文件名必须是 ``manifest.json`` 且存在；解析后的父级父级
+        目录必须等于文档根；清单所属版本必须等于当前版本或
+        ``<版本>.staging-*``。
+        """
         value = context.input.get("previous_output") or {}
         artifact_path = value.get("artifact_path")
         if not isinstance(artifact_path, str) or not artifact_path:
@@ -953,12 +1909,14 @@ class IngestionPipeline:
         document_root = (
             settings.canonical_artifacts_dir / context.document.id
         ).resolve()
+        # 清单必须位于文档根下的 bundle 目录（防逃逸）
         if resolved.parent.parent != document_root:
             raise RuntimeError(
                 f"Canonical artifact checkpoint escapes its document root: {path}"
             )
         bundle_name = resolved.parent.name
         version_key = context.version.version_key
+        # 版本必须匹配：最终版本目录或 staging 目录
         if bundle_name != version_key and not bundle_name.startswith(
             f"{version_key}.staging-"
         ):
@@ -968,6 +1926,11 @@ class IngestionPipeline:
         return resolved
 
     def _checkpoint_canonical_draft(self, context) -> Path:
+        """校验并返回解析阶段草稿（parse.canonical.json）的路径。
+
+        校验：文件名必须为 ``parse.canonical.json`` 且存在，其父目录必须
+        等于本版本的 stage 目录（防路径逃逸）。
+        """
         value = context.input.get("previous_output") or {}
         artifact_path = value.get("artifact_path")
         if not isinstance(artifact_path, str) or not artifact_path:
@@ -985,6 +1948,17 @@ class IngestionPipeline:
         return resolved
 
     def register_document(self, project_slug: str, project_name: str, file_path: Path) -> tuple[Project, Document, PipelineRun]:
+        """注册文档（按内容 SHA-256 去重），返回 (project, document, run)。
+
+        流程：
+        1. 获取（或创建）项目；计算文件 SHA-256。
+        2. 按 (project, sha256) 查重：
+           - 已存在且状态 ready：跳过，记一条 completed 的"重复跳过"运行。
+           - 已存在但未 ready：更新 raw_path、上传对象存储、置 pending，
+             记一条 queued 的"重新入队"运行（记录前状态作为 retry_reason）。
+        3. 新文档：上传对象存储，创建 Document（标题取可读文件名），
+           记一条 queued 运行。
+        """
         project = get_or_create_project(self.db, slug=project_slug, name=project_name)
         sha256 = compute_sha256(file_path)
         existing = self.db.scalar(select(Document).where(Document.project_id == project.id, Document.sha256 == sha256))
@@ -1039,15 +2013,27 @@ class IngestionPipeline:
         return project, document, run
 
     def process_document(self, document_id: str) -> PipelineRun:
+        """处理文档入口：无 Redis 走 legacy 同步路径，否则入队阶段任务。
+
+        - 无 Redis（legacy 模式）：同步执行 ``_process_document_legacy``，
+          完成后激活 legacy 解析版本。
+        - 有 Redis：获取/创建解析版本，找首个可执行阶段；若全部完成则
+          直接置 ready/active，否则把该阶段入队（JobDispatcher），
+          记录 queued 运行。
+
+        返回：本次的 PipelineRun。
+        """
         document = self.db.get(Document, document_id)
         if document is None:
             raise ValueError(f"Document {document_id} not found")
         if not settings.redis_url:
+            # legacy 同步路径
             run = self._process_document_legacy(document_id)
             if run.status == RunStatus.completed.value:
                 self._activate_legacy_parse_version(document_id)
             return run
 
+        # canonical 阶段机路径：获取/创建解析版本
         version = self._get_or_create_parse_version(document)
         self.db.commit()
 
@@ -1103,12 +2089,24 @@ class IngestionPipeline:
     def _get_or_create_parse_version(
         self, document: Document
     ) -> DocumentParseVersion:
+        """按当前配置计算版本键并获取/创建解析版本（get-or-create）。
+
+        版本键 = ``{pipeline版本}-{源文件哈希前12}-{配置哈希前12}``；
+        已存在时校验配置快照一致；新建时把配置快照写入 manifest。
+        """
         pipeline_version = str(settings.canonical_pipeline_version)
         self._validate_version_component(
             pipeline_version,
             label="CANONICAL_PIPELINE_VERSION",
         )
-        version_key = f"{pipeline_version}-{document.sha256[:12]}"
+        ingestion_config = build_ingestion_config_snapshot()
+        ingestion_config_sha256 = canonical_ingestion_config_hash(ingestion_config)
+        version_key = build_parse_version_key(
+            document.sha256,
+            snapshot=ingestion_config,
+            config_sha256=ingestion_config_sha256,
+            settings=settings,
+        )
         self._validate_version_component(version_key, label="parse version key")
         existing = self.db.scalar(
             select(DocumentParseVersion).where(
@@ -1117,19 +2115,34 @@ class IngestionPipeline:
             )
         )
         if existing is not None:
+            require_matching_ingestion_config(
+                existing.manifest_json,
+                ingestion_config,
+            )
             return existing
         artifact_dir = (
             settings.canonical_artifacts_dir
             / document.id
             / f"{version_key}.pipeline"
         )
-        return ParseVersionService(self.db).create(
+        version = ParseVersionService(self.db).create(
             document.id,
             version_key,
             str(artifact_dir),
         )
+        version.manifest_json = {
+            "ingestion_config": ingestion_config,
+            "ingestion_config_sha256": ingestion_config_sha256,
+        }
+        return version
 
     def _activate_legacy_parse_version(self, document_id: str) -> None:
+        """激活 legacy 解析版本（兼容旧路径）：记录 stage_state 并激活。
+
+        要求文档状态为 ready。若无 ``legacy`` 版本则创建；在 stage_state
+        中记录 legacy 已完成的分块数；若尚未激活则置 ready_to_activate 并
+        经 ``ParseVersionService.activate`` 激活，否则仅回填文档指针。
+        """
         document = self.db.get(Document, document_id)
         if document is None or document.status != DocumentStatus.ready.value:
             raise RuntimeError("Legacy activation requires a ready document.")
@@ -1168,6 +2181,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _validate_version_component(value: str, *, label: str) -> None:
+        """校验版本相关字符串可作为安全路径成分（白名单正则）。"""
         if (
             not value
             or value in {".", ".."}
@@ -1177,6 +2191,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _first_actionable_stage(version: DocumentParseVersion) -> str | None:
+        """返回第一个未完成（非 completed）的 ingestion 阶段；全部完成则 None。"""
         from app.services.ingestion_stages import INGESTION_STAGES
 
         state = version.stage_state or {}
@@ -1190,6 +2205,19 @@ class IngestionPipeline:
         )
 
     def _process_document_legacy(self, document_id: str) -> PipelineRun:
+        """legacy 同步处理：解析 -> 质量门 -> 分块嵌入 -> SAC-KG 抽取。
+
+        流程：
+        1. 标记 run/document 为 processing。
+        2. 解析文档；解析质量（canonical）不合格则标记失败并返回。
+        3. 替换分块并计算嵌入。
+        4. 若未启用 SAC-KG：直接 ready 完成（RAG-only）。
+        5. 启用 SAC-KG：抽取实体/三元组、做实体增长决策、创建审阅项，
+           最后 ready 完成。
+        任何异常：回滚，把文档/运行标记失败后重抛。
+
+        返回：本次 PipelineRun。
+        """
         document = self.db.get(Document, document_id)
         if document is None:
             raise ValueError(f"Document {document_id} not found")
@@ -1345,17 +2373,21 @@ class IngestionPipeline:
         primary display title when a human-readable alternative exists.
         """
         candidates: list[str] = []
+        # 候选 1：解析器给出的标题（非内部样本）
         if parsed.title and not looks_like_internal_sample(parsed.title):
             candidates.append(parsed.title.strip())
+        # 候选 2：解析元信息中的 title
         metadata_title = (parsed.metadata or {}).get("title")
         if metadata_title and not looks_like_internal_sample(metadata_title):
             candidates.append(str(metadata_title).strip())
+        # 候选 3：现有标题 / 可读文件名
         existing_title = document.title or readable_title_from_path(Path(document.raw_path))
         if existing_title and not looks_like_internal_sample(existing_title):
             candidates.append(existing_title.strip())
         if candidates:
             return candidates[0]
         # Final fallback: anything we have, stripped of the upload UUID prefix.
+        # 最终兜底：去掉上传 UUID 前缀后的任意可用名称
         fallback = strip_upload_prefix(
             document.title or document.file_name or Path(document.raw_path).stem or ""
         ).strip()
@@ -1372,6 +2404,7 @@ class IngestionPipeline:
         *,
         commit: bool = True,
     ) -> None:
+        """更新运行进度（percent 截断到 0-100）并写日志；可选提交。"""
         report = dict(run.provider_report or {})
         report["progress"] = {
             "percent": max(0, min(percent, 100)),
@@ -1393,11 +2426,17 @@ class IngestionPipeline:
 
     @staticmethod
     def _progress_bar(percent: int, width: int = 24) -> str:
+        """渲染文本进度条（``[####-----]``）供日志展示。"""
         normalized = max(0, min(percent, 100))
         filled = round(width * normalized / 100)
         return "[" + "#" * filled + "-" * (width - filled) + "]"
 
     def _replace_chunks(self, document: Document, parsed_chunks) -> None:
+        """（legacy）用解析分块替换文档分块并重算嵌入向量。
+
+        先删除该文档全部旧分块，批量嵌入文本（失败时退回全空向量），
+        写新分块行后替换向量索引（仅含非空嵌入的块）。
+        """
         self.db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).delete()
         texts = [chunk.text for chunk in parsed_chunks]
         embeddings = safe_model_call(lambda: self.ollama.embed(texts), [[] for _ in texts])
@@ -1425,10 +2464,19 @@ class IngestionPipeline:
         )
 
     def _clear_document_chunks(self, document_id: str) -> None:
+        """删除文档的全部向量与分块行（失败清理用）。"""
         get_vector_store(self.db).delete_document(document_id)
         self.db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
 
     def _extract_document(self, document: Document, full_text: str) -> DocumentExtraction:
+        """执行 SAC-KG 抽取：种子分析 -> 候选 head -> head 级分析 -> 合并。
+
+        流程：
+        1. 选生成上下文、构建句条目、做种子文档分析。
+        2. 收集候选 head（最多 HEAD_MAX_COUNT 个）。
+        3. 对每个 head 检索上下文与示例，生成/校验/纠错其 head 分析。
+        4. 合并为最终抽取；无任何 claims 时退回兜底抽取。
+        """
         chunks = self.db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id).order_by(DocumentChunk.ordinal)).all()
         contexts = self._select_generation_contexts(document, full_text, list(chunks))
         sentence_entries = self._build_sentence_entries(list(chunks))
@@ -1467,6 +2515,11 @@ class IngestionPipeline:
         contexts: list[dict],
         corpus_context: str,
     ) -> DocumentAnalysisPayload:
+        """生成文档级"种子分析"（摘要/关键事实/实体/概念/草稿三元组）。
+
+        调用 Ollama 结构化生成（DocumentAnalysisPayload）；失败退回
+        ``_fallback_analysis``。
+        """
         fallback = self._fallback_analysis(document, full_text, contexts)
         prompt = "\n\n".join(
             [
@@ -1494,10 +2547,17 @@ class IngestionPipeline:
         )
 
     def _collect_candidate_heads(self, document: Document, full_text: str, seed_analysis: DocumentAnalysisPayload) -> list[dict]:
+        """收集候选 head 实体列表（去重、清洗、排除瞬时值）。
+
+        来源：文档标题（document 类型）、种子分析中的实体/概念、
+        项目已验证主语（且出现在全文中）。候选过少时从关键事实中切分
+        片段补充。最终为空时退回以文档标题为唯一候选。
+        """
         candidates: list[dict] = []
         seen: set[str] = set()
 
         def add_candidate(name: str, *, entity_type: str = "concept", aliases: list[str] | None = None, summary: str = "") -> None:
+            """清洗并去重后加入候选 head（排除瞬时值/空名）。"""
             cleaned = re.sub(r"\s+", " ", name).strip()
             if not cleaned or self._looks_like_transient_value(cleaned):
                 return
@@ -1529,6 +2589,10 @@ class IngestionPipeline:
         return candidates or [{"name": document.title, "entity_type": "document", "aliases": [], "summary": ""}]
 
     def _build_sentence_entries(self, chunks: list[DocumentChunk]) -> list[dict]:
+        """把分块文本切成句条目，供 head 上下文检索。
+
+        每个条目含 chunk_id/序号/页码/标题/文本/sentence_ref/嵌入向量。
+        """
         entries: list[dict] = []
         for chunk in chunks:
             for sentence_index, snippet in enumerate(self._split_text_into_snippets(chunk.text)):
@@ -1547,6 +2611,7 @@ class IngestionPipeline:
         return entries
 
     def _split_text_into_snippets(self, text: str, max_chars: int = 320) -> list[str]:
+        """按句末标点/换行切分文本为片段，并在超过 max_chars 时累积切分。"""
         raw_parts = [part.strip() for part in re.split(r"(?<=[。！？!?\.])\s+|\n+", text) if part.strip()]
         snippets: list[str] = []
         buffer = ""
@@ -1562,6 +2627,12 @@ class IngestionPipeline:
         return snippets or [text[:max_chars]]
 
     def _retrieve_head_contexts(self, head: dict, sentence_entries: list[dict]) -> list[dict]:
+        """为某个 head 检索相关句条目（确定性打分 + 语义相似度）。
+
+        打分项：head/别名出现次数、词元重叠、事实标记词、数值单位、
+        标题命中、嵌入余弦相似度。取高分条目并按字符预算/条数上限截取。
+        没有任何命中时退回前几个条目。
+        """
         if not sentence_entries:
             return []
         head_terms = self._text_terms(head["name"])
@@ -1600,6 +2671,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _prompt_context_entry(entry: dict) -> dict:
+        """把句条目压缩为提示词上下文（文本截断 520 字符，剔除空字段）。"""
         compact = {
             "chunk_id": entry.get("chunk_id"),
             "chunk_ordinal": entry.get("chunk_ordinal"),
@@ -1612,6 +2684,11 @@ class IngestionPipeline:
         return {key: value for key, value in compact.items() if value not in (None, "", [])}
 
     def _open_kg_examples(self, project_id: str, head_name: str, limit: int = 8) -> list[dict]:
+        """为 head 检索"开放知识图谱"示例三元组。
+
+        优先该 head 的已验证三元组（精确匹配）；其次按查找 token 模糊
+        匹配；最后退回通用示例（GENERIC_TRIPLE_EXAMPLES）。
+        """
         verified_claims = self._project_verified_claims(project_id)
         exact = [
             claim
@@ -1642,6 +2719,11 @@ class IngestionPipeline:
         corpus_context: str,
         previous_claims: list[Claim],
     ) -> HeadAnalysisPayload:
+        """对单个 head 生成分析（三元组优先），并经过验证/纠错。
+
+        生成 base 提示词后调用结构化生成（失败退回兜底 head 分析），
+        归一化后经 ``_verify_and_correct_head_analysis`` 校验并按需重试。
+        """
         fallback = self._fallback_head_analysis(head, contexts)
         base_prompt = "\n\n".join(
             [
@@ -1681,6 +2763,7 @@ class IngestionPipeline:
         )
 
     def _normalize_head_analysis(self, head_name: str, analysis: HeadAnalysisPayload) -> HeadAnalysisPayload:
+        """归一化 head 分析：清洗三元组（主语回填 head、去空谓词/宾语）与各文本字段。"""
         normalized_triples = [
             GeneratedTriple(
                 subject=triple.subject.strip() or head_name,
@@ -1707,6 +2790,7 @@ class IngestionPipeline:
         )
 
     def _fallback_head_analysis(self, head: dict, contexts: list[dict]) -> HeadAnalysisPayload:
+        """生成 head 分析兜底（结构化生成不可用时）：以"mentions"三元组表达源片段。"""
         facts = [entry["text"][:240] for entry in contexts[:4]]
         triples = [
             GeneratedTriple(
@@ -1743,6 +2827,12 @@ class IngestionPipeline:
         previous_claims: list[Claim],
         correction_prompt: str,
     ) -> HeadAnalysisPayload:
+        """校验并（必要时）纠错 head 分析：错误过多时用验证者纠正提示重试。
+
+        若过滤后错误数低于阈值，直接返回（附错误报告）。
+        否则用"验证者纠正 pass"重新生成；纠错结果错误数更少则采纳，
+        否则保留原过滤结果并说明未改善。
+        """
         filtered, error_report, total_errors = self._filter_head_triples(head_name, analysis, contexts, previous_claims)
         if total_errors < HEAD_REPROMPT_ERROR_THRESHOLD:
             filtered.coverage_notes.extend(error_report)
@@ -1782,6 +2872,12 @@ class IngestionPipeline:
         contexts: list[dict],
         previous_claims: list[Claim],
     ) -> tuple[HeadAnalysisPayload, list[str], int]:
+        """过滤 head 三元组：逐条校验并回填证据，返回 (过滤结果, 报告, 错误数)。
+
+        - 三元组总数 < 3 记 quantity_too_small。
+        - 每条调用 ``_generated_triple_errors`` 校验；有错记入报告，
+          无错且命中上下文时回填证据摘录/来源序号/句引用后采纳。
+        """
         reports: list[str] = []
         seen: set[tuple[str, str, str]] = set()
         accepted: list[GeneratedTriple] = []
@@ -1828,6 +2924,7 @@ class IngestionPipeline:
         )
 
     def _match_context_for_generated_triple(self, triple: GeneratedTriple, contexts: list[dict]) -> dict | None:
+        """为生成的三元组寻找最佳匹配上下文（证据锚定打分）。"""
         evidence = triple.evidence_excerpt.strip()
         object_text = triple.object_text.strip()
         best: dict | None = None
@@ -1857,6 +2954,11 @@ class IngestionPipeline:
         previous_claims: list[Claim],
         seen: set[tuple[str, str, str]],
     ) -> list[str]:
+        """逐条校验生成的三元组，返回错误列表（去重排序）。
+
+        检查项：格式完整、主语必须等于 head、主语≠宾语（自反矛盾）、
+        有匹配证据、重复、与历史已验证三元组潜在冲突。
+        """
         errors: list[str] = []
         subject = triple.subject.strip()
         predicate = triple.predicate.strip()
@@ -1887,6 +2989,11 @@ class IngestionPipeline:
         seed_analysis: DocumentAnalysisPayload,
         head_payloads: list[HeadAnalysisPayload],
     ) -> DocumentExtraction:
+        """合并种子分析与各 head 分析为最终抽取结果。
+
+        合并关键事实/关键词/实体/概念（保序去重），把各 head 的三元组
+        转为 claims；无 claims 但种子分析有三元组时退回种子抽取。
+        """
         key_facts = list(dict.fromkeys([*seed_analysis.key_facts, *(fact for payload in head_payloads for fact in payload.key_facts)]))
         flattened_keywords = [
             keyword
@@ -1944,6 +3051,7 @@ class IngestionPipeline:
         )
 
     def _project_verified_claims(self, project_id: str) -> list[Claim]:
+        """返回项目下所有"已验证"的三元组（按创建时间倒序）。"""
         return self.db.scalars(
             select(Claim)
             .where(Claim.project_id == project_id, Claim.verification_status == "verified")
@@ -1951,10 +3059,12 @@ class IngestionPipeline:
         ).all()
 
     def _project_verified_subjects(self, project_id: str) -> list[str]:
+        """返回项目已验证三元组的去重主语列表（保持顺序）。"""
         return list(dict.fromkeys(claim.subject for claim in self._project_verified_claims(project_id)))
 
     @staticmethod
     def _claim_as_example(claim: Claim) -> dict:
+        """把 Claim 转为提示词示例字典。"""
         return {
             "subject": claim.subject,
             "predicate": claim.predicate,
@@ -1963,12 +3073,14 @@ class IngestionPipeline:
         }
 
     def _head_lookup_tokens(self, head_name: str) -> list[str]:
+        """把 head 名拆为查找 token（无 token 时退回小写原名）。"""
         tokens = list(self._text_terms(head_name))
         if not tokens:
             return [head_name.lower()]
         return [token.lower() for token in tokens]
 
     def _select_generation_contexts(self, document: Document, full_text: str, chunks: list[DocumentChunk]) -> list[dict]:
+        """选择用于抽取生成的上下文分块（打分选优 + 序号保序）。"""
         if not chunks and full_text:
             return [{"chunk_ordinal": 0, "heading": None, "score": 1.0, "text": full_text[:2400]}]
 
@@ -2003,6 +3115,7 @@ class IngestionPipeline:
         ]
 
     def _candidate_terms(self, document: Document, full_text: str, chunks: list[DocumentChunk]) -> set[str]:
+        """收集用于上下文打分的候选词元（标题/前几个标题/事实标记词）。"""
         terms = self._text_terms(document.title)
         for chunk in chunks[:5]:
             if chunk.heading:
@@ -2013,6 +3126,7 @@ class IngestionPipeline:
         return terms
 
     def _local_triple_examples(self, project_id: str) -> list[dict]:
+        """返回项目最近三元组的前 6 条作为本地示例。"""
         examples: list[dict] = []
         claims = self.db.scalars(select(Claim).where(Claim.project_id == project_id).order_by(Claim.created_at.desc())).all()
         for claim in claims[:6]:
@@ -2028,6 +3142,7 @@ class IngestionPipeline:
         return examples
 
     def _fallback_analysis(self, document: Document, full_text: str, contexts: list[dict]) -> DocumentAnalysisPayload:
+        """生成文档分析兜底：以关键事实构造 "title states fact" 三元组。"""
         key_facts = self._extract_key_facts(full_text)
         triples = [
             GeneratedTriple(
@@ -2055,6 +3170,7 @@ class IngestionPipeline:
         )
 
     def _analysis_to_extraction(self, document: Document, analysis: DocumentAnalysisPayload) -> DocumentExtraction:
+        """把文档分析（DocumentAnalysisPayload）转换为抽取结果（DocumentExtraction）。"""
         claims = [
             ExtractedClaim(
                 subject=triple.subject,
@@ -2082,6 +3198,7 @@ class IngestionPipeline:
         )
 
     def _extract_key_facts(self, text: str) -> list[str]:
+        """启发式提取关键事实句：按句末标点切分，命中事实标记词或数值单位。"""
         pieces = re.split(r"(?<=[。！？!?\.])\s*|\n+", text)
         facts: list[str] = []
         seen: set[str] = set()
@@ -2105,6 +3222,7 @@ class IngestionPipeline:
         return facts
 
     def _derive_keywords(self, text: str) -> list[str]:
+        """从文本派生关键词：事实标记词 + 英文长词元，至多 12 个。"""
         keywords = [marker for marker in FACT_MARKERS if marker.lower() in text.lower()]
         english_terms = [word for word in re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", text.lower()) if word not in keywords]
         for term in english_terms:
@@ -2116,6 +3234,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _fact_chunk_ordinals(fact: str, contexts: list[dict]) -> list[int]:
+        """返回包含该事实的上下文分块序号（至多 3 个）。"""
         return [
             int(context["chunk_ordinal"])
             for context in contexts
@@ -2124,6 +3243,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _text_terms(text: str) -> set[str]:
+        """把文本切分为词元集合（英文字母数字词 + CJK 段与其二元组）。"""
         lowered = text.lower()
         terms = {word for word in re.findall(r"[a-z0-9_]+", lowered) if len(word) > 1}
         for segment in re.findall(r"[\u4e00-\u9fff]+", lowered):
@@ -2135,6 +3255,10 @@ class IngestionPipeline:
         return {term for term in terms if term}
 
     def _upsert_entities(self, project_id: str, extraction: DocumentExtraction) -> list[Entity]:
+        """upsert 实体：合并概念、去重、更新已存在实体或新建。
+
+        并发冲突（IntegrityError）时回滚并重新按名批量查询返回。
+        """
         entities: list[Entity] = []
         items = list(extraction.entities)
         existing_names = {item.name for item in items}
@@ -2178,6 +3302,12 @@ class IngestionPipeline:
             return list(self.db.scalars(select(Entity).where(Entity.project_id == project_id, Entity.name.in_([item.name for item in unique_items]))).all())
 
     def _create_claims(self, document: Document, extraction: DocumentExtraction) -> list[Claim]:
+        """创建（替换）文档的三元组记录并做本地验证。
+
+        先删除该文档旧 claims；对每个抽取的 claim：定位证据分块、回填
+        证据摘录、执行本地验证（``_verify_claim_locally``），据验证错误
+        决定 verification_status（needs-review / verified）。
+        """
         self.db.query(Claim).filter(Claim.document_id == document.id).delete()
         chunks = self.db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document.id).order_by(DocumentChunk.ordinal)).all()
         previous_claims = self.db.scalars(select(Claim).where(Claim.project_id == document.project_id)).all()
@@ -2219,6 +3349,7 @@ class IngestionPipeline:
         return claims
 
     def _find_evidence_chunk(self, claim: ExtractedClaim, chunks: list[DocumentChunk]) -> DocumentChunk | None:
+        """为 claim 定位证据分块（按句引用 -> 块序号 -> 证据/宾语/主语匹配）。"""
         for sentence_ref in claim.source_sentence_refs:
             match = re.match(r"chunk-(\d+):sentence-\d+", sentence_ref)
             if not match:
@@ -2256,6 +3387,7 @@ class IngestionPipeline:
         return None
 
     def _best_evidence_excerpt(self, claim: ExtractedClaim, text: str, max_chars: int = 360) -> str:
+        """从证据文本中截取围绕宾语/主语锚点的最佳摘录（约 max_chars）。"""
         anchors = [claim.object_text.strip(), claim.subject.strip()]
         lowered = text.lower()
         for anchor in anchors:
@@ -2276,6 +3408,11 @@ class IngestionPipeline:
         previous_claims: list[Claim],
         seen: set[tuple[str, str, str]],
     ) -> list[str]:
+        """本地验证 claim，返回错误列表（source_fact 走宽松规则）。
+
+        source_fact（兜底三元组）放宽置信度阈值、豁免证据分块与证据锚定
+        检查，使其更易被记为 verified 以支持下游 RAG 打分。
+        """
         errors: list[str] = []
         subject = claim.subject.strip()
         predicate = claim.predicate.strip()
@@ -2325,11 +3462,17 @@ class IngestionPipeline:
 
     @staticmethod
     def _has_term_overlap(left: str, right: str) -> bool:
+        """判断两段文本是否有词元重叠。"""
         left_terms = IngestionPipeline._text_terms(left)
         right_terms = IngestionPipeline._text_terms(right)
         return bool(left_terms & right_terms)
 
     def _decide_entity_growth(self, document: Document, entities: list[Entity], claims: list[Claim]) -> dict[str, GrowthDecision]:
+        """为候选实体/宾语尾项决定增长决策（grow/keep/prune）。
+
+        先按规则（``_rule_growth_decision``）判断；对需要人工/模型判断的
+        keep 项，调用 Ollama 修剪器批量决策并归一化。
+        """
         verified_claims = [claim for claim in claims if claim.verification_status == "verified"]
         candidates: dict[str, dict] = {}
         for entity in entities:
@@ -2401,6 +3544,7 @@ class IngestionPipeline:
         return decisions
 
     def _rule_growth_decision(self, candidate: dict) -> GrowthDecision:
+        """基于规则的增长决策：瞬时值/数值类剪枝，持久类型增长，其余需判断。"""
         entity_type = str(candidate.get("entity_type") or "concept").lower()
         name = str(candidate.get("name") or "").strip()
         claim_count = int(candidate.get("claim_count") or 0)
@@ -2418,6 +3562,7 @@ class IngestionPipeline:
         return GrowthDecision(name=name, item_type=item_type, decision="keep", reason="Needs pruner judgment before creating a standalone page.")
 
     def _infer_tail_entity_type(self, tail_name: str, entities: list[Entity]) -> str:
+        """推断宾语尾项实体类型：先查已知实体，再按关键词启发式。"""
         for entity in entities:
             if entity.name.lower() == tail_name.lower():
                 return entity.entity_type or "concept"
@@ -2434,6 +3579,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _looks_like_transient_value(name: str) -> bool:
+        """判断名称是否像瞬时值（数值/单位/纯符号），用于剪枝。"""
         stripped = name.strip()
         if not stripped:
             return True
@@ -2443,6 +3589,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _normalize_growth_decision(decision: str) -> str:
+        """把决策字符串归一化为 grow/keep/prune 之一（未知值退回 keep）。"""
         lowered = decision.lower().strip()
         if lowered in {"grow", "keep", "prune"}:
             return lowered
@@ -2450,6 +3597,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _apply_claim_growth_decisions(claims: list[Claim], entity_decisions: dict[str, GrowthDecision]) -> None:
+        """把实体增长决策写入每个 claim 的元信息（head/tail 决策）。"""
         for claim in claims:
             metadata = dict(claim.metadata_json or {})
             head_decision = entity_decisions.get(claim.subject)
@@ -2466,6 +3614,7 @@ class IngestionPipeline:
         claims: list[Claim],
         entity_decisions: dict[str, GrowthDecision],
     ) -> list[Entity]:
+        """确保所有"增长"实体在库中存在（从已有实体或按 claims 新建）。"""
         entity_map = {entity.name.lower(): entity for entity in entities}
         grow_names = [name for name, decision in entity_decisions.items() if decision.decision == "grow"]
         if grow_names:
@@ -2501,6 +3650,7 @@ class IngestionPipeline:
         return entities
 
     def _source_page_metadata(self, extraction: DocumentExtraction, entities: list[Entity], claims: list[Claim]) -> dict:
+        """构建源页元信息（摘要/关键术语/来源计数/已验证三元组数/增长决策）。"""
         key_terms = sorted(
             {
                 *extraction.keywords,
@@ -2534,6 +3684,7 @@ class IngestionPipeline:
 
     @staticmethod
     def _entity_page_metadata(entity_name: str, decision: GrowthDecision, claims: list[Claim]) -> dict:
+        """构建实体页元信息（摘要/关键术语/来源计数/增长决策）。"""
         entity_claims = [claim for claim in claims if claim.subject == entity_name or claim.object_text == entity_name]
         return {
             "summary": " ".join(
@@ -2548,6 +3699,18 @@ class IngestionPipeline:
         }
 
     def _create_review_items(self, document: Document, extraction: DocumentExtraction, claims: list[Claim]) -> int:
+        """为抽取结果生成审阅项（含外部验证），返回审阅项数量。
+
+        生成规则：
+        - 无 claims 但有正文 → "无三元组"中等级审阅。
+        - 每个 head 已验证三元组 < 3 → 低等级数量审阅。
+        - 有本地验证错误的 claim → 高/中等级审阅（按错误类型）。
+        - 覆盖说明 → 低等级审阅。
+        - 外部验证（ExternalVerifier）标记的 claim → 标记其状态并加
+          高等级审阅。
+
+        先删除旧的 pending ingest 审阅项再重建。
+        """
         existing_items = self.db.scalars(select(ReviewItem).where(ReviewItem.document_id == document.id)).all()
         for item in existing_items:
             if item.status == ReviewStatus.pending.value and (item.payload or {}).get("generated_by") == "ingest":

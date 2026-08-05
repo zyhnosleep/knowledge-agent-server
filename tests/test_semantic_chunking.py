@@ -7,6 +7,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.services.canonical_models import (
+    CanonicalAsset,
     CanonicalBlock,
     CanonicalCell,
     CanonicalDocument,
@@ -15,7 +16,11 @@ from app.services.canonical_models import (
     CanonicalTable,
     SourceSpan,
 )
-from app.services.semantic_chunking import ChunkDraft, SemanticChunker
+from app.services.semantic_chunking import (
+    ChunkDraft,
+    SemanticChunker,
+    SourceFidelityError,
+)
 from app.services.structured_evidence import StructuredEvidenceBuilder
 
 
@@ -711,11 +716,11 @@ def test_child_tail_rebalances_complete_units_without_loss_or_reordering() -> No
     assert "".join(item.text for item in children) == source
 
 
-def test_only_indivisible_source_character_may_overflow_with_explicit_metadata() -> None:
+def test_indivisible_source_character_overflow_is_rejected_by_final_audit() -> None:
     def indivisible_counter(text: str) -> int:
         return len(text) * 10
 
-    chunks = SemanticChunker(
+    chunker = SemanticChunker(
         RecordingEmbedder(),
         indivisible_counter,
         parent_min_tokens=1,
@@ -726,15 +731,14 @@ def test_only_indivisible_source_character_may_overflow_with_explicit_metadata()
         child_max_tokens=6,
         overlap_tokens=0,
         break_percentile=20,
-    ).build(document(block("one-char", "界", 0)))
-
-    assert {item.text for item in chunks} == {"界"}
-    assert all(item.token_count == 10 for item in chunks)
-    assert all(item.metadata["unavoidable_token_overflow"] is True for item in chunks)
-    assert all(
-        item.metadata["overflow_reason"] == "single_source_character_exceeds_max"
-        for item in chunks
     )
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker.build(document(block("one-char", "界", 0)))
+
+    assert raised.value.block_type == "narrative"
+    assert raised.value.source_id == "one-char"
+    assert raised.value.excerpt == "界"
 
 
 def test_child_neighbors_cross_parent_within_structure_but_stop_at_section_boundary() -> None:
@@ -850,7 +854,7 @@ def test_reference_structures_are_excluded_but_appendix_structures_are_searchabl
     )
     doc.tables = [reference_table, appendix_table]
 
-    chunks = make_chunker().build(doc)
+    chunks = make_chunker(child_max_tokens=100).build(doc)
 
     assert all(item.source_block_ids != ["reference-table-block"] for item in chunks)
     assert any(item.source_block_ids == ["appendix-table-block"] for item in chunks)
@@ -1150,6 +1154,246 @@ def valid_table() -> CanonicalTable:
     )
 
 
+def _replace_draft_text(draft: ChunkDraft, old: str, new: str = "") -> None:
+    draft.text = draft.text.replace(old, new)
+    draft.embedding_text = draft.embedding_text.replace(old, new)
+    draft.token_count = word_count(draft.embedding_text)
+
+
+def test_source_fidelity_audit_rejects_omitted_narrative_unit() -> None:
+    doc = document(block("narrative-source", "First fact. Second fact.", 3))
+    chunker = make_chunker(parent_max_tokens=100, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    child = next(item for item in drafts if item.chunk_role == "child")
+    _replace_draft_text(child, "Second fact.")
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.document_id == doc.document_id
+    assert raised.value.page == 3
+    assert raised.value.block_type == "narrative"
+    assert raised.value.source_id == "narrative-source"
+    assert raised.value.excerpt == "Second fact."
+    assert len(raised.value.excerpt) <= 200
+
+
+def test_source_fidelity_audit_rejects_omitted_table_field() -> None:
+    table = valid_table()
+    table.footnotes = ["Scores are source measurements."]
+    doc = document(block("table-source", "", 1, block_type="table", table_id=table.table_id))
+    doc.tables = [table]
+    chunker = make_chunker(parent_max_tokens=200, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    for draft in drafts:
+        draft.metadata["footnotes"] = []
+        _replace_draft_text(draft, "Footnote: Scores are source measurements.")
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.block_type == "table"
+    assert raised.value.source_id == table.table_id
+    assert raised.value.excerpt == table.footnotes[0]
+
+
+def test_source_fidelity_audit_rejects_omitted_formula_field() -> None:
+    formula = CanonicalFormula(
+        formula_id="formula-audit",
+        latex="x = y + 1",
+        caption="Equation 1.",
+        description="Complete formula description.",
+        source_spans=[span("formula-object", page=4)],
+    )
+    doc = document(
+        block("formula-source", "", 4, block_type="formula", formula_id=formula.formula_id)
+    )
+    doc.formulas = [formula]
+    chunker = make_chunker(parent_max_tokens=200, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    for draft in drafts:
+        _replace_draft_text(draft, formula.description or "")
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.page == 4
+    assert raised.value.block_type == "formula"
+    assert raised.value.source_id == formula.formula_id
+    assert raised.value.excerpt == formula.description
+
+
+def test_source_fidelity_audit_rejects_omitted_figure_asset_identity() -> None:
+    figure = CanonicalFigure(
+        figure_id="figure-audit",
+        caption="Figure 1. Source trend",
+        description="Complete source description.",
+        asset_path="assets/figure-audit.png",
+        source_spans=[span("figure-object", page=5)],
+    )
+    doc = document(
+        block("figure-source", "", 5, block_type="figure", figure_id=figure.figure_id)
+    )
+    doc.figures = [figure]
+    doc.assets = [
+        CanonicalAsset(
+            asset_id="asset-figure-audit",
+            path=figure.asset_path or "",
+            media_type="image/png",
+        )
+    ]
+    chunker = make_chunker(parent_max_tokens=200, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    for draft in drafts:
+        draft.metadata["asset_path"] = None
+        for source_span in draft.source_spans:
+            source_span.metadata.pop("asset_id", None)
+        _replace_draft_text(draft, figure.asset_path or "")
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.page == 5
+    assert raised.value.block_type == "figure"
+    assert raised.value.source_id == figure.figure_id
+    assert raised.value.excerpt == figure.asset_path
+
+
+def test_source_fidelity_audit_rejects_non_direct_child_embedding() -> None:
+    doc = document(block("embedding-source", "Direct source evidence.", 0))
+    chunker = make_chunker(parent_max_tokens=100, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    child = next(item for item in drafts if item.chunk_role == "child")
+    child.embedding_text = f"Context prefix\n\n{child.text}"
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.source_id == "embedding-source"
+    assert raised.value.excerpt == child.embedding_text[:200]
+
+
+def test_source_fidelity_audit_rejects_child_over_token_limit() -> None:
+    doc = document(block("limit-source", "Bounded source evidence.", 0))
+    chunker = make_chunker(parent_max_tokens=100, child_max_tokens=100)
+    drafts = chunker.build(doc)
+    child = next(item for item in drafts if item.chunk_role == "child")
+    child.token_count = 101
+
+    with pytest.raises(SourceFidelityError) as raised:
+        chunker._audit_source_fidelity(doc, drafts)
+
+    assert raised.value.source_id == "limit-source"
+    assert raised.value.excerpt == child.text
+
+
+@pytest.mark.parametrize(
+    ("block_type", "identity_field"),
+    [
+        ("table", "table_id"),
+        ("figure", "figure_id"),
+        ("formula", "formula_id"),
+    ],
+)
+def test_missing_structured_source_raises_bounded_fidelity_error(
+    block_type: str,
+    identity_field: str,
+) -> None:
+    source_id = f"missing-{block_type}"
+    source_block = block(
+        f"{block_type}-block",
+        "",
+        6,
+        block_type=block_type,
+        **{identity_field: source_id},
+    )
+
+    with pytest.raises(SourceFidelityError) as raised:
+        make_chunker(parent_max_tokens=100, child_max_tokens=100).build(
+            document(source_block)
+        )
+
+    assert raised.value.document_id == "doc-1"
+    assert raised.value.page == 6
+    assert raised.value.block_type == block_type
+    assert raised.value.source_id == source_id
+    assert len(raised.value.excerpt) <= 200
+
+
+@pytest.mark.parametrize("field_name", ["caption", "description"])
+def test_formula_field_can_reconstruct_from_its_own_fragments(
+    field_name: str,
+) -> None:
+    source = " ".join(f"{field_name}-{index}" for index in range(80))
+    formula = CanonicalFormula(
+        formula_id=f"formula-fragmented-{field_name}",
+        latex="x = 1",
+        caption=source if field_name == "caption" else None,
+        description=source if field_name == "description" else None,
+        source_spans=[span("formula-fragment-source", page=7)],
+    )
+    doc = document(
+        block(
+            "formula-fragment-block",
+            "",
+            7,
+            block_type="formula",
+            formula_id=formula.formula_id,
+        )
+    )
+    doc.formulas = [formula]
+    chunker = make_chunker(parent_max_tokens=300, child_max_tokens=12)
+    drafts = chunker.build(doc)
+    parent = next(item for item in drafts if item.chunk_role == "parent")
+    _replace_draft_text(parent, source)
+
+    chunker._audit_source_fidelity(doc, drafts)
+
+    children = [item for item in drafts if item.chunk_role == "child"]
+    assert "".join(
+        item.metadata["source_fragment"]
+        for item in children
+        if item.metadata.get("source_fragment_kind") == field_name
+    ) == source
+
+
+def test_source_fidelity_audit_accepts_valid_mixed_document() -> None:
+    table = valid_table()
+    table.footnotes = ["Source footnote."]
+    figure = CanonicalFigure(
+        figure_id="mixed-figure",
+        caption="Figure 2. Mixed evidence",
+        description="Figure description.",
+        asset_path="assets/mixed.png",
+        source_spans=[span("mixed-figure-object", page=2)],
+    )
+    formula = CanonicalFormula(
+        formula_id="mixed-formula",
+        latex="a^2 + b^2 = c^2",
+        caption="Equation 2.",
+        description="Formula description.",
+        source_spans=[span("mixed-formula-object", page=3)],
+    )
+    doc = document(
+        block("mixed-narrative", "Narrative source evidence.", 0),
+        block("mixed-table", "", 1, block_type="table", table_id=table.table_id),
+        block("mixed-figure", "", 2, block_type="figure", figure_id=figure.figure_id),
+        block("mixed-formula", "", 3, block_type="formula", formula_id=formula.formula_id),
+    )
+    doc.tables = [table]
+    doc.figures = [figure]
+    doc.formulas = [formula]
+
+    chunks = make_chunker(parent_max_tokens=300, child_max_tokens=100).build(doc)
+
+    assert {item.block_type for item in chunks if item.chunk_role == "child"} == {
+        "narrative",
+        "table",
+        "figure",
+        "formula",
+    }
+
+
 def test_structured_blocks_are_isolated_and_table_children_keep_precise_spans() -> None:
     doc = document(
         block("before", "ordinary paragraph before.", 0),
@@ -1256,6 +1500,149 @@ def test_figure_and_formula_have_source_faithful_children_and_generated_provenan
         assert nearby_page in {item.page_index for item in parent.source_spans}
         assert object_id in {item.source_block_id for item in parent.source_spans}
         assert block_id in {item.source_block_id for item in parent.source_spans}
+
+
+def test_overlong_formula_is_losslessly_split_into_direct_embedding_children() -> None:
+    latex_rows = [f"x_{{{index}}} = y_{{{index}}} + z_{{{index}}}" for index in range(18)]
+    formula = CanonicalFormula(
+        formula_id="q-long",
+        latex=r" \\ ".join(latex_rows),
+        caption="Equation 9. Coupled system",
+        description="Complete source formula.",
+        source_spans=[span("formula-long-source")],
+    )
+    doc = document(
+        block("formula-long", "", 0, block_type="formula", formula_id=formula.formula_id)
+    )
+    doc.formulas = [formula]
+    chunker = make_chunker(parent_max_tokens=200, child_max_tokens=18)
+
+    chunks = chunker.build(doc)
+
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+    children = [item for item in chunks if item.parent_local_id == parent.local_id]
+    assert all(row in parent.text for row in latex_rows)
+    assert len(children) > 1
+    assert all(word_count(item.text) <= 18 for item in children)
+    assert all(item.token_count == word_count(item.text) for item in children)
+    assert all(item.embedding_text == item.text for item in children)
+    assert [item.metadata["structured_part_index"] for item in children] == list(
+        range(len(children))
+    )
+    assert all(
+        item.metadata["structured_part_count"] == len(children) for item in children
+    )
+    assert all(item.metadata["formula_id"] == "q-long" for item in children)
+    assert "".join(
+        item.metadata["source_fragment"]
+        for item in children
+        if item.metadata["source_fragment_kind"] == "latex"
+    ) == formula.latex
+    assert "".join(
+        item.metadata["source_fragment"]
+        for item in children
+        if item.metadata["source_fragment_kind"] == "description"
+    ) == formula.description
+
+
+def test_overlong_formula_description_passes_final_fidelity_audit() -> None:
+    description = " ".join(f"definition-{index}" for index in range(80))
+    formula = CanonicalFormula(
+        formula_id="q-long-description",
+        latex="x = y + 1",
+        caption="Equation 10.",
+        description=description,
+        source_spans=[span("formula-description-source")],
+    )
+    doc = document(
+        block(
+            "formula-description",
+            "",
+            0,
+            block_type="formula",
+            formula_id=formula.formula_id,
+        )
+    )
+    doc.formulas = [formula]
+
+    children = [
+        item
+        for item in make_chunker(parent_max_tokens=200, child_max_tokens=18).build(doc)
+        if item.chunk_role == "child"
+    ]
+
+    assert all(item.token_count <= 18 for item in children)
+    assert "".join(
+        item.metadata["source_fragment"]
+        for item in children
+        if item.metadata["source_fragment_kind"] == "description"
+    ) == description
+
+
+def test_overlong_table_cell_is_split_without_overlimit_child() -> None:
+    long_cell = " ".join(f"measurement-{index}" for index in range(80))
+    table = CanonicalTable(
+        table_id="table-long-cell",
+        caption="Table 4. Complete measurements",
+        headers=["Method", "Measurements"],
+        rows=[["SAC-KG", long_cell]],
+        cells=[
+            CanonicalCell(row_index=0, column_index=0, text="Method", is_header=True),
+            CanonicalCell(row_index=0, column_index=1, text="Measurements", is_header=True),
+            CanonicalCell(row_index=1, column_index=0, text="SAC-KG"),
+            CanonicalCell(row_index=1, column_index=1, text=long_cell),
+        ],
+        source_spans=[span("table-long-source")],
+        status="accepted_mineru",
+    )
+    doc = document(
+        block("table-long", "", 0, block_type="table", table_id=table.table_id)
+    )
+    doc.tables = [table]
+    chunker = make_chunker(parent_max_tokens=300, child_max_tokens=20)
+
+    chunks = chunker.build(doc)
+
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+    children = [item for item in chunks if item.parent_local_id == parent.local_id]
+    assert long_cell in parent.text
+    assert len(children) > 1
+    assert all(word_count(item.text) <= 20 for item in children)
+    assert all(item.token_count == word_count(item.text) for item in children)
+    assert all(item.embedding_text == item.text for item in children)
+    assert all(item.metadata["table_id"] == table.table_id for item in children)
+    assert all(item.metadata["row_indices"] == [0] for item in children)
+    assert all("Table 4" in item.text and "Method" in item.text for item in children)
+    assert "".join(item.metadata["source_fragment"] for item in children) == long_cell
+
+
+def test_overlong_figure_source_description_is_losslessly_bounded() -> None:
+    description = " ".join(f"trend-{index}" for index in range(75))
+    figure = CanonicalFigure(
+        figure_id="figure-long",
+        caption="Figure 7. Long source description",
+        description=description,
+        asset_path="assets/figure-7.png",
+        source_spans=[span("figure-long-source")],
+    )
+    doc = document(
+        block("figure-long", "", 0, block_type="figure", figure_id=figure.figure_id)
+    )
+    doc.figures = [figure]
+    chunker = make_chunker(parent_max_tokens=300, child_max_tokens=18)
+
+    chunks = chunker.build(doc)
+
+    parent = next(item for item in chunks if item.chunk_role == "parent")
+    children = [item for item in chunks if item.parent_local_id == parent.local_id]
+    assert description in parent.text
+    assert len(children) > 1
+    assert all(word_count(item.text) <= 18 for item in children)
+    assert all(item.token_count == word_count(item.text) for item in children)
+    assert all(item.embedding_text == item.text for item in children)
+    assert all(item.metadata["figure_id"] == figure.figure_id for item in children)
+    assert all("Figure 7" in item.text for item in children)
+    assert "".join(item.metadata["source_fragment"] for item in children) == description
 
 
 @pytest.mark.parametrize("block_type", ["figure", "formula"])

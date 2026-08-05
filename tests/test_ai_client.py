@@ -276,6 +276,63 @@ def test_embed_sends_keep_alive_to_single_batch_embedding_request(monkeypatch) -
     assert calls == [{"model": "fake-embedding", "input": ["alpha", "beta"], "keep_alive": 0}]
 
 
+def test_unload_loaded_models_releases_each_resident_model_once(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict | None]] = []
+
+    class FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self.data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self.data
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            calls.append(("GET", url, None))
+            if url.startswith("http://shared"):
+                return FakeResponse(
+                    {"models": [{"name": "qwen3.5:9b"}, {"model": "qwen3-embedding:4b"}]}
+                )
+            return FakeResponse({"models": []})
+
+        def post(self, url: str, json: dict) -> FakeResponse:
+            calls.append(("POST", url, json))
+            return FakeResponse({})
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    client = OllamaClient(
+        base_url="http://shared:11435",
+        embedding_base_url="http://shared:11435",
+    )
+
+    assert client.unload_loaded_models() == ["qwen3.5:9b", "qwen3-embedding:4b"]
+    assert calls == [
+        ("GET", "http://shared:11435/api/ps", None),
+        (
+            "POST",
+            "http://shared:11435/api/generate",
+            {"model": "qwen3.5:9b", "keep_alive": 0},
+        ),
+        (
+            "POST",
+            "http://shared:11435/api/generate",
+            {"model": "qwen3-embedding:4b", "keep_alive": 0},
+        ),
+    ]
+
+
 def test_json_mode_payload_uses_compact_schema_shape() -> None:
     payload = OllamaClient._json_mode_payload(
         schema=HeadAnalysisPayload,

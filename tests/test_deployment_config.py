@@ -74,6 +74,8 @@ def test_redis_is_local_and_each_environment_has_an_isolated_worker() -> None:
     assert "app.workers.runner" in test_worker
     assert "EnvironmentFile=%h/knowledge-agent-dev/runtime/app.env" in dev_worker
     assert "EnvironmentFile=%h/knowledge-agent-test/runtime/app.env" in test_worker
+    assert "Environment=CUDA_VISIBLE_DEVICES=0" in dev_worker
+    assert "Environment=CUDA_VISIBLE_DEVICES=0" not in test_worker
     expected_queues = ",".join(
         [
             "ingest.parse",

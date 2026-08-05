@@ -1,13 +1,43 @@
+"""Canonical Adapter：把不同格式的源文档统一转换为 CanonicalDocument。
+
+本模块是文档解析层的 "适配器层"，为每种支持的源格式实现一个 CanonicalAdapter：
+- TextCanonicalAdapter：纯文本文件（.txt）。
+- MarkdownCanonicalAdapter：Markdown 文件（.md / .markdown）。
+- HtmlCanonicalAdapter：HTML 文件（.html / .htm）。
+- DocxCanonicalAdapter：Word 文档（.docx）。
+- PDFCanonicalAdapter：PDF 文件（.pdf），使用 MinerU、Document Intelligence、
+  pypdf 文本层等多层解析与修复策略。
+
+通用职责：
+1. 读取源文件并转换为 CanonicalDocument（blocks、tables、figures、formulas、assets）。
+2. 维护 reading_order、section_path、source_spans 等来源信息。
+3. 物化本地/嵌入图片到 canonical asset 缓存，保证 bundle 可迁移。
+4. 在解析完成后调用 _finalize_structured_evidence 合并跨页表格并校验。
+5. 调用 _link_nearby_structured_source_blocks 为图片/公式关联附近的正文块。
+
+主要入口：
+- parse_canonical_document(path): 根据文件后缀自动分派适配器。
+
+常量/辅助：
+- MAX_TABLE_ROWS / MAX_TABLE_COLUMNS / MAX_TABLE_GRID_CELLS：表格大小限制。
+- _materialize_adapter_asset：把提取出的 asset 安全地写入共享缓存。
+- _stable_id：基于哈希生成稳定的 ID。
+- _DocumentBuilder：构建 CanonicalDocument 的辅助类。
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
 import stat
 import threading
+import unicodedata
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import unquote, urlsplit
@@ -58,9 +88,12 @@ _ADAPTER_ASSET_CACHE_LOCK = threading.RLock()
 
 
 class CanonicalAdapter(Protocol):
+    """所有 Canonical 适配器必须实现的协议。"""
+
     def parse(self, path: Path) -> CanonicalDocument: ...
 
 
+# 行信息辅助类，用于把纯文本/Markdown 源映射到 SourceSpan。
 @dataclass(frozen=True)
 class _Line:
     number: int
@@ -70,6 +103,7 @@ class _Line:
     text: str
 
 
+# Markdown 图片语法解析结果。
 @dataclass(frozen=True)
 class _MarkdownImage:
     start: int
@@ -137,6 +171,9 @@ def _safe_local_asset_name(path: Path, asset_sha: str) -> str:
     return f"{asset_sha[:24]}-{stem[:80]}{suffix}"
 
 
+# ------------------------------------------------------------------------------
+# Asset 物化：把图片/附件安全写入共享缓存
+# ------------------------------------------------------------------------------
 def _materialize_adapter_asset(
     document: CanonicalDocument,
     safe_name: str,
@@ -176,7 +213,14 @@ def _materialize_adapter_asset_locked(
     source_kind: str,
     asset_cache_root: Path | None = None,
 ) -> Path:
-    """Atomically persist an extracted asset outside parser temporary output."""
+    """在持有锁的情况下，把 asset 原子性地持久化到共享缓存。
+
+    安全保证：
+    - 缓存目录不能是符号链接。
+    - 按源文档 sha256 分目录，防止同名文件冲突。
+    - 临时文件写入后校验 sha256，再原子替换目标文件。
+    - 监控缓存总大小，避免无限制增长。
+    """
 
     source_path = Path(document.source_path or "document")
     try:
@@ -349,6 +393,9 @@ def _materialize_adapter_asset_locked(
                 pass
 
 
+# ------------------------------------------------------------------------------
+# 本地图片注册：把 Markdown/HTML 中的相对图片路径物化为 CanonicalAsset
+# ------------------------------------------------------------------------------
 def _register_local_figure_asset(
     document: CanonicalDocument,
     raw_target: str | None,
@@ -456,6 +503,9 @@ def _register_local_figure_asset(
     return asset_path
 
 
+# ------------------------------------------------------------------------------
+# 通用辅助：表格限制、HTML/DOCX 嵌套深度、稳定 ID
+# ------------------------------------------------------------------------------
 def _raise_table_limit(document: CanonicalDocument, source_format: str, detail: str) -> None:
     raise _parse_error(
         Path(document.source_path or f"document.{source_format.lower()}"),
@@ -482,6 +532,7 @@ def _stable_id(prefix: str, *parts: object) -> str:
 
 
 def _new_document(path: Path, parser_source: str, media_type: str) -> CanonicalDocument:
+    """创建一个带有基本来源元数据的新 CanonicalDocument。"""
     try:
         stat = path.stat()
         with path.open("rb") as source_file:
@@ -510,6 +561,14 @@ def _new_document(path: Path, parser_source: str, media_type: str) -> CanonicalD
 
 
 class _DocumentBuilder:
+    """构建 CanonicalDocument 的辅助类。
+
+    负责：
+    - 维护当前标题路径（heading_path）和章节树（outline）。
+    - 识别 References / Appendix 区域，自动切换 block_type。
+    - 为每个 block 生成稳定的 block_id 和递增的 reading_order。
+    """
+
     def __init__(self, document: CanonicalDocument) -> None:
         self.document = document
         self._headings: list[tuple[int, str]] = []
@@ -520,6 +579,20 @@ class _DocumentBuilder:
     @property
     def heading_path(self) -> list[str]:
         return [title for _, title in self._headings]
+
+    @property
+    def in_reference_section(self) -> bool:
+        return self._reference_level is not None
+
+    def end_reference_section(self) -> None:
+        if self._reference_level is None:
+            return
+        reference_level = self._reference_level
+        self._reference_level = None
+        while self._headings and self._headings[-1][0] >= reference_level:
+            self._headings.pop()
+        while self._outline_stack and self._outline_stack[-1][0] >= reference_level:
+            self._outline_stack.pop()
 
     def _span(self, span: SourceSpan) -> SourceSpan:
         return span.model_copy(update={"heading_path": self.heading_path})
@@ -536,6 +609,7 @@ class _DocumentBuilder:
         )
 
     def add_heading(self, title: str, level: int, span: SourceSpan, **metadata: object) -> CanonicalBlock:
+        """添加一个标题 block，并同步更新章节树 outline。"""
         if self._reference_level is not None and level <= self._reference_level:
             self._reference_level = None
         if self._appendix_level is not None and level <= self._appendix_level:
@@ -585,6 +659,7 @@ class _DocumentBuilder:
         formula_id: str | None = None,
         retrievable: bool | None = None,
     ) -> CanonicalBlock:
+        """添加一个内容 block；如果在 References / Appendix 区域会自动切换类型。"""
         if block_type == "narrative":
             if self._reference_level is not None:
                 block_type = "reference"
@@ -713,7 +788,12 @@ def _is_table_separator(value: str) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
 
 
+# ------------------------------------------------------------------------------
+# 适配器：纯文本
+# ------------------------------------------------------------------------------
 class TextCanonicalAdapter:
+    """纯文本适配器：把 .txt 文件按空行分割为 narrative block。"""
+
     parser_source = "text"
 
     def parse(self, path: Path) -> CanonicalDocument:
@@ -742,7 +822,12 @@ class TextCanonicalAdapter:
         return document
 
 
+# ------------------------------------------------------------------------------
+# 适配器：Markdown
+# ------------------------------------------------------------------------------
 class MarkdownCanonicalAdapter:
+    """Markdown 适配器：解析 ATX/setext 标题、代码块、表格、公式、图片等。"""
+
     parser_source = "markdown"
     _heading_re = re.compile(
         r"^[ ]{0,3}(#{1,6})(?P<content>(?:[ \t]+.*)?)$"
@@ -1322,7 +1407,12 @@ def _is_math_element(element: Tag) -> bool:
     return element.name == "math" or any(token in classes for token in ("math", "latex", "equation"))
 
 
+# ------------------------------------------------------------------------------
+# 适配器：HTML
+# ------------------------------------------------------------------------------
 class HtmlCanonicalAdapter:
+    """HTML 适配器：遍历 DOM 树，提取标题、段落、表格、图片、公式、代码等。"""
+
     parser_source = "html"
 
     def parse(self, path: Path) -> CanonicalDocument:
@@ -2122,8 +2212,13 @@ class HtmlCanonicalAdapter:
         )
 
 
+# ------------------------------------------------------------------------------
+# 适配器：DOCX
+# ------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _DocxEvent:
+    """DOCX 段落内的事件：普通文本、公式（OMML）、图片。"""
+
     kind: str
     text: str = ""
     element: object | None = None
@@ -2132,6 +2227,8 @@ class _DocxEvent:
 
 
 class DocxCanonicalAdapter:
+    """DOCX 适配器：解析 Word 文档的段落、表格、嵌入图片、OMML 公式。"""
+
     parser_source = "docx"
 
     def __init__(self, asset_cache_root: Path | None = None) -> None:
@@ -2875,6 +2972,9 @@ class DocxCanonicalAdapter:
             return 0
 
 
+# ------------------------------------------------------------------------------
+# PDF 适配器：MinerU / Document Intelligence / pypdf 多层解析与修复
+# ------------------------------------------------------------------------------
 def run_mineru(path: Path, page_count: int) -> CanonicalDocument | None:
     """Run MinerU without entering the canonical PDF dispatcher recursively."""
     from app.services import parser
@@ -2983,6 +3083,7 @@ def _parsed_pdf_to_canonical(
     parser_source: str,
     page_count: int,
 ) -> CanonicalDocument:
+    """把底层 PDF 解析结果（MinerU / Document Intelligence）转换为 CanonicalDocument。"""
     document = _new_document(path, parser_source, "application/pdf")
     document.parser_source = parser_source
     document.title = parsed.title
@@ -3011,16 +3112,31 @@ def _parsed_pdf_to_canonical(
         page_label = _clean_page_label(raw_table.get("page_label"))
         table_text = str(raw_table.get("markdown") or raw_table.get("text") or "").strip()
         caption, headers, rows = _parse_pdf_table_markdown(table_text)
-        span = _pdf_span(page_label, f"{parser_source}-table-{index + 1}")
-        table_id = _stable_id(
-            "table", document.document_id, page_label, index, table_text
+        span = _pdf_span(
+            page_label,
+            f"{parser_source}-table-{index + 1}",
+            bbox=raw_table.get("bbox"),
         )
-        table = CanonicalTable(
-            table_id=table_id,
-            caption=caption,
-            headers=headers,
-            rows=rows,
-            cells=[
+        source_html = str(raw_table.get("source_html") or "").strip() or None
+        cells: list[CanonicalCell] = []
+        if source_html:
+            from app.services.canonical_artifacts import CanonicalArtifactStore
+
+            try:
+                cells, html_headers, html_rows = (
+                    CanonicalArtifactStore._canonical_table_from_html(source_html)
+                )
+                if html_headers:
+                    headers, rows = html_headers, html_rows
+                else:
+                    cells = []
+            except ValueError:
+                cells = []
+        if cells:
+            for cell in cells:
+                cell.source_spans = [span]
+        else:
+            cells = [
                 CanonicalCell(
                     text=value,
                     row_index=row_index,
@@ -3030,16 +3146,42 @@ def _parsed_pdf_to_canonical(
                 )
                 for row_index, row in enumerate([headers, *rows])
                 for column_index, value in enumerate(row)
-            ],
-            source_markdown=table_text or None,
-            normalized_markdown=_table_markdown(headers, rows) or table_text or None,
+            ]
+        table_id = _stable_id(
+            "table", document.document_id, page_label, index, table_text
+        )
+        canonical_markdown = _table_markdown(headers, rows) or table_text or None
+        source_markdown = table_text or None
+        table_metadata = {
+            key: value
+            for key, value in raw_table.items()
+            if key not in {"markdown", "text", "source_html"}
+        }
+        if source_html and canonical_markdown:
+            if table_text:
+                table_metadata["parser_source_markdown"] = table_text
+            source_markdown = "\n\n".join(
+                part for part in (caption, canonical_markdown) if part
+            )
+        table = CanonicalTable(
+            table_id=table_id,
+            caption=caption,
+            headers=headers,
+            rows=rows,
+            cells=cells,
+            footnotes=[
+                str(footnote).strip()
+                for footnote in raw_table.get("footnotes", [])
+                if str(footnote).strip()
+            ]
+            if isinstance(raw_table.get("footnotes"), list)
+            else [],
+            source_html=source_html,
+            source_markdown=source_markdown,
+            normalized_markdown=canonical_markdown,
             source_spans=[span],
             status="accepted_mineru" if parser_source == "mineru" else "repaired_by_vision",
-            metadata={
-                key: value
-                for key, value in raw_table.items()
-                if key not in {"markdown", "text"}
-            },
+            metadata=table_metadata,
         )
         document.tables.append(table)
         table_entries.append((page_label, table_text, table))
@@ -3147,6 +3289,16 @@ def _parsed_pdf_to_canonical(
             "source_chunk_ordinal": chunk.ordinal,
             "source_heading": chunk.heading,
         }
+        if (
+            builder.in_reference_section
+            and any(item is not None for item in (table, formula, figure))
+            and any(
+                marker in heading
+                for marker in ("table", "figure", "image", "chart", "formula", "equation")
+            )
+        ):
+            builder.end_reference_section()
+            metadata["reference_scope_reset"] = True
         if table is not None:
             builder.add_content(
                 text,
@@ -3227,11 +3379,29 @@ def _clean_page_label(value: object) -> str | None:
     return label if label and label != "?" else None
 
 
-def _pdf_span(page_label: str | None, source_block_id: str) -> SourceSpan:
+def _pdf_span(
+    page_label: str | None,
+    source_block_id: str,
+    *,
+    bbox: object = None,
+) -> SourceSpan:
     page_index = int(page_label) - 1 if page_label and page_label.isdigit() else None
+    source_bbox = None
+    if (
+        isinstance(bbox, (list, tuple))
+        and len(bbox) == 4
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in bbox
+        )
+    ):
+        source_bbox = tuple(float(value) for value in bbox)
     return SourceSpan(
         page_index=page_index,
         page_label=page_label,
+        bbox=source_bbox,
         source_block_id=source_block_id,
     )
 
@@ -3443,6 +3613,8 @@ def _attach_pdf_audit(
     primary_parser: str,
     repair_scopes: list[str] | None = None,
 ) -> None:
+    if not (document.abstract or "").strip():
+        document.abstract = extract_explicit_abstract(page_texts[:2])
     explicit_pages = {
         page
         for page in document.metadata.get("parsed_page_indices", [])
@@ -3481,6 +3653,302 @@ def _attach_pdf_audit(
             document.warnings.append(warning)
 
 
+def _supplement_missing_pdf_pages_from_text_layer(
+    document: CanonicalDocument,
+    page_texts: list[str],
+    page_count: int,
+) -> set[int]:
+    """Add source-located pypdf blocks only for pages MinerU did not cover."""
+    parsed_pages = {
+        page
+        for page in document.metadata.get("parsed_page_indices", [])
+        if isinstance(page, int) and 0 <= page < page_count
+    }
+    parsed_pages.update(_document_structured_page_indices(document))
+    fallback_pages = {
+        page
+        for page in range(page_count)
+        if page not in parsed_pages
+        and page < len(page_texts)
+        and page_texts[page].strip()
+    }
+    if not fallback_pages:
+        return set()
+
+    builder = _DocumentBuilder(document)
+    for page_index in sorted(fallback_pages):
+        block = builder.add_content(
+            page_texts[page_index],
+            SourceSpan(
+                page_index=page_index,
+                page_label=str(page_index + 1),
+                source_block_id=f"pypdf-page-{page_index + 1}",
+            ),
+            metadata={
+                "source": "pypdf_text_layer",
+                "fallback_reason": "mineru_page_missing",
+            },
+        )
+        block.parser_source = "pypdf_text_layer"
+
+    original_order = {
+        block.block_id: block.reading_order for block in document.blocks
+    }
+    document.blocks.sort(
+        key=lambda block: (
+            min(
+                (
+                    span.page_index
+                    for span in block.source_spans
+                    if span.page_index is not None
+                ),
+                default=page_count,
+            ),
+            original_order[block.block_id],
+        )
+    )
+    for reading_order, block in enumerate(document.blocks):
+        block.reading_order = reading_order
+
+    document.metadata["parsed_page_indices"] = sorted(
+        parsed_pages | fallback_pages
+    )
+    existing_fallbacks = {
+        page
+        for page in document.metadata.get(
+            "text_layer_fallback_page_indices", []
+        )
+        if isinstance(page, int) and 0 <= page < page_count
+    }
+    document.metadata["text_layer_fallback_page_indices"] = sorted(
+        existing_fallbacks | fallback_pages
+    )
+    return fallback_pages
+
+
+def _repeated_pdf_margin_ranges(page_texts: list[str]) -> dict[int, list[tuple[int, int]]]:
+    candidates: dict[str, list[tuple[int, int, int]]] = {}
+    for page_index, text in enumerate(page_texts):
+        lines = list(re.finditer(r"[^\r\n]+(?:\r?\n|$)", text))
+        nonblank = [match for match in lines if match.group(0).strip()]
+        for match in [*nonblank[:2], *nonblank[-2:]]:
+            normalized = " ".join(match.group(0).split()).casefold()
+            if len(normalized) >= 20:
+                candidates.setdefault(normalized, []).append(
+                    (page_index, match.start(), match.end())
+                )
+    ignored: dict[int, list[tuple[int, int]]] = {}
+    for occurrences in candidates.values():
+        if len({page for page, _start, _end in occurrences}) < 2:
+            continue
+        for page, start, end in occurrences:
+            ignored.setdefault(page, []).append((start, end))
+    return ignored
+
+
+def _normalize_pdf_match_text(
+    text: str,
+    *,
+    ignored_ranges: list[tuple[int, int]] | None = None,
+) -> tuple[str, list[int]]:
+    ignored = sorted(ignored_ranges or [])
+    ignored_index = 0
+    normalized: list[str] = []
+    source_offsets: list[int] = []
+    index = 0
+    while index < len(text):
+        while ignored_index < len(ignored) and index >= ignored[ignored_index][1]:
+            ignored_index += 1
+        if (
+            ignored_index < len(ignored)
+            and ignored[ignored_index][0] <= index < ignored[ignored_index][1]
+        ):
+            index = ignored[ignored_index][1]
+            continue
+        dehyphenation = re.match(r"-\s*\r?\n\s*(?=[\w])", text[index:])
+        if (
+            dehyphenation is not None
+            and index > 0
+            and text[index - 1].isalnum()
+        ):
+            index += len(dehyphenation.group(0))
+            continue
+        char = text[index]
+        if char == "\u00ad":
+            index += 1
+            continue
+        if char.isspace():
+            if normalized and normalized[-1] != " ":
+                normalized.append(" ")
+                source_offsets.append(index)
+            index += 1
+            continue
+        folded = unicodedata.normalize("NFKC", char).casefold()
+        for output_char in folded:
+            normalized.append(output_char)
+            source_offsets.append(index)
+        index += 1
+    while normalized and normalized[-1] == " ":
+        normalized.pop()
+        source_offsets.pop()
+    return "".join(normalized), source_offsets
+
+
+def _page_primary_text(document: CanonicalDocument, page_index: int) -> str:
+    parts: list[str] = []
+    for block in sorted(document.blocks, key=lambda item: item.reading_order):
+        if block.parser_source == "pypdf_text_layer":
+            continue
+        if any(span.page_index == page_index for span in block.source_spans):
+            value = block.text.strip()
+            if value:
+                parts.append(value)
+    return "\n\n".join(parts)
+
+
+def _looks_like_pdf_formula_encoding_noise(text: str) -> bool:
+    word_tokens = re.findall(r"[A-Za-z0-9]+", text)
+    if len(word_tokens) < 12:
+        return False
+    short_ratio = sum(len(token) <= 2 for token in word_tokens) / len(word_tokens)
+    operator_count = sum(
+        text.count(marker)
+        for marker in ("+", "-", "=", "/", "*", "^", ";", "∑", "∫", "√")
+    )
+    return short_ratio >= 0.80 and operator_count >= 8
+
+
+def _recover_pdf_page_omissions_from_text_layer(
+    document: CanonicalDocument,
+    page_texts: list[str],
+    page_count: int,
+    *,
+    skip_pages: set[int] | None = None,
+    minimum_normalized_chars: int = 80,
+) -> set[int]:
+    skipped = set(skip_pages or set())
+    repeated_margins = _repeated_pdf_margin_ranges(page_texts)
+    builder = _DocumentBuilder(document)
+    recovered_pages: set[int] = set()
+    page_audits: list[dict[str, object]] = []
+    for page_index in range(min(page_count, len(page_texts))):
+        source_text = page_texts[page_index]
+        primary_text = _page_primary_text(document, page_index)
+        if page_index in skipped or not source_text.strip() or not primary_text.strip():
+            continue
+        source_normalized, source_offsets = _normalize_pdf_match_text(
+            source_text,
+            ignored_ranges=repeated_margins.get(page_index),
+        )
+        primary_normalized, _primary_offsets = _normalize_pdf_match_text(primary_text)
+        if not source_normalized:
+            continue
+        matcher = SequenceMatcher(
+            None,
+            source_normalized,
+            primary_normalized,
+            autojunk=False,
+        )
+        opcodes = matcher.get_opcodes()
+        matched_chars = sum(
+            source_end - source_start
+            for tag, source_start, source_end, _other_start, _other_end in opcodes
+            if tag == "equal"
+        )
+        unmatched = [
+            (source_start, source_end)
+            for tag, source_start, source_end, _other_start, _other_end in opcodes
+            if tag in {"delete", "replace"} and source_end > source_start
+        ]
+        largest_unmatched = max(
+            (end - start for start, end in unmatched),
+            default=0,
+        )
+        coverage_ratio = round(matched_chars / len(source_normalized), 6)
+        page_audits.append(
+            {
+                "page_index": page_index,
+                "page_label": str(page_index + 1),
+                "coverage_ratio": coverage_ratio,
+                "largest_unmatched_normalized_chars": largest_unmatched,
+            }
+        )
+        for normalized_start, normalized_end in unmatched:
+            if normalized_end - normalized_start < minimum_normalized_chars:
+                continue
+            unmatched_normalized = source_normalized[
+                normalized_start:normalized_end
+            ].strip()
+            if unmatched_normalized in primary_normalized:
+                continue
+            source_start = source_offsets[normalized_start]
+            source_end = source_offsets[normalized_end - 1] + 1
+            while source_start < source_end and source_text[source_start].isspace():
+                source_start += 1
+            while source_end > source_start and source_text[source_end - 1].isspace():
+                source_end -= 1
+            recovered_text = source_text[source_start:source_end]
+            if len("".join(char for char in recovered_text if char.isalnum())) < 20:
+                continue
+            if _looks_like_pdf_formula_encoding_noise(recovered_text):
+                continue
+            block = builder.add_content(
+                recovered_text,
+                SourceSpan(
+                    page_index=page_index,
+                    page_label=str(page_index + 1),
+                    source_block_id=(
+                        f"pypdf-recovery-page-{page_index + 1}-{source_start}-{source_end}"
+                    ),
+                ),
+                metadata={
+                    "source": "pdf_text_recovery",
+                    "fallback_reason": "mineru_text_omission",
+                    "page_coverage_ratio": coverage_ratio,
+                    "largest_unmatched_normalized_chars": largest_unmatched,
+                    "source_char_start": source_start,
+                    "source_char_end": source_end,
+                },
+            )
+            block.parser_source = "pypdf_text_layer"
+            recovered_pages.add(page_index)
+    low_coverage_pages = [
+        int(audit["page_index"])
+        for audit in page_audits
+        if float(audit["coverage_ratio"]) < 0.90
+    ]
+    document.metadata["text_layer_page_coverage"] = page_audits
+    document.metadata["text_layer_low_coverage_page_indices"] = low_coverage_pages
+    for page_index in low_coverage_pages:
+        warning = (
+            f"PDF text-layer coverage for page {page_index + 1} is below 0.90; "
+            "review the page audit for possible short omissions."
+        )
+        if warning not in document.warnings:
+            document.warnings.append(warning)
+    document.metadata["text_layer_recovery_page_indices"] = sorted(recovered_pages)
+    if recovered_pages:
+        for reading_order, block in enumerate(
+            sorted(
+                document.blocks,
+                key=lambda item: (
+                    min(
+                        (
+                            span.page_index
+                            for span in item.source_spans
+                            if span.page_index is not None
+                        ),
+                        default=page_count,
+                    ),
+                    item.reading_order,
+                ),
+            )
+        ):
+            block.reading_order = reading_order
+        document.blocks.sort(key=lambda item: item.reading_order)
+    return recovered_pages
+
+
 def _finalize_pdf_audit(document: CanonicalDocument) -> CanonicalDocument:
     _finalize_structured_evidence(document)
     page_count = document.metadata.get("expected_page_count")
@@ -3492,6 +3960,13 @@ def _finalize_pdf_audit(document: CanonicalDocument) -> CanonicalDocument:
             list(document.metadata.get("repair_scopes", [])),
             page_count,
         )
+    )
+    fallback_pages.update(
+        page + 1
+        for page in document.metadata.get(
+            "text_layer_fallback_page_indices", []
+        )
+        if isinstance(page, int) and 0 <= page < page_count
     )
     if document.metadata.get("primary_parser") != "mineru":
         fallback_pages.update(range(1, page_count + 1))
@@ -3809,6 +4284,14 @@ def _merge_pdf_page_repairs(
     page_indices: set[int],
     issues: list[CanonicalQualityIssue] | None = None,
 ) -> CanonicalDocument:
+    """把 repair 文档中指定页面的结构合并回 primary 文档。
+
+    - 如果 issues 为 None，则替换目标页面的全部文本和结构（整页修复）。
+    - 如果 issues 不为 None，则只替换 issues 涉及的结构类型（targeted repair）。
+    - 保留未受影响页面的 narrative block 不变。
+    - 重新生成 block_id、reading_order，并更新 outline / nearby_block_ids / quality issues。
+    """
+
     replacement_types = (
         {"table", "figure", "formula"}
         if issues is None
@@ -3988,7 +4471,20 @@ def _merge_pdf_page_repairs(
     return primary
 
 
+# ------------------------------------------------------------------------------
+# PDF 适配器主类：多层 fallback 与 targeted repair
+# ------------------------------------------------------------------------------
 class PDFCanonicalAdapter:
+    """PDF 适配器：多层解析与修复策略。
+
+    解析流程：
+    1. 优先使用 MinerU 解析。
+    2. 如果 MinerU 结果存在可修复问题（如表格无效），用 Document Intelligence
+       对指定页面进行 targeted repair。
+    3. 如果 MinerU 不可用或存在 fatal 问题，尝试完整 Document Intelligence 解析。
+    4. 最后回退到 pypdf 文本层，保证至少能提取文本。
+    """
+
     parser_source = "mineru"
 
     def parse(self, path: Path) -> CanonicalDocument:
@@ -4022,6 +4518,49 @@ class PDFCanonicalAdapter:
                 attempts=attempts,
                 primary_parser="mineru",
             )
+            text_layer_fallback_pages = _supplement_missing_pdf_pages_from_text_layer(
+                mineru_document,
+                page_texts,
+                page_count,
+            )
+            text_layer_recovery_pages = _recover_pdf_page_omissions_from_text_layer(
+                mineru_document,
+                page_texts,
+                page_count,
+                skip_pages=text_layer_fallback_pages,
+            )
+            if text_layer_fallback_pages:
+                attempts.append(
+                    "pypdf_text_layer:missing_pages:"
+                    + ",".join(
+                        str(page + 1)
+                        for page in sorted(text_layer_fallback_pages)
+                    )
+                )
+                _attach_pdf_audit(
+                    mineru_document,
+                    page_count=page_count,
+                    page_texts=page_texts,
+                    text_layer_warnings=text_layer_warnings,
+                    attempts=attempts,
+                    primary_parser="mineru",
+                )
+            if text_layer_recovery_pages:
+                attempts.append(
+                    "pypdf_text_layer:page_recovery:"
+                    + ",".join(
+                        str(page + 1)
+                        for page in sorted(text_layer_recovery_pages)
+                    )
+                )
+                _attach_pdf_audit(
+                    mineru_document,
+                    page_count=page_count,
+                    page_texts=page_texts,
+                    text_layer_warnings=text_layer_warnings,
+                    attempts=attempts,
+                    primary_parser="mineru",
+                )
             report = gate.evaluate(mineru_document)
             _finalize_structured_evidence(mineru_document)
             report = mineru_document.quality
@@ -4192,7 +4731,15 @@ class PDFCanonicalAdapter:
         return _finalize_pdf_audit(fallback)
 
 
+# ------------------------------------------------------------------------------
+# 公开入口与解析后处理
+# ------------------------------------------------------------------------------
 def parse_canonical_document(path: Path) -> CanonicalDocument:
+    """根据文件后缀自动分派适配器，解析为 CanonicalDocument。
+
+    支持的后缀：.pdf, .docx, .html, .htm, .md, .markdown, .txt。
+    默认按纯文本处理未知后缀。
+    """
     path = _validate_path(Path(path))
     adapter: CanonicalAdapter = {
         ".pdf": PDFCanonicalAdapter(),
@@ -4211,7 +4758,14 @@ def parse_canonical_document(path: Path) -> CanonicalDocument:
 
 
 def _finalize_structured_evidence(document: CanonicalDocument) -> None:
-    """Merge and validate tables at the canonical adapter boundary."""
+    """在适配器边界对结构化证据进行最终处理。
+
+    包括：
+    1. 合并跨页表格（merge_cross_page_tables）。
+    2. 使用 TableValidator 校验每个表格；失败的表格标记为 validation_failed。
+    3. 更新 table_aliases、table_repair_requests、table_activation_allowed。
+    4. 运行 CanonicalQualityGate 评估文档质量。
+    """
 
     from app.services.canonical_quality import CanonicalQualityGate
     from app.services.structured_evidence import StructuredEvidenceBuilder, TableValidator
@@ -4296,11 +4850,10 @@ def _finalize_structured_evidence(document: CanonicalDocument) -> None:
 
 
 def _link_nearby_structured_source_blocks(document: CanonicalDocument) -> None:
-    """Attach nearby source prose without manufacturing descriptions.
+    """为图片和公式关联附近的来源正文块。
 
-    The links are format-neutral: every adapter already emits canonical blocks,
-    so Figure/Formula retrieval can use the same provenance rule for PDF, DOCX,
-    HTML, Markdown, and plain text.
+    用于检索增强：Figure/Formula 在需要时可以引用附近的 narrative block，
+    而不是依赖 AI 生成的描述。关联规则基于阅读顺序距离（<=2）和页面一致性。
     """
 
     ordered = sorted(document.blocks, key=lambda block: (block.reading_order, block.block_id))

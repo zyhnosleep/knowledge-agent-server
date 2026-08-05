@@ -28,7 +28,7 @@ def _child(
     }
 
 
-def _contextualized_child(*, block_type: str = "table") -> dict[str, object]:
+def _contextualized_child(*, block_type: str = "figure") -> dict[str, object]:
     child = _child(block_type=block_type, text="| A | B |")
     child.update(
         contextual_prefix="This table reports the main comparison.",
@@ -41,10 +41,10 @@ def _contextualized_child(*, block_type: str = "table") -> dict[str, object]:
     return child
 
 
-def test_only_structured_evidence_requires_llm_context() -> None:
-    assert CONTEXTUALIZED_BLOCK_TYPES == frozenset({"table", "figure", "formula"})
+def test_no_retrievable_child_requires_llm_context() -> None:
+    assert CONTEXTUALIZED_BLOCK_TYPES == frozenset()
     assert PLAIN_EMBEDDING_BLOCK_TYPES == frozenset(
-        {"narrative", "caption", "appendix"}
+        {"narrative", "caption", "appendix", "table", "figure", "formula"}
     )
     for block_type in CONTEXTUALIZED_BLOCK_TYPES:
         assert requires_contextualization(block_type) is True
@@ -58,7 +58,7 @@ def test_unknown_retrievable_block_type_fails_closed() -> None:
 
 
 def test_plain_child_requires_exact_raw_embedding_text_and_no_context_fields() -> None:
-    child = _child(block_type="narrative")
+    child = _child(block_type="table")
 
     assert valid_plain_embedding(child) is True
 
@@ -71,21 +71,13 @@ def test_plain_child_requires_exact_raw_embedding_text_and_no_context_fields() -
     assert valid_plain_embedding(contextualized) is False
 
 
-def test_structured_child_requires_complete_provenance_and_prefixed_text() -> None:
+def test_no_child_type_accepts_contextualized_embedding() -> None:
     child = _contextualized_child()
 
-    assert valid_contextualized_embedding(child) is True
-
-    incomplete = deepcopy(child)
-    incomplete["contextualization_model"] = None
-    assert valid_contextualized_embedding(incomplete) is False
-
-    altered = deepcopy(child)
-    altered["embedding_text"] = str(altered["text"])
-    assert valid_contextualized_embedding(altered) is False
+    assert valid_contextualized_embedding(child) is False
 
 
 def test_policy_validation_accepts_attribute_objects() -> None:
-    child = SimpleNamespace(**_contextualized_child(block_type="figure"))
+    child = SimpleNamespace(**_child(block_type="figure"))
 
-    assert valid_contextualized_embedding(child) is True
+    assert valid_plain_embedding(child) is True

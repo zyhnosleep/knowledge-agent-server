@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -31,7 +34,13 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models.records import Claim, Document, DocumentChunk, DocumentStatus, Project, QuestionAnswer
 from app.schemas.common import Citation, QueryResponse
-from app.services.ai import QueryAnswerPayload, VerificationPayload, cosine_similarity, safe_model_call
+from app.services.ai import (
+    QueryAnswerPayload,
+    VerificationPayload,
+    _is_retryable_error,
+    cosine_similarity,
+    safe_model_call,
+)
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
 from app.services.paper_profile import (
@@ -41,6 +50,7 @@ from app.services.paper_profile import (
     paper_profile_text,
     source_fields_for_document,
 )
+from app.services.scientific_normalization import normalize_scientific_selector
 from app.services.table_extraction import summarize_ablation_table, table_metric_values
 from app.services.table_evidence import (
     CanonicalTableChunk,
@@ -54,6 +64,7 @@ from app.services.structured_evidence import StructuredEvidenceBuilder
 from app.services.vector_store import get_vector_store
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 MIN_CONTEXT_SCORE = 2.5
 CONTEXT_SCORE_RATIO = 0.40
 MAX_CONTEXTS = 8
@@ -64,6 +75,10 @@ MAX_CONTEXTS = 8
 CANONICAL_TABLE_CONTEXT_LIMIT = 24
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
+# The table-answer repair prompt lists the selected evidence's canonical facts
+# as a deterministic, bounded inventory so the model can only report verbatim
+# values.  The cap keeps a wide table from ballooning the repair prompt.
+REPAIR_TABLE_FACT_INVENTORY_LIMIT = 60
 QUERY_GENERATION_TIMEOUT_SECONDS = 45
 DRAFT_CONTEXT_TOKEN_BUDGET = 6000
 NEIGHBOR_EXPANSION_TOKEN_BUDGET = 900
@@ -232,6 +247,7 @@ class QueryService:
         ("van der Waals", re.compile(r"\bvan der Waals\b", re.IGNORECASE)),
         ("vdW", re.compile(r"\bvdW\b", re.IGNORECASE)),
         ("chi1", re.compile(r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*1\s*\}?", re.IGNORECASE)),
+        ("chi2", re.compile(r"(?:\\chi|\u03c7|chi)\s*_?\s*\{?\s*2\s*\}?", re.IGNORECASE)),
         ("Alanine", re.compile(r"\bAlanine\b", re.IGNORECASE)),
         ("Valine", re.compile(r"\bValine\b", re.IGNORECASE)),
         ("Leucine", re.compile(r"\bLeucine\b", re.IGNORECASE)),
@@ -895,9 +911,24 @@ class QueryService:
             if contexts:
                 return self._finalize_contexts(contexts, question=question)
         if self._is_table_query(question) or self._is_metric_query(question):
-            table_contexts = self._search_document_table_contexts(question, project_id, derived_document_ids, limit=MAX_CONTEXTS)
+            table_limit = (
+                CANONICAL_TABLE_CONTEXT_LIMIT
+                if self._is_table_query(question) or self._is_metric_query(question)
+                else MAX_CONTEXTS
+            )
+            table_contexts = self._search_document_table_contexts(
+                question,
+                project_id,
+                derived_document_ids,
+                limit=table_limit,
+            )
             if not table_contexts and derived_document_ids and not locked_document_ids:
-                table_contexts = self._search_document_table_contexts(question, project_id, [], limit=MAX_CONTEXTS)
+                table_contexts = self._search_document_table_contexts(
+                    question,
+                    project_id,
+                    [],
+                    limit=table_limit,
+                )
             contexts.extend(table_contexts)
             if table_contexts:
                 return self._finalize_contexts(contexts, question=question)
@@ -1723,6 +1754,21 @@ class QueryService:
                 match = pattern.search(text)
                 if match:
                     positions.append(match.start())
+                else:
+                    # Matching itself is performed through the shared
+                    # selector normalizer. If a LaTeX font wrapper hides the
+                    # raw regex anchor (for example ``\\mathbb{\\chi}_1``),
+                    # use the underlying scientific command only to locate a
+                    # display window around the already-normalized match.
+                    normalized_label = cls._normalize_selector(wanted_label)
+                    if normalized_label in {"chi1", "chi2", "alphal"}:
+                        symbol_match = re.search(
+                            r"(?:\\(?:chi|alpha)|[χα]|\b(?:chi|alpha)\b)",
+                            text,
+                            re.IGNORECASE,
+                        )
+                        if symbol_match:
+                            positions.append(symbol_match.start())
                 break
         if not positions:
             return text[:max_chars]
@@ -1736,7 +1782,34 @@ class QueryService:
         if last_anchor >= end:
             end = min(len(text), last_anchor + 240)
             start = max(0, end - max_chars)
+        # Never end a scientific anchor excerpt on a half line; the exact
+        # retrieval tokenizer remains the prompt-size gate.
+        next_newline = text.find("\n", end)
+        if next_newline != -1:
+            end = next_newline
         return text[start:end].strip()
+
+    @staticmethod
+    def _snippet_to_complete_line(source: str, snippet: str) -> str:
+        """Extend a character-bounded window so it ends on a complete line.
+
+        The exact retrieval tokenizer remains the prompt-size gate; character
+        windows only bound display excerpts.  Ending on a complete line keeps a
+        table row or citation sentence intact so required anchors are never cut
+        at an arbitrary character boundary.  When no line break follows within
+        a bounded distance the window is returned unchanged so a prose-only
+        source never expands without limit.
+        """
+        if not snippet or not source:
+            return snippet
+        start = source.find(snippet)
+        if start < 0:
+            return snippet
+        end = start + len(snippet)
+        next_newline = source.find("\n", end)
+        if next_newline == -1 or next_newline - end > max(512, len(snippet)):
+            return snippet
+        return source[start:next_newline]
 
     @classmethod
     def _scientific_anchor_labels_in_text(cls, text: str) -> list[str]:
@@ -1757,7 +1830,12 @@ class QueryService:
                     matched = label_key in evidence_key
             key = cls._normalize_selector(label)
             if matched and key and key not in seen:
-                labels.append("\u03c71" if key == "chi1" else label)
+                if key == "chi1":
+                    labels.append("\u03c71")
+                elif key == "chi2":
+                    labels.append("\u03c72")
+                else:
+                    labels.append(label)
                 seen.add(key)
         return labels
 
@@ -1882,6 +1960,7 @@ class QueryService:
             score = 3.0 + len(matched_terms) * 1.5
             if any(self._is_scientific_profile_term_key(self._normalize_selector(term)) for term in matched_terms):
                 score = 28.0 + len(matched_terms) * 3.0 + min(len(query_terms & self._tokenize(chunk.text)), 5)
+            identifiers = self._canonical_chunk_identifiers(chunk)
             scored.append(
                 RetrievedContext(
                     citation=Citation(
@@ -1890,9 +1969,14 @@ class QueryService:
                         **source_page_fields.get(chunk.document_id, {}),
                         score=score,
                         page_label=chunk.page_label,
-                        excerpt=excerpt[:280],
+                        excerpt=chunk.text,
+                        parse_version=chunk.parse_version,
+                        parent_chunk_id=chunk.parent_chunk_id,
+                        block_type=chunk.block_type,
+                        source_spans=list(chunk.source_spans or []),
+                        **identifiers,
                 ),
-                prompt_text=excerpt,
+                prompt_text=chunk.text,
                 score=score,
                 evidence_kind="profile-term",
             )
@@ -2270,6 +2354,29 @@ class QueryService:
         for siblings in chunks_by_table.values():
             siblings.sort(key=lambda item: (item.ordinal, item.id))
 
+        explicit_table_terms = [
+            self._normalize_selector(anchor)
+            for anchor in self._query_priority_anchors(question)["figure_table"]
+            if self._normalize_selector(anchor)
+        ]
+
+        # Match additional tables against the complete table group rather than
+        # a single Child.  A semantic table split may put the row label and its
+        # metric header in different Children; requiring both terms in one
+        # Child would incorrectly discard the table even though the canonical
+        # table is complete when assembled by ``table_id``.
+        grouped_table_matches: dict[tuple[str, str, str], bool] = {}
+        for key, siblings in chunks_by_table.items():
+            group_text = "\n".join(sibling.text for sibling in siblings if sibling.text)
+            explicit_match = bool(
+                explicit_table_terms
+                and any(term in self._normalize_selector(group_text) for term in explicit_table_terms)
+            )
+            grouped_table_matches[key] = explicit_match or self._table_group_matches_query(
+                question,
+                group_text,
+            )
+
         expanded: list[tuple[DocumentChunk, float, str | None]] = []
         seen_ids: set[str] = set()
 
@@ -2307,26 +2414,20 @@ class QueryService:
         # the top vector hits.  Include matching Children from the same mapped
         # documents, but never pull an unrelated table merely because it shares
         # a page or parent.
-        explicit_table_terms = [
-            self._normalize_selector(anchor)
-            for anchor in self._query_priority_anchors(question)["figure_table"]
-            if self._normalize_selector(anchor)
-        ]
         max_score = max(score for _chunk, score, _kind in table_hits)
-        for chunk in table_chunks:
-            if chunk.id in seen_ids:
+        for key, siblings in sorted(
+            chunks_by_table.items(),
+            key=lambda item: (
+                not grouped_table_matches.get(item[0], False),
+                item[0],
+            ),
+        ):
+            if not grouped_table_matches.get(key, False):
                 continue
-            table_id = self._canonical_chunk_identifiers(chunk).get("table_id")
-            if not table_id:
-                continue
-            text_key = self._normalize_selector(chunk.text)
-            explicit_match = bool(
-                explicit_table_terms
-                and any(term in text_key for term in explicit_table_terms)
-            )
-            if not explicit_match and not self._table_block_matches_query(question, chunk.text):
-                continue
-            append(chunk, max_score - 0.5, "table")
+            for sibling in siblings:
+                if sibling.id in seen_ids:
+                    continue
+                append(sibling, max_score - 0.5, "table")
 
         return expanded
 
@@ -2840,6 +2941,86 @@ class QueryService:
         block_terms = cls._tokenize(block)
         return len(query_terms & block_terms) >= 2
 
+    @classmethod
+    def _table_group_matches_query(cls, question: str, group: str) -> bool:
+        """Match a table using one entity anchor and one metric family.
+
+        ``_table_block_matches_query`` intentionally ignores broad metric words
+        such as RMSE.  That is useful for ordinary row filtering, but it would
+        reject a complete table whose only entity anchor is ``binding`` and
+        whose second signal is the requested RMSE metric.  At table-group
+        scope, pairing the metric family with a concrete entity is safe and
+        keeps unrelated OPLS tables out of the reserved top slots.
+        """
+        base_match = cls._table_block_matches_query(question, group)
+        specific_terms = [
+            term
+            for term in [
+                *cls._question_row_selectors(question),
+                *cls._extract_generic_table_terms(question),
+            ]
+            if cls._is_specific_table_anchor(term)
+        ]
+        normalized_question = cls._normalize_selector(question)
+        normalized_group = cls._normalize_selector(group)
+        metric_hits: list[str] = []
+        if "hfe" in normalized_question and (
+            "hfe" in normalized_group
+            or ("hydration" in normalized_group and "free" in normalized_group)
+        ):
+            metric_hits.append("hfe")
+        if "pka" in normalized_question and "pka" in normalized_group:
+            metric_hits.append("pka")
+        if "rmse" in normalized_question and (
+            "rmse" in normalized_group or "rootmeansquare" in normalized_group
+        ):
+            metric_hits.append("rmse")
+        if "hvap" in normalized_question and (
+            "hvap" in normalized_group
+            or "vaporizationenthalpy" in normalized_group
+        ):
+            metric_hits.append("hvap")
+        metric_words = {"hfe", "pka", "rmse", "hvap", "shift"}
+        entity_match = any(
+            cls._normalize_selector(term) not in metric_words
+            and cls._selector_matches_text(term, group, normalized_group)
+            for term in specific_terms
+        )
+        if len(
+            {
+                cls._normalize_selector(term)
+                for term in specific_terms
+                if cls._selector_matches_text(term, group, normalized_group)
+            }
+        ) >= 2:
+            return True
+        if base_match:
+            return bool(metric_hits or entity_match)
+
+        # Some canonical tables spell an acronym out in the caption/header
+        # (for example, “hydration free energies” rather than “HFE”).  Treat
+        # that stable domain phrase as the metric anchor; requiring the phrase
+        # keeps this fallback narrower than accepting a bare acronym anywhere
+        # in an unrelated table.
+        metric_phrase_match = (
+            "hfe" in metric_hits
+            and "hydration" in normalized_group
+            and "free" in normalized_group
+        ) or (
+            "pka" in metric_hits
+            and "pka" in normalized_group
+        ) or (
+            "rmse" in metric_hits
+            and "binding" in normalized_group
+        ) or (
+            "hvap" in metric_hits
+            and (
+                "vaporization" in normalized_group
+                or "enthalpy" in normalized_group
+            )
+        )
+        return bool(metric_phrase_match or (metric_hits and entity_match))
+
     # ------------------------------------------------------------------
     # evidence relevance — guard against answering from irrelevant sources
     # ------------------------------------------------------------------
@@ -2979,7 +3160,7 @@ class QueryService:
             fallback_text = "\n".join(
                 [
                     "## 回答",
-                    "[?????LLM ???????????????????????????]",
+                    "[系统提示：LLM 生成暂时失败，以下为原始检索证据，仅供参考]",
                     "",
                     context_text[:1400],
                 ]
@@ -3038,10 +3219,23 @@ class QueryService:
                 if original_timeout is not None:
                     self.ollama.timeout = original_timeout
 
-        return safe_model_call(
-            lambda: generate_with_query_timeout(),
-            fallback,
-        )
+        def generate_with_query_retries() -> QueryAnswerPayload:
+            """Retry transient Ollama failures twice before returning fallback."""
+            for attempt in range(3):
+                try:
+                    return generate_with_query_timeout()
+                except Exception as exc:  # noqa: BLE001
+                    if attempt >= 2 or not _is_retryable_error(exc):
+                        raise
+                    logger.warning(
+                        "Transient RAG draft generation failure; retrying (%d/2): %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    time.sleep(5)
+            raise RuntimeError("unreachable RAG draft retry state")
+
+        return safe_model_call(generate_with_query_retries, fallback)
 
     def _build_answer_constraints(self, question: str, contexts: list[RetrievedContext]) -> str:
         """Build guardrail instructions based on the question type."""
@@ -3240,12 +3434,13 @@ class QueryService:
             for label in anchor_hits:
                 query_terms.update(self._tokenize(label))
                 query_terms.add(self._normalize_selector(label))
-            snippet = self._window_text(
+            window = self._window_text(
                 evidence,
                 query_terms,
                 max_chars=90 if self._is_chinese_question(question) else 520,
                 question=question,
-            ).strip()
+            )
+            snippet = self._snippet_to_complete_line(evidence, window).strip()
             snippet = re.sub(r"\bnot present\b", "absent", snippet, flags=re.IGNORECASE)
             if not snippet:
                 continue
@@ -3345,13 +3540,36 @@ class QueryService:
         extracted_metrics = self._extract_requested_metric_values(question, contexts, table_indexes)
         answer_missing = self._answer_claims_table_data_missing(answer_payload.answer_markdown)
         answer_lacks_metrics = self._answer_lacks_requested_metrics(question, answer_payload.answer_markdown, extracted_metrics)
+        draft_unsupported_numbers = self._unsupported_answer_numbers(
+            answer_payload.answer_markdown,
+            contexts,
+            table_indexes,
+            # The initial draft must clear the same strict gate as the repaired
+            # answer below.  A number present only in a profile/narrative
+            # context must not survive merely because the draft already
+            # contains every requested metric.
+            strict=True,
+        )
         if not answer_missing and not answer_lacks_metrics:
+            if draft_unsupported_numbers:
+                # The draft is complete but carries a number that only exists
+                # in a non-cited profile/narrative context.  Fall back to the
+                # deterministic table answer so no unsupported number is ever
+                # emitted.
+                return self._deterministic_table_answer(question, contexts, table_indexes, answer_payload.risk_level)
             return answer_payload
 
+        selected_indexes = table_indexes[:4]
         prompt_sections: list[str] = []
         if index_context and not table_indexes:
             prompt_sections.append("Index overview:\n" + index_context)
-        prompt_sections.extend(f"[{index}] {self._prompt_context_text(question, contexts[index])}" for index in table_indexes[:4])
+        prompt_sections.extend(f"[{index}] {self._prompt_context_text(question, contexts[index])}" for index in selected_indexes)
+        facts_text = self._canonical_table_facts_text(contexts, selected_indexes)
+        if facts_text:
+            prompt_sections.append(
+                "Canonical fact inventory — the only verbatim values the model may report "
+                "(table_id, row_label, column, value):\n" + facts_text
+            )
         context_text = "\n\n".join(prompt_sections)
         fallback = self._deterministic_table_answer(question, contexts, table_indexes, answer_payload.risk_level)
         prompt = "\n\n".join(
@@ -3364,7 +3582,7 @@ class QueryService:
                     "Do not say the values are absent unless none of the requested table/dataset/metric values appear below. "
                     "Return citation indexes exactly as shown in square brackets."
                 ),
-                self._build_answer_constraints(question, [contexts[index] for index in table_indexes[:4]]),
+                self._build_answer_constraints(question, [contexts[index] for index in selected_indexes]),
                 context_text,
             ]
         )
@@ -3377,11 +3595,56 @@ class QueryService:
             fallback,
         )
         repaired.answer_markdown = self._normalize_answer_citation_markup(repaired.answer_markdown)
-        repaired.citations = [index for index in repaired.citations if index in table_indexes] or table_indexes[:2]
+        repaired.citations = [index for index in repaired.citations if index in table_indexes]
         repaired_lacks_metrics = self._answer_lacks_requested_metrics(question, repaired.answer_markdown, extracted_metrics)
-        if self._answer_claims_table_data_missing(repaired.answer_markdown) or repaired_lacks_metrics:
+        unsupported_numbers = self._unsupported_answer_numbers(
+            repaired.answer_markdown,
+            contexts,
+            repaired.citations,
+            # Table repair must validate against the selected/cited table
+            # evidence only; a profile-term context elsewhere must not make an
+            # otherwise unsupported table number pass.
+            strict=True,
+        )
+        if (
+            self._answer_claims_table_data_missing(repaired.answer_markdown)
+            or repaired_lacks_metrics
+            or bool(unsupported_numbers)
+            or not repaired.citations
+        ):
             return fallback
         return repaired
+
+    @staticmethod
+    def _canonical_table_facts_text(
+        contexts: list[RetrievedContext],
+        table_indexes: list[int],
+        limit: int = REPAIR_TABLE_FACT_INVENTORY_LIMIT,
+    ) -> str:
+        """Deterministic, bounded inventory of the selected tables' canonical facts.
+
+        Each fact is emitted verbatim from ``TableFact`` (table_id, row_label,
+        column, value), so the repair model can only ever report values already
+        present in the selected evidence.  Facts come exclusively from the
+        selected contexts' ``table_facts``; unrelated contexts or other parse
+        versions are never consulted.
+        """
+        facts: list[str] = []
+        for index in table_indexes:
+            if index < 0 or index >= len(contexts):
+                continue
+            for fact in contexts[index].table_facts:
+                facts.append(
+                    "- table_id={table_id}, row_label={row_label}, column={column}, value={value}".format(
+                        table_id=fact.table_id or "unknown",
+                        row_label=fact.row_label or "",
+                        column=fact.column or "",
+                        value=fact.value or "",
+                    )
+                )
+                if len(facts) >= limit:
+                    return "\n".join(facts)
+        return "\n".join(facts)
 
     def _supported_citation_indexes(self, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
         if not contexts:
@@ -3474,13 +3737,48 @@ class QueryService:
                 score += 3.0
             scored.append((score, index))
         canonical_table_context = any(
-            context.citation.block_type == "table"
-            and context.citation.parse_version not in {None, "legacy"}
+            contexts[index].citation.block_type == "table"
+            and contexts[index].citation.parse_version not in {None, "legacy"}
             for _score, index in scored
             if 0 <= index < len(contexts)
         )
         limit = CANONICAL_TABLE_CONTEXT_LIMIT if canonical_table_context else 5
-        return [index for _, index in sorted(scored, reverse=True)[:limit]]
+        # 按 canonical table identity 分组，避免单个高分表挤掉其他请求表的所有行
+        # （opls5 Table 7 回归中，低分行全部落在旧的全局 top-24 截断之外）。
+        # table_id 只在文档内唯一；跨论文比较时，document_id 和 parse_version
+        # 也属于表格身份。每张表保留得分最高的 chunk；canonical 表格 chunk
+        # 携带完整 table_facts，因此一个 chunk 足以让
+        # `_extract_requested_metric_values` 恢复该表的全部行。剩余名额按全局
+        # 分数降序填充，保证第一个 citation 仍然是全局最高分 chunk。
+        best_per_table: dict[tuple[str, str, str], tuple[float, int]] = {}
+        for score, index in scored:
+            citation = contexts[index].citation
+            table_id = citation.table_id
+            if table_id:
+                group_key = (
+                    str(citation.document_id or ""),
+                    str(citation.parse_version or ""),
+                    str(table_id),
+                )
+            else:
+                group_key = ("", "", f"__no_table_id__{index}")
+            previous = best_per_table.get(group_key)
+            if previous is None or score > previous[0]:
+                best_per_table[group_key] = (score, index)
+        guaranteed = sorted(
+            best_per_table.values(), key=lambda item: item[0], reverse=True
+        )[:limit]
+        selected_set = {index for _score, index in guaranteed}
+        remaining = [
+            (score, index)
+            for score, index in scored
+            if index not in selected_set
+        ]
+        for score, index in sorted(remaining, reverse=True):
+            if len(guaranteed) >= limit:
+                break
+            guaranteed.append((score, index))
+        return [index for _score, index in guaranteed]
 
     @staticmethod
     def _context_has_table_data(text: str) -> bool:
@@ -3661,26 +3959,63 @@ class QueryService:
     ) -> QueryAnswerPayload | None:
         citations: list[int] = []
         parts: list[str] = []
-        rows_by_context: list[tuple[int, str, list[dict[str, str]]]] = []
+        # A canonical table is retrieved through several row-level contexts
+        # that carry the same assembled facts.  Group rows by the canonical
+        # table identity so duplicate contexts collapse into one row set;
+        # otherwise the same answer row repeats once per context and consumes
+        # the bounded row budget before later requested rows are reached.
+        groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+        group_labels: dict[tuple[str, str, str], str] = {}
+        seen_row_keys: dict[tuple[str, str, str], set[str]] = {}
         for index in table_indexes:
             text = self._context_table_evidence_text(contexts[index])
-            rows = self._generic_table_value_rows(question, text)
+            identity = self._table_context_identity(contexts[index])
+            if identity is None:
+                # Legacy text tables have no stable canonical table identity.
+                # Group by a content digest of the table evidence so
+                # byte-identical duplicate contexts of one legacy table
+                # collapse into a single row group (the exact-duplicate budget
+                # gap).  The digest is deliberately conservative: contexts
+                # whose captions/headers/content differ never merge, and when a
+                # legacy table's identity is ambiguous the contexts stay
+                # separate groups.
+                identity = ("legacy", self._legacy_table_content_key(text), "")
+            rows = self._generic_table_value_rows(
+                question,
+                text,
+                table_context=contexts[index].table_context,
+                table_facts=contexts[index].table_facts,
+                table_identity=identity,
+            )
             if not rows:
                 continue
             if index not in citations:
                 citations.append(index)
-            table_label = self._extract_table_label(text)
-            rows_by_context.append((index, table_label, rows))
-            continue
-        if rows_by_context:
+            group_labels.setdefault(identity, self._extract_table_label(text))
+            seen = seen_row_keys.setdefault(identity, set())
+            group_rows = groups.setdefault(identity, [])
+            for row in rows:
+                row_key = row.get("row_key") or self._content_row_key(row)
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+                group_rows.append(row)
+        if groups:
+            # Keep enough complete rows for long comparison tables.  The
+            # previous eight-row round-robin cap was small enough that a
+            # requested value near the tail of Table 7 disappeared whenever
+            # several sibling tables were retrieved together.  Canonical
+            # rows are already identity-deduplicated above, so this larger
+            # bounded inventory trades a small amount of answer length for
+            # deterministic coverage of every requested table.
             selected_rows: list[tuple[str, dict[str, str]]] = []
             row_offset = 0
-            while len(selected_rows) < 8:
+            while len(selected_rows) < 32:
                 added = False
-                for _index, table_label, rows in rows_by_context:
-                    if row_offset >= len(rows) or len(selected_rows) >= 8:
+                for identity, rows in groups.items():
+                    if row_offset >= len(rows) or len(selected_rows) >= 32:
                         continue
-                    selected_rows.append((table_label, rows[row_offset]))
+                    selected_rows.append((group_labels[identity], rows[row_offset]))
                     added = True
                 if not added:
                     break
@@ -3717,22 +4052,96 @@ class QueryService:
 
     @classmethod
     def _salient_table_header_terms(cls, contexts: list[RetrievedContext], citations: list[int], question: str = "") -> list[str]:
-        text = " ".join(cls._context_table_evidence_text(contexts[index])[:1200] for index in citations if 0 <= index < len(contexts))
-        normalized = normalize_table_text(text)
+        table_text = " ".join(cls._context_table_evidence_text(contexts[index])[:1200] for index in citations if 0 <= index < len(contexts))
+        # The assembled ``TableContext.markdown`` re-serialises headers after
+        # LaTeX cleanup, so a ``$\\theta _ { 0 }$`` header can arrive there as a
+        # bare ``0``.  The raw context evidence (``prompt_text``) still holds
+        # the original LaTeX, so search it as well for Greek/label surfaces.
+        raw_text = " ".join(cls._context_evidence_text(contexts[index])[:1200] for index in citations if 0 <= index < len(contexts))
+        normalized = normalize_table_text(table_text)
+        normalized_raw = normalize_table_text(raw_text)
         terms: list[str] = []
         normalized_key = cls._normalize_selector(normalized)
         for term in [*cls._scientific_identifier_selectors(question), *cls._extract_generic_table_terms(question)]:
             key = cls._normalize_selector(term)
             if len(key) >= 3 and key in normalized_key and term not in terms:
                 terms.append(term)
-        if re.search(r"(?:χ|chi)\s*1\b", normalized, re.IGNORECASE):
+        if re.search(r"(?:χ|chi)\s*1\b", normalized + " " + normalized_raw, re.IGNORECASE):
             terms.append("χ1")
-        if re.search(r"(?:χ|chi)\s*2\b", normalized, re.IGNORECASE):
+        if re.search(r"(?:χ|chi)\s*2\b", normalized + " " + normalized_raw, re.IGNORECASE):
             terms.append("χ2")
+        # A LaTeX ``$\\theta _ { 0 }$`` header often collapses to a bare ``0``
+        # by the time it reaches the facts, so the human-readable theta label
+        # has to be recovered from the raw table text itself.  The double-
+        # backslash OCR form survives in the raw text as ``\\theta`` even
+        # though normalization strips it, so search the raw text for the
+        # literal ``theta``/``θ`` surface as well as the normalized forms.
+        theta_surface = bool(
+            re.search(r"(?:θ|theta)", raw_text, re.IGNORECASE)
+            or re.search(r"(?:θ|theta)\s*0?(?:\b|[^a-z0-9])", normalized + " " + normalized_raw, re.IGNORECASE)
+        )
+        if theta_surface and "theta0" not in terms:
+            terms.append("theta0")
         return terms
 
     @classmethod
-    def _generic_table_value_rows(cls, question: str, table_text: str) -> list[dict[str, str]]:
+    def _generic_table_value_rows(
+        cls,
+        question: str,
+        table_text: str,
+        *,
+        table_context: TableContext | None = None,
+        table_facts: tuple[TableFact, ...] = (),
+        table_identity: tuple[str, str, str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Return question-relevant complete table value rows.
+
+        Structured canonical data takes precedence: deterministic
+        ``TableFact`` entries select question-relevant complete rows first,
+        then the complete ``TableContext`` rows are scanned directly.  Neither
+        path applies a character-window excerpt, so a fact in a long table's
+        final row is never lost to a 2400-style slice.  Callers passing
+        Markdown text keep the historical excerpt-bounded text path.
+
+        When both a deterministic fact set and a complete ``TableContext`` are
+        available, the complete-row scan supplements the fact rows.  A
+        property row whose LaTeX label defeats the question-term matcher (for
+        example a double-backslash ``\\gamma ( mN m^-1 )`` surface-tension row)
+        can still carry the requested model-column values; the cell scan makes
+        those complete rows reach the deterministic answer instead of hiding
+        behind the subset of rows ``extract_table_facts`` selected.
+
+        ``table_identity`` carries the canonical table identity so a
+        citation-only context (no assembled ``TableContext``) still emits the
+        same identity-prefixed row keys as the full-table path, letting both
+        representations of one canonical table deduplicate against each other.
+        """
+        facts_rows: list[dict[str, str]] = []
+        cell_rows: list[dict[str, str]] = []
+        if table_facts:
+            facts_rows = cls._generic_table_fact_value_rows(question, table_facts, table_text)
+        if table_context is not None and table_context.headers and table_context.rows:
+            headers = list(table_context.headers)
+            cell_rows = cls._generic_table_cell_value_rows(
+                question,
+                headers,
+                [
+                    [str(row.get(header) or "").strip() for header in headers]
+                    for row in table_context.rows
+                ],
+                table_text,
+                table_identity=(
+                    table_context.document_id,
+                    table_context.parse_version,
+                    table_context.table_id,
+                ),
+            )
+        if facts_rows and cell_rows:
+            return cls._merge_table_value_rows(facts_rows, cell_rows)
+        if facts_rows:
+            return facts_rows
+        if cell_rows:
+            return cell_rows
         excerpt = cls._table_block_excerpt(table_text, question, max_chars=2400)
         table_lines = [line for line in normalize_table_text(excerpt).splitlines() if cls._is_table_line(line)]
         if not table_lines:
@@ -3743,13 +4152,159 @@ class QueryService:
         if not header_rows or not data_lines:
             return []
         headers = cls._compose_display_headers(header_rows)
+        cell_rows = [cls._markdown_table_line_cells(line) for line in data_lines]
+        return cls._generic_table_cell_value_rows(
+            question, headers, cell_rows, table_text, table_identity=table_identity
+        )
+
+    @classmethod
+    def _merge_table_value_rows(
+        cls,
+        facts_rows: list[dict[str, str]],
+        cell_rows: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """Merge deterministic fact rows with complete-row scan rows.
+
+        Fact rows are authoritative for the rows they cover; the complete-row
+        scan only adds rows whose canonical ``row_key`` the facts path did not
+        already produce.  Both representations of one canonical table emit the
+        same identity-prefixed row key, so a row never appears twice.
+        """
+        merged: list[dict[str, str]] = list(facts_rows)
+        seen_keys = {row.get("row_key") for row in merged}
+        for row in cell_rows:
+            row_key = row.get("row_key")
+            if row_key and row_key in seen_keys:
+                continue
+            seen_keys.add(row_key)
+            merged.append(row)
+        return merged
+
+    @classmethod
+    def _generic_table_fact_value_rows(
+        cls,
+        question: str,
+        table_facts: tuple[TableFact, ...],
+        table_text: str,
+    ) -> list[dict[str, str]]:
+        """Build complete value rows from deterministic table facts.
+
+        ``extract_table_facts`` already selects question-relevant rows and
+        columns from the complete canonical table, so facts-based rows never
+        rely on a character-window excerpt and a tail-row fact stays
+        discoverable.  Score-0 fallback rows are gated by the same
+        question/table-anchor rule the text/cell path uses, so an unrelated
+        co-retrieved canonical table cannot leak rows or citations into a
+        deterministic answer.
+        """
+        grouped: dict[tuple[int, str], dict[str, str]] = {}
+        for fact in table_facts:
+            key = (fact.row_index, fact.row_label or "Table row")
+            grouped.setdefault(key, {})[fact.column] = fact.value
+        if not grouped:
+            return []
+        identity = (
+            table_facts[0].document_id,
+            table_facts[0].parse_version,
+            table_facts[0].table_id,
+        )
+        value_rows: list[dict[str, str]] = []
+        fallback_value_rows: list[dict[str, str]] = []
+        for ordinal, ((row_index, row_label), values) in enumerate(sorted(grouped.items())):
+            if not values:
+                continue
+            values_text = ", ".join(f"{column} {value}" for column, value in values.items())
+            score = cls._generic_table_row_relevance(question, row_label, "")
+            row_payload = {
+                "group": row_label,
+                "property": "",
+                "values": values_text,
+                "score": str(score),
+                "ordinal": str(ordinal),
+                "row_key": cls._canonical_row_key(
+                    identity, row_index, cls._row_key_label(row_label), "", values
+                ),
+            }
+            if score > 0:
+                value_rows.append(row_payload)
+            elif len(fallback_value_rows) < 32:
+                fallback_value_rows.append({**row_payload, "score": "0.1"})
+        value_rows = cls._apply_fallback_value_rows(question, table_text, value_rows, fallback_value_rows)
+        value_rows.sort(key=lambda row: (float(row.get("score") or 0), -float(row.get("ordinal") or 0)), reverse=True)
+        return value_rows
+
+    @classmethod
+    def _apply_fallback_value_rows(
+        cls,
+        question: str,
+        table_text: str,
+        value_rows: list[dict[str, str]],
+        fallback_value_rows: list[dict[str, str]],
+        headers: Sequence[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Boundedly supplement scored rows with the table's fallback rows.
+
+        The score-0 fallback rows of a model-column property table stay
+        relevant: a property row whose LaTeX label defeated the question-term
+        matcher (for example a double-backslash surface-tension label) still
+        carries the requested model-column values.  Rows already produced by
+        the scored path are never duplicated, and the supplement only fires
+        when the table's columns actually name the requested subject.  A
+        question that names one specific row must not pull in every sibling
+        row, so non-subject-column tables keep the historical behavior
+        (fallback rows are used only when nothing scored above zero).
+        """
+        if not cls._table_allows_fallback_rows(question, table_text):
+            return value_rows
+        if not value_rows:
+            return fallback_value_rows
+        if not cls._table_headers_name_question_subject(question, list(headers or [])):
+            return value_rows
+        seen_keys = {row.get("row_key") for row in value_rows}
+        for row in fallback_value_rows:
+            if row.get("row_key") not in seen_keys:
+                value_rows.append(row)
+                seen_keys.add(row.get("row_key"))
+        return value_rows
+
+    @classmethod
+    def _table_headers_name_question_subject(cls, question: str, headers: list[str]) -> bool:
+        """Whether the table's column headers name the question's subject.
+
+        Water-model tables carry TIP3P/TIP4P-D (or OPLS4/OPLS5) as columns and
+        list physical properties as rows, so a question naming those models is
+        asking for every property row.  A row-label table whose columns are
+        ``Model``/``F1`` does not name the subject in its headers, and a
+        question naming one specific row must not drag in its siblings.
+        """
+        if not headers:
+            return False
+        header_keys = {cls._normalize_selector(header) for header in headers if header and cls._normalize_selector(header)}
+        for term in [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question)]:
+            key = cls._normalize_selector(term)
+            if len(key) >= 3 and key in header_keys:
+                return True
+        return False
+
+    @classmethod
+    def _generic_table_cell_value_rows(
+        cls,
+        question: str,
+        headers: list[str],
+        cell_rows: list[list[str]],
+        table_text: str,
+        *,
+        table_identity: tuple[str, str, str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Score complete table cell rows against the question selectors."""
+        if not headers or not cell_rows:
+            return []
         selected_columns = cls._selected_table_value_columns(question, headers)
         include_all_numeric_columns = cls._is_comparison_or_difference_query(question)
         value_rows: list[dict[str, str]] = []
         fallback_value_rows: list[dict[str, str]] = []
         current_group = ""
-        for ordinal, line in enumerate(data_lines):
-            cells = cls._markdown_table_line_cells(line)
+        for ordinal, cells in enumerate(cell_rows):
             if not cells or cls._is_markdown_separator_row(cells):
                 continue
             padded = cells + [""] * max(0, len(headers) - len(cells))
@@ -3771,29 +4326,148 @@ class QueryService:
             if not columns:
                 columns = numeric_columns
             property_cell = padded[1].strip() if len(padded) > 1 else ""
+            values_dict: dict[str, str] = {}
             values: list[str] = []
             for column in columns:
                 header = headers[column] if column < len(headers) else f"Column {column + 1}"
                 value = padded[column].strip()
                 if header and value:
+                    values_dict[header] = value
                     values.append(f"{header} {value}")
             if values:
                 score = cls._generic_table_row_relevance(question, current_group or first_cell, property_cell)
+                property_value = property_cell if not re.search(r"\d+(?:\.\d+)?", property_cell) else ""
+                values_text = ", ".join(values)
                 row_payload = {
                     "group": current_group or first_cell,
-                    "property": property_cell if not re.search(r"\d+(?:\.\d+)?", property_cell) else "",
-                    "values": ", ".join(values),
+                    "property": property_value,
+                    "values": values_text,
                     "score": str(score),
                     "ordinal": str(ordinal),
+                    "row_key": cls._canonical_row_key(
+                        table_identity,
+                        ordinal,
+                        current_group or first_cell,
+                        property_value,
+                        values_dict,
+                    ),
                 }
                 if score > 0:
                     value_rows.append(row_payload)
-                elif len(fallback_value_rows) < 4:
+                elif len(fallback_value_rows) < 32:
                     fallback_value_rows.append({**row_payload, "score": "0.1"})
-        if not value_rows and cls._table_allows_fallback_rows(question, table_text):
-            value_rows = fallback_value_rows
+        value_rows = cls._apply_fallback_value_rows(
+            question, table_text, value_rows, fallback_value_rows, headers=headers
+        )
         value_rows.sort(key=lambda row: (float(row.get("score") or 0), -float(row.get("ordinal") or 0)), reverse=True)
         return value_rows
+
+    @staticmethod
+    def _table_context_identity(context: RetrievedContext) -> tuple[str, str, str] | None:
+        """Return the canonical table identity carried by a context, if any.
+
+        Canonical table contexts attach the complete ``TableContext``; legacy
+        text tables have no stable table identity and must not be merged
+        across row-level contexts.  The citation fallback covers canonical
+        contexts that reach the generic answer without an assembled
+        ``TableContext``.
+        """
+        table_context = context.table_context
+        if table_context is not None:
+            return (
+                str(table_context.document_id or ""),
+                str(table_context.parse_version or ""),
+                str(table_context.table_id or ""),
+            )
+        citation = context.citation
+        if (
+            citation.block_type == "table"
+            and citation.table_id
+            and citation.parse_version not in (None, "legacy")
+        ):
+            return (
+                str(citation.document_id or ""),
+                str(citation.parse_version or ""),
+                str(citation.table_id or ""),
+            )
+        return None
+
+    @staticmethod
+    def _content_row_key(row: dict[str, str]) -> str:
+        """Stable content key for rows without canonical table identity."""
+        return "|".join(
+            [
+                str(row.get("group") or ""),
+                str(row.get("property") or ""),
+                str(row.get("values") or ""),
+            ]
+        )
+
+    @staticmethod
+    def _row_key_label(row_label: str) -> str:
+        """Leading label component for a row key.
+
+        Facts carry the full forward-filled joined row label (for example
+        ``ACTR (71 aa) / 25.00 ± 1.00 ^60``) while the cell path keeps only
+        the first label column (``ACTR (71 aa)``).  The row key uses the
+        leading component so equivalent canonical rows collide across both
+        representations; the complete joined label stays in the answer row's
+        ``group`` field unchanged.
+        """
+        return (row_label or "").split(" / ", 1)[0]
+
+    @classmethod
+    def _canonical_row_key(
+        cls,
+        identity: tuple[str, str, str] | None,
+        row_position: int,
+        row_label: str,
+        property_value: str,
+        values: dict[str, str],
+    ) -> str:
+        """Stable, path-independent identity for one canonical table row.
+
+        For a canonical table the key is the table identity plus the row's
+        physical position and leading row label.  The property cell and the
+        exact column=value pairs are deliberately omitted: the facts path
+        emits only question-matched value columns with an empty property
+        component, while the cell path emits all numeric columns and keeps a
+        non-numeric property cell, so those components are not
+        representation-independent.  Position stays in the key, so repeated
+        hierarchical labels at different row positions never collapse; the
+        leading label keeps the key readable and aligns the two
+        representations.  Legacy rows without a table identity keep the
+        conservative position/label/property/value components as a fallback
+        so ambiguous rows are never merged by label alone.
+        """
+        parts = (
+            [str(identity[0]), str(identity[1]), str(identity[2])]
+            if identity
+            else []
+        )
+        if identity is None:
+            parts.extend(
+                [
+                    str(row_position),
+                    str(row_label or ""),
+                    str(property_value or ""),
+                ]
+            )
+            parts.extend(f"{column}={value}" for column, value in sorted(values.items()))
+        else:
+            parts.extend([str(row_position), str(row_label or "")])
+        return "|".join(parts)
+
+    @staticmethod
+    def _legacy_table_content_key(text: str) -> str:
+        """Stable content digest for legacy table evidence identity.
+
+        Legacy text contexts have no canonical table identity, so exact
+        duplicates are recognised by a digest of their table evidence.  The
+        digest is conservative by construction: evidence that differs in
+        caption, headers, or content never shares a key.
+        """
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     @classmethod
     def _table_allows_fallback_rows(cls, question: str, table_text: str) -> bool:
@@ -3952,41 +4626,125 @@ class QueryService:
             fact_metrics = self._table_fact_metrics(contexts[index], index)
             if fact_metrics:
                 results.extend(fact_metrics)
-                continue
             text = self._context_table_evidence_text(contexts[index])
-            table_label = self._extract_table_label(text)
-            requested = self._requested_datasets_for_table(question, text)
-            table_row_selectors = [
-                selector
-                for selector in row_selectors
-                if self._normalize_selector(selector) not in {self._normalize_selector(dataset) for dataset in requested}
-            ]
-            structured_metrics = table_metric_values(text, requested, row_selectors=table_row_selectors)
-            if structured_metrics:
-                for item in structured_metrics:
-                    values = item.get("values") or {}
-                    dataset = str(item.get("dataset") or "")
-                    if dataset and values:
-                        results.append(ExtractedMetric(index, str(item.get("table_label") or table_label or "") or None, dataset, dict(values)))
-                continue
-            parsed = self._extract_metric_values_from_markdown_table(text, index, table_label, requested, table_row_selectors)
-            if not parsed:
-                parsed = self._extract_inline_metric_values(text, index, table_label, requested)
-            results.extend(parsed)
+            # A retrieved citation can contain more than one markdown table.
+            # In particular, a canonical fact-bearing context for Table 8 may
+            # still carry a prompt/excerpt containing Table 5.  The old
+            # ``fact_metrics`` fast path skipped the whole context, and the
+            # old single-table parser fed all table rows to one header.  Split
+            # first, then parse each table independently; fact metrics remain
+            # authoritative and the later content de-duplication removes any
+            # duplicate values produced by the textual fallback.
+            table_blocks = self._markdown_table_blocks(text) or [text]
+            for table_block in table_blocks:
+                table_label = self._extract_table_label(table_block)
+                requested = self._requested_datasets_for_table(question, table_block)
+                table_row_selectors = [
+                    selector
+                    for selector in row_selectors
+                    if self._normalize_selector(selector)
+                    not in {self._normalize_selector(dataset) for dataset in requested}
+                ]
+                structured_metrics = table_metric_values(
+                    table_block,
+                    requested,
+                    row_selectors=table_row_selectors,
+                )
+                if structured_metrics:
+                    for item in structured_metrics:
+                        values = item.get("values") or {}
+                        dataset = str(item.get("dataset") or "")
+                        if dataset and values:
+                            results.append(
+                                ExtractedMetric(
+                                    index,
+                                    str(item.get("table_label") or table_label or "") or None,
+                                    dataset,
+                                    dict(values),
+                                )
+                            )
+                    continue
+                parsed = self._extract_metric_values_from_markdown_table(
+                    table_block,
+                    index,
+                    table_label,
+                    requested,
+                    table_row_selectors,
+                )
+                if not parsed:
+                    parsed = self._extract_inline_metric_values(
+                        table_block,
+                        index,
+                        table_label,
+                        requested,
+                    )
+                results.extend(parsed)
 
         requested_all = self._requested_datasets_for_contexts(question, contexts, table_indexes)
-        filtered = [item for item in results if not requested_all or item.dataset.upper() in requested_all]
+        filtered: list[ExtractedMetric] = []
+        for item in results:
+            if requested_all and item.dataset.upper() not in requested_all:
+                continue
+            if not self._extracted_metric_relevant(question, contexts[item.context_index], item):
+                continue
+            filtered.append(item)
+        # Bound metric extraction by the requested rows/tables, not by a global
+        # eight-result cutoff.  A canonical table can appear in several source
+        # documents, so identical (dataset, values) rows are deduplicated across
+        # contexts and the per-table cap keeps any one table from ballooning a
+        # later requested table out of the answer.
         ordered: list[ExtractedMetric] = []
-        seen: set[tuple[int, str, tuple[tuple[str, str], ...]]] = set()
+        seen_content: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        per_table_counts: dict[tuple[object, ...], int] = {}
         for item in filtered:
-            key = (item.context_index, item.dataset.upper(), tuple(item.values.items()))
-            if key in seen:
+            content_key = (item.dataset.upper(), tuple(item.values.items()))
+            if content_key in seen_content:
+                continue
+            seen_content.add(content_key)
+            table_key = self._metric_table_identity(
+                contexts[item.context_index],
+                item.table_label,
+                item.context_index,
+            )
+            per_table_counts[table_key] = per_table_counts.get(table_key, 0) + 1
+            if per_table_counts[table_key] > 24:
                 continue
             ordered.append(item)
-            seen.add(key)
-            if len(ordered) >= 8:
-                break
         return ordered
+
+    @staticmethod
+    def _metric_table_identity(
+        context: RetrievedContext,
+        table_label: str | None,
+        context_index: int,
+    ) -> tuple[object, ...]:
+        """Identify one physical table for metric-result budgeting.
+
+        The previous cap was keyed only by ``context_index``.  That silently
+        discarded a requested Table 5 row when the same context also carried
+        enough rows from Table 8.  Canonical identity is preferred; a label
+        distinguishes multiple legacy markdown tables living in one context.
+        """
+        table_context = context.table_context
+        label_key = QueryService._normalize_selector(table_label or "")
+        if table_context is not None:
+            return (
+                "canonical",
+                table_context.document_id,
+                table_context.parse_version,
+                table_context.table_id,
+                label_key,
+            )
+        citation = context.citation
+        if citation.block_type == "table" and citation.table_id:
+            return (
+                "citation",
+                citation.document_id,
+                citation.parse_version,
+                citation.table_id,
+                label_key,
+            )
+        return ("legacy", context_index, label_key)
 
     @staticmethod
     def _table_fact_metrics(
@@ -3997,16 +4755,177 @@ class QueryService:
 
         if not context.table_facts:
             return []
-        grouped: dict[str, dict[str, str]] = {}
+        # Group by the physical row as well as the label: hierarchical tables
+        # can repeat a child label (for example ``C36m`` under several parent
+        # systems), and grouping by label alone silently overwrites the other
+        # rows' values.  The row index keeps every distinct row visible.
+        grouped: dict[tuple[int, str], dict[str, str]] = {}
         for fact in context.table_facts:
-            row_label = fact.row_label or "Table row"
-            grouped.setdefault(row_label, {})[fact.column] = fact.value
+            row_label = fact.row_label or f"Row {fact.row_index}"
+            grouped.setdefault((fact.row_index, row_label), {})[fact.column] = fact.value
         table_label = context.table_context.label if context.table_context else None
-        return [
-            ExtractedMetric(context_index, table_label, row_label, values)
-            for row_label, values in grouped.items()
-            if values
+        rows = context.table_context.rows if context.table_context is not None else None
+        metrics: list[ExtractedMetric] = []
+        for (row_index, row_label), values in grouped.items():
+            if not values:
+                continue
+            # ``extract_table_facts`` keeps only question-anchored model
+            # columns, so a measured/reference column such as ``Exp.`` is
+            # dropped even though the question compares against it, and a
+            # metric sub-column such as ``MSE(chil = 180)`` is dropped when its
+            # header lacks a strong question signal.  Merge those complete-row
+            # cells back so the metric answer keeps the experimental baseline
+            # next to the OPLS4/OPLS5 model values and every requested metric
+            # value of the same row reaches the deterministic answer.
+            if rows is not None and 0 <= row_index < len(rows):
+                values = dict(values)
+                existing_keys = [QueryService._normalize_selector(column) for column in values]
+                for column, value in rows[row_index].items():
+                    cell = str(value or "").strip()
+                    if not cell or column in values:
+                        continue
+                    if QueryService._is_metric_reference_column(column):
+                        values[column] = cell
+                        continue
+                    if not re.search(r"\d+(?:\.\d+)?", cell):
+                        continue
+                    header_key = QueryService._normalize_selector(column)
+                    if any(
+                        existing and (existing in header_key or header_key in existing)
+                        for existing in existing_keys
+                    ):
+                        values[column] = cell
+            metrics.append(ExtractedMetric(context_index, table_label, row_label, values))
+        return metrics
+
+    @staticmethod
+    def _is_metric_reference_column(header: str) -> bool:
+        """Experimental/reference columns such as ``Exp.`` or ``Exptl``.
+
+        The metric answer is built from model columns (for example OPLS4/OPLS5)
+        that ``extract_table_facts`` selected against the question anchors.  A
+        comparison question also relies on the measured value those models are
+        checked against, so ``Exp.``/``Exptl``/``Obs.`` reference columns are
+        retained alongside them.
+        """
+        return bool(
+            re.search(
+                r"(?:^|[^a-z])(?:exp(?:tl|eriment|erimental)?|obs(?:erved)?|reference)\b",
+                str(header or ""),
+                re.IGNORECASE,
+            )
+        )
+
+    def _extracted_metric_relevant(
+        self,
+        question: str,
+        context: RetrievedContext,
+        metric: ExtractedMetric,
+    ) -> bool:
+        """Keep only metrics whose table caption or row label the question asks about.
+
+        The Chinese-facet aliases expand one subject across every co-retrieved
+        table (for example ``盐桥`` → ``acetate``/``guanidinium``), so a table
+        whose caption never establishes the requested subject can leak rows that
+        merely reuse the alias vocabulary.  A metric survives when its table
+        caption names a requested subject, or when the row label itself matches
+        a question selector (the dataset-column path).  With no subject anchors
+        the gate is a no-op, preserving legacy behavior.
+        """
+        if self._metric_table_caption_relevant(question, self._context_table_evidence_text(context)):
+            return True
+        return self._metric_row_anchor_relevant(question, metric)
+
+    @classmethod
+    def _metric_row_anchor_relevant(cls, question: str, metric: ExtractedMetric) -> bool:
+        """Whether a metric's row label matches a question selector.
+
+        Dataset-column tables (for example ``| Model | PubMedQA | BioASQ |``)
+        name the requested dataset in the row label.  Those rows are kept even
+        when the table caption itself does not restate the dataset, so the
+        generic dataset-column path is unaffected by the caption gate.
+        """
+        row_key = cls._normalize_selector(metric.dataset)
+        if not row_key:
+            return False
+        for selector in [*cls._question_row_selectors(question), *cls._scientific_identifier_selectors(question)]:
+            selector_key = cls._normalize_selector(selector)
+            if selector_key and (selector_key in row_key or row_key in selector_key):
+                return True
+        return False
+
+    @classmethod
+    def _metric_table_caption_relevant(cls, question: str, table_text: str) -> bool:
+        """Whether a table caption names a subject the question requests.
+
+        The caption (text before the first table row) must contain a specific
+        anchor from the question.  When that anchor is paired with a metric term
+        in the question (``binding RMSE``), the caption must also carry a
+        metric/error signal so an unrelated ``binding free energy`` table does
+        not leak ``binding`` rows into a ``binding RMSE`` answer.
+        """
+        caption = cls._table_caption_text(table_text)
+        if not caption:
+            return False
+        caption_key = cls._normalize_selector(caption)
+        anchors = [
+            term
+            for term in [*cls._question_row_selectors(question), *cls._extract_generic_table_terms(question)]
+            if cls._is_specific_table_anchor(term)
         ]
+        if not anchors:
+            return True
+        matched = [anchor for anchor in anchors if cls._selector_matches_text(anchor, caption, caption_key)]
+        if not matched:
+            return False
+        if any(cls._anchor_adjacent_to_metric_term(question, anchor) for anchor in matched):
+            if not cls._caption_has_metric_signal(caption):
+                return False
+        return True
+
+    @classmethod
+    def _table_caption_text(cls, table_text: str) -> str:
+        """Leading caption/prose lines before the first markdown table row."""
+        caption: list[str] = []
+        for line in normalize_table_text(table_text).splitlines():
+            stripped = line.strip()
+            if cls._is_table_line(stripped):
+                break
+            if stripped:
+                caption.append(stripped)
+        return " ".join(caption)
+
+    @staticmethod
+    def _caption_has_metric_signal(caption: str) -> bool:
+        """Whether a caption carries a metric/error concept beyond the subject."""
+        key = QueryService._normalize_selector(caption)
+        return bool(
+            re.search(
+                r"rmse|rootmeansquare|error|mse|mae|deviation|score|f1|auc|metric",
+                key,
+            )
+        )
+
+    @staticmethod
+    def _anchor_adjacent_to_metric_term(question: str, anchor: str) -> bool:
+        """Whether a subject anchor sits next to a broad metric term.
+
+        ``binding RMSE`` pairs the ``binding`` subject with the ``RMSE`` metric,
+        so a caption matching only ``binding`` without an error signal is not the
+        requested table.  ``pKa shift`` and ``GLU pKa`` have no adjacent broad
+        metric term and stay subject-only.
+        """
+        key = QueryService._normalize_selector(anchor)
+        if not key:
+            return False
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", question)
+        for index, token in enumerate(tokens):
+            if QueryService._normalize_selector(token) != key:
+                continue
+            for neighbor in (index - 1, index + 1):
+                if 0 <= neighbor < len(tokens) and QueryService._normalize_selector(tokens[neighbor]) in QueryService._TABLE_BROAD_METRIC_TERM_KEYS:
+                    return True
+        return False
 
     @classmethod
     def _requested_datasets_for_contexts(
@@ -4041,6 +4960,102 @@ class QueryService:
         # tokenizer in _fit_contexts_to_token_budget is now the sole prompt
         # size gate, so every selected context remains lossless.
         return evidence
+
+    def _reserve_requested_table_contexts(
+        self,
+        contexts: list[RetrievedContext],
+        *,
+        question: str,
+        limit: int,
+    ) -> list[RetrievedContext]:
+        """Place one representative Child from each requested table first.
+
+        Table retrieval can expand one high-scoring hit into many row Children.
+        Without a reservation, those siblings occupy the first evidence slots
+        and a lower-scoring but independently requested table is never exposed
+        to the caller's ``limit`` slice.  Matching is performed on the complete
+        table group so split header/row Children are treated as one unit.
+        """
+        groups: dict[tuple[str, str, str], list[RetrievedContext]] = {}
+        for context in contexts:
+            citation = context.citation
+            if citation.block_type != "table" or not citation.table_id:
+                continue
+            key = (
+                str(citation.document_id or ""),
+                str(citation.parse_version or ""),
+                str(citation.table_id),
+            )
+            groups.setdefault(key, []).append(context)
+        if len(groups) <= 1:
+            return []
+
+        explicit_terms = {
+            self._normalize_selector(anchor)
+            for anchor in self._query_priority_anchors(question)["figure_table"]
+            if self._normalize_selector(anchor)
+        }
+        specific_terms = [
+            term
+            for term in [
+                *self._question_row_selectors(question),
+                *self._extract_generic_table_terms(question),
+            ]
+            if self._is_specific_table_anchor(term)
+        ]
+        ranked_groups: list[tuple[float, RetrievedContext]] = []
+        for key, group in groups.items():
+            group_text = "\n".join(
+                self._context_table_evidence_text(context) for context in group
+            )
+            normalized_group = self._normalize_selector(group_text)
+            explicit_match = any(term in normalized_group for term in explicit_terms)
+            matched_specific = sum(
+                1
+                for term in specific_terms
+                if self._selector_matches_text(term, group_text, normalized_group)
+            )
+            group_match = self._table_group_matches_query(question, group_text)
+            if not explicit_match and not group_match:
+                continue
+            # Require at least two independent non-model anchors when a table
+            # label was not named explicitly; this avoids reserving generic
+            # metric tables that merely mention one common word.  The
+            # table-group matcher is allowed to satisfy this rule when a
+            # canonical caption uses a stable metric phrase (for example,
+            # “hydration free energies” for HFE).
+            if not explicit_match and matched_specific < 2 and not group_match:
+                continue
+            relevance = float(matched_specific * 10)
+            if explicit_match:
+                relevance += 100.0
+            relevance += self._rank_blocks(question, [group_text])[0][1]
+
+            representative = max(
+                group,
+                key=lambda context: (
+                    sum(
+                        1
+                        for term in specific_terms
+                        if self._selector_matches_text(
+                            term,
+                            self._context_table_evidence_text(context),
+                        )
+                    ),
+                    context.score,
+                ),
+            )
+            ranked_groups.append((relevance, representative))
+
+        ranked_groups.sort(
+            key=lambda item: (
+                item[0],
+                item[1].score,
+                item[1].citation.ordinal if hasattr(item[1].citation, "ordinal") else 0,
+            ),
+            reverse=True,
+        )
+        return [context for _score, context in ranked_groups[: min(8, limit)]]
 
     @staticmethod
     def _context_evidence_text(context: RetrievedContext) -> str:
@@ -4253,14 +5268,7 @@ class QueryService:
 
     @staticmethod
     def _normalize_selector(value: str) -> str:
-        normalized = str(value or "").lower()
-        normalized = re.sub(r"\\(?:chi|alpha|beta)", lambda match: match.group(0).lstrip("\\"), normalized)
-        normalized = (
-            normalized.replace("\u03c7", "chi")
-            .replace("\u03b1", "alpha")
-            .replace("\u03b2", "beta")
-        )
-        return re.sub(r"[^a-z0-9]+", "", normalized)
+        return normalize_scientific_selector(value)
 
     @classmethod
     def _scientific_identifier_selectors(cls, question: str) -> list[str]:
@@ -4320,6 +5328,46 @@ class QueryService:
                 continue
             rows.append(cells)
         return rows
+
+    @classmethod
+    def _markdown_table_blocks(cls, text: str) -> list[str]:
+        """Split a mixed evidence excerpt into independent markdown tables.
+
+        Retrieval excerpts commonly concatenate a caption and its table, a
+        blank line, then another caption and table.  Parsing all pipe rows as
+        one table lets the second header overwrite the first table's column
+        meaning.  Keep the non-table caption lines immediately preceding each
+        pipe-row run so labels and table identity remain available to the
+        existing parsers.
+        """
+        lines = normalize_table_text(text).splitlines()
+        blocks: list[str] = []
+        pending_caption: list[str] = []
+        current: list[str] = []
+        in_table = False
+        for raw_line in lines:
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                # Blank lines separate tables only when a following caption or
+                # non-table line arrives; they are harmless inside a block.
+                continue
+            if cls._is_table_line(stripped):
+                if not in_table:
+                    current = [*pending_caption, line]
+                    pending_caption = []
+                    in_table = True
+                else:
+                    current.append(line)
+                continue
+            if in_table:
+                blocks.append("\n".join(current).strip())
+                current = []
+                in_table = False
+            pending_caption.append(line)
+        if in_table and current:
+            blocks.append("\n".join(current).strip())
+        return [block for block in blocks if cls._markdown_table_rows(block)]
 
     @staticmethod
     def _normalize_metric_name(value: str) -> str | None:
@@ -4501,24 +5549,40 @@ class QueryService:
         return terms
 
     @classmethod
-    def _unsupported_answer_numbers(cls, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> set[str]:
+    def _unsupported_answer_numbers(
+        cls,
+        answer_markdown: str,
+        contexts: list[RetrievedContext],
+        chosen_indexes: list[int],
+        *,
+        strict: bool = False,
+    ) -> set[str]:
         numbers = cls._answer_numbers(answer_markdown)
         if not numbers:
             return set()
         evidence = "\n".join(cls._context_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
         unsupported = {number for number in numbers if not cls._number_supported_by_evidence(number, evidence)}
-        if unsupported and any(cls._context_evidence_kind(context) == "profile-term" for context in contexts):
+        if (
+            not strict
+            and unsupported
+            and any(cls._context_evidence_kind(context) == "profile-term" for context in contexts)
+        ):
             all_evidence = "\n".join(cls._context_evidence_text(context) for context in contexts)
             unsupported = {number for number in unsupported if not cls._number_supported_by_evidence(number, all_evidence)}
         return unsupported
 
     @staticmethod
     def _number_supported_by_evidence(number: str, evidence: str) -> bool:
-        if number in evidence:
+        # Boundary-aware verbatim match: "1.0" must not be treated as present
+        # just because "21.0" contains it as a substring.  Alphanumeric
+        # adjacency is rejected, while exact decimals, percentages, signed
+        # values, and ASCII/Chinese delimiters around the number still match.
+        boundary = r"(?<![A-Za-z0-9])"
+        if re.search(boundary + re.escape(number) + r"(?![A-Za-z0-9])", evidence):
             return True
         if number.isdigit() and len(number) > 1:
             spaced = r"\s*".join(re.escape(char) for char in number)
-            return bool(re.search(rf"(?<!\w){spaced}(?!\w)", evidence))
+            return bool(re.search(boundary + spaced + r"(?![A-Za-z0-9])", evidence))
         return False
 
     @staticmethod
@@ -4638,6 +5702,20 @@ class QueryService:
             if term not in priority_supported_terms:
                 priority_supported_terms.append(term)
             supported_translation_terms.add(term)
+
+        # A requested acronym is supported when the evidence spells out its
+        # full phrase instead of the acronym (IDP -> "intrinsically disordered
+        # protein", FRET -> "Förster resonance energy transfer").  Without
+        # this, the acronym would be silently dropped from a deterministic
+        # evidence answer even though the underlying term is present.
+        if re.search(r"\bIDP\b", question, re.IGNORECASE) and re.search(
+            r"\bintrinsically disordered proteins?\b", evidence, re.IGNORECASE
+        ):
+            add_priority_term("IDP")
+        if re.search(r"\bFRET\b", question, re.IGNORECASE) and re.search(
+            r"\bF[öo]rster\s+resonance\s+energy\s+transfer\b", evidence, re.IGNORECASE
+        ):
+            add_priority_term("FRET")
 
         if cls._is_parameterization_anchor_query(question):
             parameterization_required_terms = [
@@ -4931,20 +6009,60 @@ class QueryService:
         limit = 5 if has_table_evidence else 2
         kept: list[tuple[int, Citation]] = []
         seen_excerpts: set[str] = set()
+
+        def push(index: int, citation: Citation) -> None:
+            excerpt_normalized = citation.excerpt.strip()[:120]
+            if excerpt_normalized in seen_excerpts:
+                return
+            kept.append((index, citation))
+            seen_excerpts.add(excerpt_normalized)
+
+        if has_table_evidence:
+            # A canonical table is retrieved as one row Child per row, so the
+            # highest-scoring table's rows would otherwise crowd every slot in
+            # the same-source-page cap and drop a later requested table's
+            # citation.  Reserve one representative per canonical table first;
+            # the score-based fill below then tops up the remaining slots.
+            table_groups: dict[tuple[str, str, str], list[tuple[int, Citation]]] = {}
+            for index, citation in sorted_pairs:
+                if (
+                    QueryService._citation_is_table_evidence(citation)
+                    and citation.table_id
+                    and citation.parse_version not in {None, "legacy"}
+                ):
+                    key = (
+                        str(citation.document_id or ""),
+                        str(citation.parse_version),
+                        str(citation.table_id),
+                    )
+                    table_groups.setdefault(key, []).append((index, citation))
+            for _key, group in table_groups.items():
+                push(*group[0])
+                if len(kept) >= limit:
+                    return kept
+
         for index, citation in sorted_pairs:
             if len(kept) >= limit:
                 break
             if has_table_evidence and not QueryService._citation_is_table_evidence(citation) and len(kept) >= 2:
                 continue
-            excerpt_normalized = citation.excerpt.strip()[:120]
-            if excerpt_normalized in seen_excerpts:
-                continue
-            kept.append((index, citation))
-            seen_excerpts.add(excerpt_normalized)
+            push(index, citation)
         return kept
 
     @staticmethod
     def _citation_is_table_evidence(citation: Citation) -> bool:
+        # A canonical table row Child carries only its single row as
+        # ``Citation.excerpt``, so the row-count-based table-data check
+        # rejects it.  The block/table identity is the authoritative signal
+        # for canonical row Children; otherwise the same-source-page citation
+        # cap collapses to two rows and drops a later requested table's
+        # citation even though the answer still cites its values.
+        if (
+            citation.block_type == "table"
+            and citation.table_id
+            and citation.parse_version not in {None, "legacy"}
+        ):
+            return True
         return QueryService._context_has_table_data(citation.excerpt or "")
 
     def _infer_citation_indexes(self, answer_markdown: str, context_count: int) -> list[int]:
@@ -5081,21 +6199,31 @@ class QueryService:
                 or chunk.block_type == "reference"
             ):
                 continue
+            expanded_context = self._expand_child_hit(
+                chunk,
+                question=question,
+                score=context.score,
+                page_fields={
+                    key: value
+                    for key, value in {
+                        "page_slug": context.citation.page_slug,
+                        "page_title": context.citation.page_title,
+                        "page_kind": context.citation.page_kind,
+                    }.items()
+                    if value is not None
+                },
+                evidence_kind=context.evidence_kind,
+            )
+            # Finalization rehydrates the citation from the selected canonical
+            # Child so shadow-version routing and exact source spans cannot be
+            # bypassed.  Preserve structured table evidence attached before
+            # this pass; otherwise ``table_facts`` silently disappears before
+            # it reaches ``EvidencePack`` and the Agent synthesizer.
             expanded_contexts.append(
-                self._expand_child_hit(
-                    chunk,
-                    question=question,
-                    score=context.score,
-                    page_fields={
-                        key: value
-                        for key, value in {
-                            "page_slug": context.citation.page_slug,
-                            "page_title": context.citation.page_title,
-                            "page_kind": context.citation.page_kind,
-                        }.items()
-                        if value is not None
-                    },
-                    evidence_kind=context.evidence_kind,
+                replace(
+                    expanded_context,
+                    table_context=context.table_context,
+                    table_facts=context.table_facts,
                 )
             )
         table_query = self._is_table_query(question) or self._is_metric_query(question)
@@ -5153,6 +6281,23 @@ class QueryService:
             return (structure_priority, relevance, evidence_priority, context.score)
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
+        if table_query:
+            reserved_table_contexts = self._reserve_requested_table_contexts(
+                sorted_contexts,
+                question=question,
+                limit=context_limit,
+            )
+            if reserved_table_contexts:
+                reserved_ids = {
+                    context.citation.chunk_id
+                    for context in reserved_table_contexts
+                    if context.citation.chunk_id
+                }
+                sorted_contexts = reserved_table_contexts + [
+                    context
+                    for context in sorted_contexts
+                    if context.citation.chunk_id not in reserved_ids
+                ]
         deduped: list[RetrievedContext] = []
         seen_keys: set[str] = set()
         page_counts: dict[str, int] = {}
@@ -5719,7 +6864,24 @@ class QueryService:
             if line not in excerpt_lines:
                 excerpt_lines.append(line)
         excerpt = "\n".join(excerpt_lines).strip() or "\n".join(lines).strip()
-        return excerpt[:max_chars]
+        return cls._complete_line_excerpt(excerpt, max_chars)
+
+    @staticmethod
+    def _complete_line_excerpt(excerpt: str, max_chars: int) -> str:
+        """Cap a display excerpt at a complete line so it never ends on a half row.
+
+        The character limit only trims citation/display excerpts; the exact
+        retrieval tokenizer remains the sole prompt-size gate.  When the
+        character slice would cut through a line, extend through the end of
+        that complete line so a table row or citation sentence is preserved
+        intact.
+        """
+        if len(excerpt) <= max_chars:
+            return excerpt
+        boundary = excerpt.find("\n", max_chars)
+        if boundary == -1:
+            return excerpt
+        return excerpt[:boundary]
 
     @classmethod
     def _table_caption_lines(cls, lines: list[str]) -> list[str]:
@@ -5767,6 +6929,8 @@ class QueryService:
         if not selector_key:
             return False
         if selector_key in {"mu", "dipole"} and re.search(r"(?:μ|渭|\bmu\b|\bdipole\b|\(D\))", text, re.IGNORECASE):
+            return True
+        if selector_key == "gamma" and re.search(r"(?:γ|\bgamma\b|\bsurface\s+tension\b)", text, re.IGNORECASE):
             return True
         if re.fullmatch(r"[a-z][a-z0-9]*", selector_text):
             return bool(re.search(rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])", text, re.IGNORECASE))

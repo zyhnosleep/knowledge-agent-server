@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import get_settings
 from app.services import canonical_adapters
 from app.services.canonical_adapters import (
     MarkdownCanonicalAdapter,
@@ -36,6 +39,7 @@ from app.services.canonical_table_identity import (
     table_identity_fingerprint,
 )
 from app.services.parser import ParsedChunk, ParsedDocument
+from app.services.pipeline import IngestionPipeline
 
 
 def _table(
@@ -102,6 +106,52 @@ def _table(
         source_spans=[span],
         metadata={"table_number": "1", **(metadata or {})},
     )
+
+
+def test_semantic_split_checkpoint_records_completed_fidelity_audits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import semantic_chunking
+
+    canonical = CanonicalDocument(
+        document_id="doc-fidelity",
+        parser_source="test",
+        parse_version="version-fidelity",
+    )
+
+    class FakeChunker:
+        def __init__(self, _embedder) -> None:
+            pass
+
+        def build(self, loaded: CanonicalDocument):
+            assert loaded is canonical
+            return [SimpleNamespace(model_dump=lambda **_kwargs: {"local_id": "draft-1"})]
+
+    monkeypatch.setattr(semantic_chunking, "SemanticChunker", FakeChunker)
+    monkeypatch.setattr(CanonicalArtifactStore, "load", lambda *_args: canonical)
+    captured: dict[str, object] = {}
+
+    pipeline = SimpleNamespace(
+        ollama=object(),
+        validate_ingestion_identity=lambda *_args: None,
+        _write_stage_artifact=lambda _context, _filename, _payload, *, extra: captured.update(extra)
+        or dict(extra),
+    )
+    context = SimpleNamespace(
+        document=SimpleNamespace(id=canonical.document_id),
+        version=SimpleNamespace(version_key=canonical.parse_version),
+        stage="semantic_split",
+    )
+
+    result = IngestionPipeline._run_semantic_split_stage(pipeline, context)
+
+    assert result["source_fidelity_completeness"] == 1.0
+    assert result["structured_limit_completeness"] == 1.0
+    assert captured == {
+        "chunk_count": 1,
+        "source_fidelity_completeness": 1.0,
+        "structured_limit_completeness": 1.0,
+    }
 
 
 def test_valid_mineru_table_is_accepted_without_repair_request() -> None:
@@ -711,19 +761,113 @@ def test_table_chunks_honor_explicit_semantic_groups_when_they_fit() -> None:
     assert [child.metadata["row_indices"] for child in children] == [[0, 1], [2, 3]]
 
 
-def test_single_overlong_row_is_explicit_overflow_without_truncation() -> None:
+def test_single_overlong_row_is_losslessly_split_without_overflow() -> None:
     long_value = " ".join(f"token-{index}" for index in range(80))
     table = _table(rows=[["News", "Verbose", long_value]])
 
     _parent, children = StructuredEvidenceBuilder(
         token_counter=lambda text: len(text.split())
     ).table_chunks(table, max_tokens=24)
-    child = children[0]
+    long_cell_children = [
+        child
+        for child in children
+        if child.metadata.get("cell_fragment_column_index") == 2
+    ]
 
-    assert child.metadata["overflow"] is True
-    assert child.token_count > 24
-    assert long_value in child.text
-    assert child.metadata["rows"] == table.rows
+    assert len(long_cell_children) > 1
+    assert all(child.metadata["overflow"] is False for child in children)
+    assert all(child.token_count <= 24 for child in children)
+    assert "".join(
+        child.metadata["source_fragment"] for child in long_cell_children
+    ) == long_value
+    assert all(child.metadata["rows"] == table.rows for child in children)
+
+
+def test_overlong_table_row_keeps_short_footnote_in_direct_embedding_children() -> None:
+    long_value = " ".join(f"token-{index}" for index in range(80))
+    table = _table(rows=[["News", "Verbose", long_value]])
+    table.footnotes = ["* denotes statistical significance."]
+
+    _parent, children = StructuredEvidenceBuilder(
+        token_counter=lambda text: len(text.split())
+    ).table_chunks(table, max_tokens=28)
+    row_children = [
+        child for child in children if child.metadata.get("row_indices") == [0]
+    ]
+
+    assert row_children
+    assert all("Footnote: * denotes statistical significance." in child.text for child in row_children)
+    assert all(child.embedding_text == child.text for child in row_children)
+    assert all(child.token_count <= 28 for child in children)
+
+
+def test_overlong_table_footnote_gets_lossless_bounded_citation_children() -> None:
+    long_value = " ".join(f"value-{index}" for index in range(60))
+    long_footnote = " ".join(f"footnote-{index}" for index in range(70))
+    table = _table(rows=[["News", "Verbose", long_value]])
+    table.footnotes = [long_footnote]
+
+    _parent, children = StructuredEvidenceBuilder(
+        token_counter=lambda text: len(text.split())
+    ).table_chunks(table, max_tokens=24)
+    footnote_children = [
+        child for child in children if child.metadata.get("footnote_index") == 0
+    ]
+
+    assert len(footnote_children) > 1
+    assert all(child.chunk_role == "child" for child in footnote_children)
+    assert all(child.source_spans for child in footnote_children)
+    assert all(child.token_count <= 24 for child in footnote_children)
+    assert "".join(
+        child.metadata["source_fragment"] for child in footnote_children
+    ) == long_footnote
+
+
+def test_overlong_identity_cell_is_losslessly_split_without_overflow() -> None:
+    long_identity = " ".join(f"dataset-{index}" for index in range(80))
+    table = _table(rows=[[long_identity, "Proposed", "84.9%"]])
+
+    _parent, children = StructuredEvidenceBuilder(
+        token_counter=lambda text: len(text.split())
+    ).table_chunks(table, max_tokens=24)
+    identity_children = [
+        child
+        for child in children
+        if child.metadata.get("cell_fragment_column_index") == 0
+    ]
+
+    assert len(identity_children) > 1
+    assert all(child.metadata["overflow"] is False for child in children)
+    assert all(child.token_count <= 24 for child in children)
+    assert "".join(
+        child.metadata["source_fragment"] for child in identity_children
+    ) == long_identity
+
+
+def test_overlong_formula_description_is_losslessly_split_without_overflow() -> None:
+    description = " ".join(f"definition-{index}" for index in range(80))
+    formula = CanonicalFormula(
+        formula_id="formula-long-description",
+        latex="x = y + 1",
+        caption="Equation 3.",
+        description=description,
+        source_spans=[SourceSpan(page_index=2, source_block_id="formula-source")],
+    )
+    _parent, children = StructuredEvidenceBuilder(
+        token_counter=lambda text: len(text.split())
+    ).formula_chunks(formula, [], max_tokens=20)
+    description_children = [
+        child
+        for child in children
+        if child.metadata.get("source_fragment_kind") == "description"
+    ]
+
+    assert len(description_children) > 1
+    assert all(child.token_count <= 20 for child in children)
+    assert all(child.embedding_text == child.text for child in children)
+    assert "".join(
+        child.metadata["source_fragment"] for child in description_children
+    ) == description
 
 
 def test_token_count_fallback_is_conservative_for_cjk_formula_and_long_identifier() -> None:
@@ -744,9 +888,225 @@ def test_token_count_fallback_is_conservative_for_cjk_formula_and_long_identifie
     assert parent.token_count == len(parent.text.encode("utf-8"))
     assert parent.metadata["token_count_mode"] == "utf8_bytes_fallback"
     assert parent.metadata["tokenizer_name"] == "local/test-tokenizer"
-    assert children[0].metadata["overflow"] is True
-    assert children[0].token_count > 160
-    assert long_identifier in children[0].text
+    assert all(child.metadata["overflow"] is False for child in children)
+    assert all(child.token_count <= 160 for child in children)
+    assert long_identifier in "".join(
+        str(child.metadata.get("source_fragment") or "") for child in children
+    )
+
+
+def test_strict_tokenizer_loading_fails_instead_of_changing_count_mode() -> None:
+    def unavailable(_name: str):
+        raise OSError("tokenizer is not cached")
+
+    builder = StructuredEvidenceBuilder(
+        tokenizer_name="local/required-tokenizer",
+        tokenizer_loader=unavailable,
+        strict_tokenizer=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "local/required-tokenizer.*5cf2132abc99cad020ac570b19d031efec650f2b"
+            ".*local cache"
+        ),
+    ):
+        builder.estimate_tokens("must use real tokenizer tokens")
+
+    assert builder.token_count_mode == "transformers"
+
+
+def test_tokenizer_asset_hash_is_stable_and_content_addressed(tmp_path: Path) -> None:
+    from app.services.ingestion_identity import tokenizer_asset_content_hash
+
+    first = tmp_path / "tokenizer.json"
+    second = tmp_path / "tokenizer_config.json"
+    first.write_text('{"model":"qwen"}', encoding="utf-8")
+    second.write_text('{"padding_side":"left"}', encoding="utf-8")
+
+    initial = tokenizer_asset_content_hash(tmp_path)
+    assert initial == tokenizer_asset_content_hash(tmp_path)
+    assert len(initial) == 64
+
+    second.write_text('{"padding_side":"right"}', encoding="utf-8")
+    assert tokenizer_asset_content_hash(tmp_path) != initial
+
+
+def _write_local_tokenizer_identity(
+    snapshot_path: Path,
+    *,
+    name: str = "Qwen/Qwen3-Embedding-4B",
+    revision: str = "5cf2132abc99cad020ac570b19d031efec650f2b",
+    content_sha256: str | None = None,
+) -> None:
+    from app.services.ingestion_identity import tokenizer_asset_content_hash
+
+    payload = {
+        "schema_version": "knowledge-agent-tokenizer-snapshot-v1",
+        "name": name,
+        "revision": revision,
+        "content_sha256": content_sha256 or tokenizer_asset_content_hash(snapshot_path),
+    }
+    (snapshot_path / ".knowledge-agent-tokenizer-snapshot.json").write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def test_explicit_local_snapshot_requires_trusted_identity_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from app.services import ingestion_identity as identity_module
+
+    (tmp_path / "tokenizer.json").write_text('{"model":"qwen"}', encoding="utf-8")
+    monkeypatch.setattr(
+        identity_module.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: object(),
+    )
+    identity_module.resolve_local_tokenizer.cache_clear()
+
+    with pytest.raises(
+        identity_module.TokenizerUnavailableError,
+        match="identity metadata",
+    ):
+        identity_module.resolve_local_tokenizer(
+            "Qwen/Qwen3-Embedding-4B",
+            "5cf2132abc99cad020ac570b19d031efec650f2b",
+            local_path=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("revision", "content_sha256", "error"),
+    [
+        ("wrong-revision", None, "revision"),
+        ("5cf2132abc99cad020ac570b19d031efec650f2b", "b" * 64, "SHA-256"),
+    ],
+)
+def test_explicit_local_snapshot_rejects_untrusted_identity(
+    tmp_path: Path,
+    monkeypatch,
+    revision: str,
+    content_sha256: str | None,
+    error: str,
+) -> None:
+    from app.services import ingestion_identity as identity_module
+
+    (tmp_path / "tokenizer.json").write_text('{"model":"qwen"}', encoding="utf-8")
+    _write_local_tokenizer_identity(
+        tmp_path,
+        revision=revision,
+        content_sha256=content_sha256,
+    )
+    monkeypatch.setattr(
+        identity_module.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: object(),
+    )
+    identity_module.resolve_local_tokenizer.cache_clear()
+
+    with pytest.raises(identity_module.TokenizerUnavailableError, match=error):
+        identity_module.resolve_local_tokenizer(
+            "Qwen/Qwen3-Embedding-4B",
+            "5cf2132abc99cad020ac570b19d031efec650f2b",
+            local_path=tmp_path,
+        )
+
+
+def test_explicit_local_snapshot_keeps_logical_pinned_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from app.services import ingestion_identity as identity_module
+
+    (tmp_path / "tokenizer.json").write_text('{"model":"qwen"}', encoding="utf-8")
+    _write_local_tokenizer_identity(tmp_path)
+    calls: list[tuple[str, dict[str, object]]] = []
+    tokenizer = object()
+
+    def load(path: str, **kwargs):
+        calls.append((path, kwargs))
+        return tokenizer
+
+    monkeypatch.setattr(identity_module.AutoTokenizer, "from_pretrained", load)
+    identity_module.resolve_local_tokenizer.cache_clear()
+
+    resolved = identity_module.resolve_local_tokenizer(
+        "Qwen/Qwen3-Embedding-4B",
+        "5cf2132abc99cad020ac570b19d031efec650f2b",
+        local_path=tmp_path,
+    )
+
+    assert resolved.tokenizer is tokenizer
+    assert calls == [(str(tmp_path.resolve()), {"local_files_only": True})]
+    assert resolved.identity == {
+        "name": "Qwen/Qwen3-Embedding-4B",
+        "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+        "content_sha256": identity_module.tokenizer_asset_content_hash(tmp_path),
+    }
+
+
+def test_nonexistent_explicit_snapshot_fails_with_diagnostic(tmp_path: Path) -> None:
+    from app.services import ingestion_identity as identity_module
+
+    missing = tmp_path / "missing-tokenizer"
+    identity_module.resolve_local_tokenizer.cache_clear()
+
+    with pytest.raises(
+        identity_module.TokenizerUnavailableError,
+        match="Qwen/Qwen3-Embedding-4B.*revision.*local cache.*missing-tokenizer",
+    ):
+        identity_module.resolve_local_tokenizer(
+            "Qwen/Qwen3-Embedding-4B",
+            "5cf2132abc99cad020ac570b19d031efec650f2b",
+            local_path=missing,
+        )
+
+
+def test_hf_cache_resolution_is_local_only_and_diagnostic(monkeypatch) -> None:
+    from app.services import ingestion_identity as identity_module
+
+    calls: list[dict[str, object]] = []
+
+    def unavailable(**kwargs):
+        calls.append(kwargs)
+        raise OSError("pinned snapshot missing")
+
+    monkeypatch.setattr(identity_module, "snapshot_download", unavailable)
+    identity_module.resolve_local_tokenizer.cache_clear()
+
+    with pytest.raises(
+        identity_module.TokenizerUnavailableError,
+        match="5cf2132abc99cad020ac570b19d031efec650f2b.*local cache",
+    ):
+        identity_module.resolve_local_tokenizer(
+            "Qwen/Qwen3-Embedding-4B",
+            "5cf2132abc99cad020ac570b19d031efec650f2b",
+        )
+
+    assert calls == [
+        {
+            "repo_id": "Qwen/Qwen3-Embedding-4B",
+            "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+            "local_files_only": True,
+        }
+    ]
+
+
+def test_injected_counter_ignores_unavailable_configured_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings,
+        "semantic_tokenizer_local_path",
+        tmp_path / "missing-tokenizer",
+    )
+    builder = StructuredEvidenceBuilder(token_counter=lambda text: len(text.split()))
+
+    assert builder.estimate_tokens("alpha beta gamma") == 3
+    assert builder.token_count_mode == "injected_counter"
 
 
 def test_configured_tokenizer_loader_drives_real_token_boundaries() -> None:
@@ -1049,6 +1409,54 @@ def test_quality_gate_accepts_consistent_cross_page_source_segments() -> None:
     assert not any(issue.code == "table_invalid" for issue in report.issues)
 
 
+def test_all_td_cross_page_html_uses_the_same_promoted_header_grid_everywhere() -> None:
+    first = _table(
+        table_id="all-td-page-1",
+        rows=[["News", "Base", "81.2%"]],
+        page_index=0,
+    )
+    continuation = _table(
+        table_id="all-td-page-2",
+        rows=[["News", "Proposed", "84.9%"]],
+        page_index=1,
+        metadata={"continuation_of": first.table_id},
+    )
+    first.source_html = (
+        "<table><tr><td>Dataset</td><td>Method</td><td>Accuracy</td></tr>"
+        "<tr><td>News</td><td>Base</td><td>81.2%</td></tr></table>"
+    )
+    continuation.source_html = (
+        "<table><tr><td>Dataset</td><td>Method</td><td>Accuracy</td></tr>"
+        "<tr><td>News</td><td>Proposed</td><td>84.9%</td></tr></table>"
+    )
+
+    merged = StructuredEvidenceBuilder(
+        token_counter=lambda _text: 0
+    ).merge_cross_page_tables([first, continuation])[0]
+    validation = TableValidator().validate(merged)
+    document = CanonicalDocument(
+        document_id="all-td-cross-page",
+        parser_source="mineru",
+        parse_version="canonical-v1",
+        blocks=[
+            CanonicalBlock(
+                block_id="source-prose",
+                block_type="narrative",
+                text="Source evidence",
+                reading_order=0,
+                parser_source="mineru",
+            )
+        ],
+        tables=[merged],
+    )
+    report = CanonicalQualityGate().evaluate(document)
+
+    assert validation.accepted is True
+    assert "cross_page_source_html_mismatch" not in validation.reasons
+    assert report.accepted is True
+    assert not any(issue.code == "table_invalid" for issue in report.issues)
+
+
 def test_structured_finalization_recomputes_quality_score_and_fallback_for_bad_html() -> None:
     table = _table(page_index=0)
     table.source_html = (
@@ -1264,6 +1672,62 @@ def test_figure_and_formula_evidence_keep_source_and_generated_text_separate() -
     assert "DO NOT EXPOSE NESTED GENERATED DISCUSSION" not in formula_chunk.text
     assert "AI says this regularizes" in formula_chunk.embedding_text
     assert formula_chunk.metadata["provenance"]["generated_explanation"]["generated"] is True
+
+
+def test_figure_child_windowing_does_not_repeat_overlong_nearby_narrative() -> None:
+    nearby_text = " ".join(f"nearby-{index}" for index in range(100))
+    nearby = CanonicalBlock(
+        block_id="long-nearby",
+        block_type="narrative",
+        text=nearby_text,
+        reading_order=0,
+        parser_source="mineru",
+        source_spans=[SourceSpan(page_index=2, source_block_id="nearby-source")],
+    )
+    figure = CanonicalFigure(
+        figure_id="figure-short-description",
+        caption="Figure 2. Accuracy curve",
+        description="The curve rises steadily.",
+        asset_path="assets/figure-2.png",
+        nearby_block_ids=[nearby.block_id],
+        source_spans=[SourceSpan(page_index=2, source_block_id="figure-source")],
+    )
+    builder = StructuredEvidenceBuilder(token_counter=lambda text: len(text.split()))
+
+    parent, children = builder.figure_chunks(figure, [nearby], max_tokens=20)
+
+    assert nearby_text in parent.text
+    assert children
+    assert all(nearby_text not in child.text for child in children)
+    assert all(child.token_count <= 20 for child in children)
+    assert "".join(child.metadata["source_fragment"] for child in children) == figure.description
+
+
+def test_figure_child_windowing_does_not_duplicate_long_caption_in_image_alt() -> None:
+    caption = " ".join(f"caption-{index}" for index in range(12))
+    description = " ".join(f"description-{index}" for index in range(40))
+    figure = CanonicalFigure(
+        figure_id="figure-long-caption",
+        caption=caption,
+        description=description,
+        asset_path="assets/figure-with-a-long-content-hash.png",
+        source_spans=[SourceSpan(page_index=3, source_block_id="figure-source")],
+    )
+    builder = StructuredEvidenceBuilder(token_counter=lambda text: len(text.split()))
+
+    parent, children = builder.figure_chunks(figure, [], max_tokens=20)
+
+    assert caption in parent.text
+    assert children
+    assert all(child.token_count <= 20 for child in children)
+    assert "".join(child.metadata["source_fragment"] for child in children) == description
+    assert all(caption in child.text for child in children)
+    assert all(
+        "![figure-long-caption](assets/figure-with-a-long-content-hash.png)"
+        in child.text
+        for child in children
+    )
+    assert all(f"![{caption}]" not in child.text for child in children)
 
 
 def test_failed_optional_analysis_is_a_warning_not_rejection() -> None:

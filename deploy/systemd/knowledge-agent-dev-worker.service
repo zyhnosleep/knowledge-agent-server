@@ -8,6 +8,7 @@ Requires=knowledge-agent-redis.service
 Type=simple
 WorkingDirectory=%h/knowledge-agent-dev
 EnvironmentFile=%h/knowledge-agent-dev/runtime/app.env
+Environment=CUDA_VISIBLE_DEVICES=0
 Environment=PYTHONPATH=%h/knowledge-agent-dev/src
 Environment=INGESTION_WORKER_QUEUES=ingest.parse,ingest.repair,ingest.canonicalize,ingest.semantic_split,ingest.contextualize,ingest.embed,ingest.index,ingest.activate,ingest
 Environment=INGESTION_WORKER_CONCURRENCY=1

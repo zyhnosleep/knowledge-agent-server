@@ -126,6 +126,37 @@ def test_pgvector_query_joins_document_active_parse_version() -> None:
     assert "idx.parse_version" in db.sql
 
 
+def test_pgvector_query_uses_shadow_version_only_for_mapped_documents() -> None:
+    class RowsResult:
+        def all(self):
+            return []
+
+    class RecordingPostgresDatabase(_FakeDatabase):
+        def __init__(self) -> None:
+            super().__init__("postgresql")
+            self.sql = ""
+            self.parameters = {}
+
+        def execute(self, statement, parameters):
+            self.sql = str(statement)
+            self.parameters = parameters
+            return RowsResult()
+
+    db = RecordingPostgresDatabase()
+    store = PGVectorStore(db)  # type: ignore[arg-type]
+
+    assert store._search_rows(
+        [1.0, 0.0],
+        5,
+        ["d1", "d2"],
+        parse_version_map={"d1": "staged-v"},
+    ) == []
+    assert db.parameters["shadow_document_id_0"] == "d1"
+    assert db.parameters["shadow_parse_version_0"] == "staged-v"
+    assert "idx.document_id NOT IN" in db.sql
+    assert "idx.parse_version = document.active_parse_version" in db.sql
+
+
 def test_sqlite_vec_hits_include_only_the_document_active_parse_version() -> None:
     db = make_session()
     db.add(Project(id="p1", slug="demo", name="Demo"))
@@ -184,6 +215,68 @@ def test_sqlite_vec_hits_include_only_the_document_active_parse_version() -> Non
     assert hits == [
         VectorHit(chunk_id="new-child", distance=0.02, parse_version="new-v")
     ]
+
+
+def test_sqlite_vec_shadow_map_selects_staged_version_without_pointer_change() -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="Paper",
+            file_name="paper.pdf",
+            sha256="abc",
+            raw_path="raw/paper.pdf",
+            status="ready",
+            active_parse_version="old-v",
+        )
+    )
+    db.add_all(
+        [
+            DocumentChunk(
+                id="old-child",
+                document_id="d1",
+                parse_version="old-v",
+                ordinal=0,
+                text="Old evidence",
+            ),
+            DocumentChunk(
+                id="staged-child",
+                document_id="d1",
+                parse_version="staged-v",
+                ordinal=0,
+                text="Staged evidence",
+            ),
+        ]
+    )
+    db.commit()
+    store = SQLiteVecStore(db)
+    store._ensure_meta_table()
+    now = "2026-07-29T12:00:00"
+    db.execute(
+        text(
+            "INSERT INTO document_chunk_vector_index "
+            "(id, chunk_id, document_id, parse_version, dimensions, created_at, updated_at) "
+            "VALUES (1, 'old-child', 'd1', 'old-v', 2, :now, :now), "
+            "(2, 'staged-child', 'd1', 'staged-v', 2, :now, :now)"
+        ),
+        {"now": now},
+    )
+
+    hits = store._hits_from_vector_rows(
+        [
+            SimpleNamespace(rowid=1, distance=0.01),
+            SimpleNamespace(rowid=2, distance=0.02),
+        ],
+        ["d1"],
+        parse_version_map={"d1": "staged-v"},
+    )
+
+    assert hits == [
+        VectorHit(chunk_id="staged-child", distance=0.02, parse_version="staged-v")
+    ]
+    assert db.get(Document, "d1").active_parse_version == "old-v"
 
 
 def test_sqlite_vec_unscoped_search_expands_past_inactive_versions(monkeypatch) -> None:
@@ -337,6 +430,70 @@ def test_search_source_chunks_prefers_sqlite_vec_hits(monkeypatch) -> None:
     contexts = service._search_source_chunks("unmatched query", "p1", ["d1"], limit=1)
 
     assert [context.citation.chunk_id for context in contexts] == ["semantic"]
+
+
+def test_search_source_chunks_passes_shadow_map_to_vector_store(monkeypatch) -> None:
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="Paper",
+            file_name="paper.pdf",
+            sha256="abc",
+            raw_path="raw/paper.pdf",
+            status="ready",
+            active_parse_version="old-v",
+        )
+    )
+    db.add(
+        DocumentChunk(
+            id="staged-child",
+            document_id="d1",
+            parse_version="staged-v",
+            chunk_role="child",
+            block_type="narrative",
+            ordinal=0,
+            text="Staged semantic evidence.",
+            embedding=[1.0, 0.0],
+        )
+    )
+    db.commit()
+
+    class ShadowVectorStore:
+        def search(
+            self,
+            embedding: list[float],
+            *,
+            limit: int,
+            document_ids: list[str] | None = None,
+            parse_version_map: dict[str, str] | None = None,
+        ) -> list[VectorHit]:
+            assert document_ids == ["d1"]
+            assert parse_version_map == {"d1": "staged-v"}
+            return [
+                VectorHit(
+                    chunk_id="staged-child",
+                    distance=0.0,
+                    parse_version="staged-v",
+                )
+            ]
+
+    import app.services.search as search_module
+
+    monkeypatch.setattr(
+        search_module, "get_vector_store", lambda _db: ShadowVectorStore()
+    )
+    service = QueryService(db, parse_version_map={"d1": "staged-v"})
+    service.ollama = EmbedOnlyOllama([1.0, 0.0])
+
+    contexts = service._search_source_chunks(
+        "staged semantic evidence", "p1", ["d1"], limit=1
+    )
+
+    assert [context.citation.chunk_id for context in contexts] == ["staged-child"]
+    assert db.get(Document, "d1").active_parse_version == "old-v"
 
 
 def test_sqlite_vec_failure_does_not_roll_back_written_chunks(monkeypatch) -> None:
