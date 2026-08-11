@@ -1363,8 +1363,11 @@ def make_executor_with_scoped_retrieve(
     )
 
 
-def _seed_retrieve_turn(db: Session, session_id: str, document_id: str) -> None:
+def _seed_retrieve_turn(
+    db: Session, session_id: str, document_ids: str | list[str]
+) -> None:
     """预置一轮成功检索的历史（retrieve turn 带命中文档 citations）。"""
+    ids = [document_ids] if isinstance(document_ids, str) else document_ids
     memory = ConversationMemory(db)
     memory.add_turn(
         session_id,
@@ -1374,7 +1377,7 @@ def _seed_retrieve_turn(db: Session, session_id: str, document_id: str) -> None:
         tool_args={"project_slug": "demo", "question": "previous question"},
         tool_result="3",
         step_type="retrieve",
-        citations=[{"document_id": document_id}],
+        citations=[{"document_id": doc_id} for doc_id in ids],
     )
     db.commit()
 
@@ -1469,6 +1472,70 @@ def test_retrieve_persists_hit_document_ids() -> None:
         for c in t.citations
     }
     assert "d1" in doc_ids, f"retrieve turn 应持久化命中文档 d1, got {doc_ids}"
+
+
+def test_majority_hit_document_id_majority_vote() -> None:
+    """T2：回退锚定取历史多数（按轮次投票，防单轮大量 citations 碾压）。"""
+    db = make_db()
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "s_maj", "d1")  # 主题轮 ×2
+    _seed_retrieve_turn(db, "s_maj", "d1")
+    _seed_retrieve_turn(db, "s_maj", ["d2"] * 4)  # 跨主题轮：4 citations 只算 1 票
+    assert executor._majority_hit_document_id("s_maj") == "d1"
+
+
+def test_majority_hit_document_id_recent_loses_to_majority() -> None:
+    """T2：最近命中被多数否决——跨主题轮（如 R33/R34 命中 OPLS5）不覆盖主主题。"""
+    db = make_db()
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "s_rec", "d1")
+    _seed_retrieve_turn(db, "s_rec", "d1")
+    _seed_retrieve_turn(db, "s_rec", "d1")
+    _seed_retrieve_turn(db, "s_rec", "d2")  # 最近一轮命中 d2
+    assert executor._majority_hit_document_id("s_rec") == "d1"
+
+
+def test_majority_hit_document_id_tie_breaks_by_recency() -> None:
+    """T2：平票时取最近命中文档（保持指代就近性）。"""
+    db = make_db()
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "s_tie", "d1")
+    _seed_retrieve_turn(db, "s_tie", "d2")
+    _seed_retrieve_turn(db, "s_tie", "d1")
+    _seed_retrieve_turn(db, "s_tie", "d2")  # d2 最近且平票
+    assert executor._majority_hit_document_id("s_tie") == "d2"
+
+
+def test_majority_hit_document_id_empty_history_returns_none() -> None:
+    """T2：无历史检索命中时返回 None（不触发回退）。"""
+    db = make_db()
+    executor = make_executor_with_scoped_retrieve(db)
+    assert executor._majority_hit_document_id("s_none") is None
+
+
+def test_fallback_prefers_majority_document_over_recent_hit() -> None:
+    """T2（集成）：项目级 0 items 回退锚定多数主题文档，而非最近命中。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "s_t5", "d1")  # 主题轮 ×3
+    _seed_retrieve_turn(db, "s_t5", "d1")
+    _seed_retrieve_turn(db, "s_t5", "d1")
+    _seed_retrieve_turn(db, "s_t5", "d2")  # 跨主题轮（最近命中 d2）
+
+    request = AgentQueryRequest(
+        project_slug="demo", query="general question", session_id="s_t5"
+    )
+    response = executor.execute(request)
+
+    retrieve_steps = [s for s in response.steps if s.step_type == "retrieve"]
+    assert len(retrieve_steps) >= 2, (
+        f"检索空结果应回退历史文档重检索，got {len(retrieve_steps)} retrieve steps"
+    )
+    assert retrieve_steps[-1].metadata.get("document_id") == "d1"
 
 
 def test_execute_includes_retrieve_step() -> None:

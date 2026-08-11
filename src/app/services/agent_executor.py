@@ -362,16 +362,17 @@ class AgentExecutor:
                     session_id,
                 )
 
-                # T1：项目级会话（无文档锁定）检索 0 items 时，回退到会话
-                # 历史最近成功检索命中的文档重新检索——弱指代查询（"展开
-                # 第二张"等）与论文 profile 词元零交集导致全项目路由 miss，
-                # 历史命中文档是当前主题最可能的归属。
+                # T1/T2：项目级会话（无文档锁定）检索 0 items 时，回退到会话
+                # 历史多数命中的主题文档重新检索——弱指代查询（"展开第二张"
+                # 等）与论文 profile 词元零交集导致全项目路由 miss；历史中
+                # 出现最多的文档是当前主题最可能的归属（T2 多数投票，防跨
+                # 主题轮污染，见 _majority_hit_document_id）。
                 effective_document_id = request.document_id
                 if (
                     (not evidence_pack or not evidence_pack.get("items"))
                     and request.document_id is None
                 ):
-                    history_document_id = self._last_hit_document_id(session_id)
+                    history_document_id = self._majority_hit_document_id(session_id)
                     if history_document_id is not None:
                         fallback_pack = self._run_retrieve_evidence(
                             request.project_slug,
@@ -1010,21 +1011,33 @@ class AgentExecutor:
             session_id, max_turns=settings.agent_max_conversation_turns
         )
 
-    def _last_hit_document_id(self, session_id: str) -> str | None:
-        """返回会话历史最近一次成功检索命中的文档 id（T1 回退锚定）。
+    def _majority_hit_document_id(self, session_id: str) -> str | None:
+        """返回会话历史中检索命中次数最多的文档 id（回退锚定，T2 多数投票）。
 
-        从后往前扫描 retrieve 轮次，取 citations 中含 document_id 的
-        最近一轮（当前轮 0 items 时 citations 为空，自然被跳过）。
+        按 retrieve 轮次统计各命中文档的出现轮数——每轮每文档一票
+        （同一轮内去重，防止单轮大量 citations 碾压主题，如 R22 单轮
+        35 条 opls-aa 命中）——取票数最高者；平票时取最近一轮出现的
+        文档，保持指代就近性。跨主题轮（如 R33/R34 命中 OPLS5）因此
+        无法覆盖会话主主题，解决 R35/R36 回退锚错论文问题。
         """
+        counts: dict[str, int] = {}
+        last_seen: dict[str, int] = {}
         history = self._memory.get_history(session_id)
-        for turn in reversed(history):
+        for turn_index, turn in enumerate(history):
             if turn.step_type != "retrieve":
                 continue
+            seen_docs: set[str] = set()
             for cit in turn.citations:
                 doc = str(cit.get("document_id") or "").strip()
-                if doc:
-                    return doc
-        return None
+                if not doc:
+                    continue
+                if doc not in seen_docs:
+                    counts[doc] = counts.get(doc, 0) + 1
+                    last_seen[doc] = turn_index
+                    seen_docs.add(doc)
+        if not counts:
+            return None
+        return max(counts, key=lambda doc: (counts[doc], last_seen[doc]))
 
     def _run_retrieve_evidence(
         self,

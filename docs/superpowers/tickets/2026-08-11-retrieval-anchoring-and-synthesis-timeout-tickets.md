@@ -29,16 +29,18 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** completed
 
 **What to build:** 项目级会话检索 0 items 触发历史回退时，锚定的文档改为历史中出现次数最多的主题文档（多数投票，可带轮次衰减），而不是"最近一次成功命中"——后者会被跨主题轮（用户临时换话题，如 R33/R34 命中 OPLS5）污染，导致回退锚错论文。回退后答案内容应回到会话主题论文。
 
 **Acceptance criteria:**
-- [ ] R35/R36 回退后锚定 CHARMM36 主题论文（当前锚错 OPLS5），答案内容为 CHARMM36 而非 OPLS5
-- [ ] 单一主题会话回退行为与现有一致（R18/R20/R39 不回退错）
-- [ ] 多主题历史（含换话题轮）时投票正确选主主题
-- [ ] 锁定会话不触发回退（既有行为保持）
-- [ ] 本地 pytest 全量通过，无回归
+- [x] R35/R36 回退后锚定 CHARMM36 主题论文（当前锚错 OPLS5），答案内容为 CHARMM36 而非 OPLS5——真实回放：6/6 回退点投票锚定 fdf5282c（R35/R36 时 OPLS5 仅 6-7 票 vs 主论文 14 票）
+- [x] 单一主题会话回退行为与现有一致（R18/R20/R39 不回退错）——回放：R18 锚 fdf5282c（8 票）、R20 锚 fdf5282c（9 票）、R39 锚 fdf5282c（14 票，原 ca3b89b3 亦为 CHARMM36 系，内容仍正确）
+- [x] 多主题历史（含换话题轮）时投票正确选主主题——`recent_loses_to_majority` 测试
+- [x] 锁定会话不触发回退（既有行为保持）——`test_locked_session_does_not_fallback` 保持通过
+- [x] 本地 pytest 全量通过，无回归——2069 passed（+5 新测试）
+
+**实施记录（2026-08-11）**：`_last_hit_document_id` → `_majority_hit_document_id`（轮次投票：每轮每文档一票、轮内去重防单轮 citations 碾压、平票按最近轮出现的文档）；5 新测试（多数/最近被否决/平票/空历史/集成回退）；code review 双轴：Standards 无硬违规（采纳命名建议改名 + 调用点注释 T1/T2 更新），Spec 无缺失/越界（指出真实回放风险 → 用回归会话 DB citations 回放 6/6 锚定主论文验证）；部署 + 验收集 3/3 PASS（A2 项目级回退答案内容为 C36 表格比较）；用户指示跳过全量 40 题回归。
 
 ## Ticket 3 — synthesize 长延迟调查与超时保护
 
