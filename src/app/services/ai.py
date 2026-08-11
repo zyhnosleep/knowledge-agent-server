@@ -315,7 +315,9 @@ class OllamaClient:
         - ``schema``：目标 Pydantic 模型，决定输出结构。
         - ``system_prompt`` / ``user_prompt``：提示词。
         - ``model``：模型名，默认 ``settings.ollama_generation_model``。
-        - ``think`` / ``options``：透传给 Ollama 的可选参数。
+        - ``think``：是否启用推理链，默认 ``False``（与 ``generate_chat``
+          对齐；qwen3.5 推理模型开启思考链会显著拖慢生成）；``options``
+          透传给 Ollama。
 
         实现要点：
         1. ``format=schema.model_json_schema()`` —— 关键：强制大模型按
@@ -332,9 +334,10 @@ class OllamaClient:
             ],
             "stream": False,
             "format": schema.model_json_schema(),  # 关键：强制大模型按JSON Schema输出
+            # 默认关闭推理链（与 generate_chat 对齐）：qwen3.5 是推理模型，
+            # 不传 think 时思考链默认开启，生成耗时实测慢约 6 倍。
+            "think": False if think is None else think,
         }
-        if think is not None:
-            payload["think"] = think
         if options:
             payload["options"] = options
         data = self._post_chat(payload)
@@ -563,9 +566,8 @@ class OllamaClient:
             ],
             "stream": False,
             "format": "json",
+            "think": False if think is None else think,
         }
-        if think is not None:
-            payload["think"] = think
         if options:
             payload["options"] = options
         return payload

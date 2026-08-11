@@ -197,6 +197,74 @@ def test_generate_structured_retries_empty_schema_response(monkeypatch) -> None:
     assert calls[1]["format"] == "json"
 
 
+def test_generate_structured_disables_thinking_by_default(monkeypatch) -> None:
+    """结构化生成默认关闭推理链：与 generate_chat 对齐，避免 qwen3.5 思考链拖慢生成。"""
+    client = OllamaClient()
+    calls: list[dict] = []
+
+    def fake_post_chat(payload):
+        calls.append(payload)
+        return {"message": {"content": '{"head_entity":"Hypertension","summary":"Recovered","triples":[]}'}}
+
+    monkeypatch.setattr(client, "_post_chat", fake_post_chat)
+
+    client.generate_structured(
+        HeadAnalysisPayload,
+        system_prompt="Return JSON.",
+        user_prompt="Analyze this head.",
+        model="fake-model",
+    )
+
+    assert calls[0]["think"] is False
+
+
+def test_generate_structured_retry_json_mode_also_disables_thinking(monkeypatch) -> None:
+    """Schema 约束失败后的 JSON 模式重试同样默认关闭推理链。"""
+    client = OllamaClient()
+    calls: list[dict] = []
+
+    def fake_post_chat(payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"message": {"content": ""}}
+        return {"message": {"content": '{"head_entity":"Hypertension","summary":"Recovered","triples":[]}'}}
+
+    monkeypatch.setattr(client, "_post_chat", fake_post_chat)
+
+    client.generate_structured(
+        HeadAnalysisPayload,
+        system_prompt="Return JSON.",
+        user_prompt="Analyze this head.",
+        model="fake-model",
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["think"] is False
+    assert calls[1]["think"] is False
+
+
+def test_generate_structured_honors_explicit_think_override(monkeypatch) -> None:
+    """显式传 think=True 时仍允许覆盖默认值（保留推理链能力）。"""
+    client = OllamaClient()
+    calls: list[dict] = []
+
+    def fake_post_chat(payload):
+        calls.append(payload)
+        return {"message": {"content": '{"head_entity":"Hypertension","summary":"Recovered","triples":[]}'}}
+
+    monkeypatch.setattr(client, "_post_chat", fake_post_chat)
+
+    client.generate_structured(
+        HeadAnalysisPayload,
+        system_prompt="Return JSON.",
+        user_prompt="Analyze this head.",
+        model="fake-model",
+        think=True,
+    )
+
+    assert calls[0]["think"] is True
+
+
 def test_generate_structured_sends_keep_alive_to_all_chat_requests(monkeypatch) -> None:
     monkeypatch.setattr(ai.settings, "ollama_keep_alive", "0", raising=False)
     client = OllamaClient()

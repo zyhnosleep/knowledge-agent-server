@@ -23,6 +23,7 @@ Agent Executor：单轮 Agent 查询的编排器。
 """
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.models.records import DocumentChunk
 from app.schemas.agent import (
     AgentConstraints,
     AgentQueryRequest,
@@ -56,6 +58,12 @@ from app.services.tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# 跨轮引用的指代词集合，共享给 `_is_cross_turn_query`（synthesize 启用判定）
+# 与 `_contextualize_retrieval_query`（检索 query 扩展），避免两处漂移。
+_CROSS_TURN_MARKERS = (
+    "那", "那个", "这个", "它", "上述", "前面", "之前", "刚才", "上一轮",
+)
 
 
 class _EventStepList(list[AgentStep]):
@@ -314,6 +322,11 @@ class AgentExecutor:
             attachment_only_requested = self._is_attachment_only_query(request.query)
             attachment_only = False
             session_attachment_pack = None
+            # 预置：attachment_only 分支不定义 `_evidence_insufficient` 与
+            # `rag_verification_status`，而 skip_synthesis 会引用它们；预置
+            # 避免依赖合取短路顺序。
+            _evidence_insufficient = False
+            rag_verification_status = "local-only"
             retrieval_query = self._contextualize_retrieval_query(
                 session_id, request.query
             )
@@ -371,7 +384,12 @@ class AgentExecutor:
 
                 self._commit_progress()
                 # ---- 调用 RAG 生成草稿答案 ----
-                answer_text, citations, tool_calls_used = self._run_rag_answer(
+                (
+                    answer_text,
+                    citations,
+                    tool_calls_used,
+                    rag_verification_status,
+                ) = self._run_rag_answer(
                     request.project_slug,
                     retrieval_query,
                     request.document_id,
@@ -384,6 +402,17 @@ class AgentExecutor:
                 attachment_citations = self._session_attachment_citations(evidence_pack)
                 if attachment_citations:
                     citations = self._merge_citations(citations, attachment_citations)
+
+                # ``rag.answer`` intentionally returns a compact citation list
+                # for ordinary answers.  Table retrieval, however, assembles
+                # complete same-table evidence in the evidence pack and the
+                # synthesis pass must be able to see every table Child (not
+                # only the five citations selected by the draft answer).
+                citations = self._merge_table_evidence_citations(
+                    citations,
+                    evidence_pack,
+                    extra_citations=self._table_fact_source_citations(evidence_pack),
+                )
 
                 # ---- 检测证据不足 ----
                 _evidence_insufficient = bool(
@@ -405,10 +434,146 @@ class AgentExecutor:
                         "the target documents."
                     )
 
-            # ---- answer.synthesize：把 RAG 草稿综合为终稿 ----
+            # ==============================================================
+            # Task 2：draft verify 前置 + 直通门禁 + synthesize/final verify
+            # ==============================================================
+            # 9.1 路由决策矩阵：单轮/对比路由（simple_rag / evidence_required /
+            # table_or_metric / multi_source_compare）且非跨轮引用时，先执行
+            # draft verify（确定性校验，非第二次 LLM 综合）；通过才直通
+            # rag.answer，关闭"LLM 无差别重写压缩精确事实"的破坏路径。
+            # 复杂多跳与跨轮引用保留 synthesize（受约束组织器）+ final verify。
+            _direct_routes = {
+                "simple_rag",
+                "evidence_required",
+                "table_or_metric",
+                "multi_source_compare",
+            }
+            direct_candidate = (
+                not attachment_only
+                and not max_steps_hit
+                and route.route in _direct_routes
+                and not self._is_cross_turn_query(request.query, session_id)
+            )
+            direct_block_reason: str | None = None
+            draft_verification = False
+            final_verification = False
+            draft_verify_result: dict[str, Any] | None = None
+
+            # ---- 前置 draft verify（仅 direct candidate）----
+            if direct_candidate:
+                draft_verification = True
+                draft_verify_result = self._run_verify(
+                    request.query,
+                    answer_text,
+                    citations,
+                    route.route,
+                    constraints,
+                    steps,
+                    usage,
+                    tool_calls,
+                )
+                tool_calls = usage.tool_calls
+                draft_retry = bool(
+                    draft_verify_result["ok"]
+                    and draft_verify_result.get("result", {}).get(
+                        "retry_recommended", False
+                    )
+                )
+                # draft verify 建议 retry 且路由允许时，RAG retry 后重验
+                if (
+                    draft_retry
+                    and route.max_retries > 0
+                    and tool_calls < constraints.max_tool_calls
+                    and len(steps) < constraints.max_steps
+                ):
+                    (
+                        retry_answer,
+                        retry_citations,
+                        retry_calls,
+                        _retry_verification_status,
+                    ) = self._run_rag_answer(
+                        request.project_slug,
+                        retrieval_query,
+                        request.document_id,
+                        constraints,
+                        steps,
+                        usage,
+                        session_id,
+                    )
+                    if retry_calls > 0:
+                        tool_calls += retry_calls
+                        if retry_answer.strip():
+                            answer_text = retry_answer
+                            citations = retry_citations
+                            # Task 9：draft retry 采用新答案时，verification status
+                            # 与 evidence-insufficient 必须同步为最终答案的状态，
+                            # 直通门禁与 finalize trace 不得沿用第一次答案的状态。
+                            rag_verification_status = _retry_verification_status
+                            _evidence_insufficient = bool(
+                                answer_text
+                                and _INSUFFICIENT_EVIDENCE_RE.search(answer_text)
+                            )
+                        warnings.append(
+                            "Retry performed after draft verification warning"
+                        )
+                        # retry 后的结果重新执行 draft verify，不能沿用旧结果
+                        draft_verify_result = self._run_verify(
+                            request.query,
+                            answer_text,
+                            citations,
+                            route.route,
+                            constraints,
+                            steps,
+                            usage,
+                            tool_calls,
+                        )
+                        tool_calls = usage.tool_calls
+                        draft_retry = bool(
+                            draft_verify_result["ok"]
+                            and draft_verify_result.get("result", {}).get(
+                                "retry_recommended", False
+                            )
+                        )
+
+            # ---- 直通门禁（Task 2：draft verify 通过 + RAG 校验；Task 3：coverage）----
+            # 9.1.6 coverage 门禁生效范围：仅 table_or_metric 且 RAG 明确声明
+            # coverage_status == "partial" 时阻塞直通。partial 即代表表格覆盖不
+            # 完整——即使 table_facts 为空，也必须阻止 rag-direct，不能把未覆盖
+            # 的表格答案标记为已直通；unknown（旧 EvidencePack 缺 inventory
+            # 字段）与非表格路由一律中立，不得因缺字段或空 facts 让已通过的直通退化。
+            coverage_partial = bool(
+                route.route == "table_or_metric"
+                and evidence_pack is not None
+                and evidence_pack.get("coverage_status") == "partial"
+            )
+            skip_synthesis = bool(
+                direct_candidate
+                and not _evidence_insufficient
+                and bool(answer_text.strip())
+                and bool(citations)
+                and rag_verification_status != "contradicted"
+                and not draft_retry
+                and not coverage_partial
+            )
+            if direct_candidate and not skip_synthesis:
+                if _evidence_insufficient:
+                    direct_block_reason = "evidence_insufficient"
+                elif not answer_text.strip():
+                    direct_block_reason = "empty_answer"
+                elif not citations:
+                    direct_block_reason = "no_citations"
+                elif rag_verification_status == "contradicted":
+                    direct_block_reason = "rag_contradicted"
+                elif draft_retry:
+                    direct_block_reason = "draft_verify_retry"
+                elif coverage_partial:
+                    direct_block_reason = "coverage_partial"
+
             synth_provider = "local"
-            synth_model = "local-fallback"
-            if not max_steps_hit and not attachment_only:
+            synth_model = "rag-direct" if skip_synthesis else "local-fallback"
+            # 9.8：需求侧期望 facts 状态（synthesize 未调用时为 None）
+            expected_facts_status: str | None = None
+            if not max_steps_hit and not attachment_only and not skip_synthesis:
                 self._commit_progress()
                 synth_result = self._run_synthesize(
                     request.query,
@@ -427,47 +592,75 @@ class AgentExecutor:
                     answer_text = synth_data.get("answer_markdown", answer_text)
                     synth_provider = synth_data.get("provider", "local")
                     synth_model = synth_data.get("model", "local-fallback")
+                    expected_facts_status = synth_data.get("expected_facts_status")
                     synth_warnings = synth_data.get("warnings", [])
                     if isinstance(synth_warnings, list):
                         warnings.extend(synth_warnings)
                     # 根据综合结果过滤引用：只保留被明确引用的 citation
                     cited_indexes = synth_data.get("cited_indexes", [])
                     if isinstance(cited_indexes, list) and cited_indexes:
-                        citations = [c for i, c in enumerate(citations) if i in cited_indexes]
+                        selected_indexes = sorted(
+                            {
+                                index
+                                for index in cited_indexes
+                                if isinstance(index, int) and 0 <= index < len(citations)
+                            }
+                        )
+                        if selected_indexes:
+                            answer_text = self._retarget_citation_markers(
+                                answer_text,
+                                selected_indexes,
+                            )
+                            selected_set = set(selected_indexes)
+                            citations = [
+                                citation
+                                for index, citation in enumerate(citations)
+                                if index in selected_set
+                            ]
 
-            # ---- answer.verify：质量验证 ----
-            verify_result = self._run_verify(
-                request.query,
-                answer_text,
-                citations,
-                route.route,
-                constraints,
-                steps,
-                usage,
-                tool_calls,
-            )
-            # _run_verify handles usage.tool_calls internally; track for
-            # the retry gate using the current usage count.
-            tool_calls = usage.tool_calls
-            if verify_result["ok"]:
-                verify_warnings = verify_result.get("result", {}).get("warnings", [])
-                if isinstance(verify_warnings, list):
-                    warnings.extend(verify_warnings)
+            # ---- final verify：直通路径 draft verify 即最终校验（不重复消耗）；
+            #      synthesize 路径在综合后执行 final verify ----
+            if skip_synthesis:
+                verify_result = draft_verify_result
+            else:
+                final_verification = True
+                verify_result = self._run_verify(
+                    request.query,
+                    answer_text,
+                    citations,
+                    route.route,
+                    constraints,
+                    steps,
+                    usage,
+                    tool_calls,
+                )
+                tool_calls = usage.tool_calls
+                if verify_result["ok"]:
+                    verify_warnings = verify_result.get("result", {}).get(
+                        "warnings", []
+                    )
+                    if isinstance(verify_warnings, list):
+                        warnings.extend(verify_warnings)
 
-            # ---- 重试：验证建议重试且路由允许时，最多再调一次 rag.answer ----
+            # ---- 重试：仅 synthesize 路径的 final verify 建议重试时 ----
             retry_recommended = (
-                verify_result["ok"]
+                not skip_synthesis
+                and verify_result["ok"]
                 and verify_result.get("result", {}).get("retry_recommended", False)
             )
             if (
                 not attachment_only
-                and
-                retry_recommended
+                and retry_recommended
                 and route.max_retries > 0
                 and tool_calls < constraints.max_tool_calls
                 and len(steps) < constraints.max_steps
             ):
-                retry_answer, retry_citations, retry_calls = self._run_rag_answer(
+                (
+                    retry_answer,
+                    retry_citations,
+                    retry_calls,
+                    _retry_verification_status,
+                ) = self._run_rag_answer(
                     request.project_slug,
                     retrieval_query,
                     request.document_id,
@@ -481,7 +674,39 @@ class AgentExecutor:
                     if retry_answer.strip():
                         answer_text = retry_answer
                         citations = retry_citations
+                        # Task 9：最终答案来自 retry，verification status 必须
+                        # 同步为 retry 返回的状态，finalize trace 才能与最终答案一致。
+                        rag_verification_status = _retry_verification_status
                     warnings.append("Retry performed after verification warning")
+                    # Task 9：retry 后必须对最终答案与 citations 重新执行 final
+                    # verify；retry 前的第一次 verify 结果不能作为最终校验依据。
+                    verify_result = self._run_verify(
+                        request.query,
+                        answer_text,
+                        citations,
+                        route.route,
+                        constraints,
+                        steps,
+                        usage,
+                        tool_calls,
+                    )
+                    tool_calls = usage.tool_calls
+                    if verify_result["ok"]:
+                        verify_warnings = verify_result.get("result", {}).get(
+                            "warnings", []
+                        )
+                        if isinstance(verify_warnings, list):
+                            warnings.extend(verify_warnings)
+                    # 重验后若仍建议 retry，不再发起第二次重试（retry 只执行
+                    # 一次），但 retry_recommended 保留重验结果，finalize trace
+                    # 不得宣称最终答案已验证通过。
+                    retry_recommended = (
+                        verify_result["ok"]
+                        and verify_result.get("result", {}).get(
+                            "retry_recommended", False
+                        )
+                    )
+
 
             # ---- 检查 max_steps 是否耗尽 ----
             hit_limit = len(steps) >= constraints.max_steps
@@ -511,6 +736,18 @@ class AgentExecutor:
                             else "project_and_session"
                         ),
                         "project_rag_skipped": attachment_only,
+                        "synthesis_skipped": skip_synthesis,
+                        # 9.6.3：trace 完整记录校验与门禁结果
+                        "draft_verification": draft_verification,
+                        "final_verification": final_verification,
+                        "direct_block_reason": direct_block_reason,
+                        "rag_verification_status": rag_verification_status,
+                        "coverage_status": (
+                            evidence_pack.get("coverage_status", "unknown")
+                            if evidence_pack
+                            else "unknown"
+                        ),
+                        "expected_facts_status": expected_facts_status,
                     },
                 )
                 steps.append(finalize_step)
@@ -868,16 +1105,17 @@ class AgentExecutor:
         steps: list[AgentStep],
         usage: AgentUsage,
         session_id: str,
-    ) -> tuple[str, list[Citation], int]:
-        """调用 rag.answer 工具，记录 step，返回 (答案文本, 引用列表, 实际工具调用数)。
+    ) -> tuple[str, list[Citation], int, str]:
+        """调用 rag.answer 工具，记录 step，返回
+        (答案文本, 引用列表, 实际工具调用数, verification_status)。
 
-        如果受 max_tool_calls / max_steps 限制，返回 ("", [], 0)。
+        如果受 max_tool_calls / max_steps 限制，返回 ("", [], 0, "local-only")。
         """
         # Enforce limits
         if usage.tool_calls >= constraints.max_tool_calls:
-            return "", [], 0
+            return "", [], 0, "local-only"
         if len(steps) >= constraints.max_steps:
-            return "", [], 0
+            return "", [], 0, "local-only"
 
         step_id = len(steps)
         t0 = time.monotonic()
@@ -951,7 +1189,10 @@ class AgentExecutor:
             step_type="tool_call",
         )
 
-        return answer_text, citations, 1
+        verification_status = str(
+            rag_data.get("verification_status", "local-only")
+        ) if tool_result["ok"] else "local-only"
+        return answer_text, citations, 1, verification_status
 
     def _run_verify(
         self,
@@ -1108,6 +1349,9 @@ class AgentExecutor:
             tool_args["evidence_pack"] = evidence_pack
         if target is not None:
             tool_args["target"] = asdict(target)
+        # 9.3.1：跨轮引用场景收窄 prompt（只含 summary + rag_answer +
+        # citations + table_facts，不含 evidence_pack items 摘录）。
+        tool_args["narrow_context"] = self._is_cross_turn_query(query, session_id)
 
         queue_wait_ms = 0
         if target is not None and target.profile == "generation":
@@ -1224,31 +1468,14 @@ class AgentExecutor:
         except Exception:
             return ""
 
-    def _contextualize_retrieval_query(self, session_id: str, query: str) -> str:
-        """把简短的指代性追问扩展为自包含的 RAG 查询。
+    def _resolvable_previous_turn(self, session_id: str, normalized: str) -> str | None:
+        """返回可解析的上一轮用户提问；无 session/历史/与当前相同 → None。
 
-        例如用户先问“这篇文章的方法是什么”，再问“它的准确率呢？”；
-        第二个 query 很短且包含“它”，需要把前一个问题拼接进去，
-        否则 RAG 检索不到上下文。
+        `_is_cross_turn_query` 与 `_contextualize_retrieval_query` 共用，
+        避免 user-turn 提取与阈值逻辑重复（发散式修改风险）。
         """
-        normalized = query.strip()
-        follow_up_markers = (
-            "详细",
-            "展开",
-            "继续",
-            "为什么",
-            "真的吗",
-            "是否",
-            "这个",
-            "那个",
-            "它",
-            "上述",
-            "前面",
-        )
-        if len(normalized) > 30 or not any(
-            marker in normalized for marker in follow_up_markers
-        ):
-            return query
+        if not session_id:
+            return None
         try:
             user_turns = [
                 turn
@@ -1256,11 +1483,62 @@ class AgentExecutor:
                 if turn.role == "user" or turn.step_type == "user_query"
             ]
         except Exception:
-            return query
+            return None
         if len(user_turns) < 2:
-            return query
+            return None
         previous_query = user_turns[-2].content.strip()
         if not previous_query or previous_query == normalized:
+            return None
+        return previous_query
+
+    def _is_cross_turn_query(self, query: str, session_id: str | None) -> bool:
+        """判断当前 query 是否为跨轮引用（依赖历史轮次才能回答）。
+
+        判定规则（9.2）：
+        1. 无 session_id 或 query 过长（>30 字符）→ 不是跨轮；
+        2. 必须含指代词（`_CROSS_TURN_MARKERS`）；单轮问题中的"对比"
+           不单独触发跨轮；
+        3. 必须存在可解析的上一轮用户提问（`_resolvable_previous_turn`）。
+
+        返回值只决定 synthesize 是否启用；检索侧的记忆扩展仍由
+        `_contextualize_retrieval_query` 负责。
+        """
+        if not session_id:
+            return False
+        normalized = (query or "").strip()
+        if not normalized or len(normalized) > 30:
+            return False
+        if not any(marker in normalized for marker in _CROSS_TURN_MARKERS):
+            return False
+        return self._resolvable_previous_turn(session_id, normalized) is not None
+
+    def _contextualize_retrieval_query(self, session_id: str, query: str) -> str:
+        """把简短的指代性追问扩展为自包含的 RAG 查询。
+
+        例如用户先问“这篇文章的方法是什么”，再问“它的准确率呢？”；
+        第二个 query 很短且包含“它”，需要把前一个问题拼接进去，
+        否则 RAG 检索不到上下文。指代词与历史解析复用
+        `_CROSS_TURN_MARKERS` / `_resolvable_previous_turn`。
+
+        注意：与旧实现相比，指代词集合新增了"那/之前/刚才/上一轮"，
+        检索扩展的触发面有所扩大（属于有意的行为漂移，与跨轮判定
+        `_is_cross_turn_query` 保持一致）。
+        """
+        normalized = query.strip()
+        follow_up_markers = _CROSS_TURN_MARKERS + (
+            "详细",
+            "展开",
+            "继续",
+            "为什么",
+            "真的吗",
+            "是否",
+        )
+        if len(normalized) > 30 or not any(
+            marker in normalized for marker in follow_up_markers
+        ):
+            return query
+        previous_query = self._resolvable_previous_turn(session_id, normalized)
+        if previous_query is None:
             return query
         return f"上一轮问题：{previous_query}\n当前追问：{normalized}"
 
@@ -1355,7 +1633,43 @@ class AgentExecutor:
             status = "ok"
         if status == "project_not_found" and items:
             status = "ok"
-        return {"status": status, "items": items, "table_facts": table_facts}
+        result = {"status": status, "items": items, "table_facts": table_facts}
+        # 9.7.3：coverage 元数据透传——附件 facts 并入后无法按单一 inventory
+        # 验证，降级为 unknown（门禁中性）；否则原样保留 base 的 coverage 字段。
+        if session_pack and session_pack.get("table_facts"):
+            result["coverage_status"] = "unknown"
+            result["coverage_missing_tables"] = []
+            result["inventory"] = []
+        else:
+            for key in ("inventory", "coverage_status", "coverage_missing_tables"):
+                if key in base:
+                    result[key] = base[key]
+        return result
+
+    @staticmethod
+    def _retarget_citation_markers(
+        answer_text: str,
+        selected_indexes: list[int],
+    ) -> str:
+        """Retarget inline citation markers after compacting citations.
+
+        The synthesis model cites indexes from the pre-filter citation list.
+        Once uncited entries are removed for the final response, the remaining
+        citations receive compact zero-based indexes.  Rewrite only markers
+        that refer to selected entries and drop stale markers so the answer
+        cannot point at a different source than the response metadata.
+        """
+        index_map = {
+            old_index: new_index
+            for new_index, old_index in enumerate(selected_indexes)
+        }
+
+        def replace(match: re.Match[str]) -> str:
+            old_index = int(match.group(1))
+            new_index = index_map.get(old_index)
+            return f"[{new_index}]" if new_index is not None else ""
+
+        return re.sub(r"\[(\d+)\]", replace, answer_text)
 
     @staticmethod
     def _session_attachment_citations(
@@ -1416,6 +1730,183 @@ class AgentExecutor:
             seen.add(key)
             merged.append(citation)
         return merged
+
+    @staticmethod
+    def _merge_table_evidence_citations(
+        base_citations: list[Citation],
+        evidence_pack: dict[str, Any] | None,
+        *,
+        extra_citations: list[Citation] | None = None,
+    ) -> list[Citation]:
+        """Add complete table evidence as independent synthesis citations.
+
+        ``rag.answer`` may return only its top few citations even when
+        ``rag.retrieve_evidence`` assembled all requested table Children.
+        Promote those table items into the citation list used by synthesis,
+        preserving exact excerpts and source metadata.  An exact duplicate
+        replaces the compact citation so the richer table identity is kept.
+        Narrative evidence is deliberately untouched.
+        """
+        merged = list(base_citations)
+        positions: dict[tuple[Any, ...], int] = {}
+
+        def key(citation: Citation) -> tuple[Any, ...]:
+            if citation.chunk_id:
+                return (
+                    "chunk",
+                    citation.document_id,
+                    citation.chunk_id,
+                    citation.excerpt,
+                )
+            return (
+                "page",
+                citation.document_id,
+                citation.excerpt,
+                citation.page_title,
+                citation.page_kind,
+            )
+
+        for position, citation in enumerate(merged):
+            positions[key(citation)] = position
+
+        table_items = evidence_pack.get("items", []) if evidence_pack else []
+        if not isinstance(table_items, list):
+            table_items = []
+        for item in table_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("evidence_kind") != "table" and not item.get("table_id"):
+                continue
+            excerpt = str(item.get("excerpt") or "").strip()
+            if not excerpt:
+                continue
+            source_spans = item.get("source_spans")
+            if not isinstance(source_spans, list):
+                source_spans = []
+            citation = Citation(
+                document_id=item.get("document_id"),
+                chunk_id=item.get("chunk_id"),
+                attachment_id=item.get("attachment_id"),
+                page_slug=item.get("page_slug"),
+                page_title=item.get("page_title"),
+                page_kind=item.get("page_kind") or "source",
+                score=float(item.get("score") or 0.0),
+                page_label=item.get("page_label"),
+                excerpt=excerpt,
+                parse_version=item.get("parse_version"),
+                parent_chunk_id=item.get("parent_chunk_id"),
+                block_type=item.get("block_type") or "table",
+                source_spans=source_spans,
+                asset_id=item.get("asset_id"),
+                table_id=item.get("table_id"),
+                figure_id=item.get("figure_id"),
+                formula_id=item.get("formula_id"),
+            )
+            citation_key = key(citation)
+            existing_position = positions.get(citation_key)
+            if existing_position is None:
+                positions[citation_key] = len(merged)
+                merged.append(citation)
+            else:
+                merged[existing_position] = citation
+
+        for citation in extra_citations or []:
+            if not isinstance(citation, Citation) or not citation.excerpt.strip():
+                continue
+            citation_key = key(citation)
+            existing_position = positions.get(citation_key)
+            if existing_position is None:
+                positions[citation_key] = len(merged)
+                merged.append(citation)
+            else:
+                merged[existing_position] = citation
+
+        return merged
+
+    def _table_fact_source_citations(
+        self,
+        evidence_pack: dict[str, Any] | None,
+    ) -> list[Citation]:
+        """Load exact Child excerpts referenced by complete table facts.
+
+        Table facts can be assembled from sibling Children that fall outside
+        the bounded top-context list.  Resolve their source IDs directly from
+        the same database, but require document/table/parse-version identity
+        from the fact before exposing a citation to synthesis.
+        """
+        if not self._db or not evidence_pack:
+            return []
+        facts = evidence_pack.get("table_facts")
+        items = evidence_pack.get("items")
+        if not isinstance(facts, list) or not facts:
+            return []
+        if not isinstance(items, list):
+            items = []
+
+        expected: dict[str, tuple[str, str, str]] = {}
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            document_id = str(fact.get("document_id") or "").strip()
+            parse_version = str(fact.get("parse_version") or "").strip()
+            table_id = str(fact.get("table_id") or "").strip()
+            source_ids = fact.get("source_chunk_ids")
+            if not document_id or not parse_version or not table_id:
+                continue
+            if not isinstance(source_ids, list):
+                continue
+            for source_id in source_ids:
+                source_id = str(source_id or "").strip()
+                if source_id:
+                    expected[source_id] = (document_id, parse_version, table_id)
+        if not expected:
+            return []
+
+        templates: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                str(item.get("document_id") or ""),
+                str(item.get("parse_version") or ""),
+                str(item.get("table_id") or ""),
+            )
+            if all(key):
+                templates.setdefault(key, item)
+
+        citations: list[Citation] = []
+        for chunk_id in sorted(expected):
+            document_id, parse_version, table_id = expected[chunk_id]
+            chunk = self._db.get(DocumentChunk, chunk_id)
+            if chunk is None:
+                continue
+            if (
+                chunk.document_id != document_id
+                or str(chunk.parse_version or "") != parse_version
+                or chunk.chunk_role != "child"
+                or chunk.block_type != "table"
+            ):
+                continue
+            template = templates.get((document_id, parse_version, table_id), {})
+            source_spans = chunk.source_spans if isinstance(chunk.source_spans, list) else []
+            citations.append(
+                Citation(
+                    document_id=chunk.document_id,
+                    chunk_id=chunk.id,
+                    page_slug=template.get("page_slug"),
+                    page_title=template.get("page_title") or getattr(chunk.document, "title", None),
+                    page_kind=template.get("page_kind") or "source",
+                    score=float(template.get("score") or 0.0),
+                    page_label=chunk.page_label or template.get("page_label"),
+                    excerpt=str(chunk.text or "").strip(),
+                    parse_version=chunk.parse_version,
+                    parent_chunk_id=chunk.parent_chunk_id,
+                    block_type=chunk.block_type,
+                    source_spans=source_spans,
+                    table_id=table_id,
+                )
+            )
+        return citations
 
     @staticmethod
     def _draft_session_attachment_answer(

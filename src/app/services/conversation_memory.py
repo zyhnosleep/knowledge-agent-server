@@ -1,3 +1,22 @@
+"""多轮会话记忆：基于数据库表为每个会话持久化对话历史。
+
+本模块提供 :class:`ConversationMemory` 与轻量数据结构 :class:`TurnRecord`，
+负责：
+
+- 追加/读取单个会话（session_id）的对话轮次（turn），支持 Agent 执行器
+  在多轮对话间恢复上下文；
+- 维护会话的 TTL 过期时间（``expires_at = now + ttl_days``），并清理
+  过期会话及其轮次、附件、trace；
+- 提供轮次压缩（compact_history）、会话删除、按文档删除会话等辅助能力。
+
+存储模型：
+- ``conversation_turns`` 表：每行一轮对话（角色、内容、可选的工具调用信息）。
+- ``conversation_sessions`` 表：会话元数据（归属用户、项目、文档范围、过期时间）。
+
+多租户隔离：构造时可绑定 ``owner_user_id``，写入时记录归属、读取时校验归属，
+防止跨用户访问。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,7 +33,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TurnRecord:
-    """In-memory representation of a conversation turn."""
+    """一轮对话的内存表示（数据库行的脱敏/只读视图）。
+
+    In-memory representation of a conversation turn.
+
+    - ``turn_index``: 该轮在会话内的序号（从 0 开始，升序）。
+    - ``role``: 发言方角色（如 "user" / "assistant"）。
+    - ``content``: 文本内容。
+    - ``tool_name`` / ``tool_args`` / ``tool_result``: 若该轮涉及工具调用，
+      记录工具名、参数与执行结果。
+    - ``step_type``: 该轮对应的 Agent 执行步骤类型。
+    - ``citations``: 该轮引用的结构化条目。
+    - ``created_at``: 创建时间（可能为空）。
+    """
 
     turn_index: int
     role: str
@@ -28,13 +59,25 @@ class TurnRecord:
 
 
 class ConversationMemory:
-    """Per-session conversation memory backed by the ConversationTurn table.
+    """基于 ConversationTurn 表的按会话对话记忆。
+
+    Per-session conversation memory backed by the ConversationTurn table.
 
     Stores turn history so the Agent Executor can resume conversations
     and enforce turn budgets.
+
+    主要能力：追加轮次、读取历史（可限制最近 N 轮）、统计轮数、
+    取首个用户轮次、压缩历史、删除会话、刷新会话过期时间、
+    批量清理过期会话。
     """
 
     def __init__(self, db: Session, owner_user_id: str | None = None) -> None:
+        """初始化会话记忆访问器。
+
+        :param db: 活动的 SQLAlchemy 会话（事务由调用方管理）。
+        :param owner_user_id: 数据归属用户 ID；写入时记录归属、读取时
+            用于归属校验（多租户数据隔离）。为 None 时不启用归属校验。
+        """
         self._db = db
         self._owner_user_id = owner_user_id
 
@@ -54,7 +97,21 @@ class ConversationMemory:
         step_type: str | None = None,
         citations: list[dict] | None = None,
     ) -> ConversationTurn:
-        """Append a turn and return the persisted row."""
+        """向会话追加一轮对话，并返回已持久化的行。
+
+        Append a turn and return the persisted row.
+
+        :param session_id: 目标会话 ID。
+        :param role: 发言方角色（如 "user" / "assistant"）。
+        :param content: 轮次文本内容。
+        :param tool_name: 可选的工具调用名。
+        :param tool_args: 可选的工具调用参数。
+        :param tool_result: 可选的工具执行结果。
+        :param step_type: 可选的执行步骤类型。
+        :param citations: 可选的引用条目列表（会被拷贝一份，避免外部共享修改）。
+        :return: 已 flush 的 :class:`ConversationTurn` 行对象。
+        """
+        # 下一轮序号 = 当前会话已有轮数（从 0 递增），保证顺序稳定。
         next_index = self._next_turn_index(session_id)
         turn = ConversationTurn(
             session_id=session_id,
@@ -72,10 +129,17 @@ class ConversationMemory:
         return turn
 
     def get_history(self, session_id: str, *, last_n: int | None = None) -> list[TurnRecord]:
-        """Return turns for *session_id* ordered by turn_index ascending.
+        """返回 *session_id* 的轮次历史，按 turn_index 升序。
+
+        Return turns for *session_id* ordered by turn_index ascending.
 
         When *last_n* is provided only the most recent N turns are
         returned.
+
+        :param session_id: 目标会话 ID。
+        :param last_n: 若指定且 > 0，仅返回最近 N 轮（用于控制送入模型的
+            上下文长度）。
+        :return: 按时间正序排列的 :class:`TurnRecord` 列表。
         """
         statement = (
             select(ConversationTurn)
@@ -83,6 +147,7 @@ class ConversationMemory:
             .order_by(ConversationTurn.turn_index.asc())
         )
         rows = self._db.scalars(statement).all()
+        # 只保留最近 N 轮：切片取末尾，保持原有升序。
         if last_n is not None and last_n > 0:
             rows = rows[-last_n:]
         return [
@@ -94,6 +159,8 @@ class ConversationMemory:
                 tool_args=row.tool_args,
                 tool_result=row.tool_result,
                 step_type=row.step_type,
+                # 兼容旧数据：citations 若不以 list 存储（如 None 或 JSON 串），
+                # 一律降级为空列表。
                 citations=row.citations if isinstance(row.citations, list) else [],
                 created_at=row.created_at,
             )
@@ -101,7 +168,12 @@ class ConversationMemory:
         ]
 
     def turn_count(self, session_id: str) -> int:
-        """Return the number of turns for *session_id*."""
+        """返回 *session_id* 的轮次数量。
+
+        Return the number of turns for *session_id*.
+
+        通过 COUNT 聚合查询统计，供轮次预算 / 压缩决策使用。
+        """
         return int(
             self._db.scalar(
                 text(
@@ -113,7 +185,12 @@ class ConversationMemory:
         )
 
     def first_user_turn(self, session_id: str) -> TurnRecord | None:
-        """Return the first user turn for *session_id*, if any."""
+        """返回 *session_id* 的首个用户轮次；不存在时返回 None。
+
+        Return the first user turn for *session_id*, if any.
+
+        用于提取会话的初始意图（通常作为上下文摘要的种子）。
+        """
         statement = (
             select(ConversationTurn)
             .where(
@@ -139,16 +216,24 @@ class ConversationMemory:
         )
 
     def compact_history(self, session_id: str, max_turns: int) -> int:
-        """Delete oldest turns so at most *max_turns* remain.
+        """删除最旧的轮次，使会话最多保留 *max_turns* 轮。
+
+        Delete oldest turns so at most *max_turns* remain.
 
         Returns the number of deleted rows.
+
+        :param session_id: 目标会话 ID。
+        :param max_turns: 允许保留的最大轮次数；< 0 视为 0。
+        :return: 实际删除的行数。
         """
         if max_turns < 0:
             max_turns = 0
         current = self.turn_count(session_id)
         if current <= max_turns:
+            # 当前轮数未超上限，无需压缩。
             return 0
         to_delete = current - max_turns
+        # 按 turn_index 升序取最旧的 to_delete 行并删除。
         self._db.execute(
             text(
                 "DELETE FROM conversation_turns WHERE id IN ("
@@ -164,11 +249,21 @@ class ConversationMemory:
         return to_delete
 
     def delete_session(self, session_id: str) -> int:
-        """Remove one session and its stored side data. Returns deleted turn count."""
+        """删除单个会话及其关联的附属数据，返回删除的轮次数量。
+
+        Remove one session and its stored side data. Returns deleted turn count.
+
+        删除范围（保持外键一致性）：会话附件 → trace steps → trace runs →
+        conversation_turns → conversation_sessions。
+        """
+        # 延迟导入，避免循环依赖（session_attachments 依赖本模块的表结构）。
         from app.services.session_attachments import delete_attachments_for_session
 
         count = self.turn_count(session_id)
+        # 先删除会话绑定的附件（文件等侧数据）。
         delete_attachments_for_session(self._db, session_id)
+        # 先删 trace steps 再删 trace runs：SQLite 外键级联不一定开启，
+        # 必须显式按引用顺序清理，避免孤儿记录。
         self._db.execute(
             text(
                 "DELETE FROM agent_trace_steps WHERE run_id IN ("
@@ -181,6 +276,7 @@ class ConversationMemory:
             text("DELETE FROM agent_trace_runs WHERE session_id = :sid"),
             {"sid": session_id},
         )
+        # 删除对话轮次与会话本体。
         self._db.execute(
             text("DELETE FROM conversation_turns WHERE session_id = :sid"),
             {"sid": session_id},
@@ -193,12 +289,18 @@ class ConversationMemory:
         return count
 
     def delete_sessions_for_document(self, document_id: str) -> int:
-        """Remove all sessions scoped to *document_id* and return session count."""
+        """删除绑定到 *document_id* 的全部会话，返回删除的会话数量。
+
+        Remove all sessions scoped to *document_id* and return session count.
+
+        文档被删除时，需要级联清理其所有会话。
+        """
         rows = self._db.execute(
             text("SELECT id FROM conversation_sessions WHERE document_id = :did"),
             {"did": document_id},
         ).all()
         count = 0
+        # 逐个调用 delete_session，复用统一的附属数据清理逻辑。
         for (session_id,) in rows:
             self.delete_session(session_id)
             count += 1
@@ -213,30 +315,45 @@ class ConversationMemory:
         ttl_days: int,
         document_id: str | None = None,
     ) -> None:
-        """Create or update a conversation session with an expiry time.
+        """创建或更新会话，并为其设置过期时间（TTL）。
+
+        Create or update a conversation session with an expiry time.
 
         Sets ``expires_at = now + ttl_days``.  An existing session is never
         silently rebound to a different project or document scope.
+
+        TTL 机制：每次"触碰"会话都会把 ``expires_at`` 刷新为
+        ``now + ttl_days``，即会话活跃期随使用自动顺延；长期不活跃的
+        会话将自然过期并被 :meth:`purge_expired_sessions` 清理。
+
+        防误绑：已存在的会话不允许被静默改绑到其他项目 / 文档范围，
+        也禁止跨用户访问（见下方归属校验）。
         """
         existing = self._db.get(ConversationSession, session_id)
         if existing is not None:
+            # 归属校验：绑定了 owner 时，禁止访问他人会话。
             if self._owner_user_id is not None and existing.owner_user_id != self._owner_user_id:
                 raise ValueError(f"Session {session_id} belongs to another user.")
+            # 项目范围不可变：禁止把会话改绑到其他项目。
             if existing.project_slug != project_slug:
                 raise ValueError(
                     f"Session {session_id} belongs to project {existing.project_slug}; "
                     f"cannot rebind to project {project_slug}."
                 )
+            # 文档范围不可变：禁止把会话改绑到其他文档。
             if existing.document_id != document_id:
                 raise ValueError(
                     f"Session {session_id} is scoped to document {existing.document_id}; "
                     f"cannot rebind to document {document_id}."
                 )
+        # 重新计算过期时间：从当前 UTC 时间顺延 ttl_days 天。
         expires_at = datetime.utcnow() + timedelta(days=ttl_days)
         if existing:
+            # 已有会话：只刷新过期时间与更新时间，不改变归属/范围。
             existing.expires_at = expires_at
             existing.updated_at = datetime.utcnow()
         else:
+            # 新会话：创建完整记录（含归属用户、项目、可选文档范围）。
             session = ConversationSession(
                 id=session_id,
                 owner_user_id=self._owner_user_id,
@@ -248,12 +365,16 @@ class ConversationMemory:
         self._db.flush()
 
     def purge_expired_sessions(self) -> int:
-        """Delete expired sessions and their conversation turns and attachments.
+        """删除所有已过期的会话及其对话轮次、附件与 trace。
+
+        Delete expired sessions and their conversation turns and attachments.
 
         Returns the number of sessions deleted.
+
+        由定时任务周期性调用：避免过期会话无限累积，回收存储空间。
         """
         now = datetime.utcnow()
-        # Find expired session ids
+        # 找出所有 expires_at 早于当前时刻的过期会话 ID。
         result = self._db.execute(
             text("SELECT id FROM conversation_sessions WHERE expires_at < :now"),
             {"now": now},
@@ -262,9 +383,9 @@ class ConversationMemory:
         if not expired_ids:
             return 0
 
-        # Delete turns, attachments, and sessions one-by-one for SQLite compatibility.
-        # SQLAlchemy text() does not expand tuples for IN clauses on
-        # SQLite, so a batch DELETE WHERE id IN :ids is not portable.
+        # 逐个删除以兼容 SQLite：SQLAlchemy 的 text() 不会为 IN 子句展开
+        # 元组参数，因此无法使用可移植的 "DELETE ... WHERE id IN :ids" 批量写法；
+        # 逐个调用 delete_session 还能统一复用附件/trace/轮次的清理逻辑。
         count = 0
         for sid in expired_ids:
             self.delete_session(sid)
@@ -277,4 +398,5 @@ class ConversationMemory:
     # ------------------------------------------------------------------
 
     def _next_turn_index(self, session_id: str) -> int:
+        """计算会话下一轮的序号（= 当前轮数，从 0 递增）。"""
         return self.turn_count(session_id)

@@ -341,6 +341,14 @@ class ToolRegistry:
                             "type": "object",
                             "description": "Resolved local inference profile.",
                         },
+                        "narrow_context": {
+                            "type": "boolean",
+                            "description": (
+                                "跨轮引用场景为 True 时收窄合成上下文：prompt "
+                                "不含 evidence_pack items 摘录与完整 inventory，"
+                                "只保留 citations 与结构化 table_facts。"
+                            ),
+                        },
                     },
                     "required": ["query", "rag_answer"],
                 },
@@ -524,6 +532,10 @@ def _rag_retrieve_evidence_handler(
         # bounded citation excerpt and can hide rows that retrieval already
         # proved.  Keep the wire shape JSON-safe for ToolRegistry callers.
         "table_facts": [fact.model_dump() for fact in pack.table_facts],
+        # 9.7：表格覆盖元数据原样透传，Agent 只做门禁，不在工具层重新推断。
+        "inventory": [inv.model_dump() for inv in pack.inventory],
+        "coverage_status": pack.coverage_status,
+        "coverage_missing_tables": list(pack.coverage_missing_tables),
     }
 
 
@@ -574,6 +586,7 @@ def _answer_synthesize_handler(
         citations=args.get("citations") or [],
         evidence_pack=args.get("evidence_pack"),
         target=target,
+        narrow_context=bool(args.get("narrow_context", False)),
     )
     ctx = ctx or {}
     event_sink = ctx.get("event_sink")

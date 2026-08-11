@@ -28,7 +28,7 @@
 
 1. PDF 使用 MinerU 作为主解析器。
 2. MinerU 失败或质量不合格时，Document Intelligence 负责局部修复或整篇 fallback；pypdf 文本层是最终兜底。
-3. 主要输入是出版社或论文官网下载的数字版 PDF，OCR 不作为常规路径。
+U3. 主要输入是出版社或论文官网下载的数字版 PDF，OCR 不作为常规路径。
 4. Chunk 使用 parent-child 结构。
 5. 章节边界优先，章节内部使用 `qwen3-embedding:4b` 做 embedding-based semantic splitting，并由 token 上下限保护。
 6. 每个可检索 Child 都必须由 LLM 生成 1～2 句 contextual prefix。

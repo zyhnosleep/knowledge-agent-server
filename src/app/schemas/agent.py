@@ -227,7 +227,12 @@ class EvidenceItem(BaseModel):
 
 
 class TableFactEvidence(BaseModel):
-    """Exact table value preserved for answer and Agent synthesis."""
+    """Exact table value preserved for answer and Agent synthesis.
+
+    ``fact_id`` 是稳定的事实标识（table + row + column + value 哈希）；
+    ``unit`` 从 value 尾部解析（如 "21.0%" 的 "%"），无单位时为空；
+    ``term`` 是该事实的指标术语（取 column 列名），供期望 facts 遗漏校验使用。
+    """
 
     table_id: str
     document_id: str | None = None
@@ -237,6 +242,28 @@ class TableFactEvidence(BaseModel):
     value: str
     row_index: int = 0
     source_chunk_ids: list[str] = Field(default_factory=list)
+    fact_id: str = ""
+    unit: str = ""
+    term: str = ""
+
+
+class TableCoverage(BaseModel):
+    """Per-table coverage metadata mirrored from the canonical typed inventory.
+
+    9.7.1：每表至少保留 canonical manifest 已有的轻量覆盖元数据，不注入
+    完整 manifest 或 child 文本。``row_indices`` 是该表在 inventory 中的
+    全部行索引，供下游与已返回 table_facts 的行做覆盖比较。
+    """
+
+    document_id: str = ""
+    parse_version: str = ""
+    table_id: str = ""
+    row_count: int = 0
+    source_block_ids: list[str] = Field(default_factory=list)
+    child_ids: list[str] = Field(default_factory=list)
+    child_count: int = 0
+    parent_ids: list[str] = Field(default_factory=list)
+    row_indices: list[int] = Field(default_factory=list)
 
 
 class EvidencePack(BaseModel):
@@ -250,6 +277,11 @@ class EvidencePack(BaseModel):
     ``status`` indicates the outcome: ``ok`` when evidence was found,
     ``project_not_found`` when the project slug is unknown, or
     ``empty`` when no matching evidence was found.
+
+    ``inventory`` / ``coverage_status`` / ``coverage_missing_tables``（9.7）：
+    表格覆盖元数据。``coverage_status`` 取值 complete / partial / unknown；
+    旧调用方不提供这些字段时默认 unknown，避免用空列表同时表示"没有表"和
+    "尚未计算"。coverage 门禁只对 partial 生效（见 agent_executor 直通门禁）。
     """
 
     status: str = "empty"  # 检索结果状态（默认 "empty"）
@@ -257,6 +289,11 @@ class EvidencePack(BaseModel):
 
 
     table_facts: list[TableFactEvidence] = Field(default_factory=list)
+
+    # 9.7：轻量 typed inventory / coverage 通道（旧调用方缺省时 unknown 兼容）
+    inventory: list[TableCoverage] = Field(default_factory=list)
+    coverage_status: str = "unknown"  # complete | partial | unknown
+    coverage_missing_tables: list[str] = Field(default_factory=list)
 
 
 class ToolSpec(BaseModel):

@@ -1,5 +1,15 @@
 # Knowledge Agent 工作记录
 
+## 2026-08-06 Task 9：主控续作、本地验证与 GPU0 candidate 同步
+
+- 按用户要求，本轮不再使用 `codex-with-cc` 或子智能体，全部由主控窗口执行；工作树为 `codex/internal-pilot`。
+- 昨日 RAG candidate 的最终报告已核实：`/home/zhangyh/knowledge-agent-dev/runtime/task15/task15-rag-candidate-direct-full30-20260805-f496859-activation-cleanup.json`，`route_identity=candidate`、`case_count=30`、`passed_cases=30`、`answer_pass_rate=1.0`、`citation_pass_rate=1.0`、`strict_pass=true`。25/30、29/30 等是旧重试报告，不覆盖该最终基线；本轮不重复运行 RAG 30/30。
+- Task 9 本地主控验证：专项测试 `453 passed`；全量测试 `2025 passed, 3 skipped`；目标文件 `py_compile` 通过；`git diff --check` 通过。这里未把 collected 数量写成 passed 数量。
+- 服务器预检：`192.168.31.20` 上 candidate API/worker/Ollama（8002）健康，隔离 test 服务保持 active；active/GPU1（8001）未写入、未切换、未删除。
+- 仅同步了 5 个 Task 9 文件到 `/home/zhangyh/knowledge-agent-dev`：`agent_executor.py`、`agent_synthesizer.py`、`schemas/agent.py`、`search.py`、`tool_registry.py`。同步前备份保存在 `/home/zhangyh/knowledge-agent-dev/runtime/task9-backups/20260806-main-control/`；同步后远端 SHA-256 与本地完全一致。仅重启 candidate API/worker，首次立即健康检查因端口尚未监听失败，等待后恢复为 `status=ok`。
+- 曾启动一次 Agent 30 题评测，但用户随后要求只保留同步，因此已终止唯一评测进程（PID `1819020`），未生成最终报告，不能将其视为 Agent 验收结果。第 1 题 `charmm36_overview` 已通过，用时约 `29125 ms`；第 2 题尚未完成。
+- 按用户要求补做 1 题 candidate 实测（问题与第 1 题相同）：API 总耗时约 `37 s`；`retrieve=17261 ms`、`rag.answer=18627 ms`、`answer.verify retry=false`、`synthesis_skipped=true`、`answer_model=rag-direct`、2 个 citations，答案通过。旧 RAG 最终报告的 P50 为 retrieval `16869 ms` + answer `17942 ms`，但 P95 answer 达 `145980 ms`，因此过去出现单题约 1 分钟属于尾延迟/模型队列或重试情况，并非每题固定 1 分钟；本次直通跳过了 Agent 第二次综合。
+
 ## 2026-07-30 Task 15：`search.py` 恢复、PDF 表格一致性与本地最终复核
 
 - 已确认用户提到的 `search.py` 误改真实存在：该文件曾被部分旧实现覆盖。现已恢复完整 Parent（不再按 1600/2400 字符截断）、10,000 个真实 tokenizer token 的回答预算、最多 6 个唯一 Parent、表格前后 Child 的独立 citation，以及 staged `parse_version_map` 对 paper profile、SQL、vector store 和 `_finalize_contexts()` 的全链路透传。另修复遗留的多余 `@classmethod`，避免 `_is_high_risk()` 实例调用报错；无 shadow map 时仍兼容旧 vector-store 测试替身。

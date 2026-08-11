@@ -163,6 +163,123 @@ def test_synthesize_ollama_provider_uses_injected_client_and_structured_model(mo
     assert ollama.calls and ollama.calls[0]["model"] == "qwen3.5:9b-synthesis"
 
 
+def test_ollama_evidence_route_retries_when_exact_anchor_is_omitted(monkeypatch) -> None:
+    """Ollama synthesis must retry once when evidence-heavy output drops an anchor."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    class SequencedStructuredOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.responses = [
+                SynthesisPayload(
+                    answer_markdown="The structure was analyzed.",
+                    cited_indexes=[0],
+                    warnings=[],
+                    confidence=0.7,
+                ),
+                SynthesisPayload(
+                    answer_markdown="The structure was analyzed using NMR spectroscopy.",
+                    cited_indexes=[0],
+                    warnings=[],
+                    confidence=0.85,
+                ),
+            ]
+
+        def generate_structured(self, schema, **kwargs):
+            self.calls.append({"schema": schema, **kwargs})
+            return self.responses.pop(0)
+
+    ollama = SequencedStructuredOllama()
+    result = AgentSynthesizer(ollama_client=ollama).synthesize(
+        query="What technique analyzed the structure?",
+        route="evidence_required",
+        rag_answer="The structure was analyzed.",
+        citations=[
+            {
+                "document_id": "d1",
+                "excerpt": "NMR spectroscopy was used to analyze the molecular structure.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "score": 0.95,
+                    "excerpt": "NMR spectroscopy was used to analyze the molecular structure.",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+    )
+
+    assert len(ollama.calls) == 2
+    assert "NMR" in result["answer_markdown"]
+    assert result["provider"] == "ollama"
+
+
+def test_ollama_first_prompt_requires_exact_evidence_for_table_routes(monkeypatch) -> None:
+    """The first Ollama pass must preserve table labels, terms, and values."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    class CapturingStructuredOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def generate_structured(self, schema, **kwargs):
+            self.calls.append({"schema": schema, **kwargs})
+            return SynthesisPayload(
+                answer_markdown="Table 5 reports 21.0 and 95.3.",
+                cited_indexes=[0],
+                warnings=[],
+                confidence=0.9,
+            )
+
+    ollama = CapturingStructuredOllama()
+    AgentSynthesizer(ollama_client=ollama).synthesize(
+        query="Compare Table 5 metrics and explain the QM/NMR evidence.",
+        route="table_or_metric",
+        rag_answer="The table reports the exact values.",
+        citations=[
+            {
+                "document_id": "d1",
+                "page_title": "Paper",
+                "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+            "table_facts": [
+                {"table_id": "t5", "table_label": "Table 5", "row_label": "QM", "column": "NMR", "value": "21.0"},
+            ],
+        },
+    )
+
+    prompt = ollama.calls[0]["system_prompt"] + "\n" + ollama.calls[0]["user_prompt"]
+    assert "preserve" in prompt.lower()
+    assert "exact numeric" in prompt.lower()
+    assert "table labels" in prompt.lower()
+    assert "canonical table facts" in prompt.lower()
+    assert "do not summarize" in prompt.lower()
+
+
 def test_synthesize_generation_target_calls_9b_once_as_plain_markdown(monkeypatch) -> None:
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
     ollama = FakeOllamaClient(result=_local_result())
@@ -208,6 +325,989 @@ def test_synthesize_stream_forwards_tokens_then_citation(monkeypatch) -> None:
         "answer_markdown"
     ]
     assert events[-1][1]["index"] == 0
+
+
+# ------------------------------------------------------------------
+# local synthesis fidelity tests (Task 16 agent synthesis fidelity fix)
+# ------------------------------------------------------------------
+
+
+class _SequencedLocalOllama:
+    """Non-streaming local client with a scripted sequence of answers."""
+
+    def __init__(self, responses: list[dict]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def generate_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        answer = self.responses.pop(0)["answer_markdown"]
+        return {
+            "content": answer,
+            "model": kwargs["model"],
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        }
+
+    def generate_structured(self, *args, **kwargs):
+        raise AssertionError("Local synthesis must not request structured JSON")
+
+    def stream_chat(self, **kwargs):
+        raise AssertionError("Non-stream local synthesis must not stream")
+
+
+class _SequencedStreamingOllama:
+    """Streaming client whose first stream misses anchors and retry fixes it."""
+
+    def __init__(self, *, stream_text: str, retry_text: str) -> None:
+        self.stream_text = stream_text
+        self.retry_text = retry_text
+        self.stream_calls: list[dict] = []
+        self.retry_calls: list[dict] = []
+
+    def stream_chat(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        midpoint = max(1, len(self.stream_text) // 2)
+        yield {"content": self.stream_text[:midpoint], "model": kwargs["model"], "done": False}
+        yield {"content": self.stream_text[midpoint:], "model": kwargs["model"], "done": True}
+
+    def generate_chat(self, **kwargs):
+        self.retry_calls.append(kwargs)
+        return {
+            "content": self.retry_text,
+            "model": kwargs["model"],
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        }
+
+    def generate_structured(self, *args, **kwargs):
+        raise AssertionError("Local synthesis must not request structured JSON")
+
+
+def test_local_prompt_includes_precision_rules_and_table_facts(monkeypatch) -> None:
+    """The local prompt must carry the same fidelity controls as ollama/external."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="Table 5: NMR spectroscopy at 7.5 kcal/mol was used [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    syn.synthesize(
+        query="Compare Table 5 metrics and explain the QM/NMR evidence.",
+        route="table_or_metric",
+        rag_answer="The table reports the exact values.",
+        citations=[
+            {
+                "document_id": "d1",
+                "page_title": "Paper",
+                "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+            "table_facts": [
+                {"table_id": "t5", "row_label": "QM", "column": "NMR", "value": "21.0"},
+            ],
+        },
+        target=_generation_target(),
+    )
+    prompt = ollama.calls[0]["messages"][0]["content"] + "\n" + ollama.calls[0]["messages"][1]["content"]
+    assert "exact numeric" in prompt.lower()
+    assert "table labels" in prompt.lower()
+    assert "canonical table facts" in prompt.lower()
+    assert "do not summarize" in prompt.lower()
+    assert "value=21.0" in prompt
+
+
+def test_streaming_local_prompt_includes_precision_rules_and_table_facts(monkeypatch) -> None:
+    """The streaming local prompt must carry fidelity controls too."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="Table 5: NMR spectroscopy at 7.5 kcal/mol was used [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    events: list[tuple[str, dict]] = []
+    syn.synthesize_stream(
+        query="Compare Table 5 metrics and explain the QM/NMR evidence.",
+        route="table_or_metric",
+        rag_answer="NMR spectroscopy at 7.5 kcal/mol was used.",
+        citations=[
+            {
+                "document_id": "d1",
+                "page_title": "Paper",
+                "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: QM and NMR validation values are 21.0 and 95.3.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+            "table_facts": [
+                {"table_id": "t5", "row_label": "QM", "column": "NMR", "value": "21.0"},
+            ],
+        },
+        target=_generation_target(),
+        event_sink=lambda name, data: events.append((name, data)),
+    )
+    prompt = ollama.calls[0]["messages"][0]["content"] + "\n" + ollama.calls[0]["messages"][1]["content"]
+    assert "exact numeric" in prompt.lower()
+    assert "canonical table facts" in prompt.lower()
+    assert "value=21.0" in prompt
+
+
+def test_local_evidence_route_retries_when_exact_anchor_is_omitted(monkeypatch) -> None:
+    """The local path must retry once when an evidence-heavy answer drops an anchor."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = _SequencedLocalOllama(
+        responses=[
+            {"answer_markdown": "The structure was analyzed."},
+            {"answer_markdown": "The structure was analyzed using NMR spectroscopy."},
+        ]
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    result = syn.synthesize(
+        query="What technique analyzed the structure?",
+        route="evidence_required",
+        rag_answer="The structure was analyzed.",
+        citations=[
+            {
+                "document_id": "d1",
+                "excerpt": "NMR spectroscopy was used to analyze the molecular structure.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "NMR spectroscopy was used to analyze the molecular structure.",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert len(ollama.calls) == 2
+    assert "NMR" in result["answer_markdown"]
+    assert result["provider"] == "local"
+    assert result["model"] == "qwen3.5:9b"
+    assert any("retry" in w.lower() for w in result["warnings"])
+
+
+def test_local_coverage_retry_bounded_to_one_retry(monkeypatch) -> None:
+    """Even a retry that still misses anchors never triggers a second retry."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+
+    class AlwaysMissingOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def generate_chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "content": "General analysis was performed.",
+                "model": kwargs["model"],
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+            }
+
+        def generate_structured(self, *args, **kwargs):
+            raise AssertionError("Local synthesis must not request structured JSON")
+
+        def stream_chat(self, **kwargs):
+            raise AssertionError("Non-stream local synthesis must not stream")
+
+    ollama = AlwaysMissingOllama()
+    syn = AgentSynthesizer(ollama_client=ollama)
+    result = syn.synthesize(
+        query="What technique?",
+        route="evidence_required",
+        rag_answer="Analysis was done.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy at 7.5 kcal/mol was used."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "NMR spectroscopy at 7.5 kcal/mol was used.",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert len(ollama.calls) == 2, f"Expected exactly 2 calls, got {len(ollama.calls)}"
+    assert any("retry" in w.lower() for w in result["warnings"])
+
+
+def test_local_retry_prompt_uses_evidence_anchors_not_benchmark_terms(monkeypatch) -> None:
+    """The retry prompt lists generic evidence anchors, never benchmark ids/terms."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = _SequencedLocalOllama(
+        responses=[
+            {"answer_markdown": "The structure was analyzed."},
+            {"answer_markdown": "The structure was analyzed using NMR spectroscopy."},
+        ]
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    syn.synthesize(
+        query="What technique analyzed the structure?",
+        route="evidence_required",
+        rag_answer="The structure was analyzed.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy was used to analyze the structure."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "NMR spectroscopy was used to analyze the structure.",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert len(ollama.calls) == 2
+    retry_prompt = ollama.calls[1]["messages"][0]["content"] + "\n" + ollama.calls[1]["messages"][1]["content"]
+    # The only anchor available in the evidence is NMR — it must drive the retry.
+    assert "NMR" in retry_prompt
+    # No benchmark case ids / domain anchor lists may appear.
+    assert "opls5_table_metrics" not in retry_prompt
+    assert "charmm36" not in retry_prompt
+
+
+def test_local_synthesis_introducing_unsupported_number_falls_back(monkeypatch) -> None:
+    """9.3.3：合成答案引入证据不支持的数值（999.0）必须回退 RAG 草稿。
+
+    draft_fidelity 守卫只检查 anchor 覆盖下降；本场景合成保留 21.0（覆盖不降）
+    但新增 999.0——需要独立的新数字打回校验。
+    """
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="The accuracy is 21.0% and improved to 999.0% [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The accuracy is 21.0%."
+    result = syn.synthesize(
+        query="What is the accuracy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: accuracy 21.0%."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "accuracy",
+                    "value": "21.0",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert "999.0" not in result["answer_markdown"]
+    assert result["answer_markdown"] == draft
+    assert result["provider"] == "local"
+    assert result["model"] == "local-fallback"
+
+
+def test_local_synthesis_keeps_number_format_variants(monkeypatch) -> None:
+    """9.3.3 数值规范化：'21' 与 '21.0' 数值等价，不应触发假阳性回退。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: accuracy 21.0% [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The accuracy is 21.0%."
+    result = syn.synthesize(
+        query="What is the accuracy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: accuracy 21."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "accuracy",
+                    "value": "21",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 合成答案保留 21.0（证据是 21，数值等价）→ 不被视为编造
+    assert "21.0" in result["answer_markdown"]
+    assert result["answer_markdown"] != draft
+
+
+def test_local_synthesis_rounded_number_falls_back(monkeypatch) -> None:
+    """9.3.3 数值规范化：80 与 80.5 数值不等，取整编造必须回退。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="The value is 80 [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The value is 80.5."
+    result = syn.synthesize(
+        query="What is the value?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 1: value 80.5."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-1",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "80.5",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 取整编造被回退：答案必须回退到含 80.5 的草稿
+    assert result["answer_markdown"] == draft
+    assert result["provider"] == "local"
+    assert result["model"] == "local-fallback"
+
+
+def test_local_synthesis_dropping_table_label_falls_back(monkeypatch) -> None:
+    """9.3.3：合成答案删除证据中的表号（Table 7）必须回退。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="The accuracy is 21.0% [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "Table 7: accuracy 21.0%."
+    result = syn.synthesize(
+        query="What is the accuracy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: accuracy 21.0%."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "accuracy",
+                    "value": "21.0",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 答案删除了 Table 7 表号 → 回退 RAG 草稿（保留表号）
+    assert "Table 7" in result["answer_markdown"]
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+
+
+def test_local_synthesis_missing_fact_value_falls_back(monkeypatch) -> None:
+    """9.3.2b：期望 facts（table_facts values）中 draft 覆盖但合成答案遗漏
+    （1.18）时回退。citations 不含 1.18，隔离 draft_fidelity 的 anchor 覆盖。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    # 合成答案保留表号（避免表号守卫拦截），但遗漏 draft 覆盖的 1.18
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: value 21.0 [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The value is 21.0 and 1.18 kcal/mol."
+    result = syn.synthesize(
+        query="What are the values?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: value 21.0."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "inventory": [_inventory_entry()],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "21.0",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                },
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "other",
+                    "column": "value",
+                    "value": "1.18",
+                    "row_index": 1,
+                    "source_chunk_ids": ["c1"],
+                },
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 合成答案删掉了 draft 覆盖的 1.18 → 回退 RAG 草稿
+    assert "1.18" in result["answer_markdown"]
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+
+
+def test_local_narrow_context_excludes_evidence_pack_items(monkeypatch) -> None:
+    """9.3.1：narrow_context=True 时 prompt 不含 evidence_pack items 摘录。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(result=_local_result())
+    syn = AgentSynthesizer(ollama_client=ollama)
+    result = syn.synthesize(
+        query="那个的值是多少？",
+        route="table_or_metric",
+        conversation_summary="User previously asked about charmm36m.",
+        rag_answer="The value is 21.0.",
+        # 摘录不带句号：_answer_numbers 不提取"21.0." 这类句尾数字
+        citations=[{"document_id": "d1", "excerpt": "Table 7: value 21.0"}],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "score": 0.9,
+                    "excerpt": "full narrative evidence paragraph that should be excluded",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+            "inventory": [_inventory_entry()],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "21.0",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+        narrow_context=True,
+    )
+    assert result["provider"] == "local"
+    prompt_text = ollama.calls[0]["messages"][1]["content"]
+    # evidence-item 摘录与完整 inventory 被排除，citations excerpt 与
+    # conversation_summary 保留
+    assert "evidence-item-0" not in prompt_text
+    assert "excluded" not in prompt_text
+    assert "inv-child-1" not in prompt_text
+    assert "Table 7: value 21.0" in prompt_text
+    assert "User previously asked about charmm36m." in prompt_text
+
+
+def test_local_synthesis_dropping_fact_unit_falls_back(monkeypatch) -> None:
+    """9.3.2：合成答案删除期望 facts 的单位（%），draft 覆盖但合成遗漏 → 回退。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    # 合成保留数值 21.0 与表号，但删除单位 %（隔离 value/表号守卫）
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: value 21.0 [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "Table 7: value 21.0%."
+    result = syn.synthesize(
+        query="What is the value?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: value 21.0."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "inventory": [_inventory_entry()],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "21.0",
+                    "unit": "%",
+                    "term": "value",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 合成答案删除 % → 回退 RAG 草稿（保留单位）
+    assert "%" in result["answer_markdown"]
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+
+
+def test_local_draft_fidelity_guard_returns_draft_when_synthesis_drops_anchors(monkeypatch) -> None:
+    """A synthesis that loses draft-covered anchors must fall back to the draft."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="Table 5: NMR spectroscopy at 7.5 kcal/mol was used [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+    assert result["provider"] == "local"
+    assert any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_local_draft_fidelity_keeps_synthesis_when_coverage_preserved(monkeypatch) -> None:
+    """A synthesis that preserves draft anchor coverage is kept."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    synthesized = "Table 5: NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used [0]."
+    ollama = FakeOllamaClient(result=_local_result(answer_markdown=synthesized))
+    syn = AgentSynthesizer(ollama_client=ollama)
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer="NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used.",
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    assert result["answer_markdown"] == synthesized
+    assert result["model"] == "qwen3.5:9b"
+    assert not any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_streaming_local_coverage_retry_recovers_missing_anchor(monkeypatch) -> None:
+    """The streaming path retries once (bounded) when the stream drops an anchor."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = _SequencedStreamingOllama(
+        stream_text="The structure was analyzed using standard methods.",
+        retry_text="The structure was analyzed using NMR spectroscopy.",
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    events: list[tuple[str, dict]] = []
+    result = syn.synthesize_stream(
+        query="What technique?",
+        route="evidence_required",
+        rag_answer="The structure was analyzed.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy was used."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "NMR spectroscopy was used.",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+        event_sink=lambda name, data: events.append((name, data)),
+    )
+    assert len(ollama.stream_calls) == 1
+    assert len(ollama.retry_calls) == 1
+    assert "NMR" in result["answer_markdown"]
+    assert result["provider"] == "local"
+    assert result["model"] == "qwen3.5:9b"
+    assert any("retry" in w.lower() for w in result["warnings"])
+
+
+def test_streaming_draft_fidelity_guard_returns_draft(monkeypatch) -> None:
+    """The streaming selection path falls back to the draft on coverage loss."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="Table 5: NMR spectroscopy at 7.5 kcal/mol was used [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    events: list[tuple[str, dict]] = []
+    result = syn.synthesize_stream(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+        target=_generation_target(),
+        event_sink=lambda name, data: events.append((name, data)),
+    )
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+    assert any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_streaming_synthesis_introducing_unsupported_number_falls_back(monkeypatch) -> None:
+    """9.3.3：流式路径同样拦截证据外数值（999.0）并回退 RAG 草稿。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(
+            answer_markdown="The accuracy is 21.0% and improved to 999.0% [0]."
+        )
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The accuracy is 21.0%."
+    events: list[tuple[str, dict]] = []
+    result = syn.synthesize_stream(
+        query="What is the accuracy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {"document_id": "d1", "excerpt": "Table 7: accuracy 21.0%."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "accuracy",
+                    "value": "21.0",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+        event_sink=lambda name, data: events.append((name, data)),
+    )
+    assert "999.0" not in result["answer_markdown"]
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+    assert any("not supported" in w.lower() for w in result["warnings"])
+
+
+# ------------------------------------------------------------------
+# provider-consistency draft-fidelity tests (Task 16 provider fidelity rework)
+# ------------------------------------------------------------------
+
+
+class _StructuredOllama:
+    """Structured-output client with a scripted SynthesisPayload sequence."""
+
+    def __init__(self, payloads: list[SynthesisPayload]) -> None:
+        self.payloads = list(payloads)
+        self.calls: list[dict] = []
+
+    def generate_structured(self, schema, **kwargs):
+        self.calls.append({"schema": schema, **kwargs})
+        return self.payloads.pop(0)
+
+
+def _provider_consistency_case() -> dict:
+    """Shared evidence inputs for the provider-consistency guard tests."""
+    return {
+        "citations": [
+            {
+                "document_id": "d1",
+                "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+            }
+        ],
+        "evidence_pack": {
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+                    "evidence_kind": "table",
+                    "source_stage": "document_table",
+                    "support_hint": "direct",
+                }
+            ],
+        },
+    }
+
+
+def test_ollama_draft_fidelity_guard_returns_draft_when_synthesis_drops_anchors(monkeypatch) -> None:
+    """An Ollama synthesis that loses draft-covered anchors must fall back to the draft."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+    ollama = _StructuredOllama(
+        [
+            SynthesisPayload(
+                answer_markdown="Table 5: NMR spectroscopy at 7.5 kcal/mol was used [0].",
+                cited_indexes=[0],
+                warnings=[],
+                confidence=0.85,
+            )
+        ]
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    case = _provider_consistency_case()
+    draft = "NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=case["citations"],
+        evidence_pack=case["evidence_pack"],
+    )
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+    assert result["provider"] == "local"
+    assert any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_ollama_draft_fidelity_keeps_synthesis_when_coverage_preserved(monkeypatch) -> None:
+    """An Ollama synthesis that preserves draft anchor coverage is kept."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+    synthesized = "Table 5: NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used [0]."
+    ollama = _StructuredOllama(
+        [
+            SynthesisPayload(
+                answer_markdown=synthesized,
+                cited_indexes=[0],
+                warnings=[],
+                confidence=0.9,
+            )
+        ]
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    case = _provider_consistency_case()
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer="NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used.",
+        citations=case["citations"],
+        evidence_pack=case["evidence_pack"],
+    )
+    assert result["answer_markdown"] == synthesized
+    assert result["provider"] == "ollama"
+    assert result["model"] == "qwen3.5:9b-synthesis"
+    assert not any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_external_draft_fidelity_guard_returns_draft_when_synthesis_drops_anchors(monkeypatch) -> None:
+    """An external synthesis that loses draft-covered anchors must fall back to the draft."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_external
+    )
+    import httpx
+
+    def fake_post(self, url, json, headers, **kw):
+        return _fake_response(
+            '{"answer_markdown": "NMR spectroscopy at 7.5 kcal/mol was used.", '
+            '"cited_indexes": [0], "warnings": [], "confidence": 0.85}'
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    syn = AgentSynthesizer()
+    case = _provider_consistency_case()
+    draft = "NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=case["citations"],
+        evidence_pack=case["evidence_pack"],
+    )
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+    assert result["provider"] == "local"
+    assert any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_external_draft_fidelity_keeps_synthesis_when_coverage_preserved(monkeypatch) -> None:
+    """An external synthesis that preserves draft anchor coverage is kept."""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_external
+    )
+    import httpx
+
+    synthesized = "Table 5: NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    fake_response_content = (
+        '{"answer_markdown": "Table 5: NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used.", '
+        '"cited_indexes": [0], "warnings": [], "confidence": 0.9}'
+    )
+
+    def fake_post(self, url, json, headers, **kw):
+        return _fake_response(fake_response_content)
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    syn = AgentSynthesizer()
+    case = _provider_consistency_case()
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer="NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used.",
+        citations=case["citations"],
+        evidence_pack=case["evidence_pack"],
+    )
+    assert result["answer_markdown"] == synthesized
+    assert result["provider"] == "external_api"
+    assert result["model"] == "gpt-4o-mini"
+    assert not any("coverage" in w.lower() for w in result["warnings"])
+
+
+def test_draft_fidelity_fallback_generic_coverage_math() -> None:
+    """_draft_fidelity_fallback keeps synthesis when coverage is not lower."""
+    syn = AgentSynthesizer()
+    # Synthesis preserves every draft anchor -> kept (None).
+    assert syn._draft_fidelity_fallback(
+        rag_answer="NMR at 7.5 kcal/mol for GLH mutant.",
+        citations=[{"excerpt": "NMR at 7.5 kcal/mol for GLH mutant."}],
+        evidence_pack={
+            "status": "ok",
+            "items": [{"excerpt": "NMR at 7.5 kcal/mol for GLH mutant."}],
+        },
+        synthesized_answer="NMR at 7.5 kcal/mol for GLH mutant was used.",
+        warnings=[],
+    ) is None
+    # Synthesis drops GLH (draft-covered) -> draft fallback.
+    fallback = syn._draft_fidelity_fallback(
+        rag_answer="NMR at 7.5 kcal/mol for GLH mutant.",
+        citations=[{"excerpt": "NMR at 7.5 kcal/mol for GLH mutant."}],
+        evidence_pack={
+            "status": "ok",
+            "items": [{"excerpt": "NMR at 7.5 kcal/mol for GLH mutant."}],
+        },
+        synthesized_answer="NMR at 7.5 kcal/mol was used.",
+        warnings=["prior warning"],
+    )
+    assert fallback is not None
+    assert fallback["answer_markdown"] == "NMR at 7.5 kcal/mol for GLH mutant."
+    assert fallback["model"] == "local-fallback"
+    assert "prior warning" in fallback["warnings"]
+    assert any("coverage" in w.lower() for w in fallback["warnings"])
 
 
 def test_synthesize_local_failure_returns_evidence_fallback_with_warning(monkeypatch) -> None:
@@ -600,6 +1700,41 @@ def test_synthesize_without_evidence_pack_still_works(monkeypatch) -> None:
     assert "answer_markdown" in result
     for field in ("answer_markdown", "cited_indexes", "warnings", "confidence", "provider", "model"):
         assert field in result, f"Missing required field: {field}"
+
+
+def test_table_facts_prompt_keeps_human_readable_table_labels() -> None:
+    """Exact facts must remain associated with their source table label."""
+    evidence_pack = {
+        "status": "ok",
+        "items": [
+            {
+                "table_id": "table-2",
+                "excerpt": "Table 2. Hydration free energies for small aromatic molecules.",
+            }
+        ],
+        "table_facts": [
+            {
+                "table_id": "table-2",
+                "row_label": "RMS error",
+                "column": "OPLS4",
+                "value": "0.76",
+            },
+            {
+                "table_id": "table-2",
+                "row_label": "RMS error",
+                "column": "OPLS5",
+                "value": "0.46",
+            },
+        ],
+    }
+
+    rendered = AgentSynthesizer._format_table_facts_section(evidence_pack)
+
+    assert "label=Table 2" in rendered
+    assert "caption=Hydration free energies for small aromatic molecules" in rendered
+    assert "table=table-2" in rendered
+    assert "row=RMS error column=OPLS4 value=0.76" in rendered
+    assert "row=RMS error column=OPLS5 value=0.46" in rendered
 
 
 def _fake_settings_external():
@@ -1255,3 +2390,637 @@ def _fake_response(content: str):
             }
 
     return FakeResponse()
+
+
+def test_local_synthesis_unknown_expected_facts_skips_missing_field_check(
+    monkeypatch,
+) -> None:
+    """9.8：问题无可解析需求目标（指代追问）→ expected_facts_status=unknown，
+    不触发 facts 遗漏回退（draft-fidelity 锚点守卫仍生效）。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    # 合成答案保留 draft 全部锚点（21.0/1.18/kcal/mol），仅隔离 facts 校验
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: the value is 21.0 and 1.18 kcal/mol [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The value is 21.0 and 1.18 kcal/mol."
+    result = syn.synthesize(
+        query="那 C36 呢？",
+        route="table_or_metric",
+        rag_answer=draft,
+        # 摘录不带句号：_answer_numbers 不提取"21.0." 这类句尾数字
+        citations=[{"document_id": "d1", "excerpt": "Table 7: value 21.0"}],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "1.18",
+                    "row_index": 1,
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 期望集合不可判定 → facts 遗漏校验短路；合成结果保留、状态可审计
+    assert result["answer_markdown"] == "Table 7: the value is 21.0 and 1.18 kcal/mol [0]."
+    assert result["expected_facts_status"] == "unknown"
+
+
+def test_local_synthesis_missing_expected_facts_does_not_rollback(
+    monkeypatch,
+) -> None:
+    """9.8：需求目标解析但 facts 零命中 → expected_facts_status=missing，
+    不触发遗漏回退（需求存在但供给未返回，不是 synthesis 的错）。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    # 合成答案保留 draft 全部锚点与 Table 7 标签，仅隔离 facts 校验；
+    # 摘录不带句号（_answer_numbers 不提取"21.0." 这类句尾数字）
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: the value is 21.0 and 1.18 kcal/mol [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "The value is 21.0 and 1.18 kcal/mol."
+    result = syn.synthesize(
+        query="What about the accuracy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[{"document_id": "d1", "excerpt": "Table 7: value 21.0"}],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "inventory": [_inventory_entry()],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "1.18",
+                    "row_index": 1,
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 无事实可对照 → 保留合成结果、状态可审计（需求存在但供给未返回）
+    assert result["answer_markdown"] == "Table 7: the value is 21.0 and 1.18 kcal/mol [0]."
+    assert result["expected_facts_status"] == "missing"
+
+
+def test_expected_facts_matches_explicit_table_reference() -> None:
+    """9.8/任务9：显式 Table N + 列需求经 typed inventory 解析 →
+    与已返回 facts 全部精确命中 → complete。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    evidence_pack = {
+        "inventory": [_inventory_entry()],
+        "table_facts": [
+            _table_fact(
+                row_label="OPLS5",
+                column="binding RMSE",
+                value="1.18",
+                row_index=2,
+            )
+        ],
+    }
+    status, targets = syn._expected_facts_status(
+        "Table 7 的 binding RMSE 是多少？", evidence_pack
+    )
+    assert status == "complete"
+    assert targets and targets[0]["column"] == "binding rmse"
+    assert targets[0]["table_id"] == "table-7"
+    assert targets[0]["document_id"] == "d1"
+    assert targets[0]["parse_version"] == "canonical-v4"
+    assert targets[0]["row_index"] is None
+    assert targets[0]["identity"] == "d1|canonical-v4|table-7|any|binding rmse"
+
+
+def test_expected_facts_unknown_without_parseable_target() -> None:
+    """9.8/任务9：无术语且无表引用的指代追问 → unknown，不移除任何 facts 校验。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    status, targets = syn._expected_facts_from_question(
+        "那 C36 呢？",
+        [_inventory_entry()],
+    )
+    assert status == "unknown"
+    assert targets == []
+
+
+# ------------------------------------------------------------------
+# 9.8/任务9：需求侧 expected facts（typed inventory + exact join）
+# ------------------------------------------------------------------
+
+
+def _inventory_entry(
+    table_id: str = "table-7",
+    document_id: str = "d1",
+    parse_version: str = "canonical-v4",
+    row_indices: list[int] | None = None,
+) -> dict:
+    """构造 typed inventory（TableCoverage dict 形态）测试数据。"""
+    row_indices = row_indices or []
+    return {
+        "document_id": document_id,
+        "parse_version": parse_version,
+        "table_id": table_id,
+        "row_count": len(row_indices),
+        "source_block_ids": ["sb-1"],
+        "child_ids": ["inv-child-1"],
+        "child_count": 1,
+        "parent_ids": ["p-1"],
+        "row_indices": row_indices,
+    }
+
+
+def _table_fact(
+    table_id: str = "table-7",
+    document_id: str = "d1",
+    parse_version: str = "canonical-v4",
+    row_index: int = 0,
+    row_label: str = "",
+    column: str = "value",
+    value: str = "21.0",
+    unit: str = "",
+    term: str | None = None,
+) -> dict:
+    """构造已返回 table_facts（TableFactEvidence dict 形态）测试数据。"""
+    return {
+        "table_id": table_id,
+        "document_id": document_id,
+        "parse_version": parse_version,
+        "row_label": row_label,
+        "column": column,
+        "value": value,
+        "row_index": row_index,
+        "source_chunk_ids": ["c1"],
+        "fact_id": f"{table_id}|{row_index}|{column}|{value}",
+        "unit": unit,
+        "term": term or column,
+    }
+
+
+def test_expected_facts_from_question_requires_unique_inventory() -> None:
+    """9.8/任务9：inventory 缺失或无法唯一解析（多表/多版本）→ unknown。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    assert syn._expected_facts_from_question("What is X?", None)[0] == "unknown"
+    assert syn._expected_facts_from_question("What is X?", [])[0] == "unknown"
+    # 无表引用 + 多表 inventory → 无法唯一解析目标表 → unknown
+    multi = [_inventory_entry(), _inventory_entry(table_id="table-2")]
+    assert (
+        syn._expected_facts_from_question("What about the accuracy?", multi)[0]
+        == "unknown"
+    )
+    # 同一表号出现在两个解析版本 → 无法唯一解析 → unknown
+    two_versions = [_inventory_entry(), _inventory_entry(parse_version="v3")]
+    assert (
+        syn._expected_facts_from_question("Table 7 的 accuracy 是多少？", two_versions)[0]
+        == "unknown"
+    )
+    # 请求的表不在 inventory 中 → 无法唯一解析 → unknown
+    only_other = [_inventory_entry(table_id="table-2")]
+    assert (
+        syn._expected_facts_from_question("Table 7 的 accuracy 是多少？", only_other)[0]
+        == "unknown"
+    )
+
+
+def test_expected_facts_from_question_returns_demand_targets() -> None:
+    """9.8/任务9：返回需求目标（含 join 身份），不是已召回 facts。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    status, targets = syn._expected_facts_from_question(
+        "Table 7 的 binding RMSE 是多少？",
+        [_inventory_entry(row_indices=[2])],
+    )
+    assert status == "resolved"
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["table_ref"] == "Table 7"
+    assert target["table_id"] == "table-7"
+    assert target["document_id"] == "d1"
+    assert target["parse_version"] == "canonical-v4"
+    assert target["column"] == "binding rmse"
+    assert target["row_index"] is None
+    assert target["identity"] == "d1|canonical-v4|table-7|any|binding rmse"
+
+
+def test_expected_facts_multicolumn_demand_partial_supply_is_missing() -> None:
+    """9.8/任务9：问题要求 Asp、C6、exptl，仅返回 Asp=21.0 →
+    missing，单个 fact 命中不能把多列需求判为 complete。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    evidence_pack = {
+        "inventory": [_inventory_entry()],
+        "table_facts": [_table_fact(column="Asp", value="21.0")],
+    }
+    status, targets = syn._expected_facts_status(
+        "Table 7 的 Asp、C6、exptl 值是多少？", evidence_pack
+    )
+    assert status == "missing"
+    assert [t["column"] for t in targets] == ["asp", "c6", "exptl"]
+
+
+def test_expected_facts_all_demanded_columns_returned_is_complete() -> None:
+    """9.8/任务9：多列需求全部命中 → complete（join 的正向对照）。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    evidence_pack = {
+        "inventory": [_inventory_entry()],
+        "table_facts": [
+            _table_fact(column="Asp", value="21.0"),
+            _table_fact(column="C6", value="1.18"),
+            _table_fact(column="exptl", value="2.5"),
+        ],
+    }
+    status, _ = syn._expected_facts_status(
+        "Table 7 的 Asp、C6、exptl 值是多少？", evidence_pack
+    )
+    assert status == "complete"
+
+
+def test_expected_facts_wrong_table_facts_do_not_satisfy() -> None:
+    """9.8/任务9：明确请求 Table 7，只返回 Table 2 facts → missing，
+    错表 fact 不能当作 Table 7 需求的满足项。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    evidence_pack = {
+        "inventory": [_inventory_entry(), _inventory_entry(table_id="table-2")],
+        "table_facts": [
+            _table_fact(table_id="table-2", column="binding RMSE", value="1.18")
+        ],
+    }
+    status, targets = syn._expected_facts_status(
+        "Table 7 的 binding RMSE 是多少？", evidence_pack
+    )
+    assert status == "missing"
+    assert targets[0]["table_id"] == "table-7"
+
+
+def test_expected_facts_exact_join_on_document_version_table_row() -> None:
+    """9.8/任务9：exact join 按 document_id + parse_version + table_id +
+    row_index/row_label + column/term；任一维度不匹配即 missing。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    inventory = [_inventory_entry(row_indices=[2, 3])]
+    question = "Table 7 的 row 3 binding RMSE 是多少？"
+    # 行号 + 列全部匹配 → complete
+    ok = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_index=3, column="binding RMSE", value="1.18")
+        ],
+    }
+    assert syn._expected_facts_status(question, ok)[0] == "complete"
+    # 行不匹配 → missing
+    wrong_row = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_index=2, column="binding RMSE", value="1.12")
+        ],
+    }
+    assert syn._expected_facts_status(question, wrong_row)[0] == "missing"
+    # 版本不匹配 → missing
+    wrong_version = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(
+                row_index=3, parse_version="v3", column="binding RMSE", value="1.18"
+            )
+        ],
+    }
+    assert syn._expected_facts_status(question, wrong_version)[0] == "missing"
+    # 文档不匹配 → missing
+    wrong_doc = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(
+                row_index=3, document_id="d2", column="binding RMSE", value="1.18"
+            )
+        ],
+    }
+    assert syn._expected_facts_status(question, wrong_doc)[0] == "missing"
+
+
+def test_expected_facts_empty_facts_parseable_inventory_is_missing() -> None:
+    """9.8/任务9：table_facts=[] 但 inventory 可解析 → demand targets 仍
+    生成且状态为 missing，不能静默变成 unknown 或 complete。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    evidence_pack = {
+        "inventory": [_inventory_entry()],
+        "table_facts": [],
+    }
+    status, targets = syn._expected_facts_status(
+        "Table 7 的 Asp、C6、exptl 值是多少？", evidence_pack
+    )
+    assert status == "missing"
+    assert [t["column"] for t in targets] == ["asp", "c6", "exptl"]
+    assert all(t["table_id"] == "table-7" for t in targets)
+
+
+def test_expected_facts_row_label_demand_complete_and_missing() -> None:
+    """9.8/任务9：问题明确提到行标签（"the total row"）→ 需求 target
+    携带 row_label 并参与 exact identity join：同标签 fact 满足 →
+    complete，其他标签（mean）不能满足 → missing，无行标签 fact
+    同样不满足（行维度不放松为 any）。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    inventory = [_inventory_entry()]
+    # 自然语言 "the total row" 形式（英文）
+    question = "What is the binding free energy in the total row of Table 7?"
+    same_label = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_label="total", column="binding free energy", value="1.18")
+        ],
+    }
+    status, targets = syn._expected_facts_status(question, same_label)
+    assert status == "complete"
+    assert targets[0]["row_label"] == "total"
+    assert targets[0]["column"] == "binding free energy"
+    assert (
+        targets[0]["identity"]
+        == "d1|canonical-v4|table-7|label:total|binding free energy"
+    )
+    # 其他行标签 fact 不能满足同一需求
+    other_label = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_label="mean", column="binding free energy", value="1.18")
+        ],
+    }
+    assert syn._expected_facts_status(question, other_label)[0] == "missing"
+    # 无行标签 fact（行维度为 any）同样不满足行标签需求
+    any_row = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_label="", column="binding free energy", value="1.18")
+        ],
+    }
+    assert syn._expected_facts_status(question, any_row)[0] == "missing"
+
+
+@pytest.mark.parametrize("alias", ["total", "average", "mean", "overall"])
+def test_expected_facts_row_label_aliases_join_exactly(alias: str) -> None:
+    """9.8/任务9：total/average/mean/overall 行别名（"X row" 形式）均映射
+    到 canonical row label 并参与 exact join；同标签返回 complete。"""
+    syn = AgentSynthesizer(ollama_client=FakeOllamaClient())
+    inventory = [_inventory_entry()]
+    question = f"Table 7 的 {alias} row 的 binding free energy 是多少？"
+    matched = {
+        "inventory": inventory,
+        "table_facts": [
+            _table_fact(row_label=alias, column="binding free energy", value="1.18")
+        ],
+    }
+    status, targets = syn._expected_facts_status(question, matched)
+    assert status == "complete"
+    assert targets[0]["row_label"] == alias
+    assert targets[0]["identity"].endswith(f"label:{alias}|binding free energy")
+
+
+def test_local_synthesis_multicolumn_demand_partial_facts_status_missing(
+    monkeypatch,
+) -> None:
+    """9.8/任务9：端到端——问题要求 Asp、C6、exptl，只返回 Asp=21.0 →
+    expected_facts_status=missing，不因单个 fact 命中而 complete，也不
+    触发遗漏回退（供给缺失不是 synthesis 的错）。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: Asp=21.0 [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "Table 7: Asp=21.0."
+    result = syn.synthesize(
+        query="Table 7 的 Asp、C6、exptl 值是多少？",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[{"document_id": "d1", "excerpt": "Table 7: Asp=21.0"}],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "inventory": [_inventory_entry()],
+            "table_facts": [_table_fact(column="Asp", value="21.0")],
+        },
+        target=_generation_target(),
+    )
+    # 其余守卫通过（锚点/数值/表号均保留），仅需求侧状态为 missing
+    assert result["answer_markdown"] == "Table 7: Asp=21.0 [0]."
+    assert result["expected_facts_status"] == "missing"
+
+
+def test_local_synthesis_dropping_fact_term_falls_back(monkeypatch) -> None:
+    """9.3.2/任务9：合成答案删除期望 facts 的术语（RMS error），
+    draft 覆盖但合成遗漏 → 回退。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    # 合成保留数值 21.0 与表号，但删除术语 RMS error（隔离 value/表号守卫）
+    ollama = FakeOllamaClient(
+        result=_local_result(answer_markdown="Table 7: RMS 21.0 [0].")
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    draft = "Table 7: RMS error is 21.0%."
+    result = syn.synthesize(
+        query="Table 7 的 RMS error 值是多少？",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[{"document_id": "d1", "excerpt": "Table 7: RMS error is 21.0%"}],
+        evidence_pack={
+            "status": "ok",
+            "items": [],
+            "inventory": [_inventory_entry()],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "RMS error",
+                    "value": "21.0",
+                    "unit": "%",
+                    "term": "RMS error",
+                    "row_index": 0,
+                    "source_chunk_ids": ["c1"],
+                }
+            ],
+        },
+        target=_generation_target(),
+    )
+    # 合成答案删除术语 → 回退 RAG 草稿（保留术语）
+    assert result["answer_markdown"] == draft
+    assert result["model"] == "local-fallback"
+
+
+# ------------------------------------------------------------------
+# 9.3.1/任务9：四路径 narrow_context 收窄矩阵（local/ollama/external）
+# ------------------------------------------------------------------
+
+
+def test_local_narrow_context_retry_second_call_also_narrowed(monkeypatch) -> None:
+    """9.3.1/任务9：local coverage retry 的第二次调用同样收窄（不含
+    evidence items 摘录与完整 inventory）。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    ollama = _SequencedLocalOllama(
+        responses=[
+            {"answer_markdown": "Standard analysis was performed."},
+            {"answer_markdown": "NMR spectroscopy at 7.5 kcal/mol was used."},
+        ]
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    syn.synthesize(
+        query="What technique?",
+        route="evidence_required",
+        rag_answer="Some analysis.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy at 7.5 kcal/mol."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "full narrative evidence paragraph excluded",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+            "inventory": [_inventory_entry()],
+        },
+        target=_generation_target(),
+        narrow_context=True,
+    )
+    assert len(ollama.calls) == 2, f"Expected first + retry, got {len(ollama.calls)}"
+    for call in ollama.calls:
+        prompt = (
+            call["messages"][0]["content"] + "\n" + call["messages"][1]["content"]
+        )
+        assert "evidence-item-0" not in prompt
+        assert "full narrative evidence paragraph excluded" not in prompt
+        assert "inv-child-1" not in prompt
+
+
+def test_ollama_narrow_context_excludes_items_and_inventory_retry(monkeypatch) -> None:
+    """9.3.1/任务9：ollama 路径 narrow_context=True 时首轮与 coverage
+    retry 第二次调用均不含 evidence items 摘录与完整 inventory，
+    结构化 table_facts 保留。"""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    class SequencedStructuredOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.responses = [
+                SynthesisPayload(
+                    answer_markdown="The structure was analyzed.",
+                    cited_indexes=[0],
+                    warnings=[],
+                    confidence=0.7,
+                ),
+                SynthesisPayload(
+                    answer_markdown="The structure was analyzed using NMR spectroscopy.",
+                    cited_indexes=[0],
+                    warnings=[],
+                    confidence=0.85,
+                ),
+            ]
+
+        def generate_structured(self, schema, **kwargs):
+            self.calls.append({"schema": schema, **kwargs})
+            return self.responses.pop(0)
+
+    ollama = SequencedStructuredOllama()
+    AgentSynthesizer(ollama_client=ollama).synthesize(
+        query="What technique analyzed the structure?",
+        route="evidence_required",
+        rag_answer="The structure was analyzed.",
+        citations=[
+            {
+                "document_id": "d1",
+                "excerpt": "NMR spectroscopy was used to analyze the molecular structure.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "full narrative evidence paragraph excluded",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+            "inventory": [_inventory_entry()],
+            "table_facts": [_table_fact()],
+        },
+        narrow_context=True,
+    )
+    assert len(ollama.calls) == 2, f"Expected first + retry, got {len(ollama.calls)}"
+    for call in ollama.calls:
+        prompt = (
+            str(call.get("system_prompt") or "") + "\n" + str(call.get("user_prompt") or "")
+        )
+        assert "full narrative evidence paragraph excluded" not in prompt
+        assert "inv-child-1" not in prompt
+        # 结构化 table_facts 在收窄时仍保留（只去 items/inventory）
+        assert "21.0" in prompt
+
+
+def test_external_narrow_context_excludes_items_and_inventory_retry(monkeypatch) -> None:
+    """9.3.1/任务9：external 路径 narrow_context=True 时首轮与 coverage
+    retry 第二次调用均不含 evidence items 摘录与完整 inventory，
+    结构化 table_facts 保留。"""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_external
+    )
+    import httpx
+
+    captured: list[str] = []
+    call_count = [0]
+
+    def fake_post(self, url, json, headers, **kw):
+        call_count[0] += 1
+        captured.append(json["messages"][1]["content"])
+        if call_count[0] == 1:
+            return _fake_response(
+                '{"answer_markdown": "Standard analysis was performed.", '
+                '"cited_indexes": [0], "warnings": [], "confidence": 0.5}'
+            )
+        return _fake_response(
+            '{"answer_markdown": "NMR spectroscopy at 7.5 kcal/mol was used.", '
+            '"cited_indexes": [0], "warnings": [], "confidence": 0.8}'
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    syn = AgentSynthesizer()
+    syn.synthesize(
+        query="What technique?",
+        route="evidence_required",
+        rag_answer="Some analysis.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy at 7.5 kcal/mol."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "full narrative evidence paragraph excluded",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+            "inventory": [_inventory_entry()],
+            "table_facts": [_table_fact()],
+        },
+        narrow_context=True,
+    )
+    assert call_count[0] == 2, f"Expected first + retry, got {call_count[0]} calls"
+    for prompt in captured:
+        assert "full narrative evidence paragraph excluded" not in prompt
+        assert "inv-child-1" not in prompt
+        # 结构化 table_facts 在收窄时仍保留（只去 items/inventory）
+        assert "21.0" in prompt

@@ -23,11 +23,15 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+from typing import Literal
+
+from pydantic import ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
@@ -87,6 +91,25 @@ NEIGHBOR_EXPANSION_TOKEN_BUDGET = 900
 # independent, lossless evidence unit and must remain available to the answer.
 MAX_COMPLETE_PARENT_CONTEXTS = 6
 _RETRIEVAL_TOKEN_PROVIDER = StructuredEvidenceBuilder()
+
+
+# value 尾部可识别的单位（供 TableFactEvidence.unit 解析）。
+_FACT_UNIT_RE = re.compile(
+    r"(?i)(%|kcal/mol|kJ/mol|kcal|kJ|nm|Å|eV|K|°C|ms|fs|ps|ns|us)\s*$"
+)
+
+
+def _fact_unit(value: str) -> str:
+    """从表格事实 value 尾部解析单位；无单位时返回空字符串。"""
+    match = _FACT_UNIT_RE.search(str(value or "").strip())
+    return match.group(1) if match else ""
+
+
+def _fact_id(table_id: str, row_index: int, column: str, value: str) -> str:
+    """生成稳定的表格事实标识（table + row + column + value 哈希）。"""
+    return hashlib.sha256(
+        f"{table_id}|{row_index}|{column}|{value}".encode("utf-8")
+    ).hexdigest()[:16]
 
 
 @dataclass
@@ -362,7 +385,13 @@ class QueryService:
         LLM、不验证、不持久化 QuestionAnswer。当提供 *document_id* 时，
         检索被限定在单篇文档内，不 fallback 到整个项目。
         """
-        from app.schemas.agent import EvidenceItem, EvidencePack, TableFactEvidence
+        from app.schemas.agent import (
+            EvidenceItem,
+            EvidencePack,
+            TableCoverage,
+            TableFactEvidence,
+        )
+        from app.services.canonical_artifacts import CanonicalArtifactStore
 
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
         if project is None:
@@ -380,6 +409,99 @@ class QueryService:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
             if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
+        items, table_facts = self._evidence_items_and_facts(
+            contexts, limit, question=question
+        )
+        status = "ok" if items else "empty"
+        # 9.7：对照 canonical typed inventory 计算表格覆盖状态（完整/部分/未知），
+        # 让"RAG 回答覆盖了哪些目标表"可审计地传到 Agent 层。
+        # 9.7.5：覆盖目标取显式作用域（document_id + parse_version + table_id，
+        # 同一版本绑定），即使 table_facts 为空（目标表行被 limit 裁剪或
+        # extract_table_facts 未产出行），仍逐目标表比较 inventory，
+        # 避免"明确请求的表无 facts"被误报为 complete/unknown。
+        # 9.7.6（decision Q5-A）：覆盖目标只取问题显式请求的表（复用预约
+        # 匹配器 _match_requested_table_groups），不再把检索命中的全部表
+        # 当作目标 —— 多表检索（8-15 张）把全表当目标必然 partial，会把
+        # 表格题误逼进 synthesize（137-423s）。问题未显式请求表 → 空
+        # 作用域 → coverage 聚合 unknown → 表格直通门禁不触发。
+        requested_table_scopes = self._requested_table_scopes(
+            contexts[:limit], question=question
+        )
+        inventory, coverage_status, coverage_missing = self._build_table_coverage(
+            table_facts,
+            requested_table_scopes=requested_table_scopes,
+        )
+        # 9.7.8（decision Q7-A）：请求的表在 coverage 中缺失 → 定向补表。
+        # 检索阶段请求表的行可能被 limit/候选裁剪，或整表未进候选：先按
+        # 缺失表作用域直查 DB 补载整表并重建 pack，再重新计算 coverage，
+        # 避免"请求的表无行"把表格题误逼进 synthesize（137-423s）。
+        # 表在同版本 DB 中不存在（已删除/legacy）→ 保持 partial →
+        # Agent 层 synthesize 兜底（不伪造 complete）。
+        if (
+            coverage_status == "partial"
+            and coverage_missing
+            and (self._is_table_query(question) or self._is_metric_query(question))
+        ):
+            fill_contexts = self._fill_requested_table_contexts(
+                question,
+                project_id=project.id,
+                missing_table_ids=coverage_missing,
+                requested_table_scopes=requested_table_scopes,
+            )
+            if fill_contexts:
+                existing_chunk_ids = {ctx.citation.chunk_id for ctx in contexts}
+                contexts = [
+                    ctx
+                    for ctx in fill_contexts
+                    if ctx.citation.chunk_id not in existing_chunk_ids
+                ] + contexts
+                items, table_facts = self._evidence_items_and_facts(
+                    contexts, limit, question=question
+                )
+                status = "ok" if items else "empty"
+                # 9.7.9（decision Q7-A 兜底语义补全）：fill 已把全部缺失
+                # 请求表整表载入 evidence pack → 直接标记 complete。
+                # 行级 facts 按问题相关性筛选（巨型表只产目标行），不
+                # 能代表证据完整性；fill 成功后 table contexts 已含完整表，
+                # 表格直通门禁放行，不再误进 synthesize（40-124s）。
+                # 仅当仍有请求表在 DB 中不存在（已删除/legacy）时才保持
+                # partial → Agent 层 synthesize 兜底。
+                inventory, coverage_status, coverage_missing = (
+                    self._build_table_coverage(
+                        table_facts,
+                        requested_table_scopes=requested_table_scopes,
+                    )
+                )
+                filled_table_ids = {
+                    ctx.citation.table_id for ctx in fill_contexts
+                }
+                remaining_missing = [
+                    table_id
+                    for table_id in coverage_missing
+                    if table_id not in filled_table_ids
+                ]
+                if not remaining_missing:
+                    coverage_status = "complete"
+                    coverage_missing = []
+        return EvidencePack(
+            status=status,
+            items=items,
+            table_facts=table_facts,
+            inventory=inventory,
+            coverage_status=coverage_status,
+            coverage_missing_tables=coverage_missing,
+        )
+
+    def _evidence_items_and_facts(
+        self,
+        contexts: list[RetrievedContext],
+        limit: int,
+        *,
+        question: str,
+    ) -> "tuple[list[EvidenceItem], list[TableFactEvidence]]":
+        """构建 EvidencePack 的 items 与 table_facts（主路径与补表重建共用）。"""
+        from app.schemas.agent import EvidenceItem, TableFactEvidence
+
         items: list[EvidenceItem] = []
         table_facts: list[TableFactEvidence] = []
         seen_table_facts: set[tuple[str, str, str, int, str, str]] = set()
@@ -434,10 +556,169 @@ class QueryService:
                         value=fact.value,
                         row_index=fact.row_index,
                         source_chunk_ids=list(fact.source_chunk_ids),
+                        # 9.3.2：期望 facts 校验所需的结构化字段——
+                        # fact_id 稳定标识、unit 从 value 尾部解析、
+                        # term 取列名作为指标术语。
+                        fact_id=_fact_id(
+                            fact.table_id,
+                            fact.row_index,
+                            fact.column,
+                            fact.value,
+                        ),
+                        unit=_fact_unit(fact.value),
+                        term=fact.column,
                     )
                 )
-        status = "ok" if items else "empty"
-        return EvidencePack(status=status, items=items, table_facts=table_facts)
+        return items, table_facts
+
+    def _build_table_coverage(
+        self,
+        table_facts: list[TableFactEvidence],
+        *,
+        requested_table_scopes: Iterable[tuple[str | None, str | None, str | None]]
+        | None = None,
+        typed_inventory_loader: Callable[[str, str], dict[str, Any]] | None = None,
+    ) -> tuple[list[TableCoverage], str, list[str]]:
+        """9.7：按 (document_id, parse_version, table_id) 作用域对照 typed inventory。
+
+        9.7.5 起，覆盖目标优先取调用方显式传入的 ``requested_table_scopes``
+        （同一版本作用域的 ``document_id + parse_version + table_id``）：即使
+        ``table_facts=[]``（例如目标表行被 limit/token 预算裁剪，或
+        extract_table_facts 未产出任何行），仍逐目标表对照 inventory 比较，
+        修复"明确请求 Table 7 却只按已返回 facts 推断 → 误报 complete/unknown"
+        的缺口。``table_facts`` 仅按精确 (document_id, parse_version, table_id)
+        作用域计入覆盖行 —— candidate 版本 facts 与 active inventory 绝不混算，
+        因此不会产生错误的 complete。
+
+        对每个作用域复用只读 ``load_typed_inventory``（版本来自作用域携带的
+        parse_version，即与检索同一版本作用域，禁止 active/candidate 混用）；
+        逐表比较 inventory 的 row_indices 与已覆盖行：
+
+        - 全部目标表行 ⊆ 已覆盖行 → complete；
+        - 有目标表/行缺失（含请求的表在同版本 inventory 中无记录）→ partial
+          （缺失表记入 ``coverage_missing_tables``）；
+        - 版本缺失 / manifest 缺失 / 加载失败 / 记录无 row_indices → unknown
+          （记录可审计 warning，不伪造 complete）。
+
+        未提供 ``requested_table_scopes`` 时回退为按 facts 分组推断（旧调用方
+        兼容）；无 facts 也无 scopes → unknown。聚合规则（pack 级）：任一
+        partial → partial；否则任一 unknown → unknown；全部 complete → complete。
+        ``typed_inventory_loader`` 仅在测试中注入，默认走真实 store。
+        """
+        from app.schemas.agent import TableCoverage
+        from app.services.canonical_artifacts import CanonicalArtifactStore
+
+        loader = typed_inventory_loader or (
+            lambda doc_id, version: CanonicalArtifactStore(
+                settings.canonical_artifacts_dir
+            ).load_typed_inventory(doc_id, version)
+        )
+        # 9.7.5：调用方显式给定目标表作用域时以其为覆盖全集（去重保序）；
+        # 否则回退为 facts 携带的表作用域（旧调用方兼容）。
+        # 显式判断 ``is not None``：空列表 / 空生成器也属于"显式传入"，
+        # 统一走显式 coverage 逻辑（零目标 → unknown），不得因 truthiness
+        # 误入 facts 回退分支，也不能让生成器对象因恒真而行为漂移。
+        explicit_scopes = requested_table_scopes is not None
+        if explicit_scopes:
+            scopes = list(
+                dict.fromkeys(
+                    (str(doc or ""), str(version or ""), str(table or ""))
+                    for doc, version, table in requested_table_scopes
+                )
+            )
+            scope_facts: dict[tuple[str, str, str], list[TableFactEvidence]] = {}
+            for fact in table_facts:
+                scope_facts.setdefault(
+                    (fact.document_id or "", fact.parse_version or "", fact.table_id), []
+                ).append(fact)
+        elif not table_facts:
+            return [], "unknown", []
+        else:
+            scopes = []
+            scope_facts = {}
+            for fact in table_facts:
+                key = (fact.document_id or "", fact.parse_version or "", fact.table_id)
+                scope_facts.setdefault(key, []).append(fact)
+                scopes.append(key)
+            scopes = list(dict.fromkeys(scopes))
+        inventory: list[TableCoverage] = []
+        missing_tables: list[str] = []
+        pack_statuses: list[str] = []
+        loaded_typed: dict[tuple[str, str], dict[str, Any] | None] = {}
+        for doc_id, version, table_id in scopes:
+            if not doc_id or not version:
+                pack_statuses.append("unknown")
+                continue
+            typed_key = (doc_id, version)
+            if typed_key not in loaded_typed:
+                try:
+                    loaded_typed[typed_key] = loader(doc_id, version)
+                except (FileNotFoundError, ValueError) as exc:
+                    loaded_typed[typed_key] = None
+                    logger.warning(
+                        "coverage: typed inventory unavailable for %s@%s: %s",
+                        doc_id,
+                        version,
+                        exc,
+                    )
+            typed = loaded_typed[typed_key]
+            if not typed:
+                pack_statuses.append("unknown")
+                continue
+            record = next(
+                (
+                    table
+                    for table in (typed.get("tables") or [])
+                    if table.get("table_id") == table_id
+                ),
+                None,
+            )
+            if record is None:
+                if explicit_scopes:
+                    # 9.7.5：目标表在同版本 inventory 中无记录 → 目标表缺失，
+                    # 记 partial 并上报缺失表；不得以"无法验证"掩盖缺失。
+                    pack_statuses.append("partial")
+                    missing_tables.append(table_id)
+                    continue
+                # 旧路径：事实声称的表无法在 inventory 中验证 → unknown
+                pack_statuses.append("unknown")
+                continue
+            expected_rows = set(record.get("row_indices") or [])
+            if not expected_rows:
+                # inventory 记录存在但无行集合 → 无法验证，不得伪造 complete
+                pack_statuses.append("unknown")
+                continue
+            covered_rows = {
+                fact.row_index
+                for fact in scope_facts.get((doc_id, version, table_id), [])
+            }
+            inventory.append(
+                TableCoverage(
+                    document_id=doc_id,
+                    parse_version=version,
+                    table_id=table_id,
+                    row_count=int(record.get("row_count") or 0),
+                    source_block_ids=list(record.get("source_block_ids") or []),
+                    child_ids=list(record.get("child_ids") or []),
+                    child_count=int(record.get("child_count") or 0),
+                    parent_ids=list(record.get("parent_ids") or []),
+                    row_indices=sorted(expected_rows),
+                )
+            )
+            if expected_rows.issubset(covered_rows):
+                pack_statuses.append("complete")
+            else:
+                pack_statuses.append("partial")
+                missing_tables.append(table_id)
+        if "partial" in pack_statuses:
+            status = "partial"
+        elif "unknown" in pack_statuses:
+            status = "unknown"
+        elif pack_statuses:
+            status = "complete"
+        else:
+            status = "unknown"
+        return inventory, status, missing_tables
 
     def _validate_document_scope(
         self, project_id: str, document_id: str | None
@@ -3156,38 +3437,26 @@ class QueryService:
         # Build figure/table/dataset-aware guardrails.
         constraints = self._build_answer_constraints(question, contexts)
 
-        if self._is_chinese_question(question):
-            fallback_text = "\n".join(
-                [
-                    "## 回答",
-                    "[系统提示：LLM 生成暂时失败，以下为原始检索证据，仅供参考]",
-                    "",
-                    context_text[:1400],
-                ]
-            )
-        else:
-            fallback_text = "\n".join(
-                [
-                    "## Answer",
-                    "[System notice: LLM generation temporarily failed. The following is raw retrieval evidence for reference only, not a final answer.]",
-                    "",
-                    context_text[:1400],
-                ]
-            )
+        fallback_text = (
+            self._degradation_notice(question, kind="raw") + "\n\n" + context_text[:1400]
+        )
         deterministic_scientific = self._deterministic_scientific_evidence_answer_if_supported(
             question,
             contexts,
             "high" if self._is_high_risk(question) else "normal",
         )
-        if (
-            deterministic_scientific is not None
-            and self._is_chinese_question(question)
-            and any(self._context_evidence_kind(context) == "profile-term" for context in contexts)
-            and not (
-            self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
+        # Task 17（2026-08-07 用户拍板"非表格全 LLM"）：确定性科学模板
+        # （"证据片段 N 支持…"清单输出）不再作为主路径短路 —— 其产出不可读，
+        # 答案必须经 LLM 组织（中英文一致，机制/overview/参数化核查等一律走
+        # LLM draft）。表格/指标题的确定性直通不受影响（在 answer() 主流程
+        # 独立短路）。模板仅保留为 LLM 生成失败时的降级输出，且带显式降级
+        # 标记，让调用方一眼识别这不是最终答案。
+        if deterministic_scientific is not None:
+            deterministic_scientific.answer_markdown = (
+                self._degradation_notice(question, kind="template")
+                + "\n\n"
+                + deterministic_scientific.answer_markdown
             )
-        ):
-            return deterministic_scientific
         fallback = deterministic_scientific or QueryAnswerPayload(
             answer_markdown=fallback_text,
             citations=list(range(len(contexts))),
@@ -3199,7 +3468,12 @@ class QueryService:
                 (
                     "Answer using only the retrieved source evidence. "
                     "If the question contains multiple entities, datasets, metrics, tables, figures, or components, "
-                    "answer each requested item explicitly. Return citation indexes that directly support each claim."
+                    "answer each requested item explicitly. "
+                    # Task 17（2026-08-07）：防遗漏 —— 答案必须显式覆盖问题中
+                    # 每个显式术语/实体/指标/组件名，不得省略（helix-coil 类
+                    # 验收词偶发漏回显的教训：词只在问题中出现时尤其要回显）。
+                    "Explicitly mention every entity, term, metric, or component named in the question; do not omit any. "
+                    "Return citation indexes that directly support each claim."
                 ),
                 constraints,
                 context_text,
@@ -3219,13 +3493,34 @@ class QueryService:
                 if original_timeout is not None:
                     self.ollama.timeout = original_timeout
 
+        def _is_retryable_draft_error(exc: BaseException) -> bool:
+            """判断 draft 生成失败是否值得重试。
+
+            除了网络/服务端瞬时错误（``_is_retryable_error``），模型输出
+            格式崩坏（结构化解析失败：pydantic ``ValidationError``、空内容
+            或文本中无合法 JSON 的 ``ValueError``）也值得重试 —— 生成是
+            随机的，重试一次大概率恢复合法 JSON（Task 18 实测：多轮追问
+            "压缩成三点" 类问题时 qwen3.5:9b 输出 ``[1]`` 数组而非对象，
+            旧逻辑 1 轮失败即 fallback 原始证据，用户看到不可读的降级输出）。
+            """
+            if _is_retryable_error(exc):
+                return True
+            if isinstance(exc, ValidationError):
+                return True
+            if isinstance(exc, ValueError):
+                message = str(exc)
+                return message.startswith(
+                    ("Ollama returned empty content", "No valid JSON object found")
+                )
+            return False
+
         def generate_with_query_retries() -> QueryAnswerPayload:
             """Retry transient Ollama failures twice before returning fallback."""
             for attempt in range(3):
                 try:
                     return generate_with_query_timeout()
                 except Exception as exc:  # noqa: BLE001
-                    if attempt >= 2 or not _is_retryable_error(exc):
+                    if attempt >= 2 or not _is_retryable_draft_error(exc):
                         raise
                     logger.warning(
                         "Transient RAG draft generation failure; retrying (%d/2): %s",
@@ -3236,6 +3531,28 @@ class QueryService:
             raise RuntimeError("unreachable RAG draft retry state")
 
         return safe_model_call(generate_with_query_retries, fallback)
+
+    def _degradation_notice(self, question: str, *, kind: Literal["raw", "template"]) -> str:
+        """LLM 生成失败时的降级提示（双语样板统一出口）。
+
+        两个降级路径共用同一结构（语言分叉 heading + [系统提示] 标记 + 正文），
+        仅正文措辞不同：``kind="raw"`` 指原始检索证据（LLM 完全失败、无模板
+        可用）；``kind="template"`` 指确定性科学模板的原始证据片段。统一出口
+        避免两处各自维护语言分叉与样板（Task 17 code review 收敛）。
+        """
+        if self._is_chinese_question(question):
+            body = (
+                "以下为原始证据片段，非最终答案"
+                if kind == "template"
+                else "以下为原始检索证据，仅供参考"
+            )
+            return f"## 回答\n[系统提示：LLM 生成暂时失败，{body}]"
+        body = (
+            "The following are raw evidence snippets for reference only, not a final answer."
+            if kind == "template"
+            else "The following is raw retrieval evidence for reference only, not a final answer."
+        )
+        return f"## Answer\n[System notice: LLM generation temporarily failed. {body}]"
 
     def _build_answer_constraints(self, question: str, contexts: list[RetrievedContext]) -> str:
         """Build guardrail instructions based on the question type."""
@@ -3967,9 +4284,26 @@ class QueryService:
         groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
         group_labels: dict[tuple[str, str, str], str] = {}
         seen_row_keys: dict[tuple[str, str, str], set[str]] = {}
+        # Only tables the question explicitly requested may contribute rows
+        # (decision Q5-A, same scope as the coverage targets).  Background
+        # tables retrieved alongside the requested ones (for example a
+        # J-coupling table that merely mentions the same force field) would
+        # otherwise flood the answer with values the retrieved row-level
+        # evidence does not carry verbatim, tripping the unsupported-number
+        # gate and sending the deterministic answer into the flaky repair
+        # path.  When no table is explicitly requested the historical
+        # all-retrieved-tables selection stays.
+        requested_scopes = self._requested_table_scopes(contexts, question=question)
+        requested_scope_keys: set[tuple[str, str, str]] | None = (
+            set(requested_scopes) if requested_scopes else None
+        )
         for index in table_indexes:
             text = self._context_table_evidence_text(contexts[index])
             identity = self._table_context_identity(contexts[index])
+            if requested_scope_keys is not None and (
+                identity is None or identity not in requested_scope_keys
+            ):
+                continue
             if identity is None:
                 # Legacy text tables have no stable canonical table identity.
                 # Group by a content digest of the table evidence so
@@ -4961,20 +5295,19 @@ class QueryService:
         # size gate, so every selected context remains lossless.
         return evidence
 
-    def _reserve_requested_table_contexts(
+    def _match_requested_table_groups(
         self,
         contexts: list[RetrievedContext],
         *,
         question: str,
-        limit: int,
-    ) -> list[RetrievedContext]:
-        """Place one representative Child from each requested table first.
+    ) -> list[tuple[tuple[str, str, str], float]]:
+        """返回问题显式请求的表格组 ``(scope_key, relevance)``。
 
-        Table retrieval can expand one high-scoring hit into many row Children.
-        Without a reservation, those siblings occupy the first evidence slots
-        and a lower-scoring but independently requested table is never exposed
-        to the caller's ``limit`` slice.  Matching is performed on the complete
-        table group so split header/row Children are treated as one unit.
+        与 ``_reserve_requested_table_contexts`` 共享的匹配核心：按
+        (document_id, parse_version, table_id) 分组后，只有显式
+        figure/table 锚点命中、canonical 表组匹配器接受、或满足两条
+        独立锚点规则的组才计入"被问题请求"。relevance 与历史预约
+        排序口径完全一致，返回按 relevance 降序。
         """
         groups: dict[tuple[str, str, str], list[RetrievedContext]] = {}
         for context in contexts:
@@ -4987,7 +5320,7 @@ class QueryService:
                 str(citation.table_id),
             )
             groups.setdefault(key, []).append(context)
-        if len(groups) <= 1:
+        if not groups:
             return []
 
         explicit_terms = {
@@ -5003,7 +5336,7 @@ class QueryService:
             ]
             if self._is_specific_table_anchor(term)
         ]
-        ranked_groups: list[tuple[float, RetrievedContext]] = []
+        matched: list[tuple[tuple[str, str, str], float]] = []
         for key, group in groups.items():
             group_text = "\n".join(
                 self._context_table_evidence_text(context) for context in group
@@ -5030,7 +5363,163 @@ class QueryService:
             if explicit_match:
                 relevance += 100.0
             relevance += self._rank_blocks(question, [group_text])[0][1]
+            matched.append((key, relevance))
+        matched.sort(key=lambda item: item[1], reverse=True)
+        return matched
 
+    def _requested_table_scopes(
+        self,
+        contexts: list[RetrievedContext],
+        *,
+        question: str,
+    ) -> list[tuple[str | None, str | None, str | None]]:
+        """覆盖目标表作用域：仅问题显式请求的表（decision Q5-A）。
+
+        coverage 目标从"检索命中的全部表"收窄为"问题显式请求的表"：
+        多表检索（8-15 张）把全表当目标必然 partial，会把表格题误逼进
+        synthesize（137-423s）。问题未显式请求任何表 → 空作用域 →
+        ``_build_table_coverage`` 聚合为 unknown → 表格直通门禁不触发。
+        """
+        return [
+            (doc, version, table)
+            for (doc, version, table), _relevance in self._match_requested_table_groups(
+                contexts, question=question
+            )
+        ]
+
+    def _fill_requested_table_contexts(
+        self,
+        question: str,
+        *,
+        project_id: str,
+        missing_table_ids: list[str],
+        requested_table_scopes: list[tuple[str | None, str | None, str | None]],
+    ) -> list[RetrievedContext]:
+        """9.7.8（decision Q7-A）：coverage 缺失请求表 → 定向直查 DB 补载整表。
+
+        检索阶段 table child 候选可能被 limit/候选裁剪，或整表未进候选，
+        导致请求表的行缺失（coverage partial）。对每个缺失表按
+        (document_id, parse_version, table_id) 作用域直接查询全部行子块，
+        ``assemble_table_context`` 重建完整表，``extract_table_facts`` 提取
+        事实，再经 ``_expand_child_hit`` 构造 RetrievedContext（与检索路径
+        同一构造器），使补表行可被 Agent 层确定性表格答案直接引用。
+        表在同版本 DB 中不存在（已删除/legacy 版本）→ 跳过该表，
+        coverage 保持 partial，由 Agent 层 synthesize 兜底（不伪造 complete）。
+        """
+        from app.services.table_evidence import assemble_table_context, extract_table_facts
+
+        scope_by_table_id: dict[str, tuple[str, str]] = {}
+        for document_id, parse_version, table_id in requested_table_scopes:
+            if not (table_id and document_id and parse_version):
+                continue
+            scope_by_table_id.setdefault(table_id, (document_id, parse_version))
+        fills: list[RetrievedContext] = []
+        for table_id in dict.fromkeys(missing_table_ids):
+            scope = scope_by_table_id.get(table_id)
+            if scope is None:
+                continue
+            document_id, parse_version = scope
+            statement = (
+                select(DocumentChunk)
+                .where(
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.parse_version == parse_version,
+                    DocumentChunk.chunk_role == "child",
+                    DocumentChunk.block_type == "table",
+                    *self._selected_child_chunk_conditions(),
+                )
+                .order_by(DocumentChunk.ordinal)
+            )
+            chunks = self.db.scalars(statement).all()
+            # table_id 是 canonical 标识（存于 source_spans.metadata），
+            # 无独立列 → 与 _expand_table_candidates 一致在 Python 侧过滤。
+            chunks = [
+                chunk
+                for chunk in chunks
+                if self._canonical_chunk_identifiers(chunk).get("table_id") == table_id
+            ]
+            if not chunks:
+                continue
+            try:
+                table = assemble_table_context(
+                    [
+                        CanonicalTableChunk(
+                            chunk_id=chunk.id,
+                            document_id=chunk.document_id,
+                            parse_version=str(chunk.parse_version or ""),
+                            table_id=table_id,
+                            ordinal=int(chunk.ordinal or 0),
+                            text=chunk.text,
+                            page_label=chunk.page_label,
+                            source_spans=tuple(chunk.source_spans or ()),
+                        )
+                        for chunk in chunks
+                    ]
+                )
+            except ValueError:
+                continue
+            facts = tuple(extract_table_facts(question, table))
+            if table.markdown:
+                score = self._rank_blocks(question, [table.markdown])[0][1]
+            else:
+                score = 0.0
+            page_fields = self._source_page_fields_by_document_id(
+                project_id, [document_id]
+            ).get(document_id, {})
+            related_chunks = {chunk.id: chunk for chunk in chunks}
+            for chunk in chunks:
+                context = self._expand_child_hit(
+                    chunk,
+                    question=question,
+                    score=score,
+                    page_fields=page_fields,
+                    evidence_kind="table",
+                    related_chunks=related_chunks,
+                )
+                fills.append(replace(context, table_context=table, table_facts=facts))
+        return fills
+
+    def _reserve_requested_table_contexts(
+        self,
+        contexts: list[RetrievedContext],
+        *,
+        question: str,
+        limit: int,
+    ) -> list[RetrievedContext]:
+        """Place one representative Child from each requested table first.
+
+        Table retrieval can expand one high-scoring hit into many row Children.
+        Without a reservation, those siblings occupy the first evidence slots
+        and a lower-scoring but independently requested table is never exposed
+        to the caller's ``limit`` slice.  Matching is performed on the complete
+        table group so split header/row Children are treated as one unit.
+        """
+        matched = self._match_requested_table_groups(contexts, question=question)
+        if len(matched) <= 1:
+            return []
+
+        groups: dict[tuple[str, str, str], list[RetrievedContext]] = {}
+        for context in contexts:
+            citation = context.citation
+            if citation.block_type != "table" or not citation.table_id:
+                continue
+            key = (
+                str(citation.document_id or ""),
+                str(citation.parse_version or ""),
+                str(citation.table_id),
+            )
+            groups.setdefault(key, []).append(context)
+        specific_terms = [
+            term
+            for term in [
+                *self._question_row_selectors(question),
+                *self._extract_generic_table_terms(question),
+            ]
+            if self._is_specific_table_anchor(term)
+        ]
+        ranked_groups: list[tuple[float, RetrievedContext]] = []
+        for key, relevance in matched:
+            group = groups[key]
             representative = max(
                 group,
                 key=lambda context: (
@@ -5451,6 +5940,13 @@ class QueryService:
             inner = match.group(1).strip()
             if re.fullmatch(r"\d+", inner):
                 return match.group(0)
+            # Task 18（2026-08-07）：降级标记豁免 —— LLM 生成失败时的
+            # "[系统提示：LLM 生成暂时失败，…]" / "[System notice: …]"
+            # 是显式输出内容（用户拍板要展示给调用方的非最终答案提示），
+            # 不是未解析的标签引用，不得被剥离（曾被误删导致用户看不到
+            # 降级说明、误以为答案未走 LLM 综合）。
+            if inner.startswith(("系统提示", "System notice")):
+                return match.group(0)
             return ""
 
         return re.sub(r"\[([^\]\n]+)\](?!\()", strip_unresolved_label, answer_markdown)
@@ -5560,14 +6056,22 @@ class QueryService:
         numbers = cls._answer_numbers(answer_markdown)
         if not numbers:
             return set()
-        evidence = "\n".join(cls._context_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
+        # Table contexts are evidence-checked against the assembled table
+        # markdown, not only the row-level chunk text: the deterministic
+        # generic answer draws its values from ``table_context`` rows, and a
+        # canonical table chunk may carry only a subset of the rows (a
+        # citation chunk can hold just the header row).  A value present in
+        # the assembled table is retrieved evidence, not fabrication, so the
+        # unsupported gate must accept it.  Non-table contexts keep their
+        # prompt-text evidence.
+        evidence = "\n".join(cls._context_table_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
         unsupported = {number for number in numbers if not cls._number_supported_by_evidence(number, evidence)}
         if (
             not strict
             and unsupported
             and any(cls._context_evidence_kind(context) == "profile-term" for context in contexts)
         ):
-            all_evidence = "\n".join(cls._context_evidence_text(context) for context in contexts)
+            all_evidence = "\n".join(cls._context_table_evidence_text(context) for context in contexts)
             unsupported = {number for number in unsupported if not cls._number_supported_by_evidence(number, all_evidence)}
         return unsupported
 
@@ -5578,11 +6082,23 @@ class QueryService:
         # adjacency is rejected, while exact decimals, percentages, signed
         # values, and ASCII/Chinese delimiters around the number still match.
         boundary = r"(?<![A-Za-z0-9])"
-        if re.search(boundary + re.escape(number) + r"(?![A-Za-z0-9])", evidence):
-            return True
-        if number.isdigit() and len(number) > 1:
-            spaced = r"\s*".join(re.escape(char) for char in number)
-            return bool(re.search(boundary + spaced + r"(?![A-Za-z0-9])", evidence))
+        # A "%" suffix in the answer is a formatting artifact of the table
+        # template: the table cell may carry the value bare ("51.9") while the
+        # assembled answer renders the same cell with a "% ppII" header
+        # attached ("51.9%").  Match the bare numeric surface as well so a
+        # percentage written in the answer is supported by the bare value in
+        # the evidence.  The boundary guards keep "1.0%" from being treated as
+        # supported by "21.0" or "1.05".
+        candidates = [number]
+        if number.endswith("%"):
+            candidates.append(number[:-1])
+        for candidate in candidates:
+            if re.search(boundary + re.escape(candidate) + r"(?![A-Za-z0-9])", evidence):
+                return True
+            if candidate.isdigit() and len(candidate) > 1:
+                spaced = r"\s*".join(re.escape(char) for char in candidate)
+                if re.search(boundary + spaced + r"(?![A-Za-z0-9])", evidence):
+                    return True
         return False
 
     @staticmethod
@@ -6687,6 +7203,70 @@ class QueryService:
             )
             or pka_metric
         )
+
+    @classmethod
+    def _is_mechanism_question(cls, question: str) -> bool:
+        """机制解释类问题检测（decision Q6-A：因果问词规则）。
+
+        Task 17（2026-08-07）后无生产调用点：该分类器曾是 9.7.7"机制题不被
+        确定性科学模板短路"门禁的唯一消费者；短路已删除（非表格全 LLM），
+        src/ 下不再被调用。有意保留 —— 分类器测试（full30 30 题矩阵）维持
+        问词词表契约，未来若需 mechanism/overview 差异化路由（如 overview
+        延迟超验收线时的分流）可直接复用，无需重建词表。
+
+        历史职责（供未来路由参考）：机制题保证走 LLM draft（路径 2）：即使
+        检索命中 profile-term 证据，也不得被确定性科学模板短路 —— 机制答案
+        需要 LLM 组织的因果组织。overview / 表格题保持确定性路径。
+
+        判定顺序：
+        1. 表格/指标/图表查询先行排除（走确定性表格/科学模板；"Table S3
+           中 … 如何变化？"、"表格中 … 如何体现一致性？" 仍是表格题）。
+        2. 概述类标记命中 → overview 题，即使同时含 为什么/如何 也不进
+           LLM（如 "ff19SB 的核心更新是什么？它为什么推荐和 OPC water
+           model 一起使用？" 是 overview 题，走确定性科学模板）。
+        3. 强因果问词（为什么/为何/原因/机制/怎么产生/如何产生/怎么造成/
+           如何造成）→ 机制题。
+        4. 弱问词（如何/怎么）→ 机制题。
+        """
+        if (
+            cls._is_table_query(question)
+            or cls._is_metric_query(question)
+            or cls._is_figure_query(question)
+        ):
+            return False
+        overview_markers = (
+            "概述",
+            "介绍",
+            "概括",
+            "总结",
+            "核心",
+            "主要",
+            "新增",
+            "扩展",
+            "覆盖",
+            "包括",
+            "列出",
+            "定位",
+            "总体",
+        )
+        if any(marker in question for marker in overview_markers):
+            return False
+        strong_causal = (
+            "为什么",
+            "为何",
+            "原因",
+            "机制",
+            "怎么产生",
+            "如何产生",
+            "怎么造成",
+            "如何造成",
+        )
+        if any(marker in question for marker in strong_causal):
+            return True
+        if any(marker in question for marker in ("如何", "怎么")):
+            return True
+        lowered = question.lower()
+        return bool(re.search(r"\bwhy\b|\bmechanism\b", lowered))
 
     @staticmethod
     def _is_document_overview_query(question: str) -> bool:

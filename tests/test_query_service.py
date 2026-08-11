@@ -86,7 +86,7 @@ class CountingFakeOllama(FakeOllama):
 
 class ExplodingOllama(FakeOllama):
     def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
-        raise AssertionError("LLM should not be required for deterministic scientific evidence answers")
+        raise AssertionError("simulated Ollama generation failure")
 
 
 class TransientThenSuccessOllama(FakeOllama):
@@ -101,6 +101,32 @@ class TransientThenSuccessOllama(FakeOllama):
             raise TimeoutError("temporary Ollama timeout")
         return QueryAnswerPayload(
             answer_markdown="Recovered answer from Ollama.",
+            citations=[0],
+            risk_level="normal",
+        )
+
+
+class ParseErrorThenSuccessOllama(FakeOllama):
+    """Task 18：模型输出格式崩坏（结构化解析失败）也应重试 —— 生成是随机的。
+
+    旧行为：ValidationError / 解析 ValueError 不在 ``_is_retryable_error``
+    范围 → 1 轮失败即 fallback（多轮追问"压缩成三点"实测：qwen3.5:9b
+    输出 ``[1]`` 数组而非 JSON 对象，用户拿到不可读的 raw 证据降级）。
+    新行为：draft 重试循环把结构化解析失败视为可重试，重试一次成功。
+    """
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.generate_calls = 0
+
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        self.generate_calls += 1
+        if self.generate_calls <= self.failures:
+            # 与实测一致：模型输出 ``[0]`` 数组而非 JSON 对象 → 真实校验失败。
+            return QueryAnswerPayload.model_validate([0])
+        return QueryAnswerPayload(
+            answer_markdown="Recovered answer after parse error.",
             citations=[0],
             risk_level="normal",
         )
@@ -226,6 +252,34 @@ def test_draft_answer_retries_two_transient_ollama_failures(monkeypatch) -> None
     assert "System notice" not in answer.answer_markdown
 
 
+def test_draft_answer_retries_structured_parse_failure(monkeypatch) -> None:
+    """Task 18：模型输出格式崩坏（结构化解析失败）也应重试而非直接 fallback。
+
+    多轮追问"压缩成三点"实测：qwen3.5:9b 输出 ``[1]`` 数组而非 JSON 对象
+    （ValidationError）——旧逻辑不在 ``_is_retryable_error`` 范围 → 1 轮
+    失败即 fallback raw 证据。新逻辑重试一次后成功。
+    """
+    from app.services import search as search_module
+
+    service = QueryService(make_session())
+    fake_ollama = ParseErrorThenSuccessOllama(failures=1)
+    service.ollama = fake_ollama
+    monkeypatch.setattr(search_module.time, "sleep", lambda _seconds: None)
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/general", page_title="General", page_kind="source_summary", score=1, excerpt="The study discusses a general method."),
+            prompt_text="The study discusses a general method.",
+            score=1,
+        )
+    ]
+
+    answer = service._draft_answer("What does the study discuss?", None, contexts)
+
+    assert fake_ollama.generate_calls == 2
+    assert answer.answer_markdown == "Recovered answer after parse error."
+    assert "System notice" not in answer.answer_markdown
+
+
 def test_draft_answer_marks_fallback_after_three_transient_ollama_failures(monkeypatch) -> None:
     from app.services import search as search_module
 
@@ -246,6 +300,130 @@ def test_draft_answer_marks_fallback_after_three_transient_ollama_failures(monke
     assert fake_ollama.generate_calls == 3
     assert "System notice: LLM generation temporarily failed" in answer.answer_markdown
     assert answer.citations == [0]
+
+
+def test_is_mechanism_question_classifies_full30_matrix() -> None:
+    """9.7.7：机制问词规则在 full30 实题上的分类（decision Q6-A）。
+
+    10 个机制题（为什么/如何/机制/原因…）→ LLM 路径；20 个
+    overview/表格题 → 确定性路径。含 为什么/如何 的 overview 边缘题
+    （ff19sb_overview、oplsaa_overview）与表格题（Table S3 中…如何变化）
+    必须判为 False。
+    """
+    db = make_session()
+    service = QueryService(db)
+    cases = [
+        ("CHARMM36 蛋白力场主要想修正 CHARMM22/CMAP 的什么问题？它用了哪些参数化和验证策略？", False),
+        ("CHARMM36IDPSFF 是从哪个力场发展来的？它主要针对哪类蛋白体系做了什么修改？", False),
+        ("CHARMM36IDPSFF 相比 CHARMM36m/a99SB- 的定位是什么？它在哪些场景仍有不足？", False),
+        ("CHARMM36 为什么能改善 C22/CMAP 的 helix-coil 平衡和侧链 rotamer 采样？", True),
+        ("CHARMM36m 主要解决 CHARMM36 在折叠蛋白和 IDP 模拟中的哪些问题？", False),
+        ("CHARMM36m 的 Table 1 中，RS peptide、FG-nucleoporin peptide 和 HEWL19 的 alphaL probability 相比 C36 降到了多少？", False),
+        ("CHARMM36 的 alphaL 过采样 artifact 是怎么产生的？CHARMM36m 如何用局部 CMAP 修正它？", True),
+        ("ff14SB 相对 ff99SB/ff12SB 的主要改进是什么？请概括侧链、骨架和拟合协议的变化。", False),
+        ("CHARMM36 在 Ala5 和 Ac-(AAQAA)3-NH2 肽采样表中给出的 ppII/alpha-helix 关键比例是多少？和 C22/CMAP 的螺旋比例有什么差异？", False),
+        ("为什么 ff14SB 的 restraint/fitting 方案能避免 ff12SB 中的 artifact？", True),
+        ("ff19SB 的核心更新是什么？它为什么推荐和 OPC water model 一起使用？", False),
+        ("ff19SB 的参数化策略中，RESP charge fitting、QM level、CMAP 分配和验证规模有哪些具体锚点？", False),
+        ("CHARMM36IDPSFF 的 Rg 表格中，Aβ40 和 ACTR 的实验值与模拟值分别是多少？这些数值说明了什么局限？", False),
+        ("ff19SB 为什么不再把 Alanine 当作所有残基的通用骨架模型？β-branched residues 的机制是什么？", True),
+        ("ff99sb-disp/TIP4P-D 这篇文献认为标准水模型导致 IDP 模拟失败的根本原因是什么？", True),
+        ("ff14SB 的 Table S3 中，Asp、Ile/Thr/Val、Phe/Tyr solving group 的 objective value 从 ff99SB 到 ff14SB 如何变化？", False),
+        ("为什么 TIP4P-D 比 TIP3P/TIP4P-EW/TIP4P/2005 更能改善 IDP 构象采样？", True),
+        ("TIP4P-D 在水模型参数表中相对 TIP3P 的 C6、偶极矩和表面张力数值是什么？", False),
+        ("ff99SB-ILDN 修改了哪些残基的侧链扭转势？它用什么 QM 和 NMR 验证策略？", False),
+        ("ff99SB-ILDN 的 Table I 列出了哪些残基/角度的修改参数？theta0 的设置是什么？", False),
+        ("ff99SB-ILDN 为什么选择 500 K 的 Boltzmann population fitting，而不是直接拟合能量曲线或室温拟合？", True),
+        ("OPLS-AA 相对 OPLS-UA 的主要扩展是什么？它如何拟合 torsion 和 nonbonded 参数？", False),
+        ("为什么 OPLS-AA 的显式氢和液体性质验证能改善相对 OPLS-UA 的可转移性？", True),
+        ("OPLS4 相对 OPLS3e 的主要改进有哪些？请覆盖水/离子、酸性残基 torsion、硫相互作用和 FEP 验证。", False),
+        ("OPLS-AA 的表格中，butane 构象能和 methanol ΔHvap 如何体现与 6-31G/实验的一致性？", False),
+        ("OPLS4 如何缓解 OPLS3e 的 salt bridge overstabilization 和酸性残基 pKa bias？", True),
+        ("OPLS5 在 OPLS4 基础上新增了哪些物理项和适用场景？", False),
+        ("OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa 和 binding RMSE 相比 OPLS4 有哪些数值改善？", False),
+        ("为什么 OPLS5 对 polarizability-sensitive/cation-pi 和金属体系比 OPLS4 更准确？", True),
+        ("OPLS4 的 pKa 和 sigma-hole 表格中，OPLS3e 到 OPLS4 的关键误差改善是多少？", False),
+    ]
+    for question, expected in cases:
+        assert service._is_mechanism_question(question) is expected, question[:60]
+
+
+def test_draft_answer_mechanism_question_uses_llm_even_with_profile_evidence() -> None:
+    """9.7.7：机制题即使命中 profile-term 证据也不被确定性模板短路。
+
+    修复前：命中 profile-term + 中文 + 非表格 → 早退返回确定性科学模板
+    （片段拼装，无 LLM）。修复后：机制题（为什么/如何）强制走 LLM draft。
+    """
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = TransientThenSuccessOllama(failures=0)
+    service.ollama = fake_ollama
+    profile = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="c1",
+            page_slug="sources/d1",
+            page_title="d1",
+            page_kind="profile",
+            score=10.0,
+            excerpt="CHARMM36 修正了 CMAP 参数以改善 helix-coil 平衡与 rotamer 采样",
+            parse_version="v1",
+            block_type="narrative",
+        ),
+        prompt_text="CHARMM36 修正了 CMAP 参数以改善 helix-coil 平衡与 rotamer 采样",
+        score=10.0,
+        evidence_kind="profile-term",
+        table_facts=(),
+    )
+
+    answer = service._draft_answer(
+        "CHARMM36 为什么能改善 C22/CMAP 的 helix-coil 平衡和侧链 rotamer 采样？",
+        None,
+        [profile],
+    )
+
+    assert fake_ollama.generate_calls == 1
+    assert answer.answer_markdown == "Recovered answer from Ollama."
+
+
+def test_draft_answer_overview_question_forces_llm_draft() -> None:
+    """Task 17（2026-08-07）：overview 题（含主要/核心等标记）也强制走 LLM draft。
+
+    旧行为（9.7.7）：命中 profile-term + 中文 + 非表格 + 非机制问词 → 早退返回
+    确定性科学模板（0 次 LLM 调用）。新行为（用户拍板"非表格全 LLM"）：
+    确定性"证据片段清单"输出不可读，一律走 LLM draft；模板仅在 LLM 失败时
+    降级使用。
+    """
+    db = make_session()
+    service = QueryService(db)
+    fake_ollama = TransientThenSuccessOllama(failures=0)
+    service.ollama = fake_ollama
+    profile = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="c1",
+            page_slug="sources/d1",
+            page_title="d1",
+            page_kind="profile",
+            score=10.0,
+            excerpt="CHARMM36 修正了 CMAP 参数以改善 helix-coil 平衡与 rotamer 采样",
+            parse_version="v1",
+            block_type="narrative",
+        ),
+        prompt_text="CHARMM36 修正了 CMAP 参数以改善 helix-coil 平衡与 rotamer 采样",
+        score=10.0,
+        evidence_kind="profile-term",
+        table_facts=(),
+    )
+
+    answer = service._draft_answer(
+        "CHARMM36 蛋白力场主要想修正 CHARMM22/CMAP 的什么问题？它用了哪些参数化和验证策略？",
+        None,
+        [profile],
+    )
+
+    assert fake_ollama.generate_calls == 1
+    assert answer.answer_markdown == "Recovered answer from Ollama."
 
 
 def test_draft_answer_preserves_complete_long_contexts() -> None:
@@ -2413,7 +2591,9 @@ def test_scientific_rag_helper_can_return_extractive_evidence_without_llm() -> N
     assert contexts[answer.citations[0]].citation.chunk_id == "c1"
 
 
-def test_draft_answer_uses_deterministic_scientific_evidence_without_llm_call() -> None:
+def test_draft_answer_overview_scientific_question_forces_llm_draft() -> None:
+    """Task 17：非机制问词的 overview 科学证据题（"新增了哪些物理项"）同样走 LLM，
+    不再被确定性科学模板短路。"""
     service = QueryService(make_session())
     service.ollama = CountingFakeOllama()
     contexts = [
@@ -2433,11 +2613,45 @@ def test_draft_answer_uses_deterministic_scientific_evidence_without_llm_call() 
         )
     ]
 
-    answer = service._draft_answer("OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？", None, contexts)
+    answer = service._draft_answer(
+        "OPLS5 在 OPLS4 基础上新增了哪些物理项和适用场景？", None, contexts
+    )
 
-    assert service.ollama.generate_calls == 0
-    assert "Drude" in answer.answer_markdown
-    assert "LFMM" in answer.answer_markdown
+    assert service.ollama.generate_calls == 1
+    assert answer.answer_markdown == "The requested table values are not present in the provided context."
+
+
+def test_draft_answer_how_question_uses_llm_draft_instead_of_deterministic() -> None:
+    """9.7.7：机制题（如何/为什么）即使命中 profile-term 也不被确定性模板短路。
+
+    旧行为：命中 profile-term + 中文 + 非表格 → 早退返回确定性科学模板
+    （0 次 LLM 调用）。新行为：机制问词命中 → 强制走 LLM draft（路径 2）。
+    """
+    service = QueryService(make_session())
+    service.ollama = CountingFakeOllama()
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id="c1",
+                page_slug="sources/opls5",
+                page_title="OPLS5",
+                page_kind="source_summary",
+                score=10,
+                excerpt="OPLS5 uses a Drude model for intramolecular polarizability and LFMM metal systems.",
+            ),
+            prompt_text="OPLS5 uses a Drude model for intramolecular polarizability and LFMM metal systems.",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+
+    answer = service._draft_answer(
+        "OPLS5 如何处理 Drude polarizability 和 LFMM metal 体系？", None, contexts
+    )
+
+    assert service.ollama.generate_calls == 1
+    assert answer.answer_markdown == "The requested table values are not present in the provided context."
 
 
 def test_scientific_rag_helper_appends_supported_terms_from_full_evidence() -> None:
@@ -2533,6 +2747,8 @@ def test_supported_term_note_normalizes_spaced_half_kcal_units() -> None:
 
 
 def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
+    """LLM 生成失败时：中文科学证据题降级到科学模板，且带显式中文降级标记
+    （Task 17：模板仅作 LLM 失败 fallback，不再作为主路径）。"""
     service = QueryService(make_session())
     service.ollama = ExplodingOllama()
     contexts = [
@@ -2545,9 +2761,68 @@ def test_draft_answer_fallback_for_chinese_question_is_chinese() -> None:
 
     answer = service._draft_answer("OPLS5 如何处理 Drude polarizability？", None, contexts)
 
-    assert "根据当前检索到的原文证据" in answer.answer_markdown or "根据原文 RAG 证据" in answer.answer_markdown
+    assert "根据原文 RAG 证据" in answer.answer_markdown
+    assert "[系统提示：LLM 生成暂时失败，以下为原始证据片段，非最终答案]" in answer.answer_markdown
     assert "Please verify" not in answer.answer_markdown
     assert answer.citations == [0]
+
+
+def test_normalize_answer_citation_markup_preserves_degradation_notices() -> None:
+    """Task 18：citation 规范化不得剥离 LLM 失败降级标记（曾被子标签剥离误删）。
+
+    降级标记 "[系统提示：…]" / "[System notice: …]" 是显式输出内容（用户拍板
+    展示的非最终答案提示），不是未解析的标签引用；answer() 主流程在
+    ``_draft_answer`` 之后会调用 ``_normalize_answer_citation_markup``，
+    ``strip_unresolved_label`` 曾把它当普通方括号标签删掉，导致用户看到
+    无降级说明的"证据片段清单"、误以为答案未走 LLM。
+    """
+    cn = (
+        "## 回答\n"
+        "[系统提示：LLM 生成暂时失败，以下为原始证据片段，非最终答案]\n\n"
+        "证据片段 1 支持回答中的一个机制或验证点。短摘录：abc [0]"
+    )
+    normalized_cn = QueryService._normalize_answer_citation_markup(cn)
+    assert "[系统提示：LLM 生成暂时失败，以下为原始证据片段，非最终答案]" in normalized_cn
+    assert "证据片段" in normalized_cn
+    assert "[0]" in normalized_cn
+
+    en = (
+        "## Answer\n"
+        "[System notice: LLM generation temporarily failed. "
+        "The following is raw retrieval evidence for reference only, not a final answer.]\n\n"
+        "Evidence snippet [0]"
+    )
+    normalized_en = QueryService._normalize_answer_citation_markup(en)
+    assert "[System notice: LLM generation temporarily failed." in normalized_en
+    assert "[0]" in normalized_en
+
+    # 既有行为不变：非数字普通标签（未解析引用）仍被剥离。
+    assert "[unresolved-label]" not in QueryService._normalize_answer_citation_markup(
+        "text [unresolved-label] and [1]"
+    )
+
+
+def test_draft_answer_fallback_for_english_scientific_question_has_english_notice() -> None:
+    """Task 17：LLM 失败降级到科学模板时，英文问题带英文降级标记。"""
+    service = QueryService(make_session())
+    service.ollama = ExplodingOllama()
+    contexts = [
+        RetrievedContext(
+            citation=Citation(document_id="d1", chunk_id="c1", page_slug="sources/opls5", page_title="OPLS5", page_kind="source_summary", score=1, excerpt="OPLS5 uses Drude polarizability and LFMM metal functionality."),
+            prompt_text="OPLS5 uses Drude polarizability and LFMM metal functionality.",
+            score=1,
+        )
+    ]
+
+    answer = service._draft_answer(
+        "What polarizability corrections does OPLS5 introduce relative to OPLS3?",
+        None,
+        contexts,
+    )
+
+    assert "[System notice: LLM generation temporarily failed." in answer.answer_markdown
+    assert "raw evidence snippets" in answer.answer_markdown
+    assert answer.citations
 
 
 def test_sac_kg_claim_evidence_requires_specific_query_anchors() -> None:
@@ -3787,6 +4062,9 @@ def test_number_supported_by_evidence_rejects_substring_collisions() -> None:
     assert service._number_supported_by_evidence("1.0", "Asp 1.0 C6") is True
     assert service._number_supported_by_evidence("74.7", "OIE2016 F1 74.7 AUC") is True
     assert service._number_supported_by_evidence("74.7%", "OIE2016 F1 74.7%") is True
+    assert service._number_supported_by_evidence("74.7%", "OIE2016 F1 74.7 AUC") is True
+    assert service._number_supported_by_evidence("74.7%", "OIE2016 F1 174.7 AUC") is False
+    assert service._number_supported_by_evidence("74.7%", "OIE2016 F1 74.78 AUC") is False
     assert service._number_supported_by_evidence("1.5", "-1.5") is True
     assert service._number_supported_by_evidence("8.95", "8.956") is False
     assert service._number_supported_by_evidence("60", "160") is False
@@ -8529,6 +8807,62 @@ def test_opls5_metric_answer_retains_tail_table7_binding_rmse_values() -> None:
 
 
 def test_table_citation_indexes_preserves_low_scored_requested_table() -> None:
+    """6B 复现：多表 + 请求表低分时，_table_citation_indexes 必须保留该表。
+
+    真实根因：`_table_citation_indexes` 曾按全局分数取 top-24
+    （CANONICAL_TABLE_CONTEXT_LIMIT），opls5 的 Table 7（binding RMSE，
+    score 56.9）14 行全部被更高分的表行挤掉，导致确定性答案缺
+    binding RMSE 的 1.18/1.12。修复后按 table_id 分组保底，每个请求表
+    至少保留一个 chunk（携带完整 table_facts）进入索引。
+    """
+    service = QueryService(make_session())
+    question = (
+        "OPLS5 的表格中，芳香小分子 HFE、盐桥 pKa shift、GLU pKa "
+        "和 binding RMSE 相比 OPLS4 有哪些数值改善？"
+    )
+    table7 = (
+        "table-7", "opls5-table-7", 56.9,
+        "Table 7. Root mean square errors for relative binding free energy results (kcal/mol).\n"
+        "| PerturbationClass | No.cmpds | OPLS4 Edgewise | OPLS4 Pairwise | OPLS5 Edgewise | OPLS5 Pairwise |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        "| R-group | 199 | 0.93 | 1.06 | 0.99 | 1.13 |\n"
+        "| HeterocycleFocused | 200 | 1.18 | 1.33 | 1.19 | 1.31 |\n"
+        "| WaterDisplacement | 65 | 1.12 | 1.19 | 1.13 | 1.15 |\n"
+        "| ChargeChange | 53 | 1.17 | 1.18 | 1.16 | 1.17 |\n"
+        "| Merck | 238 | 1.18 | 1.37 | 1.17 | 1.38 |\n"
+        "| Fragments | 79 | 0.94 | 1.08 | 0.91 | 1.02 |\n"
+        "| JanssenBACE1 | 74 | 1.15 | 1.17 | 1.16 | 1.19 |\n"
+        "| MCS docking | 49 | 1.56 | 1.38 | 1.25 | 1.34 |\n"
+        "| Scaffoldhopping | 21 | 0.79 | 0.75 | 0.75 | 0.83 |\n"
+        "| Macrocycles | 58 | 1.09 | 1.30 | 1.12 | 1.41 |\n"
+        "| Misc | 79 | 0.96 | 1.22 | 0.93 | 1.14 |",
+    )
+    # 高分表：每行一个 chunk，凑足超过 CANONICAL_TABLE_CONTEXT_LIMIT(24) 的行数，
+    # 模拟真实场景中高分表行挤占 top-24 名额。
+    filler_tables = [
+        (
+            f"table-filler-{index}", f"opls5-filler-{index}", 100.0 - index,
+            f"Table {index + 10}. Filler metric table.\n"
+            "| Row | OPLS4 | OPLS5 |\n| --- | --- | --- |\n"
+            + "\n".join(f"| item-{row} | 0.{row:02d} | 0.{row + 1:02d} |" for row in range(1, 14)),
+        )
+        for index in range(3)
+    ]
+    tables = [table7, *filler_tables]
+    contexts = _opls5_row_level_canonical_contexts(question, tables)
+    table7_chunks = [c for c in contexts if c.citation.table_id == "table-7"]
+    assert len(table7_chunks) >= 11  # 前置条件：Table 7 有 11 行
+
+    indexes = service._table_citation_indexes(question, contexts)
+
+    # 旧实现：按全局分数取 top-24，Table 7（score 56.9）会被高分 filler 挤掉。
+    # 修复后：按 table_id 分组保底，Table 7 至少一个 chunk 进入索引。
+    assert any(contexts[index].citation.table_id == "table-7" for index in indexes)
+    # 保底不能突破上限：返回索引数不得超过 CANONICAL_TABLE_CONTEXT_LIMIT。
+    assert len(indexes) <= CANONICAL_TABLE_CONTEXT_LIMIT
+
+
+def test_table_citation_indexes_preserves_low_scored_requested_table() -> None:
     """复现 6B：多表查询中必须保留低分的请求表。
 
     旧实现按全局 top-24 选择，OPLS5 Table 7 的 binding-RMSE 行（score 56.9）
@@ -8617,3 +8951,1052 @@ def test_table_citation_indexes_separates_same_table_id_across_documents() -> No
     indexes = service._table_citation_indexes(question, contexts)
 
     assert indexes[:2] == [0, 1]
+
+
+
+def test_build_table_coverage_complete_when_all_rows_covered() -> None:
+    """9.7.4：inventory 行全集 ⊆ 已返回 facts 行 → complete。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS5",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        ),
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS4",
+            column="RMSE",
+            value="1.10",
+            row_index=1,
+        ),
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-7",
+                "row_count": 2,
+                "row_indices": [1, 2],
+                "source_block_ids": ["b1"],
+                "child_ids": ["c1", "c2"],
+                "child_count": 2,
+                "parent_ids": ["p1"],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        facts, typed_inventory_loader=loader
+    )
+
+    assert status == "complete"
+    assert missing == []
+    assert len(inventory) == 1
+    assert inventory[0].table_id == "table-7"
+    assert inventory[0].row_indices == [1, 2]
+    assert inventory[0].row_count == 2
+
+
+def test_build_table_coverage_partial_when_rows_trimmed() -> None:
+    """9.7.4：目标表在 inventory 中但行被裁剪 → partial + missing_tables。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS5",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        )
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-7",
+                "row_count": 3,
+                "row_indices": [1, 2, 3],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        facts, typed_inventory_loader=loader
+    )
+
+    assert status == "partial"
+    assert missing == ["table-7"]
+    assert inventory[0].row_count == 3
+
+
+def test_build_table_coverage_unknown_without_inventory() -> None:
+    """9.7.4：无 inventory / 版本缺失 / loader 失败 → unknown，不伪造 complete。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        )
+    ]
+
+    # loader 缺失（manifest 不存在）→ unknown
+    inventory, status, missing = service._build_table_coverage(
+        facts, typed_inventory_loader=lambda doc_id, version: (_ for _ in ()).throw(
+            FileNotFoundError("bundle missing")
+        )
+    )
+    assert status == "unknown"
+    assert missing == []
+    assert inventory == []
+
+    # 版本为空 → unknown（不触 loader）
+    no_version_facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version=None,
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        )
+    ]
+    _, status, _ = service._build_table_coverage(
+        no_version_facts, typed_inventory_loader=lambda doc_id, version: {}
+    )
+    assert status == "unknown"
+
+
+def test_build_table_coverage_unknown_when_inventory_has_no_row_indices() -> None:
+    """9.7.4：inventory 记录存在但无 row_indices（旧 bundle 未回填）→ unknown。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        )
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [{"table_id": "table-7", "row_count": 2}],
+    }
+
+    _, status, _ = service._build_table_coverage(facts, typed_inventory_loader=loader)
+
+    assert status == "unknown"
+
+
+def test_build_table_coverage_empty_facts_is_unknown() -> None:
+    """9.7.4：无 table_facts → unknown（缺省兼容旧调用方）。"""
+    db = make_session()
+    service = QueryService(db)
+
+    inventory, status, missing = service._build_table_coverage(
+        [], typed_inventory_loader=lambda doc_id, version: {}
+    )
+
+    assert status == "unknown"
+    assert inventory == []
+    assert missing == []
+
+
+def test_build_table_coverage_partial_when_requested_table_has_no_facts() -> None:
+    """9.7.5：明确请求 Table 7 但 table_facts 为空 → partial + missing 表。
+
+    修复"只从已返回 facts 推断覆盖"的缺口：给定目标表作用域（document_id +
+    parse_version + table_id）时，即使 ``table_facts=[]`` 仍须对照同版本
+    inventory 比较目标表，不得直接返回 unknown / complete。
+    """
+    db = make_session()
+    service = QueryService(db)
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-7",
+                "row_count": 3,
+                "row_indices": [1, 2, 3],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        [],
+        requested_table_scopes=[("d1", "v1", "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "partial"
+    assert missing == ["table-7"]
+    assert len(inventory) == 1
+    assert inventory[0].document_id == "d1"
+    assert inventory[0].parse_version == "v1"
+    assert inventory[0].table_id == "table-7"
+    assert inventory[0].row_indices == [1, 2, 3]
+    assert inventory[0].row_count == 3
+
+
+def test_build_table_coverage_partial_when_requested_table_facts_trimmed() -> None:
+    """9.7.5：只剩 Table 2 的 facts（请求的 Table 7 目标行被裁剪）→ partial。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-2",
+            document_id="d1",
+            parse_version="v1",
+            row_label="Acetate",
+            column="HFE",
+            value="-10.5",
+            row_index=1,
+        )
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-2",
+                "row_count": 1,
+                "row_indices": [1],
+            },
+            {
+                "table_id": "table-7",
+                "row_count": 3,
+                "row_indices": [1, 2, 3],
+            },
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        facts,
+        requested_table_scopes=[("d1", "v1", "table-2"), ("d1", "v1", "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "partial"
+    assert missing == ["table-7"]
+    assert len(inventory) == 2
+    assert {entry.table_id for entry in inventory} == {"table-2", "table-7"}
+
+
+def test_build_table_coverage_complete_when_requested_table_fully_covered() -> None:
+    """9.7.5：明确请求 Table 7 且 facts 覆盖全部目标行 → complete。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS5",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        ),
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS4",
+            column="RMSE",
+            value="1.10",
+            row_index=1,
+        ),
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-7",
+                "row_count": 2,
+                "row_indices": [1, 2],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        facts,
+        requested_table_scopes=[("d1", "v1", "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "complete"
+    assert missing == []
+    assert len(inventory) == 1
+    assert inventory[0].table_id == "table-7"
+
+
+def test_build_table_coverage_never_complete_mixing_candidate_facts_with_active_inventory() -> None:
+    """9.7.5：candidate 版本 facts 与 active inventory 混用不得产生 complete。"""
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    # facts 声明 candidate 版本，作用域声明 active 版本（同一张表）：
+    # 覆盖行按精确 (document_id, parse_version, table_id) 绑定，
+    # candidate facts 不得计入 active 作用域的覆盖行。
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v-candidate",
+            row_label="OPLS4",
+            column="RMSE",
+            value="1.10",
+            row_index=1,
+        ),
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v-candidate",
+            row_label="OPLS5",
+            column="RMSE",
+            value="1.18",
+            row_index=2,
+        ),
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": "v-active",
+        "tables": [
+            {
+                "table_id": "table-7",
+                "row_count": 2,
+                "row_indices": [1, 2],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        facts,
+        requested_table_scopes=[("d1", "v-active", "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "partial"
+    assert missing == ["table-7"]
+
+
+def test_build_table_coverage_partial_when_requested_table_absent_from_inventory() -> None:
+    """9.7.5：目标表在同版本 inventory 中无记录 → 目标表缺失 → partial + missing。"""
+    db = make_session()
+    service = QueryService(db)
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [
+            {
+                "table_id": "table-2",
+                "row_count": 1,
+                "row_indices": [1],
+            }
+        ],
+    }
+
+    inventory, status, missing = service._build_table_coverage(
+        [],
+        requested_table_scopes=[("d1", "v1", "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "partial"
+    assert missing == ["table-7"]
+    assert inventory == []
+
+
+def test_build_table_coverage_unknown_when_requested_scope_lacks_version() -> None:
+    """9.7.5：目标作用域版本缺失 → unknown（不触 loader，不伪造 complete）。"""
+    db = make_session()
+    service = QueryService(db)
+
+    def loader(_doc_id: str, _version: str) -> dict:
+        raise AssertionError("loader must not be called without a version")
+
+    inventory, status, missing = service._build_table_coverage(
+        [],
+        requested_table_scopes=[("d1", None, "table-7")],
+        typed_inventory_loader=loader,
+    )
+
+    assert status == "unknown"
+    assert missing == []
+    assert inventory == []
+
+
+def test_build_table_coverage_empty_explicit_scopes_do_not_fall_back_to_facts() -> None:
+    """9.7.5：显式传入空列表 / 空生成器 ≠ 未传入 —— 不得误入 facts 回退分支。
+
+    空作用域按显式 coverage 逻辑处理（零目标 → unknown），与 None（未传入，
+    回退按 facts 推断）语义分离；空列表与空生成器的结果必须一致。
+    """
+    db = make_session()
+    service = QueryService(db)
+    from app.schemas.agent import TableFactEvidence
+
+    facts = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS4",
+            column="RMSE",
+            value="1.10",
+            row_index=1,
+        )
+    ]
+    loader = lambda doc_id, version: {
+        "document_id": doc_id,
+        "version": version,
+        "tables": [{"table_id": "table-7", "row_count": 1, "row_indices": [1]}],
+    }
+
+    # 空列表：显式零目标 → unknown（若误入 facts 回退会得到 complete）
+    inventory, status, missing = service._build_table_coverage(
+        facts, requested_table_scopes=[], typed_inventory_loader=loader
+    )
+    assert status == "unknown"
+    assert inventory == []
+    assert missing == []
+
+    # 空生成器：与空列表语义一致（生成器对象恒真，truthiness 判断会漂移）
+    inventory, status, missing = service._build_table_coverage(
+        facts,
+        requested_table_scopes=(scope for scope in ()),
+        typed_inventory_loader=loader,
+    )
+    assert status == "unknown"
+    assert inventory == []
+    assert missing == []
+
+
+def test_retrieve_evidence_wires_table_scopes_to_coverage_when_facts_empty(monkeypatch) -> None:
+    """9.7.5：retrieve_evidence 接线回归 —— 最终 contexts 的 table scope 传入 coverage。
+
+    最终 contexts 含目标表 table-7 但 ``table_facts=()``（行被裁剪 / 未提取出
+    facts）时，coverage 仍须输出 partial + missing，证明
+    contexts → requested_table_scopes → _build_table_coverage → EvidencePack
+    的整条接线有效，而不只依赖内部 helper 测试。
+    """
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    service = QueryService(db)
+    monkeypatch.setattr(
+        service,
+        "_route_papers",
+        lambda question, project_id, limit=15, document_id=None: [],
+    )
+    table_7_context = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="table-7-tail",
+            table_id="table-7",
+            parse_version="v1",
+            block_type="table",
+            score=50,
+            excerpt="Table 7: RMSE comparison of OPLS4 force field\n| Model | RMSE |",
+        ),
+        prompt_text="Table 7: RMSE comparison of OPLS4 force field\n| Model | RMSE |",
+        score=50,
+        evidence_kind="table",
+        table_facts=(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_rag_contexts",
+        lambda question, project_id, paper_matches, document_ids=None: [table_7_context],
+    )
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+
+    monkeypatch.setattr(
+        CanonicalArtifactStore,
+        "load_typed_inventory",
+        lambda self, doc_id, version: {
+            "document_id": doc_id,
+            "version": version,
+            "tables": [
+                {
+                    "table_id": "table-7",
+                    "row_count": 2,
+                    "row_indices": [1, 2],
+                }
+            ],
+        },
+    )
+
+    pack = service.retrieve_evidence("demo", "What is the RMSE of OPLS4 in Table 7?")
+
+    assert pack.status == "ok"
+    assert pack.table_facts == []
+    assert pack.coverage_status == "partial"
+    assert pack.coverage_missing_tables == ["table-7"]
+    assert len(pack.inventory) == 1
+    assert pack.inventory[0].table_id == "table-7"
+    assert pack.inventory[0].row_indices == [1, 2]
+
+
+def test_requested_table_scopes_narrow_to_explicitly_requested_tables() -> None:
+    """9.7.6：覆盖目标只取问题显式请求的表，多表检索不再全表当作目标。
+
+    问题显式点名 Table 7；同一批 contexts 里无关的 table-15（仅命中
+    检索、非问题请求）不得进入覆盖目标 —— 否则 8-15 张表全作目标
+    必然 partial，把表格题误逼进 synthesize。
+    """
+    db = make_session()
+    service = QueryService(db)
+
+    def table_ctx(doc, version, table_id, chunk, text, score):
+        return RetrievedContext(
+            citation=Citation(
+                document_id=doc,
+                chunk_id=chunk,
+                parse_version=version,
+                block_type="table",
+                table_id=table_id,
+                page_slug="sources/d1",
+                page_kind="canonical_table",
+                score=score,
+                excerpt=text,
+            ),
+            prompt_text=text,
+            score=score,
+            evidence_kind="table",
+            table_facts=(),
+        )
+
+    contexts = [
+        table_ctx(
+            "d1", "v1", "table-7", "c7a",
+            "Table 7: RMSE comparison between OPLS5 and OPLS4 force fields", 20.0,
+        ),
+        table_ctx(
+            "d1", "v1", "table-7", "c7b",
+            "Table 7: OPLS5 RMSE 1.18, OPLS4 RMSE 1.10", 15.0,
+        ),
+        table_ctx(
+            "d1", "v1", "table-15", "c15",
+            "Table 15: Delta H vapor for n-alkanes", 18.0,
+        ),
+    ]
+
+    scopes = service._requested_table_scopes(
+        contexts, question="根据 Table 7 比较 OPLS5 与 OPLS4 的 RMSE"
+    )
+
+    assert scopes == [("d1", "v1", "table-7")]
+
+
+def test_requested_table_scopes_empty_when_question_requests_no_table() -> None:
+    """9.7.6：问题未显式请求任何表 → 覆盖目标为空 → coverage unknown。
+
+    空作用域走显式 coverage 逻辑（零目标 → unknown），表格直通门禁
+    （仅 ``coverage_status == "partial"`` 触发）不误伤。
+    """
+    db = make_session()
+    service = QueryService(db)
+    context = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="c7a",
+            parse_version="v1",
+            block_type="table",
+            table_id="table-7",
+            page_slug="sources/d1",
+            page_kind="canonical_table",
+            score=20.0,
+            excerpt="Table 7: RMSE comparison between OPLS5 and OPLS4",
+        ),
+        prompt_text="Table 7: RMSE comparison between OPLS5 and OPLS4",
+        score=20.0,
+        evidence_kind="table",
+        table_facts=(),
+    )
+
+    scopes = service._requested_table_scopes(
+        [context], question="请概述本项目的整体研究内容"
+    )
+
+    assert scopes == []
+    _inventory, status, missing = service._build_table_coverage(
+        [], requested_table_scopes=scopes, typed_inventory_loader=lambda _d, _v: {}
+    )
+    assert status == "unknown"
+    assert missing == []
+
+
+def test_retrieve_evidence_coverage_narrowed_to_requested_tables(monkeypatch) -> None:
+    """9.7.6：接线回归 —— 多表检索只把问题请求的表计入覆盖目标。
+
+    检索同时命中 table-7（问题显式请求，行 1/2 完整覆盖）与无关的
+    table-15（无 facts）。修复前 table-15 也进覆盖目标 → partial →
+    逼进 synthesize；修复后只有 table-7 → complete → 直通门禁放行。
+    """
+    db = make_session()
+    project = Project(id="p2", slug="demo2", name="Demo2")
+    db.add(project)
+    db.commit()
+
+    from app.schemas.agent import TableFactEvidence
+
+    service = QueryService(db)
+    monkeypatch.setattr(
+        service,
+        "_route_papers",
+        lambda question, project_id, limit=15, document_id=None: [],
+    )
+
+    def table_ctx(chunk, table_id, text, facts):
+        return RetrievedContext(
+            citation=Citation(
+                document_id="d1",
+                chunk_id=chunk,
+                parse_version="v1",
+                block_type="table",
+                table_id=table_id,
+                page_slug="sources/d1",
+                page_kind="canonical_table",
+                score=30.0,
+                excerpt=text,
+            ),
+            prompt_text=text,
+            score=30.0,
+            evidence_kind="table",
+            table_facts=tuple(facts),
+        )
+
+    facts_7 = [
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS5",
+            column="RMSE",
+            value="1.18",
+            row_index=1,
+        ),
+        TableFactEvidence(
+            table_id="table-7",
+            document_id="d1",
+            parse_version="v1",
+            row_label="OPLS4",
+            column="RMSE",
+            value="1.10",
+            row_index=2,
+        ),
+    ]
+    contexts = [
+        table_ctx("c7a", "table-7", "Table 7: RMSE OPLS5 OPLS4", facts_7),
+        table_ctx("c15", "table-15", "Table 15: Delta H vapor n-alkanes", ()),
+    ]
+    monkeypatch.setattr(
+        service,
+        "_build_rag_contexts",
+        lambda question, project_id, paper_matches, document_ids=None: contexts,
+    )
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+
+    monkeypatch.setattr(
+        CanonicalArtifactStore,
+        "load_typed_inventory",
+        lambda self, doc_id, version: {
+            "document_id": doc_id,
+            "version": version,
+            "tables": [
+                {
+                    "table_id": "table-7",
+                    "row_count": 2,
+                    "row_indices": [1, 2],
+                },
+                {
+                    "table_id": "table-15",
+                    "row_count": 3,
+                    "row_indices": [1, 2, 3],
+                },
+            ],
+        },
+    )
+
+    pack = service.retrieve_evidence(
+        "demo2", "What is the RMSE of OPLS5 and OPLS4 in Table 7?"
+    )
+
+    assert pack.status == "ok"
+    assert pack.coverage_status == "complete"
+    assert pack.coverage_missing_tables == []
+    assert len(pack.inventory) == 1
+    assert pack.inventory[0].table_id == "table-7"
+    assert pack.inventory[0].row_indices == [1, 2]
+
+
+def test_retrieve_evidence_fills_missing_requested_table_from_db(monkeypatch) -> None:
+    """9.7.8：coverage partial 且缺失请求表 → 定向直查 DB 补载整表 → complete。
+
+    检索只带回 Table 7 的标题上下文（行被裁剪，table_facts 为空），
+    inventory 声明 table-7 有行 1/2。补表路径按 (document_id, parse_version,
+    table_id) 直查 DB 行子块，assemble + extract 后重建 pack → coverage
+    complete，表格直通门禁放行，不再误进 synthesize。
+    """
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FF paper",
+        file_name="ff.pdf",
+        sha256="abc",
+        raw_path="raw/ff.pdf",
+        raw_text="x",
+        status="ready",
+        active_parse_version="v1",
+    )
+    chunks = [
+        DocumentChunk(
+            id="t7-caption",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=0,
+            text="Table 7: RMSE comparison between OPLS5 and OPLS4",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="t7-header",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=1,
+            text="| Model | RMSE |",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="t7-row1",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=2,
+            text="| OPLS5 | 1.18 |",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="t7-row2",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=3,
+            text="| OPLS4 | 1.10 |",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    monkeypatch.setattr(
+        service,
+        "_route_papers",
+        lambda question, project_id, limit=15, document_id=None: [],
+    )
+    table_7_caption = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="t7-caption",
+            table_id="table-7",
+            parse_version="v1",
+            block_type="table",
+            page_slug="sources/d1",
+            page_kind="canonical_table",
+            score=50,
+            excerpt="Table 7: RMSE comparison between OPLS5 and OPLS4",
+        ),
+        prompt_text="Table 7: RMSE comparison between OPLS5 and OPLS4",
+        score=50,
+        evidence_kind="table",
+        table_facts=(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_rag_contexts",
+        lambda question, project_id, paper_matches, document_ids=None: [table_7_caption],
+    )
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+
+    monkeypatch.setattr(
+        CanonicalArtifactStore,
+        "load_typed_inventory",
+        lambda self, doc_id, version: {
+            "document_id": doc_id,
+            "version": version,
+            "tables": [
+                {
+                    "table_id": "table-7",
+                    "row_count": 2,
+                    # row_indices 与 extract_table_facts 同为 0-based
+                    # （canonical inventory 生成时校验 covered == range(row_count)）
+                    "row_indices": [0, 1],
+                }
+            ],
+        },
+    )
+
+    pack = service.retrieve_evidence(
+        "demo", "根据 Table 7 比较 OPLS5 与 OPLS4 的 RMSE"
+    )
+
+    assert pack.status == "ok"
+    assert pack.coverage_status == "complete"
+    assert pack.coverage_missing_tables == []
+    row_values = {
+        (fact.row_label, fact.column): fact.value for fact in pack.table_facts
+    }
+    assert row_values == {
+        ("OPLS5", "RMSE"): "1.18",
+        ("OPLS4", "RMSE"): "1.10",
+    }
+    # 补表行进入 prompt（证据单元为 table child）
+    assert any("| OPLS4 | 1.10 |" in item.context_text for item in pack.items)
+
+
+def test_retrieve_evidence_keeps_partial_when_fill_table_missing_from_db(monkeypatch) -> None:
+    """9.7.8：请求表在 DB 中不存在（删除/legacy）→ 保持 partial → synthesize 兜底。
+
+    补表查询返回空时不得伪造 complete：coverage 仍是 partial + missing，
+    由 Agent 层 synthesize 兜底（决策 Q7-A 的兜底分支）。
+    """
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    service = QueryService(db)
+    monkeypatch.setattr(
+        service,
+        "_route_papers",
+        lambda question, project_id, limit=15, document_id=None: [],
+    )
+    table_7_context = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="table-7-tail",
+            table_id="table-7",
+            parse_version="v1",
+            block_type="table",
+            score=50,
+            excerpt="Table 7: RMSE comparison of OPLS4 force field\n| Model | RMSE |",
+        ),
+        prompt_text="Table 7: RMSE comparison of OPLS4 force field\n| Model | RMSE |",
+        score=50,
+        evidence_kind="table",
+        table_facts=(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_rag_contexts",
+        lambda question, project_id, paper_matches, document_ids=None: [table_7_context],
+    )
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+
+    monkeypatch.setattr(
+        CanonicalArtifactStore,
+        "load_typed_inventory",
+        lambda self, doc_id, version: {
+            "document_id": doc_id,
+            "version": version,
+            "tables": [
+                {
+                    "table_id": "table-7",
+                    "row_count": 2,
+                    "row_indices": [1, 2],
+                }
+            ],
+        },
+    )
+
+    pack = service.retrieve_evidence("demo", "What is the RMSE of OPLS4 in Table 7?")
+
+    assert pack.status == "ok"
+    assert pack.table_facts == []
+    assert pack.coverage_status == "partial"
+    assert pack.coverage_missing_tables == ["table-7"]
+
+def test_retrieve_evidence_complete_after_fill_when_facts_row_trimmed(monkeypatch) -> None:
+    """9.7.9：fill 成功载入整表 → complete，即使行级 facts 按问题过滤只覆盖子集。
+
+    巨型表（10 行）的 inventory 声明全部行，但 extract_table_facts 只产
+    出问题命中的行（OPLS5/OPLS4 两行）——按 facts 重算 coverage 必然
+    partial，会把表格题误逼进 synthesize（40-124s）。fill 已把整表载入
+    evidence pack（table contexts 含全部行），此时直接标记 complete，
+    让表格直通门禁放行（decision Q7-A 兜底语义）。
+    """
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = Document(
+        id="d1",
+        project_id="p1",
+        title="FF paper",
+        file_name="ff.pdf",
+        sha256="abc",
+        raw_path="raw/ff.pdf",
+        raw_text="x",
+        status="ready",
+        active_parse_version="v1",
+    )
+    row_labels = [
+        "OPLS5",
+        "OPLS4",
+        "OPLS3",
+        "CHARMM36",
+        "CHARMM22",
+        "AMBER99",
+        "GROMOS53A6",
+        "OPLS2005",
+        "MMFF94",
+        "CFF91",
+    ]
+    chunks = [
+        DocumentChunk(
+            id="t7-caption",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=0,
+            text="Table 7: RMSE comparison between force fields",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+        DocumentChunk(
+            id="t7-header",
+            document_id="d1",
+            parse_version="v1",
+            chunk_role="child",
+            block_type="table",
+            ordinal=1,
+            text="| Model | RMSE |",
+            source_spans=[{"metadata": {"table_id": "table-7"}}],
+            embedding=None,
+        ),
+        *[
+            DocumentChunk(
+                id=f"t7-row{index}",
+                document_id="d1",
+                parse_version="v1",
+                chunk_role="child",
+                block_type="table",
+                ordinal=index,
+                text=f"| {label} | {1.0 + index * 0.1:.2f} |",
+                source_spans=[{"metadata": {"table_id": "table-7"}}],
+                embedding=None,
+            )
+            for index, label in enumerate(row_labels, start=2)
+        ],
+    ]
+    db.add_all([project, document, *chunks])
+    db.commit()
+
+    service = QueryService(db)
+    monkeypatch.setattr(
+        service,
+        "_route_papers",
+        lambda question, project_id, limit=15, document_id=None: [],
+    )
+    table_7_caption = RetrievedContext(
+        citation=Citation(
+            document_id="d1",
+            chunk_id="t7-caption",
+            table_id="table-7",
+            parse_version="v1",
+            block_type="table",
+            page_slug="sources/d1",
+            page_kind="canonical_table",
+            score=50,
+            excerpt="Table 7: RMSE comparison between force fields",
+        ),
+        prompt_text="Table 7: RMSE comparison between force fields",
+        score=50,
+        evidence_kind="table",
+        table_facts=(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_build_rag_contexts",
+        lambda question, project_id, paper_matches, document_ids=None: [table_7_caption],
+    )
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+
+    monkeypatch.setattr(
+        CanonicalArtifactStore,
+        "load_typed_inventory",
+        lambda self, doc_id, version: {
+            "document_id": doc_id,
+            "version": version,
+            "tables": [
+                {
+                    "table_id": "table-7",
+                    "row_count": 10,
+                    "row_indices": list(range(10)),
+                }
+            ],
+        },
+    )
+
+    pack = service.retrieve_evidence(
+        "demo", "根据 Table 7 比较 OPLS5 与 OPLS4 的 RMSE"
+    )
+
+    # 行级 facts 仍只覆盖问题命中的 2 行（提取是问题导向的）
+    assert {fact.row_label for fact in pack.table_facts} == {"OPLS5", "OPLS4"}
+    # 但 fill 已把整表（含其余 8 行）载入 evidence pack → complete
+    assert pack.coverage_status == "complete"
+    assert pack.coverage_missing_tables == []
+    assert len(pack.inventory) == 1
+    assert pack.inventory[0].row_indices == list(range(10))
+    # 完整表行进入 prompt（不止命中行）
+    assert any("| CFF91 | 2.10 |" in item.context_text for item in pack.items)

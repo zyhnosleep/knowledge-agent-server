@@ -197,12 +197,25 @@ def test_stream_emits_live_route_tokens_and_citations_in_order(monkeypatch) -> N
         raising=False,
     )
 
+    client = make_client(db)
+    # 9.1 之后单轮/对比路由跳过 synthesize（无流式 token）。要触发
+    # synthesize_stream，需要跨轮引用场景：先发一轮请求建立会话历史，
+    # 再用含指代词的 query 走同一 session。
+    client.post(
+        "/api/agent/query",
+        json={
+            "project_slug": "demo",
+            "query": "charmm36m 的 accuracy 是多少",
+            "session_id": "stream-sess",
+        },
+    )
     events = _parse_sse_events(
-        make_client(db).post(
+        client.post(
             "/api/agent/query/stream",
             json={
                 "project_slug": "demo",
-                "query": "hello?",
+                "query": "那个的 accuracy 呢？",
+                "session_id": "stream-sess",
             },
         ).text
     )
@@ -548,3 +561,136 @@ def test_stream_concurrent_requests_do_not_serialize(monkeypatch) -> None:
         f"Expected concurrent wall time < 1.8 s but took {elapsed:.2f} s "
         f"- requests appear to be serialized on the event loop"
     )
+
+
+# ------------------------------------------------------------------
+# 9.3.1/任务9：stream 路径 narrow_context 收窄断言
+# ------------------------------------------------------------------
+
+
+def _fake_settings_local():
+    from app.core.config import Settings
+
+    s = Settings()
+    s.agent_synthesis_provider = "local"
+    s.external_api_enabled = False
+    s.external_api_key = None
+    s.external_api_model = "gpt-4o-mini"
+    s.external_api_base_url = "https://api.openai.com/v1"
+    s.external_api_timeout = 90
+    return s
+
+
+class _FakeStreamingOllama:
+    """流式 local client：首轮流式缺锚点触发 coverage retry（generate_chat）。"""
+
+    def __init__(self, *, stream_text: str, retry_text: str) -> None:
+        self.stream_text = stream_text
+        self.retry_text = retry_text
+        self.stream_calls: list[dict] = []
+        self.retry_calls: list[dict] = []
+
+    def stream_chat(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        midpoint = max(1, len(self.stream_text) // 2)
+        yield {"content": self.stream_text[:midpoint], "model": kwargs["model"], "done": False}
+        yield {"content": self.stream_text[midpoint:], "model": kwargs["model"], "done": True}
+
+    def generate_chat(self, **kwargs):
+        self.retry_calls.append(kwargs)
+        return {
+            "content": self.retry_text,
+            "model": kwargs["model"],
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        }
+
+    def generate_structured(self, *args, **kwargs):
+        raise AssertionError("Local synthesis must not request structured JSON")
+
+
+def test_stream_narrow_context_excludes_items_and_inventory(monkeypatch) -> None:
+    """9.3.1/任务9：stream 路径 narrow_context=True 时，首轮流式 prompt
+    与 coverage retry 第二次调用均不含 evidence items 摘录与完整
+    inventory，结构化 table_facts 保留。"""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
+    from app.services.agent_model_router import InferenceTarget
+    from app.services.agent_synthesizer import AgentSynthesizer
+
+    ollama = _FakeStreamingOllama(
+        stream_text="Standard analysis was performed.",
+        retry_text="NMR spectroscopy at 7.5 kcal/mol was used.",
+    )
+    syn = AgentSynthesizer(ollama_client=ollama)
+    result = syn.synthesize_stream(
+        query="What technique?",
+        route="evidence_required",
+        rag_answer="Some analysis.",
+        citations=[
+            {"document_id": "d1", "excerpt": "NMR spectroscopy at 7.5 kcal/mol."}
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "full narrative evidence paragraph excluded",
+                    "evidence_kind": "source_chunk",
+                    "source_stage": "source_chunk",
+                    "support_hint": "direct",
+                }
+            ],
+            "inventory": [
+                {
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "table_id": "table-7",
+                    "row_count": 2,
+                    "source_block_ids": ["sb-1"],
+                    "child_ids": ["inv-child-1"],
+                    "child_count": 1,
+                    "parent_ids": ["p-1"],
+                    "row_indices": [0, 1],
+                }
+            ],
+            "table_facts": [
+                {
+                    "table_id": "table-7",
+                    "document_id": "d1",
+                    "parse_version": "canonical-v4",
+                    "row_label": "total",
+                    "column": "value",
+                    "value": "21.0",
+                    "row_index": 0,
+                }
+            ],
+        },
+        target=InferenceTarget(
+            profile="generation",
+            base_url="http://generation:11434",
+            model="qwen3.5:9b",
+            context_length=32768,
+            reason="test generation",
+        ),
+        event_sink=lambda name, data: None,
+        narrow_context=True,
+    )
+    # coverage retry 被触发（首轮流式缺锚点），第二次调用同样收窄
+    assert ollama.stream_calls and ollama.retry_calls
+    stream_prompt = (
+        ollama.stream_calls[0]["messages"][0]["content"]
+        + "\n"
+        + ollama.stream_calls[0]["messages"][1]["content"]
+    )
+    retry_prompt = (
+        ollama.retry_calls[0]["messages"][0]["content"]
+        + "\n"
+        + ollama.retry_calls[0]["messages"][1]["content"]
+    )
+    for prompt in (stream_prompt, retry_prompt):
+        assert "full narrative evidence paragraph excluded" not in prompt
+        assert "inv-child-1" not in prompt
+        # 结构化 table_facts 在收窄时仍保留（只去 items/inventory）
+        assert "21.0" in prompt
+    assert result["provider"] == "local"

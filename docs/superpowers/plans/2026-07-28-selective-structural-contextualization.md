@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Embed ordinary Child chunks directly while generating LLM contextual prefixes only for table, figure, and formula Children, with strict mixed-policy integrity gates and a clean `canonical-v2` artifact version.
+**Goal:** Embed every retrievable Child directly without an ingestion-time LLM call, with strict raw-embedding integrity gates and a clean `canonical-v4` artifact version.
 
-**Architecture:** A focused policy module classifies and validates Child embedding inputs. The ingestion pipeline partitions Children before contextualization, embeds a mixed inventory, persists each Child through its policy-specific schema, and activates only when both structured-context and plain-embedding completeness are 100%. Rebuild and retrieval acceptance reports expose both sides of the policy.
+**Architecture:** The policy module classifies every retrievable Child as direct embedding. The pipeline carries semantic drafts through the contextualize stage without constructing the LLM service, embeds exact `child.text`, and activates only when raw embedding completeness is 100%. Compatibility reports retain contextual metrics with an empty eligible set.
 
 **Tech Stack:** Python 3.12, Pydantic v2, SQLAlchemy, PostgreSQL/pgvector, Ollama, pytest, systemd user services.
 
@@ -31,10 +31,8 @@ Create tests that assert:
 
 ```python
 def test_only_structured_evidence_requires_llm_context() -> None:
-    assert CONTEXTUALIZED_BLOCK_TYPES == frozenset({"table", "figure", "formula"})
-    for block_type in ("table", "figure", "formula"):
-        assert requires_contextualization(block_type) is True
-    for block_type in ("narrative", "caption", "appendix"):
+    assert CONTEXTUALIZED_BLOCK_TYPES == frozenset()
+    for block_type in ("narrative", "caption", "appendix", "table", "figure", "formula"):
         assert requires_contextualization(block_type) is False
 
 
@@ -45,10 +43,8 @@ def test_plain_child_requires_exact_raw_embedding_text_and_no_context_fields() -
     assert valid_plain_embedding(child) is False
 
 
-def test_structured_child_requires_complete_provenance_and_prefixed_text() -> None:
-    child = _contextualized_child(block_type="table")
-    assert valid_contextualized_embedding(child) is True
-    child["contextualization_model"] = None
+def test_no_child_type_accepts_contextualized_embedding() -> None:
+    child = _contextualized_child(block_type="figure")
     assert valid_contextualized_embedding(child) is False
 ```
 
@@ -67,8 +63,8 @@ Expected: collection fails because `app.services.contextualization_policy` does 
 Implement these public contracts:
 
 ```python
-CONTEXTUALIZED_BLOCK_TYPES = frozenset({"table", "figure", "formula"})
-PLAIN_EMBEDDING_BLOCK_TYPES = frozenset({"narrative", "caption", "appendix"})
+CONTEXTUALIZED_BLOCK_TYPES = frozenset()
+PLAIN_EMBEDDING_BLOCK_TYPES = frozenset({"narrative", "caption", "appendix", "table", "figure", "formula"})
 RETRIEVABLE_BLOCK_TYPES = CONTEXTUALIZED_BLOCK_TYPES | PLAIN_EMBEDDING_BLOCK_TYPES
 
 
@@ -112,7 +108,7 @@ python -m pytest tests/test_contextualization_policy.py -q
 
 Expected: all policy tests pass.
 
-### Task 2: Contextualize Only Structured Children
+### Task 2: Bypass The LLM For Every Child
 
 **Files:**
 - Modify: `src/app/services/pipeline.py`
@@ -120,21 +116,18 @@ Expected: all policy tests pass.
 
 - [ ] **Step 1: Write a failing mixed contextualization-stage test**
 
-Build one Parent and six Children, one per retrievable block type. Replace `ContextualizationService` with a fake that records its input and returns valid `ContextualizedChunk` values. Assert:
+Build one Parent and six Children, one per retrievable block type. Replace `ContextualizationService` with a fake whose constructor raises. Assert:
 
 ```python
-assert [child.block_type for child in observed_children] == ["table", "figure", "formula"]
 assert output["child_count"] == 6
-assert output["contextualized_child_count"] == 3
-assert output["plain_child_count"] == 3
+assert output["contextualized_child_count"] == 0
+assert output["plain_child_count"] == 6
 
 artifact = json.loads(Path(output["artifact_path"]).read_text("utf-8"))
 by_type = {item["block_type"]: item for item in artifact if item["chunk_role"] == "child"}
-for block_type in ("narrative", "caption", "appendix"):
+for block_type in ("narrative", "caption", "appendix", "table", "figure", "formula"):
     assert by_type[block_type]["embedding_text"] == by_type[block_type]["text"]
     assert "contextual_prefix" not in by_type[block_type]
-for block_type in ("table", "figure", "formula"):
-    assert by_type[block_type]["embedding_text"].endswith("\n\n" + by_type[block_type]["text"])
 ```
 
 Add a second test with only narrative Children and assert the fake service is never constructed or called.
@@ -192,13 +185,13 @@ Expected: all selected tests pass; direct `ContextualizationService` validation 
 
 - [ ] **Step 1: Write failing embed and index tests**
 
-Change the embed-stage fixture to include one plain narrative Child and one contextualized table Child. Assert Ollama receives, in Child order:
+Change the embed-stage fixture to include plain narrative, table, and figure Children. Assert Ollama receives, in Child order:
 
 ```python
-assert calls == [["Raw narrative", "Table context.\n\n| A | B |"]]
+assert calls == [["Raw narrative", "| A | B |", "Figure 1"]]
 ```
 
-Add failures for a plain Child with modified `embedding_text` and a table Child without complete context provenance. Add an index test proving both Child types persist with vectors while only the table has contextualization columns.
+Add failures for any Child with modified `embedding_text` or contextualization fields. Add an index test proving all Child types persist with vectors and none has contextualization columns.
 
 - [ ] **Step 2: Verify RED**
 
@@ -218,7 +211,7 @@ for item in children:
         raise RuntimeError("Embedding input violates the Child contextualization policy.")
 ```
 
-In `_persist_versioned_chunks`, validate structured Children as `ContextualizedChunk` and plain Children as `ChunkDraft`. Use the common draft interface for parent linkage, vector creation, and previous/next linkage. Do not synthesize context fields for plain Children.
+In `_persist_versioned_chunks`, validate every Child with `valid_plain_embedding` and `ChunkDraft`. Use the common draft interface for parent linkage, vector creation, and previous/next linkage. Do not synthesize context fields.
 
 - [ ] **Step 4: Verify GREEN**
 
@@ -243,12 +236,12 @@ Expected: mixed inventories embed, index, and preserve old active versions until
 
 - [ ] **Step 1: Write failing activation and metric tests**
 
-Add a successful activation fixture with one plain narrative and one contextualized table. Add failures for an altered plain embedding and an uncontextualized table. In rebuild metrics assert:
+Add a successful activation fixture with plain narrative, table, and figure Children. Add failures for altered embedding text or contextualization fields. In rebuild metrics assert:
 
 ```python
-assert metrics["contextualization_eligible_children"] == 1
-assert metrics["contextualized_children"] == 1
-assert metrics["plain_embedding_children"] == 1
+assert metrics["contextualization_eligible_children"] == 0
+assert metrics["contextualized_children"] == 0
+assert metrics["plain_embedding_children"] == 3
 assert metrics["contextual_prefix_completeness"] == 1.0
 assert metrics["plain_embedding_completeness"] == 1.0
 ```
@@ -294,7 +287,7 @@ Use `_ratio(contextualized, eligible_count, empty_is_complete=True)` and `_ratio
 
 Run the three files again. Expected: all tests pass and incomplete plain or structured policy data blocks acceptance.
 
-### Task 5: Start A Clean Canonical V2 And Update Task 15 Documentation
+### Task 5: Start A Clean Canonical V4 And Update Task 15 Documentation
 
 **Files:**
 - Modify: `src/app/core/config.py`
@@ -304,7 +297,7 @@ Run the three files again. Expected: all tests pass and incomplete plain or stru
 
 - [ ] **Step 1: Write a failing default-version test**
 
-Update the dry-run expectation to require every planned version to start with `canonical-v2-`. Verify it fails while the default is still `canonical-v1`.
+Update the dry-run expectation to require every planned version to start with `canonical-v4-`. Verify it fails while the default is still `canonical-v3`.
 
 - [ ] **Step 2: Bump only the new development code default**
 
@@ -312,7 +305,7 @@ Change:
 
 ```python
 canonical_pipeline_version: str = Field(
-    default="canonical-v2", alias="CANONICAL_PIPELINE_VERSION"
+    default="canonical-v4", alias="CANONICAL_PIPELINE_VERSION"
 )
 ```
 
@@ -320,7 +313,7 @@ Do not edit the test environment or its runtime environment. Verify the developm
 
 - [ ] **Step 3: Amend Task 15 gates and progress notes**
 
-Record that `canonical-v1` is preserved and inactive, `canonical-v2` is the selective policy, ordinary Child embeddings are raw, and prefix completeness applies only to table/figure/formula. Add `plain_embedding_completeness=1.0` to every canary/full rebuild gate.
+Record that V1/V2/V3 artifacts are preserved and inactive, `canonical-v4` is the all-direct policy, every Child embedding is raw, and the contextualization eligible count is zero. Add `plain_embedding_completeness=1.0` to every canary/full rebuild gate.
 
 - [ ] **Step 4: Run the full focused local suite**
 
@@ -337,7 +330,7 @@ Expected: all tests pass and no whitespace errors exist.
 
 **Files:**
 - Deploy only changed source/script files to `/home/zhangyh/knowledge-agent-dev`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff14sb-v2.json`
+- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`
 
 - [ ] **Step 1: Capture and compare deployment hashes**
 
@@ -351,7 +344,7 @@ With `PYTHONPATH=src`, run the same focused test set in development. Require all
 
 Require no rebuild process, development worker `CUDA_VISIBLE_DEVICES=0`, test counts unchanged, source SHA unchanged, and no `CANONICAL_PIPELINE_VERSION` override in the development environment.
 
-- [ ] **Step 4: Run the clean V2 canary on GPU0**
+- [ ] **Step 4: Run the clean V4 canary on GPU0**
 
 ```bash
 cd /home/zhangyh/knowledge-agent-dev
@@ -361,10 +354,10 @@ set +a
 export CUDA_VISIBLE_DEVICES=0
 PYTHONPATH=src .venv/bin/python scripts/rebuild_canonical_index.py --resume \
   --document-id 098a4ce8-d772-46a5-ae67-e0594a355460 \
-  --report runtime/task15/canary-ff14sb-v2.json
+  --report runtime/task15/canary-ff14sb-v4.json
 ```
 
-Require the selected version to start with `canonical-v2-`; no `canonical-v1` stage may be resumed or overwritten.
+Require the selected version to start with `canonical-v4-`; no V1/V2/V3 stage may be resumed or overwritten.
 
 - [ ] **Step 5: Strictly inspect the report and artifacts**
 
@@ -382,7 +375,7 @@ artifact_link_validity = 1.0
 ready_for_acceptance = true
 ```
 
-Load persisted Children and prove that only table/figure/formula rows have contextual prefixes, all narrative/caption/appendix rows have `embedding_text == text`, and every Child has a vector. Reconfirm MinerU is primary, page coverage is 50/50, and exactly pages 7, 8, 9, 15, 16, 45, 46, 48, and 50 use `pypdf_text_layer` with `mineru_page_missing`.
+Load persisted Children and prove that no row has contextual fields, all Children have `embedding_text == text`, and every Child has a vector. Reconfirm MinerU is primary, page coverage is 50/50, and exactly pages 7, 8, 9, 15, 16, 45, 46, 48, and 50 use `pypdf_text_layer` with `mineru_page_missing`.
 
 - [ ] **Step 6: Continue Task 15 only after pass**
 

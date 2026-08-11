@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.session import Base
 from app.models.records import Project
 from app.schemas.agent import AgentQueryRequest, EvidencePack, ToolSpec
-from app.schemas.common import QueryResponse
+from app.schemas.common import Citation, QueryResponse
 from app.services.agent_executor import AgentExecutor
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
@@ -155,11 +155,7 @@ def test_generation_target_is_recorded_and_passed_to_synthesis() -> None:
 
     executor._tools.get("answer.synthesize")["handler"] = routed_synthesis
     response = executor.execute(
-        AgentQueryRequest(
-            project_slug="demo",
-            query="hello",
-            session_id="generation-session",
-        )
+        _cross_turn_request(db, session_id="generation-session")
     )
 
     route_step = next(step for step in response.steps if step.step_type == "route")
@@ -188,11 +184,7 @@ def test_generation_is_wrapped_in_selected_model_lease() -> None:
 
     executor._model_runtime = RecordingRuntime()
     response = executor.execute(
-        AgentQueryRequest(
-            project_slug="demo",
-            query="hello",
-            session_id="leased-session",
-        )
+        _cross_turn_request(db, session_id="leased-session")
     )
 
     assert response.status == "completed"
@@ -1311,7 +1303,7 @@ def test_retrieve_step_has_evidence_metadata() -> None:
         },
     ]
     executor = make_executor_with_retrieve(db, evidence_items=evidence_items)
-    request = AgentQueryRequest(project_slug="demo", query="hello?")
+    request = _cross_turn_request(db)
     response = executor.execute(request)
 
     retrieve_steps = [
@@ -1429,7 +1421,7 @@ def test_synthesize_step_has_evidence_pack_metadata() -> None:
         },
     ]
     executor = make_executor_with_retrieve(db, evidence_items=evidence_items)
-    request = AgentQueryRequest(project_slug="demo", query="hello?")
+    request = _cross_turn_request(db)
     response = executor.execute(request)
 
     assert response.status == "completed"
@@ -1462,7 +1454,7 @@ def test_synthesize_step_without_evidence_pack_no_metadata_leak() -> None:
 
     # Use make_executor (without retrieve_evidence support)
     executor = make_executor(db)
-    request = AgentQueryRequest(project_slug="demo", query="hello?")
+    request = _cross_turn_request(db)
     response = executor.execute(request)
 
     assert response.status == "completed"
@@ -1529,7 +1521,7 @@ def test_executor_passes_evidence_pack_to_synthesize_tool(monkeypatch) -> None:
     executor = AgentExecutor(
         rag=rag, tools=tools, memory=memory, db=db, trace_store=trace_store
     )
-    request = AgentQueryRequest(project_slug="demo", query="hello?")
+    request = _cross_turn_request(db)
     response = executor.execute(request)
 
     assert response.status == "completed"
@@ -1593,3 +1585,790 @@ def test_executor_normal_answer_no_false_insufficient_warning() -> None:
         f"Regular answer should NOT trigger insufficient-evidence warning, "
         f"got warnings={response.warnings}"
     )
+
+
+def test_retarget_citation_markers_after_synthesis_filtering() -> None:
+    """Inline markers must follow the compacted final citation list."""
+    answer = "Table 2 supports this value [2], while Table 4 supports that value [0]."
+
+    retargeted = AgentExecutor._retarget_citation_markers(answer, [0, 2])
+
+    assert "[1]" in retargeted
+    assert "[0]" in retargeted
+    assert "[2]" not in retargeted
+
+
+def test_table_evidence_items_are_added_to_synthesis_citations() -> None:
+    """Agent synthesis must see every retrieved table Child, not only RAG's top five."""
+    base = [
+        Citation(
+            document_id="doc-1",
+            chunk_id="child-1",
+            score=0.9,
+            excerpt="Table 2. HFE | OPLS4 | OPLS5 | 0.76 | 0.46",
+        )
+    ]
+    evidence_pack = {
+        "items": [
+            {
+                "document_id": "doc-1",
+                "chunk_id": "child-1",
+                "evidence_kind": "table",
+                "table_id": "table-2",
+                "excerpt": "Table 2. HFE | OPLS4 | OPLS5 | 0.76 | 0.46",
+                "score": 0.9,
+                "page_label": "10",
+                "parse_version": "canonical-v4",
+            },
+            {
+                "document_id": "doc-1",
+                "chunk_id": "child-5",
+                "evidence_kind": "table",
+                "table_id": "table-5",
+                "excerpt": "Table 5. GLU | OPLS4 | OPLS5 | 0.70 | 0.61",
+                "score": 0.8,
+                "page_label": "12",
+                "parse_version": "canonical-v4",
+            },
+        ]
+    }
+
+    augmented = AgentExecutor._merge_table_evidence_citations(base, evidence_pack)
+
+    assert [citation.chunk_id for citation in augmented] == ["child-1", "child-5"]
+    assert augmented[1].table_id == "table-5"
+    assert augmented[1].parse_version == "canonical-v4"
+
+
+def test_table_fact_source_citations_are_added_even_when_child_is_not_top_context() -> None:
+    """A fact's original Child must be available for exact citation binding."""
+    extra = [
+        Citation(
+            document_id="doc-1",
+            chunk_id="child-total",
+            score=0.0,
+            excerpt="Table 7 | TotalWeightedAverage | OPLS4 Edgewise 1.18 | OPLS5 Edgewise 1.12",
+            parse_version="canonical-v4",
+            block_type="table",
+            table_id="table-7",
+        )
+    ]
+
+    augmented = AgentExecutor._merge_table_evidence_citations(
+        [],
+        {"items": [], "table_facts": []},
+        extra_citations=extra,
+    )
+
+    assert [citation.chunk_id for citation in augmented] == ["child-total"]
+    assert "1.18" in augmented[0].excerpt
+
+
+def test_is_cross_turn_query_requires_history_and_reference() -> None:
+    """9.2 跨轮引用识别：必须有历史轮次 + 指代词，且"对比"不能单独触发。"""
+    db = make_db()
+    executor = make_executor(db)
+    session_id = "sess-cross-turn"
+
+    # 无历史：无论 query 如何都是 False
+    assert executor._is_cross_turn_query("那 C36 呢", session_id) is False
+    assert executor._is_cross_turn_query("对比 OPLS4 和 OPLS5", session_id) is False
+
+    # 无 session_id：一律 False
+    assert executor._is_cross_turn_query("那 C36 呢", None) is False
+
+    # 加入一轮历史后：
+    executor._memory.add_turn(
+        session_id, role="user", content="charmm36m 的 accuracy 是多少", step_type="user_query"
+    )
+    # 只有一轮历史 → 仍不是跨轮（需有"上一轮"可解析）
+    assert executor._is_cross_turn_query("那 C36 呢", session_id) is False
+
+    # 两轮历史后：
+    executor._memory.add_turn(
+        session_id, role="user", content="那 C36 呢", step_type="user_query"
+    )
+    assert executor._is_cross_turn_query("那 C36 呢", session_id) is True
+    assert executor._is_cross_turn_query("对比之前那篇", session_id) is True
+    # 无指代词的完整问题：False
+    assert executor._is_cross_turn_query("charmm36m 的 accuracy 是多少", session_id) is False
+    # 单轮"对比"（无指代词）：False
+    assert executor._is_cross_turn_query("对比 OPLS4 和 OPLS5", session_id) is False
+
+
+def _counting_synthesize(executor) -> list[int]:
+    """Wrap executor._run_synthesize with a call counter."""
+    called: list[int] = []
+    original = executor._run_synthesize
+
+    def counting(*args, **kwargs):
+        called.append(1)
+        return original(*args, **kwargs)
+
+    executor._run_synthesize = counting
+    return called
+
+
+def _cross_turn_request(
+    db: Session,
+    *,
+    query: str = "那个的 accuracy 呢？",
+    session_id: str = "synth-sess",
+) -> AgentQueryRequest:
+    """构造跨轮引用请求：先加一轮历史，使 synthesize 保留调用。
+
+    9.1 之后单轮/对比路由跳过 synthesize，只有跨轮引用与
+    complex_multi_hop 保留。需要验证 synthesize 行为的测试用此 helper。
+    """
+    memory = ConversationMemory(db)
+    memory.touch_session(session_id, project_slug="demo", ttl_days=30, document_id=None)
+    memory.add_turn(
+        session_id,
+        role="user",
+        content="charmm36m 的 accuracy 是多少",
+        step_type="user_query",
+    )
+    return AgentQueryRequest(
+        project_slug="demo", query=query, session_id=session_id
+    )
+
+
+def _make_project(db) -> None:
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+
+
+def _assert_direct_pass_through(response, *, rag_answer: str = "test answer") -> None:
+    """Task 1：断言普通首轮直通结果（无 synthesis step、rag-direct 标记）。"""
+    assert response.final_answer == rag_answer
+    assert response.answer_model == "rag-direct"
+    assert response.answer_provider == "local"
+    assert not any(step.step_type == "synthesis" for step in response.steps)
+    finalize_step = next(s for s in response.steps if s.step_type == "finalize")
+    assert finalize_step.metadata.get("synthesis_skipped") is True
+
+
+def test_route_matrix_skips_synthesis_for_single_turn_queries() -> None:
+    """9.1：单轮路由（simple_rag / evidence_required / table_or_metric /
+    multi_source_compare）跳过 synthesize，直通 rag.answer。"""
+    db = make_db()
+    _make_project(db)
+    executor = make_executor(db)
+    called = _counting_synthesize(executor)
+
+    # simple_rag：普通知识库问题
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 是多少？")
+    )
+    assert called == [], "simple_rag 路由不应调用 synthesize"
+    _assert_direct_pass_through(response)
+
+    # evidence_required：证据类问题
+    executor_er = make_executor(db)
+    called_er = _counting_synthesize(executor_er)
+    response_er = executor_er.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 引用了哪些来源？")
+    )
+    assert called_er == [], "evidence_required 路由不应调用 synthesize"
+    _assert_direct_pass_through(response_er)
+
+    # table_or_metric：指标问题（stub 答案带数值，否则 verifier 按 9.1.4
+    # 判定"缺少表格/数值证据"→ retry → 正确阻止直通）
+    executor2 = make_executor(db, rag_answer_text="test answer 1.18")
+    called2 = _counting_synthesize(executor2)
+    response2 = executor2.execute(
+        AgentQueryRequest(project_slug="demo", query="OPLS5 的表格中 binding RMSE 是多少？")
+    )
+    assert called2 == [], "table_or_metric 路由不应调用 synthesize"
+    _assert_direct_pass_through(response2, rag_answer="test answer 1.18")
+
+    # multi_source_compare：对比问题（单轮）
+    executor3 = make_executor(db)
+    called3 = _counting_synthesize(executor3)
+    response3 = executor3.execute(
+        AgentQueryRequest(project_slug="demo", query="对比 OPLS4 和 OPLS5 的 accuracy")
+    )
+    assert called3 == [], "multi_source_compare 单轮不应调用 synthesize"
+    _assert_direct_pass_through(response3)
+
+
+def test_route_matrix_calls_synthesis_for_complex_multi_hop() -> None:
+    """9.1：complex_multi_hop 路由保留 synthesize。"""
+    db = make_db()
+    _make_project(db)
+    executor = make_executor(db)
+    called = _counting_synthesize(executor)
+
+    executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="首先找到 OPLS5 论文，然后计算它的 binding RMSE 相比 OPLS4 的改善",
+        )
+    )
+    assert called, "complex_multi_hop 路由应调用 synthesize"
+
+
+def test_route_matrix_does_not_pass_through_insufficient_evidence() -> None:
+    """9.1.4：evidence-insufficient 答案不透传（保留 synthesize/降级路径）。"""
+    db = make_db()
+    _make_project(db)
+    executor = make_executor(
+        db,
+        rag_answer_text=(
+            "## Insufficient Evidence\n\nThe retrieved source documents do not "
+            "contain information about the specific scientific terms in your "
+            "question (charmm36m)."
+        ),
+    )
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 是多少？")
+    )
+    # 证据不足时不跳过 synthesize（不把未经验证的草稿标记为 rag-direct）
+    assert called, "evidence-insufficient 答案不应跳过 synthesize"
+    assert response.answer_model != "rag-direct"
+
+
+def test_route_matrix_does_not_pass_through_contradicted_rag(monkeypatch) -> None:
+    """9.1.4：RAG verification_status 为 contradicted 时不透传（保留降级路径）。"""
+    db = make_db()
+    _make_project(db)
+
+    class ContradictedRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            return QueryResponse(
+                answer_markdown="The value is 21.0%.",
+                citations=[Citation(document_id="d1", chunk_id="c1", score=0.9, excerpt="e")],
+                verification_status="contradicted",
+            )
+
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
+            return EvidencePack(status="ok", items=[])
+
+    executor = build_executor_with_rag(db, ContradictedRAG())
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 是多少？")
+    )
+    # 矛盾验证结果不透传
+    assert called, "contradicted 结果不应跳过 synthesize"
+    assert response.answer_model != "rag-direct"
+
+
+def test_route_matrix_does_not_pass_through_empty_rag_answer(monkeypatch) -> None:
+    """9.1.4：RAG answer 为空时不透传（保留 synthesize/降级路径）。"""
+    db = make_db()
+    _make_project(db)
+
+    class EmptyRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            return QueryResponse(
+                answer_markdown="",
+                citations=[Citation(document_id="d1", chunk_id="c1", score=0.9, excerpt="e")],
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
+            return EvidencePack(status="ok", items=[])
+
+    executor = build_executor_with_rag(db, EmptyRAG())
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 是多少？")
+    )
+    assert called, "空答案不应跳过 synthesize"
+    assert response.answer_model != "rag-direct"
+
+
+def test_executor_passes_narrow_context_only_for_cross_turn(monkeypatch) -> None:
+    """9.3.1：narrow_context 只在跨轮引用场景传给 synthesize。"""
+    db = make_db()
+    _make_project(db)
+    executor = make_executor(db)
+    captured: list[dict] = []
+
+    original_call_tool = executor._tools.call_tool
+
+    def capturing_call_tool(name, args=None, *, ctx=None):
+        if name == "answer.synthesize" and args:
+            captured.append({"narrow_context": args.get("narrow_context")})
+        return original_call_tool(name, args=args, ctx=ctx)
+
+    monkeypatch.setattr(executor._tools, "call_tool", capturing_call_tool)
+
+    # 跨轮引用：narrow_context=True
+    executor.execute(_cross_turn_request(db))
+    assert captured, "跨轮场景应调用 synthesize"
+    assert captured[0]["narrow_context"] is True
+
+    # 单轮 complex_multi_hop：narrow_context=False（非跨轮）
+    captured.clear()
+    executor.execute(
+        AgentQueryRequest(
+            project_slug="demo",
+            query="首先找到 OPLS5 论文，然后计算它的 binding RMSE 相比 OPLS4 的改善",
+        )
+    )
+    assert captured, "complex 场景应调用 synthesize"
+    assert captured[0]["narrow_context"] is False
+
+
+def test_coverage_partial_blocks_direct_pass_through() -> None:
+    """9.1.6：table_or_metric + coverage partial → 直通被阻止并记录原因。"""
+    from app.schemas.agent import (
+        EvidenceItem,
+        TableCoverage,
+        TableFactEvidence,
+    )
+
+    db = make_db()
+    _make_project(db)
+
+    class StubRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            from app.schemas.common import Citation, QueryResponse
+
+            return QueryResponse(
+                answer_markdown="test answer 1.18",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="sample excerpt",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
+            return EvidencePack(
+                status="ok",
+                items=[],
+                table_facts=[
+                    TableFactEvidence(
+                        table_id="table-7",
+                        document_id="d1",
+                        parse_version="v1",
+                        row_label="OPLS5",
+                        column="RMSE",
+                        value="1.18",
+                        row_index=2,
+                    )
+                ],
+                inventory=[
+                    TableCoverage(
+                        document_id="d1",
+                        parse_version="v1",
+                        table_id="table-7",
+                        row_count=3,
+                        row_indices=[1, 2, 3],
+                    )
+                ],
+                coverage_status="partial",
+                coverage_missing_tables=["table-7"],
+            )
+
+    rag = StubRAG()
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+    tools.register(
+        ToolSpec(
+            name="answer.synthesize",
+            description="deterministic test synthesizer",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            side_effect_level="none",
+        ),
+        lambda args, ctx: {"answer_markdown": args.get("rag_answer", "synth")},
+    )
+    executor = AgentExecutor(
+        rag=rag,
+        tools=tools,
+        memory=ConversationMemory(db),
+        db=db,
+        trace_store=AgentTraceStore(db),
+    )
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="OPLS5 的表格中 binding RMSE 是多少？")
+    )
+    assert called, "coverage partial 时 table_or_metric 不应直通，应调用 synthesize"
+    assert response.answer_model != "rag-direct"
+    finalize = next(s for s in response.steps if s.step_type == "finalize")
+    assert finalize.metadata.get("direct_block_reason") == "coverage_partial"
+    assert finalize.metadata.get("coverage_status") == "partial"
+
+
+def test_coverage_unknown_does_not_block_direct_pass_through() -> None:
+    """9.1.6：旧 EvidencePack 无 coverage 字段（unknown）→ 不阻塞直通。"""
+    db = make_db()
+    _make_project(db)
+    executor = make_executor_with_retrieve(db, rag_answer_text="test answer 1.18")
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="OPLS5 的表格中 binding RMSE 是多少？")
+    )
+    assert called == [], "coverage unknown 不应阻塞 table_or_metric 直通"
+    _assert_direct_pass_through(response, rag_answer="test answer 1.18")
+
+
+def test_coverage_partial_with_empty_table_facts_blocks_direct() -> None:
+    """Task 9：table_or_metric + coverage partial + 空 table_facts 也阻止直通。
+
+    RAG 明确声明 coverage_status="partial" 即代表表格覆盖不完整，即使
+    table_facts 为空也必须阻止 rag-direct，并记录 coverage_partial 原因。
+    """
+    db = make_db()
+    _make_project(db)
+
+    class PartialNoFactsRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            return QueryResponse(
+                answer_markdown="test answer 1.18",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="sample excerpt",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(
+            self, db, project_slug, question, limit=15, document_id=None
+        ):
+            return EvidencePack(
+                status="ok",
+                items=[],
+                table_facts=[],
+                inventory=[],
+                coverage_status="partial",
+                coverage_missing_tables=["table-7"],
+            )
+
+    executor = build_executor_with_rag(db, PartialNoFactsRAG())
+    executor._tools.get("answer.synthesize")["handler"] = lambda args, ctx: {
+        "answer_markdown": args.get("rag_answer", ""),
+        "cited_indexes": list(range(len(args.get("citations") or []))),
+        "warnings": [],
+        "confidence": 1.0,
+        "provider": "local",
+        "model": "local-fallback",
+    }
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo", query="OPLS5 的表格中 binding RMSE 是多少？"
+        )
+    )
+    assert called, "coverage partial（即使 table_facts 为空）时 table_or_metric 不应直通"
+    assert response.answer_model != "rag-direct"
+    finalize = next(s for s in response.steps if s.step_type == "finalize")
+    assert finalize.metadata.get("direct_block_reason") == "coverage_partial"
+    assert finalize.metadata.get("coverage_status") == "partial"
+
+
+def test_coverage_partial_does_not_block_non_table_route() -> None:
+    """Task 9：非表格路由即使收到 coverage partial 也不被 coverage 阻塞。"""
+    db = make_db()
+    _make_project(db)
+
+    class PartialCoverageRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            return QueryResponse(
+                answer_markdown="test answer",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="sample excerpt",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(
+            self, db, project_slug, question, limit=15, document_id=None
+        ):
+            return EvidencePack(
+                status="ok",
+                items=[],
+                table_facts=[],
+                coverage_status="partial",
+                coverage_missing_tables=["table-7"],
+            )
+
+    executor = build_executor_with_rag(db, PartialCoverageRAG())
+    called = _counting_synthesize(executor)
+    response = executor.execute(
+        AgentQueryRequest(project_slug="demo", query="charmm36m 的 accuracy 是多少？")
+    )
+    assert called == [], "simple_rag 路由不应因 coverage partial 被阻塞"
+    _assert_direct_pass_through(response)
+
+
+def test_final_verify_retry_reverifies_retry_answer() -> None:
+    """Task 9：final verify 触发 RAG retry 后，必须对 retry 的最终答案重验。
+
+    synthesize 路径（跨轮引用 + evidence_required，max_retries=1）下，final
+    verify 建议 retry → RAG retry 返回新答案与新 citations → 必须再次执行
+    verify；trace 中最后一条 answer.verify 与 finalize metadata 的
+    rag_verification_status 必须对应最终答案，不能复用第一次 verify 的结果。
+    """
+    db = make_db()
+    _make_project(db)
+
+    rag_calls: list[str] = []
+
+    class RetryRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            rag_calls.append(question)
+            if len(rag_calls) == 1:
+                return QueryResponse(
+                    answer_markdown="first draft without table value",
+                    citations=[
+                        Citation(
+                            document_id="d1",
+                            chunk_id="c1",
+                            score=0.9,
+                            excerpt="draft evidence",
+                        )
+                    ],
+                    verification_status="local-only",
+                )
+            return QueryResponse(
+                answer_markdown="retry answer with table value 1.18",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c9",
+                        score=0.95,
+                        excerpt="retry evidence",
+                    )
+                ],
+                verification_status="contradicted",
+            )
+
+    executor = build_executor_with_rag(db, RetryRAG())
+    # 覆盖为确定性 synthesize，避免真实模型调用
+    executor._tools.get("answer.synthesize")["handler"] = lambda args, ctx: {
+        "answer_markdown": args.get("rag_answer", ""),
+        "cited_indexes": list(range(len(args.get("citations") or []))),
+        "warnings": [],
+        "confidence": 1.0,
+        "provider": "local",
+        "model": "local-fallback",
+    }
+    verify_calls: list[dict] = []
+
+    def recording_verify(args, ctx):
+        verify_calls.append(
+            {
+                "answer_markdown": args.get("answer_markdown", ""),
+                "citations": args.get("citations") or [],
+            }
+        )
+        first = len(verify_calls) == 1
+        return {
+            "ok": True,
+            "warnings": ["draft verify recommends retry"] if first else [],
+            "retry_recommended": first,
+            "reason": "retry" if first else "ok",
+        }
+
+    executor._tools.get("answer.verify")["handler"] = recording_verify
+
+    response = executor.execute(
+        _cross_turn_request(
+            db,
+            query="那个的 accuracy 引用了哪些来源？",
+            session_id="retry-reverify-session",
+        )
+    )
+
+    # retry 发生：rag.answer 共调用两次
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) == 2, f"Expected 2 rag.answer calls, got {len(rag_steps)}"
+    # 最终答案采用 retry 结果
+    assert response.final_answer == "retry answer with table value 1.18"
+    # verify 共执行两次，且第二次收到的必须是 retry 的答案与 citations
+    assert len(verify_calls) == 2, f"Expected 2 verify calls, got {len(verify_calls)}"
+    last_verify = verify_calls[-1]
+    assert last_verify["answer_markdown"] == "retry answer with table value 1.18"
+    assert len(last_verify["citations"]) == 1
+    assert last_verify["citations"][0]["chunk_id"] == "c9"
+    # trace 中的最后一条 answer.verify 步骤对应重验结果（retry_recommended=False）
+    verify_steps = [s for s in response.steps if s.tool_name == "answer.verify"]
+    assert len(verify_steps) == 2, f"Expected 2 verify steps, got {len(verify_steps)}"
+    assert verify_steps[-1].metadata.get("retry_recommended") is False
+    # finalize metadata：rag_verification_status 对应 retry 返回的状态
+    finalize = next(s for s in response.steps if s.step_type == "finalize")
+    assert finalize.metadata.get("rag_verification_status") == "contradicted"
+    # synthesize 路径不标记 rag-direct
+    assert response.answer_model != "rag-direct"
+
+
+def test_final_verify_retry_second_verify_still_recommends_retry() -> None:
+    """Task 9：retry 后第二次 verify 仍建议 retry 时，trace 不得宣称已验证。
+
+    重验仍建议 retry 时不再发起第二次重试（retry 有界），但最后一条
+    answer.verify 步骤保留 retry_recommended=True，finalize 不得标记
+    rag-direct，也不得把最终答案当作已验证通过。
+    """
+    db = make_db()
+    _make_project(db)
+
+    class AlwaysRetryRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            return QueryResponse(
+                answer_markdown="answer attempt with table value 1.18",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.9,
+                        excerpt="evidence",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+    executor = build_executor_with_rag(db, AlwaysRetryRAG())
+    # 覆盖为确定性 synthesize，避免真实模型调用
+    executor._tools.get("answer.synthesize")["handler"] = lambda args, ctx: {
+        "answer_markdown": args.get("rag_answer", ""),
+        "cited_indexes": list(range(len(args.get("citations") or []))),
+        "warnings": [],
+        "confidence": 1.0,
+        "provider": "local",
+        "model": "local-fallback",
+    }
+    executor._tools.get("answer.verify")["handler"] = lambda args, ctx: {
+        "ok": True,
+        "warnings": ["verify keeps recommending retry"],
+        "retry_recommended": True,
+        "reason": "retry",
+    }
+
+    response = executor.execute(
+        _cross_turn_request(
+            db,
+            query="那个的 accuracy 引用了哪些来源？",
+            session_id="retry-still-retry-session",
+        )
+    )
+
+    # 只发生一次 retry，不进入重试循环
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) == 2, f"Expected exactly 2 rag.answer calls, got {len(rag_steps)}"
+    # 最后一条 verify 步骤仍保留 retry_recommended=True：trace 不得宣称通过
+    verify_steps = [s for s in response.steps if s.tool_name == "answer.verify"]
+    assert len(verify_steps) == 2, f"Expected 2 verify steps, got {len(verify_steps)}"
+    assert verify_steps[-1].metadata.get("retry_recommended") is True
+    # 未通过直通门禁：不得标记 rag-direct
+    assert response.answer_model != "rag-direct"
+    assert response.final_answer == "answer attempt with table value 1.18"
+
+
+def test_draft_verify_retry_syncs_status_from_retry_answer() -> None:
+    """Task 9：draft verify retry 采用 retry 答案后，直通门禁与 trace 只依据最终结果。
+
+    第一次 RAG 答案触发 draft verify retry（retry_recommended=True），RAG
+    retry 返回不同答案且 verification_status=contradicted：必须对 retry 的
+    最终答案重新执行 verify，直通门禁不得沿用第一次答案的 local-only 状态
+    错误放行，finalize trace 的 rag_verification_status 必须与最终答案一致，
+    synthesize/fallback 不能被错误跳过。
+    """
+    db = make_db()
+    _make_project(db)
+
+    rag_calls: list[str] = []
+
+    class DraftRetryRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            rag_calls.append(question)
+            if len(rag_calls) == 1:
+                return QueryResponse(
+                    answer_markdown="first draft answer without table value",
+                    citations=[
+                        Citation(
+                            document_id="d1",
+                            chunk_id="c1",
+                            score=0.9,
+                            excerpt="draft evidence",
+                        )
+                    ],
+                    verification_status="local-only",
+                )
+            return QueryResponse(
+                answer_markdown="retry answer is contradicted",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c9",
+                        score=0.95,
+                        excerpt="retry evidence",
+                    )
+                ],
+                verification_status="contradicted",
+            )
+
+        def retrieve_evidence(
+            self, db, project_slug, question, limit=15, document_id=None
+        ):
+            return EvidencePack(status="ok", items=[])
+
+    executor = build_executor_with_rag(db, DraftRetryRAG())
+    called = _counting_synthesize(executor)
+    verify_calls: list[dict] = []
+
+    def recording_verify(args, ctx):
+        verify_calls.append(
+            {
+                "answer_markdown": args.get("answer_markdown", ""),
+                "citations": args.get("citations") or [],
+            }
+        )
+        first = len(verify_calls) == 1
+        return {
+            "ok": True,
+            "warnings": ["draft verify recommends retry"] if first else [],
+            "retry_recommended": first,
+            "reason": "retry" if first else "ok",
+        }
+
+    executor._tools.get("answer.verify")["handler"] = recording_verify
+
+    response = executor.execute(
+        AgentQueryRequest(
+            project_slug="demo", query="charmm36m 的 accuracy 引用了哪些来源？"
+        )
+    )
+
+    # retry 发生：rag.answer 共调用两次
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) == 2, f"Expected 2 rag.answer calls, got {len(rag_steps)}"
+    # 最终答案采用 retry 结果
+    assert response.final_answer == "retry answer is contradicted"
+    # verify 至少执行两次，且第二次验证必须针对 retry 的答案与 citations
+    assert len(verify_calls) >= 2, f"Expected >= 2 verify calls, got {len(verify_calls)}"
+    second_verify = verify_calls[1]
+    assert second_verify["answer_markdown"] == "retry answer is contradicted"
+    assert len(second_verify["citations"]) == 1
+    assert second_verify["citations"][0]["chunk_id"] == "c9"
+    # retry 答案 contradicted：不得标记 rag-direct，synthesize 未被错误跳过
+    assert response.answer_model != "rag-direct"
+    assert called, "contradicted retry 答案不应跳过 synthesize"
+    # finalize trace 的 rag_verification_status 与最终答案一致（来自 retry），
+    # 不保留第一次答案的 local-only 旧状态
+    finalize = next(s for s in response.steps if s.step_type == "finalize")
+    assert finalize.metadata.get("rag_verification_status") == "contradicted"
+    assert finalize.metadata.get("direct_block_reason") == "rag_contradicted"
+    assert finalize.metadata.get("synthesis_skipped") is False
