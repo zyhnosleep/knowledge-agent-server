@@ -655,6 +655,59 @@ def test_retry_when_verify_recommends_within_limits() -> None:
     assert response.usage.tool_calls >= 2  # rag.answer * 2 + answer.verify
 
 
+def test_empty_answer_retries_even_when_route_max_retries_zero() -> None:
+    """空答案强制重试（T3）：simple_rag（max_retries=0）下空答案也必须重试一次。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    # "general question" 路由 simple_rag（max_retries=0）：修复前空答案不重试
+    executor = make_executor(db, rag_answer_text="")  # empty answer triggers retry
+    request = AgentQueryRequest(project_slug="demo", query="general question")
+    response = executor.execute(request)
+
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) >= 2, (
+        f"simple_rag (max_retries=0) 的空答案也应强制重试一次，"
+        f"got {len(rag_steps)} rag.answer calls"
+    )
+
+
+def test_empty_answer_retries_at_most_once() -> None:
+    """空答案强制重试只发生一次：两次都空则交付空答案，不无限重试（T3）。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor(db, rag_answer_text="")
+    request = AgentQueryRequest(project_slug="demo", query="general question")
+    response = executor.execute(request)
+
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) == 2, (
+        f"空答案重试只应发生一次（原始 + 1 次重试），got {len(rag_steps)} calls"
+    )
+
+
+def test_non_empty_answer_does_not_extra_retry_on_simple_rag() -> None:
+    """非空答案不因 T3 增加重试：simple_rag 正常答案仍只调用一次 rag.answer。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor(db, rag_answer_text="test answer")
+    request = AgentQueryRequest(project_slug="demo", query="general question")
+    response = executor.execute(request)
+
+    rag_steps = [s for s in response.steps if s.tool_name == "rag.answer"]
+    assert len(rag_steps) == 1, (
+        f"非空答案不应触发额外重试，got {len(rag_steps)} rag.answer calls"
+    )
+
+
 def test_max_tool_calls_limit_respected() -> None:
     """Agent never exceeds constraints.max_tool_calls."""
     db = make_db()
@@ -1248,6 +1301,174 @@ def make_executor_with_retrieve(
     return AgentExecutor(
         rag=rag, tools=tools, memory=memory, db=db, trace_store=trace_store
     )
+
+
+def make_executor_with_scoped_retrieve(
+    db: Session, *, rag_answer_text: str = "test answer"
+) -> AgentExecutor:
+    """retrieve_evidence 按 document_id 区分结果（T1 回退场景）。
+
+    项目级（document_id=None）→ 空（模拟弱指代查询全项目路由 miss）；
+    带 document_id → 该文档命中证据。
+    """
+
+    class ScopedStubRAG:
+        def answer(self, db, project_slug, question, document_id=None):
+            from app.schemas.common import QueryResponse, Citation
+
+            citations = []
+            if rag_answer_text:
+                citations = [
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="sample excerpt",
+                    )
+                ]
+            return QueryResponse(
+                answer_markdown=rag_answer_text,
+                citations=citations,
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
+            from app.schemas.agent import EvidenceItem, EvidencePack
+
+            if document_id is None:
+                return EvidencePack(status="empty", items=[])
+            return EvidencePack(
+                status="ok",
+                items=[
+                    EvidenceItem(
+                        index=0,
+                        document_id=document_id,
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="evidence from history document",
+                        evidence_kind="source_chunk",
+                        source_stage="source_chunk",
+                        support_hint="direct",
+                    )
+                ],
+            )
+
+    rag = ScopedStubRAG()
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+    memory = ConversationMemory(db)
+    trace_store = AgentTraceStore(db)
+    return AgentExecutor(
+        rag=rag, tools=tools, memory=memory, db=db, trace_store=trace_store
+    )
+
+
+def _seed_retrieve_turn(db: Session, session_id: str, document_id: str) -> None:
+    """预置一轮成功检索的历史（retrieve turn 带命中文档 citations）。"""
+    memory = ConversationMemory(db)
+    memory.add_turn(
+        session_id,
+        role="tool",
+        content="Retrieved 3 evidence items",
+        tool_name="rag.retrieve_evidence",
+        tool_args={"project_slug": "demo", "question": "previous question"},
+        tool_result="3",
+        step_type="retrieve",
+        citations=[{"document_id": document_id}],
+    )
+    db.commit()
+
+
+def test_retrieve_empty_falls_back_to_history_document() -> None:
+    """T1：项目级会话检索 0 items 时回退到历史最近成功命中文档重检索。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "sess_t1", "d1")
+
+    request = AgentQueryRequest(
+        project_slug="demo", query="general question", session_id="sess_t1"
+    )
+    response = executor.execute(request)
+
+    retrieve_steps = [s for s in response.steps if s.step_type == "retrieve"]
+    assert len(retrieve_steps) >= 2, (
+        f"检索空结果应回退历史文档重检索，got {len(retrieve_steps)} retrieve steps"
+    )
+    # 第二次（回退）检索携带历史命中文档 d1
+    assert retrieve_steps[-1].metadata.get("document_id") == "d1"
+
+
+def test_retrieve_empty_without_history_no_fallback() -> None:
+    """T1：无历史成功检索时不回退（只检索一次）。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor_with_scoped_retrieve(db)
+    request = AgentQueryRequest(
+        project_slug="demo", query="general question", session_id="sess_t2"
+    )
+    response = executor.execute(request)
+
+    retrieve_steps = [s for s in response.steps if s.step_type == "retrieve"]
+    assert len(retrieve_steps) == 1, (
+        f"无历史命中文档不应回退，got {len(retrieve_steps)} retrieve steps"
+    )
+
+
+def test_locked_session_does_not_fallback() -> None:
+    """T1：锁定文档会话（document_id 非空）不触发历史回退。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor_with_scoped_retrieve(db)
+    _seed_retrieve_turn(db, "sess_t3", "d1")
+
+    request = AgentQueryRequest(
+        project_slug="demo",
+        query="general question",
+        session_id="sess_t3",
+        document_id="d9",
+    )
+    response = executor.execute(request)
+
+    retrieve_steps = [s for s in response.steps if s.step_type == "retrieve"]
+    assert len(retrieve_steps) == 1, (
+        f"锁定会话应直接检索不回退，got {len(retrieve_steps)} retrieve steps"
+    )
+    assert retrieve_steps[0].metadata.get("document_id") == "d9"
+
+
+def test_retrieve_persists_hit_document_ids() -> None:
+    """T1：检索命中时 retrieve turn 的 citations 持久化命中文档 id。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor_with_retrieve(db)  # 默认 retrieve 命中 d1
+    request = AgentQueryRequest(
+        project_slug="demo", query="hello?", session_id="sess_t4"
+    )
+    response = executor.execute(request)
+
+    assert response.status == "completed"
+    history = ConversationMemory(db).get_history("sess_t4")
+    retrieve_turns = [t for t in history if t.step_type == "retrieve"]
+    assert retrieve_turns, "会话历史应包含 retrieve turn"
+    doc_ids = {
+        str(c.get("document_id") or "")
+        for t in retrieve_turns
+        for c in t.citations
+    }
+    assert "d1" in doc_ids, f"retrieve turn 应持久化命中文档 d1, got {doc_ids}"
 
 
 def test_execute_includes_retrieve_step() -> None:

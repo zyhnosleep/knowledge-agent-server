@@ -68,9 +68,26 @@ class PolicyRouter:
     )
 
     # 表格 / 指标 / 数值类指示词，命中即路由到 table_or_metric。
+    # "parameter"/"参数" 不在其中：单独出现（如 "torsional parameters 的
+    # 改进方向"）是叙述性问题，误路由表格会被 coverage 门禁逼进 synthesize
+    # （2026-08-11 topic-switch 案例）——需与数值/表格索取语境词共现才路由。
     _TABLE_METRIC_TERMS: tuple[str, ...] = (
-        "table", "metric", "parameter", "value",
-        "表", "指标", "参数", "数值",
+        "table", "metric", "value",
+        "表", "指标", "数值",
+    )
+
+    # parameter 类词：命中后需与 _PARAMETER_CONTEXT_TERMS 任一语境词共现，
+    # 才判定为表格/数值索取型问题（"列出参数值/参数是多少/表里的参数"）。
+    # "parameters" 由 "parameter" 子串覆盖，不单列。
+    _PARAMETER_TERMS: tuple[str, ...] = (
+        "parameter", "参数",
+    )
+
+    # 数值 / 表格索取语境词：与 parameter 类词共现时确认用户在索要
+    # 表格化/数值化的参数信息，而非叙述性描述。
+    _PARAMETER_CONTEXT_TERMS: tuple[str, ...] = (
+        "value", "values", "数值", "值", "是多少", "列出", "list",
+        "table", "表", "unit", "单位",
     )
 
     # 数值 / 单位类正则模式：命中即路由到 table_or_metric。
@@ -154,6 +171,21 @@ class PolicyRouter:
                     max_retries=1,
                     reason=f"Query contains table/metric term: {term!r}",
                 )
+        # 4b. parameter 类词：需与数值/表格索取语境词共现才路由表格，
+        # 否则视为叙述性描述（"…的改进方向/过程"），交给下游默认路径。
+        for term in self._PARAMETER_TERMS:
+            if term in query_lower:
+                for ctx in self._PARAMETER_CONTEXT_TERMS:
+                    if ctx in query_lower:
+                        return AgentRouteDecision(
+                            route="table_or_metric",
+                            requires_citations=True,
+                            max_retries=1,
+                            reason=(
+                                f"Query contains parameter term {term!r} "
+                                f"with value/table context {ctx!r}"
+                            ),
+                        )
         # 数值 / 单位正则：忽略大小写匹配（如 kcal、50% 等）。
         for pat in self._UNIT_PATTERNS:
             if re.search(pat, query_lower, re.IGNORECASE):

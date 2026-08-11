@@ -362,6 +362,30 @@ class AgentExecutor:
                     session_id,
                 )
 
+                # T1：项目级会话（无文档锁定）检索 0 items 时，回退到会话
+                # 历史最近成功检索命中的文档重新检索——弱指代查询（"展开
+                # 第二张"等）与论文 profile 词元零交集导致全项目路由 miss，
+                # 历史命中文档是当前主题最可能的归属。
+                effective_document_id = request.document_id
+                if (
+                    (not evidence_pack or not evidence_pack.get("items"))
+                    and request.document_id is None
+                ):
+                    history_document_id = self._last_hit_document_id(session_id)
+                    if history_document_id is not None:
+                        fallback_pack = self._run_retrieve_evidence(
+                            request.project_slug,
+                            retrieval_query,
+                            history_document_id,
+                            constraints,
+                            steps,
+                            usage,
+                            session_id,
+                        )
+                        if fallback_pack and fallback_pack.get("items"):
+                            evidence_pack = fallback_pack
+                            effective_document_id = history_document_id
+
                 # ---- 合并当前会话的临时附件证据 ----
                 if session_attachment_pack is None:
                     session_attachment_pack = self._run_retrieve_session_attachments(
@@ -386,7 +410,7 @@ class AgentExecutor:
                 ) = self._run_rag_answer(
                     request.project_slug,
                     retrieval_query,
-                    request.document_id,
+                    effective_document_id,
                     constraints,
                     steps,
                     usage,
@@ -488,7 +512,7 @@ class AgentExecutor:
                     ) = self._run_rag_answer(
                         request.project_slug,
                         retrieval_query,
-                        request.document_id,
+                        effective_document_id,
                         constraints,
                         steps,
                         usage,
@@ -642,10 +666,15 @@ class AgentExecutor:
                 and verify_result["ok"]
                 and verify_result.get("result", {}).get("retry_recommended", False)
             )
+            # 空答案兜底（T3）：模型生成空/纯空白答案是不可交付的硬失败，
+            # 无视路由 max_retries 配额强制重试一次（二次仍空才交付）。
+            answer_is_empty = not (answer_text or "").strip()
             if (
                 not attachment_only
-                and retry_recommended
-                and route.max_retries > 0
+                and (
+                    (retry_recommended and route.max_retries > 0)
+                    or answer_is_empty
+                )
                 and tool_calls < constraints.max_tool_calls
                 and len(steps) < constraints.max_steps
             ):
@@ -657,7 +686,7 @@ class AgentExecutor:
                 ) = self._run_rag_answer(
                     request.project_slug,
                     retrieval_query,
-                    request.document_id,
+                    effective_document_id,
                     constraints,
                     steps,
                     usage,
@@ -981,6 +1010,22 @@ class AgentExecutor:
             session_id, max_turns=settings.agent_max_conversation_turns
         )
 
+    def _last_hit_document_id(self, session_id: str) -> str | None:
+        """返回会话历史最近一次成功检索命中的文档 id（T1 回退锚定）。
+
+        从后往前扫描 retrieve 轮次，取 citations 中含 document_id 的
+        最近一轮（当前轮 0 items 时 citations 为空，自然被跳过）。
+        """
+        history = self._memory.get_history(session_id)
+        for turn in reversed(history):
+            if turn.step_type != "retrieve":
+                continue
+            for cit in turn.citations:
+                doc = str(cit.get("document_id") or "").strip()
+                if doc:
+                    return doc
+        return None
+
     def _run_retrieve_evidence(
         self,
         project_slug: str,
@@ -1063,6 +1108,16 @@ class AgentExecutor:
                 },
             )
             steps.append(step)
+            # T1：检索命中的文档 id 持久化到 turn 的 citations，供后续轮次
+            # 检索空结果时回退锚定（_history_retrieve_document）。
+            hit_docs: list[dict] = []
+            if items:
+                seen: set[str] = set()
+                for item in items:
+                    doc = str(item.get("document_id") or "").strip()
+                    if doc and doc not in seen:
+                        seen.add(doc)
+                        hit_docs.append({"document_id": doc})
             self._memory.add_turn(
                 session_id,
                 role="tool",
@@ -1071,6 +1126,7 @@ class AgentExecutor:
                 tool_args=tool_args,
                 tool_result=str(evidence_count),
                 step_type="retrieve",
+                citations=hit_docs,
             )
             return rdata
 

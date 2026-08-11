@@ -81,11 +81,15 @@ class TestPolicyRouter:
         [
             "table of contents",
             "metric value",
-            "parameter x",
+            "parameter x value",
+            "parameter x 值",
             "value is 42",
             "这是什么表",
             "指标是多少",
-            "参数设置",
+            "参数设置的值",
+            "列出所有参数",
+            "参数是多少",
+            "表 3 中的参数",
             "数值结果",
             "100 kcal",
             "50%",
@@ -101,6 +105,26 @@ class TestPolicyRouter:
         )
         assert result.requires_citations is True
         assert result.max_retries == 1
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # "parameter"/"参数" 单独出现（无数值/表格索取语境）不再路由表格——
+            # 叙述性问题（如 "torsional parameters 的改进方向"）应走正文路径，
+            # 否则被 coverage 门禁误逼进 synthesize（2026-08-11 topic-switch 案例）。
+            "parameter x",
+            "torsional parameters 相对 OPLS3 的主要改进方向",
+            "参数设置",
+            "CHARMM36 的 LJ parameters",
+            "优化参数的过程",
+        ],
+    )
+    def test_parameter_alone_does_not_route_to_table_or_metric(self, query: str) -> None:
+        router = PolicyRouter()
+        result = router.route(query)
+        assert result.route != "table_or_metric", (
+            f"Query '{query}' should NOT route to table_or_metric, got {result.route}"
+        )
 
     @pytest.mark.parametrize(
         "query",
