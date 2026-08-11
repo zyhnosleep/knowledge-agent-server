@@ -6192,6 +6192,13 @@ class QueryService:
         answer_markdown: str,
         contexts: list[RetrievedContext],
     ) -> str:
+        # 术语清单只是对真实答案的补充，不能充当答案本身：模型返回空/纯空白
+        # 答案时（如本地模型临时故障返回空对象），若把清单追加上去并补 [0]，
+        # 空答案会被包装成看似带引用的有效答案——验证器与 agent 的空答案
+        # 强制重试全部被绕过（2026-08-11 实测：Ollama 未启动时用户看到纯
+        # 术语清单 [0] 假答案）。空答案原样返回，让上游走降级/重试路径。
+        if not answer_markdown.strip():
+            return answer_markdown
         term_contexts = contexts
         evidence_parts: list[str] = []
         for context in term_contexts:

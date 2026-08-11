@@ -2053,6 +2053,36 @@ def test_supported_term_note_adds_radius_of_gyration_from_rg_symbol() -> None:
     assert "Rg" in answer
 
 
+def test_supported_term_note_does_not_mask_empty_answer() -> None:
+    # 模型返回空/纯空白答案时（如本地模型临时故障返回空对象），术语清单
+    # 不得追加上去充当答案主体——否则空答案被包装成带 [0] 的有效答案，
+    # 验证器与 agent 的空答案强制重试全部被绕过（2026-08-11 Ollama 未
+    # 启动实测：用户看到纯术语清单假答案）。
+    contexts = [
+        RetrievedContext(
+            citation=Citation(
+                page_slug="sources/charmm36",
+                page_title="CHARMM36",
+                page_kind="source_summary",
+                score=10,
+                excerpt="CMAP refinement against NMR and rotamer data at 298 K.",
+            ),
+            prompt_text="",
+            score=10,
+            evidence_kind="profile-term",
+        )
+    ]
+    for blank in ("", "   ", "\n\t "):
+        answer = QueryService._append_missing_supported_question_terms(
+            "CMAP 改进基于哪些实验数据？",
+            blank,
+            contexts,
+        )
+        assert answer == blank
+        assert "关键术语还包括" not in answer
+        assert "[0]" not in answer
+
+
 def test_supported_term_note_normalizes_plural_and_spaced_scientific_terms() -> None:
     contexts = [
         RetrievedContext(
