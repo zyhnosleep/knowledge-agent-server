@@ -5997,6 +5997,10 @@ class QueryService:
     def _ensure_valid_returned_citation_marker(answer_markdown: str, citation_count: int) -> str:
         if citation_count <= 0:
             return answer_markdown
+        if not answer_markdown.strip():
+            # 空答案不追加伪引用 [0]：否则 verify 的 .strip() 空检查被
+            # "[0]" 绕过，空答案以"有效"姿态直通（2026-08-11 实测 bug）。
+            return answer_markdown
         if any(int(match.group(1)) < citation_count for match in re.finditer(r"(?<!\[)\[(\d+)\](?!\])", answer_markdown)):
             return answer_markdown
         separator = "" if answer_markdown.endswith((" ", "\n")) else " "

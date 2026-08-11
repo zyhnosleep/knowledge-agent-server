@@ -59,12 +59,6 @@ from app.services.tool_registry import ToolRegistry
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# 跨轮引用的指代词集合，共享给 `_is_cross_turn_query`（synthesize 启用判定）
-# 与 `_contextualize_retrieval_query`（检索 query 扩展），避免两处漂移。
-_CROSS_TURN_MARKERS = (
-    "那", "那个", "这个", "它", "上述", "前面", "之前", "刚才", "上一轮",
-)
-
 
 class _EventStepList(list[AgentStep]):
     """带事件转发的 AgentStep 列表。
@@ -1471,8 +1465,9 @@ class AgentExecutor:
     def _resolvable_previous_turn(self, session_id: str, normalized: str) -> str | None:
         """返回可解析的上一轮用户提问；无 session/历史/与当前相同 → None。
 
-        `_is_cross_turn_query` 与 `_contextualize_retrieval_query` 共用，
-        避免 user-turn 提取与阈值逻辑重复（发散式修改风险）。
+        仅供 `_contextualize_retrieval_query` 使用（检索上下文化需要
+        "上一轮问题"文本；防重复与 last_n 窗口守卫在这里仍然合理）。
+        跨轮判定已独立为轮次计数（见 `_is_cross_turn_query`）。
         """
         if not session_id:
             return None
@@ -1492,13 +1487,19 @@ class AgentExecutor:
         return previous_query
 
     def _is_cross_turn_query(self, query: str, session_id: str | None) -> bool:
-        """判断当前 query 是否为跨轮引用（依赖历史轮次才能回答）。
+        """判断当前 query 是否为跨轮查询（第 2 轮起一律视为跨轮）。
 
-        判定规则（9.2）：
-        1. 无 session_id 或 query 过长（>30 字符）→ 不是跨轮；
-        2. 必须含指代词（`_CROSS_TURN_MARKERS`）；单轮问题中的"对比"
-           不单独触发跨轮；
-        3. 必须存在可解析的上一轮用户提问（`_resolvable_previous_turn`）。
+        反向默认（2026-08-11 grill 收敛）：不做指代词词表匹配——词表
+        永远追不完用户表达（"第二点/展开/审计"等实测漏检 8/8 直通失败）。
+        会话第 2 轮起的查询一律走综合路径（带历史摘要），第 1 轮保留
+        draft 直通。
+
+        注意调用顺序契约：调用方必须先把当前 query 写入历史
+        （user_query turn，见 execute 开头），因此历史中 user turn
+        数量 ≥ 2 即"第 2 轮起"。独立统计全部 user turn，不使用
+        `_resolvable_previous_turn`——后者的防重复（重复提问）与
+        last_n 窗口守卫在 marker 语义下合理，但与"一律跨轮"冲突
+        （verbatim 重试同一问题 / 长间隙会话会漏判）。
 
         返回值只决定 synthesize 是否启用；检索侧的记忆扩展仍由
         `_contextualize_retrieval_query` 负责。
@@ -1506,36 +1507,30 @@ class AgentExecutor:
         if not session_id:
             return False
         normalized = (query or "").strip()
-        if not normalized or len(normalized) > 30:
+        if not normalized:
             return False
-        if not any(marker in normalized for marker in _CROSS_TURN_MARKERS):
+        try:
+            user_turns = [
+                turn
+                for turn in self._memory.get_history(session_id)
+                if turn.role == "user" or turn.step_type == "user_query"
+            ]
+        except Exception:
             return False
-        return self._resolvable_previous_turn(session_id, normalized) is not None
+        return len(user_turns) >= 2
 
     def _contextualize_retrieval_query(self, session_id: str, query: str) -> str:
-        """把简短的指代性追问扩展为自包含的 RAG 查询。
+        """把第 2 轮起的简短查询扩展为自包含的 RAG 查询。
 
         例如用户先问“这篇文章的方法是什么”，再问“它的准确率呢？”；
-        第二个 query 很短且包含“它”，需要把前一个问题拼接进去，
-        否则 RAG 检索不到上下文。指代词与历史解析复用
-        `_CROSS_TURN_MARKERS` / `_resolvable_previous_turn`。
-
-        注意：与旧实现相比，指代词集合新增了"那/之前/刚才/上一轮"，
-        检索扩展的触发面有所扩大（属于有意的行为漂移，与跨轮判定
-        `_is_cross_turn_query` 保持一致）。
+        第二个 query 很短，需要把前一个问题拼接进去，否则 RAG 检索
+        不到上下文。短查询（≤30 字符）几乎必然是引用上文（"第二点呢"
+        "为什么""展开"），一律包装，不再依赖指代词词表（词表漏检导致
+        Q5"第二点"类查询原始检索 miss）；长查询视为自带上下文，不做
+        包装，避免污染独立新问题。
         """
         normalized = query.strip()
-        follow_up_markers = _CROSS_TURN_MARKERS + (
-            "详细",
-            "展开",
-            "继续",
-            "为什么",
-            "真的吗",
-            "是否",
-        )
-        if len(normalized) > 30 or not any(
-            marker in normalized for marker in follow_up_markers
-        ):
+        if len(normalized) > 30:
             return query
         previous_query = self._resolvable_previous_turn(session_id, normalized)
         if previous_query is None:

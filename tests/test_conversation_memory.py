@@ -98,6 +98,51 @@ def test_compact_history_no_op() -> None:
     assert memory.turn_count("s1") == 3
 
 
+def test_turn_index_monotonic_after_compact() -> None:
+    """压缩删除最旧轮次后，新轮次 turn_index 继续递增、不复用。
+
+    回归 2026-08-11：40 题会话实测仅 23 条 turn 却覆盖 40 轮乱序——
+    旧实现 `_next_turn_index` 用 turn_count() 计算，compact 删除行后
+    复用已删除 index，排序与"上一轮"解析（[-2]）随之错乱。
+    """
+    db, memory = make_memory()
+    for i in range(10):
+        memory.add_turn("s1", role="user", content=f"msg {i}")
+    db.commit()
+    memory.compact_history("s1", max_turns=3)
+    db.commit()
+
+    memory.add_turn("s1", role="user", content="msg 10")
+    db.commit()
+    history = memory.get_history("s1")
+    # 剩余 [7,8,9] + 新轮：索引必须严格递增，不得复用为 3
+    assert [t.turn_index for t in history] == [7, 8, 9, 10]
+    assert memory.turn_count("s1") == 4
+
+
+def test_turn_index_monotonic_over_forty_rounds() -> None:
+    """模拟 40 轮会话（每轮 user+agent turn + 每轮 compact）：索引严格递增。
+
+    对齐 40 题 eval 场景：max_turns=200 时 40 轮（80 条 turn）不触发
+    压缩删除，全部历史保留且顺序正确；_resolvable_previous_turn 依赖
+    的升序 [-2] 解析因此可靠。
+    """
+    db, memory = make_memory()
+    for i in range(40):
+        memory.add_turn("s1", role="user", content=f"user {i}", step_type="user_query")
+        memory.add_turn("s1", role="agent", content=f"agent {i}", step_type="finalize")
+        memory.compact_history("s1", max_turns=200)
+        db.commit()
+
+    history = memory.get_history("s1")
+    assert len(history) == 80  # 40 轮 × 2 条 turn，未触发压缩
+    indices = [t.turn_index for t in history]
+    assert indices == sorted(indices)
+    assert len(set(indices)) == 80  # 无任何复用
+    assert history[0].content == "user 0"
+    assert history[-1].content == "agent 39"
+
+
 def test_delete_session() -> None:
     db, memory = make_memory()
     memory.add_turn("s1", role="user", content="a")

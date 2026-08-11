@@ -1664,36 +1664,99 @@ def test_table_fact_source_citations_are_added_even_when_child_is_not_top_contex
     assert "1.18" in augmented[0].excerpt
 
 
-def test_is_cross_turn_query_requires_history_and_reference() -> None:
-    """9.2 跨轮引用识别：必须有历史轮次 + 指代词，且"对比"不能单独触发。"""
+def test_is_cross_turn_query_reverse_default_from_second_turn() -> None:
+    """9.2 跨轮判定（2026-08-11 反向默认）：第 2 轮起一律跨轮。
+
+    不做指代词词表匹配：短到"那 C36 呢"、长到"审计整个对话"、无
+    指代词的完整问题，只要历史中有上一轮，都判跨轮；第 1 轮保留
+    draft 直通（False）。
+    """
     db = make_db()
     executor = make_executor(db)
     session_id = "sess-cross-turn"
 
-    # 无历史：无论 query 如何都是 False
-    assert executor._is_cross_turn_query("那 C36 呢", session_id) is False
-    assert executor._is_cross_turn_query("对比 OPLS4 和 OPLS5", session_id) is False
+    def second_turn_call(query: str) -> bool:
+        """模拟 executor 时序：当前 query 先写入历史（agent_executor:158），
+        再判跨轮；[-2] 因此是真正的上一轮。"""
+        executor._memory.add_turn(
+            session_id, role="user", content=query, step_type="user_query"
+        )
+        return executor._is_cross_turn_query(query, session_id)
 
     # 无 session_id：一律 False
     assert executor._is_cross_turn_query("那 C36 呢", None) is False
 
-    # 加入一轮历史后：
+    # 第 1 轮（历史中只有当前 turn，无上一轮可解析）：False
     executor._memory.add_turn(
         session_id, role="user", content="charmm36m 的 accuracy 是多少", step_type="user_query"
     )
-    # 只有一轮历史 → 仍不是跨轮（需有"上一轮"可解析）
     assert executor._is_cross_turn_query("那 C36 呢", session_id) is False
 
-    # 两轮历史后：
+    # 第 2 轮起：无论 query 内容如何，一律 True
+    assert second_turn_call("那 C36 呢") is True
+    assert second_turn_call("对比之前那篇") is True
+    # 无指代词的完整问题也跨轮（反向默认）
+    assert second_turn_call("charmm36m 的 accuracy 是多少") is True
+    assert second_turn_call("对比 OPLS4 和 OPLS5") is True
+    # 长查询（>30 字符）同样跨轮：长度门槛只作用于检索上下文化
+    assert second_turn_call("刚才说的证据分别来自哪些体系？请按体系分组。") is True
+
+    # 重复提问（verbatim 重试同一问题）：仍跨轮——"一律跨轮"无例外
+    # （旧实现经 _resolvable_previous_turn 的防重复守卫会漏判为单轮）
     executor._memory.add_turn(
-        session_id, role="user", content="那 C36 呢", step_type="user_query"
+        session_id, role="user", content="对比 OPLS4 和 OPLS5", step_type="user_query"
     )
-    assert executor._is_cross_turn_query("那 C36 呢", session_id) is True
-    assert executor._is_cross_turn_query("对比之前那篇", session_id) is True
-    # 无指代词的完整问题：False
-    assert executor._is_cross_turn_query("charmm36m 的 accuracy 是多少", session_id) is False
-    # 单轮"对比"（无指代词）：False
-    assert executor._is_cross_turn_query("对比 OPLS4 和 OPLS5", session_id) is False
+    assert executor._is_cross_turn_query("对比 OPLS4 和 OPLS5", session_id) is True
+
+    # 长间隙：中间夹 >12 条 agent turn 后，上一轮 user turn 掉出
+    # last_n=12 窗口，仍判跨轮（跨轮判定统计全部 user turn，不设窗口）
+    for i in range(15):
+        executor._memory.add_turn(
+            session_id, role="agent", content=f"intermediate {i}", step_type="finalize"
+        )
+    assert executor._is_cross_turn_query("新的问题", session_id) is True
+
+
+def test_contextualize_retrieval_query_length_gate() -> None:
+    """9.2 上下文化（2026-08-11 去词表）：≤30 字符一律包装，>30 字符不包装。
+
+    词表漏检（"第二点/展开"等不在旧 9 词内）导致短引用查询原始检索
+    miss；新逻辑短查询一律包装为"上一轮问题+当前追问"。长查询视为
+    自带上下文，不做包装避免污染独立新问题。
+    """
+    db = make_db()
+    executor = make_executor(db)
+    session_id = "sess-ctx"
+
+    executor._memory.add_turn(
+        session_id,
+        role="user",
+        content="CHARMM36 主链修改的验证方法是什么",
+        step_type="user_query",
+    )
+    executor._memory.add_turn(
+        session_id, role="user", content="那第二点呢", step_type="user_query"
+    )
+
+    # ≤30 字符：包装（含指代词）
+    ctx = executor._contextualize_retrieval_query(session_id, "那第二点呢")
+    assert ctx.startswith("上一轮问题：")
+    assert "CHARMM36 主链修改的验证方法是什么" in ctx
+    assert "当前追问：那第二点呢" in ctx
+
+    # ≤30 字符且无指代词：同样包装（去词表，词表漏检案例）
+    ctx2 = executor._contextualize_retrieval_query(session_id, "展开第一张表")
+    assert ctx2.startswith("上一轮问题：")
+    assert "当前追问：展开第一张表" in ctx2
+
+    # >30 字符：视为自带上下文，不包装
+    long_q = "请把你刚才列出的所有主链修改精确术语完整列出并给出每个的验证方法"
+    ctx3 = executor._contextualize_retrieval_query(session_id, long_q)
+    assert ctx3 == long_q
+
+    # 无历史（新会话）：不包装
+    ctx4 = executor._contextualize_retrieval_query("fresh-session", "第二点呢")
+    assert ctx4 == "第二点呢"
 
 
 def _counting_synthesize(executor) -> list[int]:

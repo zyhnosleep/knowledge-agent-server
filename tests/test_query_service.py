@@ -2296,6 +2296,20 @@ def test_ensure_valid_returned_citation_marker_appends_first_citation_when_missi
     assert QueryService._ensure_valid_returned_citation_marker("已有证据说明机制。", 0) == "已有证据说明机制。"
 
 
+def test_ensure_valid_returned_citation_marker_does_not_mask_empty_answer() -> None:
+    """回归 2026-08-11：空答案不得被追加 [0] 伪装成有效内容。
+
+    旧实现 `_ensure_valid_returned_citation_marker("", 2)` 产出 `" [0]"`，
+    answer_verifier 的 ``.strip()`` 空检查被 `[0]` 绕过，空答案以
+    "有效" 姿态直通。空答案应保持为空，交由上游 retry / 降级处理。
+    """
+    assert QueryService._ensure_valid_returned_citation_marker("", 2) == ""
+    assert QueryService._ensure_valid_returned_citation_marker("   ", 2) == "   "
+    assert QueryService._ensure_valid_returned_citation_marker("", 0) == ""
+    # 非空答案行为不变
+    assert QueryService._ensure_valid_returned_citation_marker("已有证据说明机制。", 2).endswith(" [0]")
+
+
 def test_finalize_contexts_keeps_more_same_source_evidence() -> None:
     service = QueryService(make_session())
     contexts = [

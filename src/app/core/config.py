@@ -211,7 +211,9 @@ class Settings(BaseSettings):
     agent_budget_tokens: int = Field(default=20000, alias="AGENT_BUDGET_TOKENS")
     agent_timeout_seconds: int = Field(default=90, alias="AGENT_TIMEOUT_SECONDS")
     agent_allow_external_network: bool = Field(default=False, alias="AGENT_ALLOW_EXTERNAL_NETWORK")
-    agent_max_conversation_turns: int = Field(default=20, alias="AGENT_MAX_CONVERSATION_TURNS")
+    # 40 轮测试会话（每轮约 3-5 条 turn）不超过 200 条，不触发压缩删除；
+    # 超长会话仍由 compact 删除最旧轮次兜底（2026-08-11 grill 收敛）。
+    agent_max_conversation_turns: int = Field(default=200, alias="AGENT_MAX_CONVERSATION_TURNS")
     agent_synthesis_provider: str = Field(default="auto", alias="AGENT_SYNTHESIS_PROVIDER")
     agent_conversation_ttl_days: int = Field(default=30, alias="AGENT_CONVERSATION_TTL_DAYS")
     agent_trace_retention_days: int = Field(default=30, alias="AGENT_TRACE_RETENTION_DAYS")

@@ -398,5 +398,18 @@ class ConversationMemory:
     # ------------------------------------------------------------------
 
     def _next_turn_index(self, session_id: str) -> int:
-        """计算会话下一轮的序号（= 当前轮数，从 0 递增）。"""
-        return self.turn_count(session_id)
+        """计算会话下一轮的序号（= 当前最大轮序 + 1，从 0 递增）。
+
+        使用 MAX(turn_index)+1 而非 turn_count()：compact_history 删除
+        最旧轮次后 count 变小，但索引必须保持单调递增——否则新轮次
+        复用已删除 index，排序与"上一轮"解析（get_history 升序取 [-2]）
+        全部错乱（40 题会话实测 23 条 turn 覆盖 40 轮的乱序 bug）。
+        """
+        max_index = self._db.scalar(
+            text(
+                "SELECT COALESCE(MAX(turn_index), -1) FROM conversation_turns "
+                "WHERE session_id = :sid"
+            ),
+            {"sid": session_id},
+        )
+        return int(max_index) + 1
