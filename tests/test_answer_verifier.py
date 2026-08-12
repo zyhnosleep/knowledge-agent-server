@@ -170,3 +170,127 @@ class TestAnswerVerifier:
         assert isinstance(result["warnings"], list)
         assert isinstance(result["retry_recommended"], bool)
         assert isinstance(result["reason"], str)
+
+
+class TestTextQualityHeuristics:
+    """T2：复读机式重复与单 token 主导噪音的文本质量启发式（2026-08-12 R15）。"""
+
+    def test_gibberish_repeating_phrase_warns_and_retries(self) -> None:
+        """R15 实测形态：'改进了Val。' 反复复读 → 4-gram 重复命中。"""
+        verifier = AnswerVerifier()
+        answer = (
+            "根据提供的证据，改进了Val。虽然改进了Val。而改进了Val。"
+            "但改进了Val。因此改进了Val。"
+        )
+        result = verifier.verify(
+            question="χ1 的改进是否意味着所有残基都得到了改善？",
+            answer_markdown=answer,
+            citations=[],
+            route_type="evidence_required",
+        )
+        assert any("repeats identical phrase" in w for w in result["warnings"]), (
+            result["warnings"]
+        )
+        assert result["retry_recommended"] is True
+
+    def test_dominant_single_token_warns_and_retries(self) -> None:
+        """同一 token 高频穿插于不同上下文（4-gram 窗口无重复）→ 单 token 主导命中。"""
+        verifier = AnswerVerifier()
+        answer = (
+            "Val。改。Val。优。Val。增。Val。减。Val。变。"
+            "Val。调。Val。保。Val。稳。Val。波。Val。升。"
+        )
+        result = verifier.verify(
+            question="什么是 Val？",
+            answer_markdown=answer,
+            citations=[],
+            route_type="simple_rag",
+        )
+        assert any("dominated by repeated token" in w for w in result["warnings"]), (
+            result["warnings"]
+        )
+        assert result["retry_recommended"] is True
+
+    def test_normal_answer_not_flagged(self) -> None:
+        """正常长答案（含重复出现的常用词）不得误报。"""
+        verifier = AnswerVerifier()
+        answer = (
+            "CHARMM36 力场对蛋白质的改进主要体现在侧链扭转势上。"
+            "其中 CMAP 项对 backbone 的二面角分布有显著影响，"
+            "Alanine 与 Valine 的 rotamer 分布与实验 NMR 数据一致。"
+            "该力场在 298 K 与 300 K 下进行 400 ns 的分子动力学模拟验证，"
+            "结果与 SPARTA 预测的化学位移对比表明误差在 1 Å 以内。"
+        )
+        result = verifier.verify(
+            question="CHARMM36 的改进效果如何？",
+            answer_markdown=answer,
+            citations=[{"document_id": "d1", "excerpt": "charmm36"}],
+            route_type="evidence_required",
+        )
+        assert not any(
+            "gibberish" in w for w in result["warnings"]
+        ), result["warnings"]
+        assert result["retry_recommended"] is False
+
+    def test_short_answer_never_statistically_flagged(self) -> None:
+        """短答案不进入统计（<12 token），即使有重复也不误报。"""
+        verifier = AnswerVerifier()
+        result = verifier.verify(
+            question="X?",
+            answer_markdown="val val val val val val",
+            citations=[],
+            route_type="simple_rag",
+        )
+        assert not any(
+            "gibberish" in w for w in result["warnings"]
+        ), result["warnings"]
+        assert result["retry_recommended"] is False
+
+    def test_markdown_table_with_repeated_zero_rows_not_flagged(self) -> None:
+        """纯数字 4-gram 不计数：合法表格答案的多行相同占位值不误报。
+
+        code review 2026-08-12：四行 "| 0 | 0 | 0 | 0 |" 的 (0,0,0,0)
+        是正常表格形态，不是复读机。
+        """
+        verifier = AnswerVerifier()
+        answer = (
+            "Table 5 reports the missing values as zero entries:\n"
+            "| a | b | c | d |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 0 | 0 | 0 | 0 |\n"
+            "| 0 | 0 | 0 | 0 |\n"
+            "| 0 | 0 | 0 | 0 |\n"
+            "| 0 | 0 | 0 | 0 |"
+        )
+        result = verifier.verify(
+            question="Table 5 的缺失值是什么？",
+            answer_markdown=answer,
+            citations=[{"page_kind": "table"}],
+            route_type="table_or_metric",
+        )
+        assert not any(
+            "gibberish" in w for w in result["warnings"]
+        ), result["warnings"]
+        assert result["retry_recommended"] is False
+
+    def test_dominant_token_flagged_below_20_tokens(self) -> None:
+        """单 token 主导规则在 12-19 token 区间同样生效（AC 对齐）。
+
+        code review 2026-08-12：原实现额外要求 ≥20 token，16 token 答案
+        中 val×8（50%）本应命中却被放过。
+        """
+        verifier = AnswerVerifier()
+        answer = (
+            "Val。改。Val。优。Val。增。Val。减。"
+            "Val。变。Val。调。Val。保。Val。稳。"
+        )
+        result = verifier.verify(
+            question="什么是 Val？",
+            answer_markdown=answer,
+            citations=[],
+            route_type="simple_rag",
+        )
+        assert any("dominated by repeated token" in w for w in result["warnings"]), (
+            result["warnings"]
+        )
+        assert result["retry_recommended"] is True

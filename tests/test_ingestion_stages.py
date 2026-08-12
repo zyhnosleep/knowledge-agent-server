@@ -636,6 +636,177 @@ def test_malicious_pipeline_version_is_rejected_before_path_construction(
     assert not (tmp_path / "escape").exists()
 
 
+def test_canonical_tables_to_document_intelligence_entries() -> None:
+    """CanonicalTable 组装为 document_intelligence.tables 条目（markdown + page_label）。
+
+    _search_document_table_contexts 只读该字段；canonical-v4 摄取必须写回，
+    否则表格查询（如表 3 展开、数值追问）拿不到表格证据。
+    """
+    from app.services.canonical_models import CanonicalTable, SourceSpan
+    from app.services.pipeline import canonical_tables_to_document_intelligence
+
+    source_md = "Table 1. RMSD.\n| FF | RMSD |\n| --- | --- |\n| C22/CMAP | 1.80 |"
+    normalized_md = "| FF | RMSD |\n| --- | --- |\n| C22/CMAP | 1.80 |"
+    tables = [
+        CanonicalTable(
+            table_id="table-1",
+            caption="Table 1. RMSD.",
+            headers=["FF", "RMSD"],
+            rows=[["C22/CMAP", "1.80"]],
+            source_markdown=source_md,
+            normalized_markdown=normalized_md,
+            source_spans=[SourceSpan(page_index=30, page_label="31")],
+        ),
+        CanonicalTable(
+            table_id="table-2",
+            headers=["A", "B"],
+            rows=[["1", "2"]],
+            source_markdown=None,
+            normalized_markdown="| A | B |\n| --- | --- |\n| 1 | 2 |",
+            source_spans=[],
+        ),
+        CanonicalTable(
+            table_id="table-empty",
+            headers=["A"],
+            rows=[],
+            source_markdown=None,
+            normalized_markdown=None,
+            source_spans=[],
+        ),
+    ]
+    entries = canonical_tables_to_document_intelligence(tables)
+    assert len(entries) == 2
+    # source_markdown（caption + 表体）优先，page_label 取自 source_spans
+    assert entries[0]["markdown"] == source_md
+    assert entries[0]["page_label"] == "31"
+    # 无 caption 时退到 normalized_markdown；无 page_label 则为 None
+    assert entries[1]["markdown"] == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+    assert entries[1]["page_label"] is None
+
+
+def test_canonical_parse_stage_writes_document_intelligence_tables(
+    db: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """canonical parse 阶段把表格写回 metadata_json.document_intelligence.tables，
+    供检索表格证据读取（_search_document_table_contexts 只认该字段）。"""
+    from app.services import pipeline as pipeline_module
+    from app.services.canonical_models import (
+        CanonicalDocument,
+        CanonicalQualityReport,
+        CanonicalTable,
+        SourceSpan,
+    )
+
+    doc = db.get(Document, "d1")
+    doc.raw_path = str(tmp_path / "paper.pdf")
+    version = db.get(DocumentParseVersion, "pv1")
+    version.version_key = "canonical-v4-abc-1234567890ab"
+    version.stage_state = {"parse": {"status": "running"}}
+    db.commit()
+
+    table_markdown = (
+        "Table 1. Properties of peptides.\n"
+        "| Peptide | Property |\n| --- | --- |\n| Ala5 | 1.80 |\n"
+        "| Ac-(AAQAA)3-NH2 | 0.74 |"
+    )
+    canonical = CanonicalDocument(
+        document_id="d1",
+        title="Paper",
+        parser_source="mineru",
+        tables=[
+            CanonicalTable(
+                table_id="table-1",
+                caption="Table 1. Properties of peptides.",
+                headers=["Peptide", "Property"],
+                rows=[["Ala5", "1.80"], ["Ac-(AAQAA)3-NH2", "0.74"]],
+                source_markdown=table_markdown,
+                normalized_markdown=table_markdown.split("\n", 1)[1],
+                source_spans=[SourceSpan(page_index=30, page_label="31")],
+            )
+        ],
+        quality=CanonicalQualityReport(status="accepted", score=1.0),
+    )
+    monkeypatch.setattr(
+        pipeline_module.IngestionPipeline,
+        "_parse_canonical_phase",
+        lambda self, _path: canonical,
+    )
+    monkeypatch.setattr(
+        pipeline_module.settings, "canonical_artifacts_dir", tmp_path / "artifacts"
+    )
+    context = SimpleNamespace(
+        document=doc,
+        version=version,
+        stage="parse",
+        input={},
+    )
+    result = IngestionPipeline(db)._run_canonical_parse_stage(context)
+    assert result["table_count"] == 1
+    metadata = doc.metadata_json
+    assert metadata["canonical_ingestion"]["version_key"] == version.version_key
+    tables = metadata["document_intelligence"]["tables"]
+    assert len(tables) == 1
+    assert tables[0]["markdown"] == table_markdown
+    assert tables[0]["page_label"] == "31"
+
+
+def test_canonical_parse_stage_preserves_legacy_tables_when_none_extracted(
+    db: Session, tmp_path: Path, monkeypatch
+) -> None:
+    """canonical 解析未提取到表格时，不得用空列表覆盖旧 DI tables。
+
+    code review 2026-08-12：文档由旧 DI/mineru 路径摄取的真实表格在
+    metadata 中，v4 重新解析失败/无表格时若被清空，检索证据将全部丢失。
+    """
+    from app.services import pipeline as pipeline_module
+    from app.services.canonical_models import (
+        CanonicalDocument,
+        CanonicalQualityReport,
+    )
+
+    doc = db.get(Document, "d1")
+    doc.raw_path = str(tmp_path / "paper.pdf")
+    doc.metadata_json = {
+        **dict(doc.metadata_json or {}),
+        "document_intelligence": {
+            "tables": [{"markdown": "| legacy | 1.80 |", "page_label": "5"}]
+        },
+    }
+    version = db.get(DocumentParseVersion, "pv1")
+    version.version_key = "canonical-v4-abc-1234567890ab"
+    version.stage_state = {"parse": {"status": "running"}}
+    db.commit()
+
+    canonical = CanonicalDocument(
+        document_id="d1",
+        title="Paper",
+        parser_source="mineru",
+        tables=[],  # 本次解析没有表格
+        quality=CanonicalQualityReport(status="accepted", score=1.0),
+    )
+    monkeypatch.setattr(
+        pipeline_module.IngestionPipeline,
+        "_parse_canonical_phase",
+        lambda self, _path: canonical,
+    )
+    monkeypatch.setattr(
+        pipeline_module.settings, "canonical_artifacts_dir", tmp_path / "artifacts"
+    )
+    context = SimpleNamespace(
+        document=doc,
+        version=version,
+        stage="parse",
+        input={},
+    )
+    result = IngestionPipeline(db)._run_canonical_parse_stage(context)
+    assert result["table_count"] == 0
+    tables = doc.metadata_json["document_intelligence"]["tables"]
+    assert len(tables) == 1, (
+        "canonical 无表格时旧 DI tables 必须保留，不得清空"
+    )
+    assert tables[0]["markdown"] == "| legacy | 1.80 |"
+
+
 def test_parse_version_key_includes_canonical_ingestion_config_hash(
     db: Session, tmp_path: Path, monkeypatch
 ) -> None:

@@ -14,7 +14,10 @@ answer_verifier.py —— 答案质量校验器（确定性规则检查）模块
 2. 需要证据的路由（evidence_required / multi_source_compare /
    table_or_metric）缺少引用 → 警告并建议重试。
 3. ``table_or_metric`` 路由上未检测到表格或数值证据 → 警告并建议重试。
-4. 其余情况 → ok，不重试。
+4. 文本质量启发式：4-gram 短语重复（胡言乱语/复读机信号）或单 token
+   主导（≥8 次且占比过半）→ 警告并建议重试（2026-08-12 回归 R15
+   实测：答案反复重复"改进了Val。"短语并通过旧校验）。
+5. 其余情况 → ok，不重试。
 
 设计说明：
 - "验证器自身永远成功"（``ok=True`` 恒定）：它只是一个质量门禁，
@@ -71,6 +74,18 @@ class AnswerVerifier:
         re.IGNORECASE,
     )
 
+    # ---- 文本质量启发式阈值（2026-08-12 回归 R15） ----
+    # 相同 4-gram 出现 ≥ 4 次 → 复读机式重复（R15 "改进了Val。" 反复出现）
+    _REPEAT_GRAM_SIZE = 4
+    _REPEAT_GRAM_MIN_COUNT = 4
+    # 单个 token 出现 ≥ 8 次且占总 token 数 ≥ 50% → 单 token 主导噪音
+    # （"Val。Val。Val。…" 这类整段只复读一个词的情况，4-gram 统计会漏检）
+    _DOMINANT_TOKEN_MIN_COUNT = 8
+    _DOMINANT_TOKEN_MIN_RATIO = 0.5
+
+    # 答案 token 化：英文单词（含数字）+ 中文单字，小写去标点
+    _TOKEN_RE: re.Pattern = re.compile(r"[a-z0-9]+|[一-鿿]")
+
     # ------------------------------------------------------------------
     def verify(
         self,
@@ -123,6 +138,13 @@ class AnswerVerifier:
         if not answer_text:
             warnings.append("Answer is empty")
             retry_recommended = True
+        else:
+            # ---- 1b. 文本质量启发式（非空答案才统计） ----
+            # ---- 检查一 b：复读机式重复/单 token 主导噪音 ----
+            quality_warnings = self._text_quality_warnings(answer_text)
+            warnings.extend(quality_warnings)
+            if quality_warnings:
+                retry_recommended = True
 
         # ---- 2. missing citations on evidence routes ----
         # ---- 检查二：需要证据的路由缺少引用 ----
@@ -159,6 +181,64 @@ class AnswerVerifier:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _text_quality_warnings(self, answer: str) -> list[str]:
+        """检测复读机式重复与单 token 主导噪音，返回警告列表。
+
+        2026-08-12 回归 R15：模型输出"改进了Val。"反复复读的胡言乱语，
+        旧校验只查空/长度/引用全部放行。此处做轻量统计：
+        - 相同 4-gram（token 序列）出现 ≥4 次 → 复读机信号；
+        - 单个 token ≥8 次且占比 ≥50%（含字母）→ 单 token 主导噪音
+          （整段只复读一个词时 4-gram 窗口统计不到，需单独兜底）。
+        短答案（<12 token）不做统计，避免小样本抖动误报。
+        """
+        tokens = self._TOKEN_RE.findall((answer or "").lower())
+        if len(tokens) < 12:
+            return []
+
+        warnings: list[str] = []
+
+        # 4-gram 重复：R15 "改进了Val。" → (改,进,了,val) 出现 4 次。
+        # 纯数字 4-gram 不计数——合法的 markdown 表格答案可能有多行
+        # "| 0 | 0 | 0 | 0 |"（占位/空值行），(0,0,0,0) 重复是正常表格
+        # 形态而非复读机（2026-08-12 code review 修正误报）。
+        if len(tokens) >= self._REPEAT_GRAM_SIZE + self._REPEAT_GRAM_MIN_COUNT - 1:
+            gram_counts: dict[tuple[str, ...], int] = {}
+            for i in range(len(tokens) - self._REPEAT_GRAM_SIZE + 1):
+                gram = tuple(tokens[i : i + self._REPEAT_GRAM_SIZE])
+                if all(token.isdigit() for token in gram):
+                    continue
+                gram_counts[gram] = gram_counts.get(gram, 0) + 1
+            if gram_counts:
+                top_count = max(gram_counts.values())
+                if top_count >= self._REPEAT_GRAM_MIN_COUNT:
+                    worst = max(gram_counts, key=gram_counts.get)
+                    warnings.append(
+                        "Answer repeats identical phrase "
+                        f"'{' '.join(worst)}' {top_count} times (possible gibberish)"
+                    )
+
+        # 单 token 主导："Val。Val。Val。…" 只复读一个词时 4-gram 无重复。
+        # 与 4-gram 规则共用同一 <12 token 短答案门（<12 不做统计）；
+        # 纯数字 token（如表格数值 "0"/"74"）不参与主导判定，避免合法
+        # 数值列表被误判为噪音。
+        counts: dict[str, int] = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+        dominant, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+        is_word = re.search(r"[a-z一-鿿]", dominant) is not None
+        if (
+            is_word
+            and dominant_count >= self._DOMINANT_TOKEN_MIN_COUNT
+            and dominant_count / len(tokens) >= self._DOMINANT_TOKEN_MIN_RATIO
+        ):
+            warnings.append(
+                "Answer dominated by repeated token "
+                f"'{dominant}' ({dominant_count}/{len(tokens)} tokens, "
+                "possible gibberish)"
+            )
+
+        return warnings
 
     def _has_table_evidence(
         self, answer: str, citations: list[dict[str, Any]]

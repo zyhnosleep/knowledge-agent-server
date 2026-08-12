@@ -397,3 +397,75 @@ def test_document_scope_rebind_is_rejected() -> None:
 
     with pytest.raises(ValueError):
         memory.touch_session("scoped", project_slug="demo", ttl_days=30, document_id="d2")
+
+
+def test_get_recent_table_anchors_extracts_table_citations() -> None:
+    """仅 agent/finalize 轮的表格类引用被提取；段落引用被跳过。"""
+    db, memory = make_memory()
+    memory.add_turn("s1", role="user", content="第一张表是什么", step_type="user_query")
+    memory.add_turn(
+        "s1",
+        role="agent",
+        content="answer1",
+        step_type="finalize",
+        citations=[
+            {
+                "block_type": "table",
+                "excerpt": "| A | B |\n| --- | --- |\n| 1 | 2 |",
+                "document_id": "d1",
+                "page_label": "8",
+            },
+            {"block_type": "paragraph", "excerpt": "plain prose", "document_id": "d1"},
+        ],
+    )
+    memory.add_turn(
+        "s1",
+        role="agent",
+        content="answer2",
+        step_type="finalize",
+        citations=[{"block_type": "paragraph", "excerpt": "more prose", "document_id": "d1"}],
+    )
+    db.commit()
+
+    anchors = memory.get_recent_table_anchors("s1")
+    assert len(anchors) == 1
+    assert anchors[0]["excerpt"] == "| A | B |\n| --- | --- |\n| 1 | 2 |"
+    assert anchors[0]["document_id"] == "d1"
+    assert anchors[0]["page_label"] == "8"
+    assert anchors[0]["turn_index"] == 1
+
+
+def test_get_recent_table_anchors_newest_first_and_limited() -> None:
+    """按轮次最新在前返回，last_n 限制回溯深度。"""
+    db, memory = make_memory()
+    for i in range(3):
+        memory.add_turn(
+            "s1",
+            role="agent",
+            content=f"ans{i}",
+            step_type="finalize",
+            citations=[{"table_id": f"tbl-{i}", "excerpt": f"| row {i} | 1 | 2 |"}],
+        )
+    db.commit()
+
+    anchors = memory.get_recent_table_anchors("s1", last_n=2)
+    assert [a["table_id"] for a in anchors] == ["tbl-2", "tbl-1"]
+    assert anchors[0]["turn_index"] == 2
+
+
+def test_get_recent_table_anchors_skips_non_table_excerpts() -> None:
+    """段落引用与空摘录不构成表格锚点（空摘录即使 block_type=table 也跳过）。"""
+    db, memory = make_memory()
+    memory.add_turn(
+        "s1",
+        role="agent",
+        content="answer",
+        step_type="finalize",
+        citations=[
+            {"block_type": "paragraph", "excerpt": "plain prose", "document_id": "d1"},
+            {"block_type": "table", "excerpt": "", "document_id": "d1"},
+        ],
+    )
+    db.commit()
+
+    assert memory.get_recent_table_anchors("s1") == []

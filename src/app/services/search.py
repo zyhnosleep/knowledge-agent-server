@@ -1191,7 +1191,14 @@ class QueryService:
             )
             if contexts:
                 return self._finalize_contexts(contexts, question=question)
-        if self._is_table_query(question) or self._is_metric_query(question):
+        if (
+            self._is_table_query(question)
+            or self._is_metric_query(question)
+            # 表格指代查询（"展开第二张"等）不含"表"字时 _is_table_query
+            # 失配，但必须走表格检索路径才能拿到候选表格（2026-08-12 回归
+            # R18"现在展开第二张"因此只命中 profile-term）。
+            or self._is_table_reference_query(question)
+        ):
             table_limit = (
                 CANONICAL_TABLE_CONTEXT_LIMIT
                 if self._is_table_query(question) or self._is_metric_query(question)
@@ -1354,7 +1361,13 @@ class QueryService:
                 if not block or not self._context_has_table_data(block):
                     continue
                 if not self._table_block_matches_query(question, block):
-                    continue
+                    # 表格指代查询（"第二张表/这张表"等）无法从自身词元
+                    # 匹配表格内容（中文序数与英文表格文本无 token 交集），
+                    # 全灭过滤会让模型拿不到任何候选表（2026-08-12 回归
+                    # R17/R18/R20/R22）；放宽为返回候选表格，由会话锚点
+                    # 与模型结合历史选择。
+                    if not QueryService._is_table_reference_query(question):
+                        continue
                 block_score = self._rank_blocks(question, [block])[0][1]
                 score = TABLE_CONTEXT_SCORE_BOOST + block_score + max(0.0, 2.0 - ordinal * 0.01)
                 excerpt = self._table_citation_excerpt(block, question)
@@ -2458,7 +2471,10 @@ class QueryService:
                 continue
             if needs_table_first and has_table_data:
                 if not self._table_block_matches_query(question, chunk.text):
-                    continue
+                    # 与 _search_document_table_contexts 相同：指代查询放宽，
+                    # 避免中文序数指代全灭过滤掉候选表格。
+                    if not QueryService._is_table_reference_query(question):
+                        continue
                 score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
                 evidence_kind = "table"
             else:
@@ -3570,12 +3586,20 @@ class QueryService:
         evidence_acronyms = self._salient_evidence_acronyms(contexts)
         evidence_phrases = self._salient_evidence_phrases(contexts)
 
-        # Figure/Table constraint: if context has them, don't say "not included".
-        if self._is_chinese_question(question):
-            parts.append(
-                "IMPORTANT: Answer in Chinese because the user's question is written in Chinese. "
-                "Keep table labels, dataset names, model names, and metric names verbatim when needed."
-            )
+        # T3（2026-08-12 回归 R29/R38/R36/R26）：语言必须跟随用户问题
+        # （旧约束只在中文问题下给中文指示，且 synthesize 路径完全缺失），
+        # 元数据禁止输出（R36 泄漏"关联地址为 21201 及 48824"），
+        # 推断需显式标记（R26 未区分证据事实与作者取舍的解读）。
+        # 三条文本来自共享模块 prompt_rules（与 synthesize 同源，防漂移）。
+        from app.services.prompt_rules import (
+            INFERENCE_MARKING_RULE,
+            METADATA_BAN_RULE,
+            language_rule,
+        )
+
+        parts.append(language_rule(question))
+        parts.append(METADATA_BAN_RULE)
+        parts.append(INFERENCE_MARKING_RULE)
         if evidence_acronyms:
             parts.append(
                 "IMPORTANT: Preserve these source acronyms/model or method names exactly when they are relevant: "
@@ -7184,8 +7208,26 @@ class QueryService:
             or "diagram" in lowered
         )
 
-    @staticmethod
-    def _is_table_query(question: str) -> bool:
+    @classmethod
+    def _is_table_reference_query(cls, question: str) -> bool:
+        """检测表格指代查询（"第二张表/这张表/刚才的表格"等）。
+
+        指代查询无法从自身词元匹配表格内容——中文序数词与英文表格文本
+        没有 token 交集，``_table_block_matches_query`` 会全灭过滤
+        （2026-08-12 锁定回归实测 R17/R18/R20/R22 因此拿不到任何表格
+        证据）。指代查询的表格检索必须放宽：返回候选表格让模型结合
+        会话历史选择，定位由会话锚点（``get_recent_table_anchors``）
+        辅助。
+
+        实现委托共享模块 ``table_reference``（与 AgentExecutor 同源，
+        避免两处正则漂移）。
+        """
+        from app.services.table_reference import is_table_reference_query
+
+        return is_table_reference_query(question)
+
+    @classmethod
+    def _is_table_query(cls, question: str) -> bool:
         """Detect questions asking about specific tables or tabular data."""
         lowered = question.lower()
         return bool(

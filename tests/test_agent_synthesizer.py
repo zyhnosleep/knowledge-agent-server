@@ -280,6 +280,58 @@ def test_ollama_first_prompt_requires_exact_evidence_for_table_routes(monkeypatc
     assert "do not summarize" in prompt.lower()
 
 
+def test_answer_rules_follow_query_language_and_ban_metadata(monkeypatch) -> None:
+    """T3：synthesize 约束语言跟随 / 元数据禁止 / 假设标记（R29/R36/R26）。"""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    chinese = AgentSynthesizer._answer_rules("为什么作者选择了 C36 而不是 C22/CMAP？")
+    assert "Answer in Chinese" in chinese
+    assert "简体中文" in chinese
+    assert "Never output internal document metadata" in chinese
+    assert "submission IDs" in chinese
+    assert "mark it explicitly as inference" in chinese
+
+    english = AgentSynthesizer._answer_rules("Why did the authors choose C36?")
+    assert "Answer in English" in english
+    assert "Answer in Chinese" not in english
+    assert "Never output internal document metadata" in english
+
+
+def test_ollama_synthesis_prompt_includes_t3_answer_rules(monkeypatch) -> None:
+    """Ollama 综合 system prompt 必须携带 T3 约束块（语言/元数据/假设）。"""
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.get_settings", _fake_settings_ollama
+    )
+
+    class CapturingStructuredOllama:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def generate_structured(self, schema, **kwargs):
+            self.calls.append({"schema": schema, **kwargs})
+            return SynthesisPayload(
+                answer_markdown="作者采用了 C36，因为其拟合质量更好。",
+                cited_indexes=[0],
+                warnings=[],
+                confidence=0.9,
+            )
+
+    ollama = CapturingStructuredOllama()
+    AgentSynthesizer(ollama_client=ollama).synthesize(
+        query="为什么作者选择了 C36 而不是 C22/CMAP？",
+        route="evidence_required",
+        rag_answer="C36 拟合质量更好。",
+        citations=[{"document_id": "d1", "excerpt": "C36 provides better fitting."}],
+    )
+
+    system_prompt = ollama.calls[0]["system_prompt"]
+    assert "Answer in Chinese" in system_prompt
+    assert "Never output internal document metadata" in system_prompt
+    assert "mark it explicitly as inference" in system_prompt
+
+
 def test_synthesize_generation_target_calls_9b_once_as_plain_markdown(monkeypatch) -> None:
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)
     ollama = FakeOllamaClient(result=_local_result())

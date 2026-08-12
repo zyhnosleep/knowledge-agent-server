@@ -842,6 +842,8 @@ class AgentSynthesizer:
             "You MUST synthesize - do NOT simply concatenate paragraphs. "
             "Only cite sources that are present in the provided evidence.\n"
             + precision_rules
+            + "\n"
+            + self._answer_rules(query)
         )
 
         user_prompt = (
@@ -914,6 +916,22 @@ class AgentSynthesizer:
         }
 
     @staticmethod
+    def _answer_rules(query: str) -> str:
+        """T3 生成约束：语言跟随 / 元数据禁止 / 假设标记。
+
+        2026-08-12 锁定回归实测失败形态：
+        - R29/R38：中文问题，综合答案却输出英文 → 语言必须跟随用户；
+        - R36：答案泄漏内部元数据（"关联地址为 21201 及 48824"、
+          "相关文献编号为 2013"）→ 元数据禁止输出；
+        - R26：基于证据的推断（作者取舍原因）未与事实区分 → 推断需显式标记。
+
+        文本来自共享模块 ``prompt_rules``（与 search draft 同源，防漂移）。
+        """
+        from app.services.prompt_rules import answer_rules
+
+        return answer_rules(query)
+
+    @staticmethod
     def _precision_rules(route: str) -> str:
         """Return first-pass fidelity rules for evidence-heavy synthesis."""
         if route in {"table_or_metric", "evidence_required", "multi_source_compare"}:
@@ -966,7 +984,8 @@ class AgentSynthesizer:
             f"evidence anchor in this list: {missing_list}. Preserve acronyms, table labels, "
             "technical terms, and numeric values verbatim; do not translate or drop them. "
             "Only cite sources present in the evidence. Return JSON with answer_markdown, "
-            "cited_indexes, warnings, and confidence."
+            "cited_indexes, warnings, and confidence.\n"
+            + self._answer_rules(query)
         )
         user_prompt = (
             f"Original query: {query}\nRoute type: {route}\n"
@@ -1767,7 +1786,8 @@ class AgentSynthesizer:
             "Only cite sources that are present in the provided evidence. "
             "Return a JSON object with keys: answer_markdown (string), "
             "cited_indexes (array of integers, only valid indexes from the evidence), "
-            "warnings (array of strings), confidence (number 0.0-1.0)."
+            "warnings (array of strings), confidence (number 0.0-1.0).\n"
+            + self._answer_rules(query)
         )
 
         user_prompt = (

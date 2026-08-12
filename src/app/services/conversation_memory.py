@@ -167,6 +167,62 @@ class ConversationMemory:
             for row in rows
         ]
 
+    def get_recent_table_anchors(
+        self, session_id: str, *, last_n: int = 2
+    ) -> list[dict]:
+        """提取最近几轮 agent 答案引用中的表格证据（轻量跨轮锚点）。
+
+        每轮 finalize 时 citations 已随 turn 持久化（agent_executor 以
+        model_dump 形式写入）。此处筛选表格类引用（block_type == "table"、
+        携带 table_id，或 excerpt 含 markdown 表行），按轮序返回（最新在
+        前），供表格指代查询（"第二张表"等）注入候选证据——指代查询无法
+        从自身词元检索到表格内容，需要历史引用定位（2026-08-12 回归
+        R17/R18/R20/R22 的根因之一）。
+
+        :param session_id: 会话 ID。
+        :param last_n: 最多回溯最近几轮 agent（finalize）轮次。
+        :return: 表格引用条目列表，每项含 citation 字段与轮次信息。
+        """
+        statement = (
+            select(ConversationTurn)
+            .where(
+                ConversationTurn.session_id == session_id,
+                ConversationTurn.role == "agent",
+                ConversationTurn.step_type == "finalize",
+            )
+            .order_by(ConversationTurn.turn_index.desc())
+            .limit(last_n)
+        )
+        rows = self._db.scalars(statement).all()
+        anchors: list[dict] = []
+        # rows 已是按 turn_index 降序（最新在前），直接顺序遍历保证
+        # anchors 返回顺序也是"最新在前"。
+        for row in rows:
+            for citation in row.citations or []:
+                if not isinstance(citation, dict):
+                    continue
+                excerpt = str(citation.get("excerpt") or "").strip()
+                if not excerpt:
+                    continue
+                is_table = bool(
+                    citation.get("block_type") == "table"
+                    or citation.get("table_id")
+                    or citation.get("page_kind") == "table"
+                    or "|" in excerpt
+                )
+                if not is_table:
+                    continue
+                anchors.append(
+                    {
+                        "excerpt": excerpt,
+                        "document_id": citation.get("document_id"),
+                        "page_label": citation.get("page_label"),
+                        "table_id": citation.get("table_id"),
+                        "turn_index": row.turn_index,
+                    }
+                )
+        return anchors
+
     def turn_count(self, session_id: str) -> int:
         """返回 *session_id* 的轮次数量。
 
