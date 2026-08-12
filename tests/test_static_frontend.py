@@ -587,6 +587,26 @@ def test_chat_answer_has_collapsible_trace() -> None:
     assert "检索与推理已完成" in html or "completed-trace" in html
 
 
+def test_chat_answer_only_layout_hides_internal_process_details() -> None:
+    html = _html()
+    soup = BeautifulSoup(html, "html.parser")
+    chat_view = soup.select_one('[data-view="chat"]')
+    assert chat_view is not None
+    assert "answer-only" in (chat_view.get("class") or [])
+    assert "chat-view.answer-only .thinking-feed" in html
+    assert "display: none !important" in html
+    assert ".chat-view.answer-only .answer" in html
+    assert "classList.toggle(\"pending\", isPending)" in html
+
+
+def test_answer_only_layout_is_fluid_at_narrow_widths() -> None:
+    html = _html()
+    assert "width: 100%;" in html
+    assert "max-width: 1400px" in html
+    assert "grid-template-columns: 36px minmax(0, 1fr)" in html
+    assert "minmax(0, 1fr)" in html
+
+
 def test_answer_uses_safe_text_citations() -> None:
     html = _html()
     assert "document.createTextNode" in html

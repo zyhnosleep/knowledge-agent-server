@@ -1693,7 +1693,7 @@
       .flow-card { display: none; }
 
       @media (max-width: 1200px) {
-        .welcome-stage { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); padding-left: 45px; }
+        .welcome-stage { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding-left: 45px; }
         .chat-welcome h1 { white-space: normal; }
         .project-overview { display: none; }
         .runs-layout { grid-template-columns: 1fr; }.runs-overview-rail { display: none; }
@@ -1725,6 +1725,136 @@
       }
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+      }
+
+      /* Answer-only conversation surface: keep the final answer readable and
+         remove internal execution details from the primary reading flow. */
+      .chat-view.answer-only .chat-surface {
+        width: 100%;
+        min-width: 0;
+        padding: 0 12px 170px;
+        overflow-x: hidden;
+      }
+
+      .chat-view.answer-only .chat-messages,
+      .chat-view.answer-only .thinking-feed,
+      .chat-view.answer-only .trace-summary {
+        display: none !important;
+      }
+
+      .chat-view.answer-only .answer {
+        display: block;
+        width: 100%;
+        max-width: 1400px;
+        min-width: 0;
+        margin: clamp(18px, 4vh, 48px) auto 170px;
+        padding: clamp(28px, 4vw, 58px) clamp(22px, 4vw, 56px);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--night-850);
+        box-shadow: 0 24px 70px rgb(0 0 0 / 24%);
+        line-height: 1.85;
+        overflow-wrap: anywhere;
+      }
+
+      .chat-view.answer-only .answer.pending {
+        max-width: 760px;
+        margin-top: clamp(18px, 5vh, 52px);
+        padding: 18px 22px;
+        border-radius: 10px;
+        background: var(--night-900);
+        box-shadow: none;
+      }
+
+      .chat-view.answer-only .answer.pending .answer-text {
+        max-width: none;
+        color: var(--paper-500);
+        font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .chat-view.answer-only .answer-meta {
+        display: none;
+      }
+
+      .chat-view.answer-only .answer-text {
+        width: 100%;
+        max-width: 1280px;
+        margin: 0 auto;
+        font-family: Georgia, "Noto Serif SC", serif;
+        font-size: clamp(17px, 1.35vw, 21px);
+        line-height: 1.95;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+
+      .chat-view.answer-only .answer-sources {
+        width: 100%;
+        max-width: 1280px;
+        margin: 28px auto 0;
+      }
+
+      .chat-view.answer-only .composer {
+        width: min(1400px, calc(100% - 24px));
+      }
+
+      .chat-view.answer-only .composer-box {
+        width: 100%;
+        min-width: 0;
+        grid-template-columns: 44px minmax(0, 1fr) auto;
+      }
+
+      .chat-view.answer-only .composer textarea {
+        min-width: 0;
+      }
+
+      @media (max-width: 768px) {
+        .chat-view.answer-only .chat-surface {
+          padding: 0 12px 136px;
+        }
+
+        .chat-view.answer-only .answer {
+          margin-top: 12px;
+          margin-bottom: 136px;
+          padding: 24px 18px;
+          border-radius: 13px;
+        }
+
+        .chat-view.answer-only .answer-text {
+          font-size: 16px;
+          line-height: 1.85;
+        }
+
+        .chat-view.answer-only .composer {
+          width: calc(100% - 24px);
+        }
+
+        .chat-view.answer-only .composer-box {
+          min-height: 92px;
+          grid-template-columns: 36px minmax(0, 1fr) auto;
+          padding: 12px;
+        }
+
+        .chat-view.answer-only .composer textarea {
+          min-height: 48px;
+          font-size: 15px;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .chat-view.answer-only .answer-text {
+          font-size: 15px;
+        }
+
+        .chat-view.answer-only .composer-box {
+          grid-template-columns: 36px minmax(0, 1fr);
+        }
+
+        .chat-view.answer-only .composer-actions {
+          grid-column: 1 / -1;
+          justify-content: flex-end;
+        }
       }
     </style>
   </head>
@@ -1791,7 +1921,7 @@
           </div>
         </header>
 
-        <section class="view chat-view" data-view="chat" hidden>
+        <section class="view chat-view answer-only" data-view="chat" hidden>
           <div class="chat-surface" id="chatSurface">
             <div class="chat-welcome" id="chatWelcome">
              <div class="welcome-stage">
@@ -2293,7 +2423,11 @@
       }
 
       function showAnswer(meta, text, citations) {
-        $("answerPanel").hidden = false;
+        var answerPanel = $("answerPanel");
+        var answerText = String(text || "").trim();
+        var isPending = /^(正在分析|正在生成)/.test(answerText) && !(citations || []).length;
+        answerPanel.hidden = false;
+        answerPanel.classList.toggle("pending", isPending);
         if ($("traceSummary")) $("traceSummary").hidden = false;
         $("answerMeta").replaceChildren();
         (meta || []).forEach(function (item) {
@@ -3508,6 +3642,12 @@
         turns.forEach(function (turn) {
           appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type, turn.citations);
         });
+        var latestAnswer = (turns || []).slice().reverse().find(function (turn) {
+          return turn && turn.role === "agent" && String(turn.content || "").trim();
+        });
+        if (latestAnswer) {
+          showAnswer([], latestAnswer.content, Array.isArray(latestAnswer.citations) ? latestAnswer.citations : []);
+        }
       }
 
       function renderAttachments() {
