@@ -948,20 +948,26 @@
 
       .chat-view {
         height: calc(100dvh - 64px);
+        min-width: 0;
         min-height: 0;
         display: grid;
         grid-template-rows: minmax(0, 1fr) auto;
-        max-width: 1100px;
-        margin: 0 auto;
+        max-width: none;
+        width: 100%;
+        margin: 0;
         padding: 0 0 28px;
         overflow: hidden;
       }
 
       .chat-surface {
+        width: 100%;
+        min-width: 0;
         min-height: 0;
+        overflow-x: hidden;
         overflow-y: auto;
         display: flex;
         flex-direction: column;
+        align-items: stretch;
         gap: 16px;
         padding: 24px 8px 18px;
       }
@@ -1261,6 +1267,7 @@
         display: flex;
         align-items: center;
         gap: 8px;
+        min-width: 0;
       }
 
       .icon-action {
@@ -1602,7 +1609,7 @@
       .chat-view { height: calc(100vh - 70px); padding: 0; overflow: hidden; position: relative; }
       /* 滚动容器统一底部安全区：悬浮输入框（含 meta 提示行）不遮挡任何内容 */
       .chat-view::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 150px; background: linear-gradient(180deg, transparent, rgb(5 8 12 / 90%)); pointer-events: none; z-index: 4; }
-      .chat-surface { max-width: none; height: 100%; padding: 0 0 210px; overflow: auto; }
+      .chat-surface { width: 100%; min-width: 0; max-width: none; height: 100%; padding: 0 0 210px; overflow-x: hidden; overflow-y: auto; }
       .welcome-stage { min-height: 100%; display: grid; grid-template-columns: minmax(520px, 1.12fr) minmax(360px, .88fr) 145px; align-items: center; gap: 24px; padding: 44px 38px 24px 70px; background: radial-gradient(circle at 62% 40%, rgb(39 80 130 / 12%), transparent 32%); text-align: left; }
       .welcome-copy { max-width: 610px; }
       .chat-welcome h1 { font-size: clamp(46px, 3.5vw, 58px); line-height: 1.16; margin: 0 0 24px; letter-spacing: -.035em; white-space: nowrap; }
@@ -1626,18 +1633,22 @@
       .project-overview dl div, .runs-overview-rail dl div { display: grid; gap: 6px; }
       .project-overview dt, .runs-overview-rail dt { color: var(--paper-500); font-size: 11px; }
       .project-overview dd, .runs-overview-rail dd { margin: 0; font-size: 22px; color: var(--paper-300); }
-      .composer { position: absolute; left: 50%; bottom: 22px; width: min(900px, calc(100% - 80px)); transform: translateX(-50%); padding: 0; z-index: 5; }
-      .composer-box { min-height: 112px; grid-template-columns: 44px 1fr auto; align-items: end; padding: 16px; background: rgb(18 25 33 / 93%); border: 1px solid #4c5863; border-radius: 10px; box-shadow: 0 22px 70px rgb(0 0 0 / 42%); backdrop-filter: blur(16px); }
+      .composer { position: absolute; left: 50%; bottom: 22px; width: min(1400px, calc(100% - 48px)); max-width: 100%; min-width: 0; transform: translateX(-50%); padding: 0; z-index: 5; }
+      .composer-box { width: 100%; min-width: 0; min-height: 112px; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: end; padding: 16px; background: rgb(18 25 33 / 93%); border: 1px solid #4c5863; border-radius: 10px; box-shadow: 0 22px 70px rgb(0 0 0 / 42%); backdrop-filter: blur(16px); }
       .composer-box textarea { align-self: start; padding: 6px 0; min-height: 50px; }
       .composer-actions { align-self: end; }
       .send-button { border-color: #4c7d32; background: transparent; color: var(--paper-100); min-width: 46px; }
       .composer-meta { padding: 10px 4px; font-style: italic; }
       .sample-prompt { border: 0; background: none; padding: 0; color: var(--paper-500); font-size: 11px; font-style: italic; cursor: pointer; }
       .sample-prompt:hover { color: var(--paper-300); }
-      .chat-messages, .answer, .thinking-feed { max-width: 1020px; margin-left: 40px; }
-      .chat-messages { padding: 28px 0 8px; }
+      .chat-messages, .thinking-feed, .trace-summary, .answer-meta { display: none !important; }
+      .answer-history { display: grid; gap: 18px; width: 100%; min-width: 0; }
+      .answer-history:empty { display: none; }
+      .answer { width: min(1400px, calc(100% - 48px)); max-width: 100%; margin: 26px auto 10px; padding: 28px 32px 34px; border: 1px solid var(--line); border-radius: 16px; background: var(--night-850); box-shadow: var(--solid-shadow); }
+      .answer-status { width: min(1400px, calc(100% - 48px)); max-width: 100%; margin: 22px auto 0; padding: 8px 2px; color: var(--paper-500); font: 12px ui-monospace, monospace; }
+      .answer-status[hidden] { display: none; }
       .message { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 18px 0; }
-      .message.agent > div:not(.message-sources), .answer-text { font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
+      .message.agent > div:not(.message-sources), .answer-text { max-width: none; font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
       .citation-ref { color: #70a8ff; font: 11px ui-monospace, monospace; vertical-align: super; cursor: pointer; }
       /* 正文结构层级：## 标题驱动的色条分块（结论/证据/不确定性/来源/其他） */
       .answer-section { position: relative; margin: 20px 0 24px; padding-left: 18px; }
@@ -1655,11 +1666,15 @@
       .answer-section-body p:last-child { margin-bottom: 0; }
       .answer-text ul { margin: 6px 0 14px; padding-left: 24px; }
       .answer-text li { margin: 5px 0; }
-      .thinking-feed { margin-top: 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); }
       .thinking-step { border: 0; border-bottom: 1px solid var(--line-soft); background: none; }
-      .trace-summary { max-width: 850px; margin: 28px 0 0 40px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); color: var(--paper-300); }
       .chat-view.researching .topbar-label i, .chat-view.researching .thinking-feed { box-shadow: 0 0 18px rgb(77 141 255 / 28%); }
       .chat-view.researching .send-button { color: var(--signal); }
+
+      /* 只保留最终答案，避免用户问题、工具步骤和 trace 抢占正文宽度。 */
+      .answer-meta { min-height: 0; margin-bottom: 18px; }
+      .answer-meta:empty { display: none; }
+      .answer-text { overflow-wrap: anywhere; word-break: normal; }
+      .answer-sources { margin-top: 28px; }
 
       .files-layout { grid-template-columns: 242px minmax(0, 1fr); gap: 26px; margin-top: 28px; }
       .files-layout > *, .upload-form, .upload-form > label { min-width: 0; }
@@ -1730,6 +1745,9 @@
         .project-overview { display: none; }
         .runs-layout { grid-template-columns: 1fr; }.runs-overview-rail { display: none; }
         .runs-layout.drawer-open { grid-template-columns: minmax(380px, .75fr) minmax(520px, 1.25fr); }
+        .composer { width: min(760px, calc(100% - 32px)); }
+        .composer-box { grid-template-columns: 40px minmax(0, 1fr); }
+        .composer-actions { grid-column: 1 / -1; justify-content: flex-end; }
       }
       @media (max-width: 900px) {
         .welcome-stage { grid-template-columns: 1fr; align-items: start; padding: 54px 34px 180px; }
@@ -1744,6 +1762,8 @@
         .topbar { padding: 0 18px; }.topbar-label i { width: 70px; }.topbar-project .project-online { display: none; }#sidebarProjectSelect { width: 170px; }.view { padding: 24px 18px; }
         .chat-view { height: calc(100vh - 134px); }.welcome-stage { padding: 40px 22px 170px; }.chat-welcome h1 { font-size: 42px; }
         .composer { width: calc(100% - 28px); bottom: 10px; }.composer-meta { display: none; }
+        .answer, .answer-status { width: calc(100% - 28px); }
+        .answer { padding: 22px 18px 26px; }
         .files-layout { grid-template-columns: 1fr; }.files-rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 25px; }
         .project-switch-bar { gap: 10px; }.project-switch-label { padding-right: 14px; }.project-tab { padding: 0 16px; }.project-sync-status { display: none; }
         .document-columns { display: none; }.document-index, .document-list { min-width: 0; overflow: hidden; }.document-row { width: 100%; grid-template-columns: 28px minmax(0, 1fr); }.document-row > .muted { display: none; }.document-row .row-actions { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
@@ -1855,14 +1875,8 @@
             <div class="chat-messages" id="chatMessages" hidden></div>
             <div class="thinking-feed" id="thinkingFeed" hidden></div>
             <details class="trace-summary" id="traceSummary" hidden><summary>检索与推理已完成</summary><p>已完成检索、原文阅读与证据整理。</p></details>
-            <article class="answer" id="answerPanel" hidden>
-              <div class="answer-meta" id="answerMeta"></div>
-              <div class="answer-text" id="answerText"></div>
-              <div class="answer-sources" id="answerSources" hidden>
-                <h4>来源文献</h4>
-                <ul id="answerSourcesList"></ul>
-              </div>
-            </article>
+            <div class="answer-status" id="answerStatus" hidden aria-live="polite">正在检索、阅读并组织证据…</div>
+            <div class="answer-history" id="answerHistory" hidden></div>
           </div>
           <div class="composer">
             <div class="attachment-bar" id="attachmentBar" hidden></div>
@@ -2500,6 +2514,8 @@
       function showWelcome() {
         $("chatWelcome").hidden = false;
         $("chatMessages").hidden = true;
+        if ($("answerHistory")) $("answerHistory").hidden = true;
+        if ($("answerStatus")) $("answerStatus").hidden = true;
       }
 
       function showMessages() {
@@ -2513,44 +2529,48 @@
         if ($("sendButton")) $("sendButton").textContent = active ? "···" : "→";
         if ($("composerHint")) $("composerHint").textContent = active ? "正在检索、阅读并组织证据…" : "可尝试：“比较不同力场的适用范围”";
         if ($("stopGenerationButton")) $("stopGenerationButton").hidden = !active;
+        if (active && $("chatWelcome")) $("chatWelcome").hidden = true;
+        if ($("answerStatus")) {
+          $("answerStatus").hidden = !active;
+          if (active) $("answerStatus").textContent = "正在检索、阅读并组织证据…";
+        }
         if (!active) setQueueChoice(null);
       }
 
       function showAnswer(meta, text, citations) {
-        $("answerPanel").hidden = false;
-        if ($("traceSummary")) $("traceSummary").hidden = false;
-        $("answerMeta").replaceChildren();
+        $("chatWelcome").hidden = true;
+        $("chatMessages").hidden = true;
+        if ($("answerStatus")) $("answerStatus").hidden = true;
+        if ($("thinkingFeed")) $("thinkingFeed").hidden = true;
+        if ($("traceSummary")) $("traceSummary").hidden = true;
+        var history = $("answerHistory");
+        if (!history) return;
+        history.hidden = false;
+        var panel = document.createElement("article");
+        panel.className = "answer";
+        var metaBox = document.createElement("div");
+        metaBox.className = "answer-meta";
+        var textBox = document.createElement("div");
+        textBox.className = "answer-text";
+        var sourcesBox = document.createElement("div");
+        sourcesBox.className = "answer-sources";
+        sourcesBox.hidden = true;
+        panel.appendChild(metaBox);
+        panel.appendChild(textBox);
+        panel.appendChild(sourcesBox);
         (meta || []).forEach(function (item) {
           var chip = document.createElement("span");
           chip.textContent = item;
-          $("answerMeta").appendChild(chip);
+          metaBox.appendChild(chip);
         });
-        renderCitedText(text, $("answerText"), citations);
-        renderSources(citations, $("answerSources"));
+        renderCitedText(text, textBox, citations);
+        renderSources(citations, sourcesBox);
+        history.appendChild(panel);
       }
 
       function appendMessage(role, content, meta, citations) {
-        var box = $("chatMessages");
-        if (!box) return;
-        showMessages();
-        var div = document.createElement("div");
-        div.className = "message " + role;
-        var label = document.createElement("strong");
-        var roleNames = { user: "你", agent: "回答", tool: "工具" };
-        var roleName = roleNames[role] || role;
-        label.textContent = meta ? roleName + " · " + meta : roleName;
-        var body = document.createElement("div");
-        renderCitedText(content || "", body, citations);
-        div.appendChild(label);
-        div.appendChild(body);
-        if ((role === "agent" || role === "tool") && citations && citations.length) {
-          var sourcesBox = document.createElement("div");
-          sourcesBox.className = "message-sources";
-          renderSources(citations, sourcesBox);
-          div.appendChild(sourcesBox);
-        }
-        box.appendChild(div);
-        box.scrollTop = box.scrollHeight;
+        // 问题、工具步骤和中间回答不进入正文，只在最终答案卡中呈现结果。
+        return;
       }
 
       function clearThinking() {
@@ -2613,7 +2633,10 @@
           var streamedCitations = [];
           var streamMeta = [];
           clearThinking();
-          showAnswer([], "正在分析...");
+          if ($("answerStatus")) {
+            $("answerStatus").hidden = false;
+            $("answerStatus").textContent = "正在分析…";
+          }
 
           function read() {
             return reader.read().then(function (result) {
@@ -2625,7 +2648,10 @@
                 var event = parseSSE(part);
                 if (!event) return;
                 if (event.name === "start") {
-                  showAnswer([], "正在分析...");
+                  if ($("answerStatus")) {
+                    $("answerStatus").hidden = false;
+                    $("answerStatus").textContent = "正在分析…";
+                  }
                 }
                 if (event.name === "route") {
                   var routeMeta = event.data && event.data.metadata ? event.data.metadata : {};
@@ -2643,12 +2669,12 @@
                 if (event.name === "token") {
                   setQueueChoice(null);
                   streamedAnswer += event.data && event.data.delta ? event.data.delta : "";
-                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
+                  if ($("answerStatus")) $("answerStatus").textContent = "正在生成最终答案…";
                 }
                 if (event.name === "citation") {
                   var citationIndex = event.data && Number.isInteger(event.data.index) ? event.data.index : streamedCitations.length;
                   streamedCitations[citationIndex] = event.data;
-                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
+                  if ($("answerStatus")) $("answerStatus").textContent = "正在整理来源…";
                 }
                 if (event.name === "final") finalData = event.data;
                 if (event.name === "error") {
@@ -2674,7 +2700,6 @@
             var citations = data && Array.isArray(data.citations) ? data.citations : [];
             var modelMeta = data && data.model ? [data.model] : streamMeta;
             showAnswer(modelMeta, answer, citations);
-            appendMessage("agent", answer, data && data.model ? data.model : null, citations);
             if (data && data.session_id) {
               activeSessionId = data.session_id;
               loadAgentSessions();
@@ -2697,7 +2722,6 @@
       }
 
       function runRag(question) {
-        appendMessage("user", question);
         var payload = { project_slug: activeProjectSlug, question: question, save_answer: true };
         if (activeDocumentId) {
           payload.document_id = activeDocumentId;
@@ -2710,7 +2734,6 @@
           var answer = data.answer_markdown || "未返回答案。";
           var citations = data.citations || [];
           showAnswer([], answer, citations);
-          appendMessage("agent", answer, null, citations);
         });
       }
 
@@ -3006,7 +3029,8 @@
       function resetChatSurface() {
         var box = $("chatMessages");
         if (box) box.replaceChildren();
-        $("answerPanel").hidden = true;
+        if ($("answerHistory")) $("answerHistory").replaceChildren();
+        if ($("answerStatus")) $("answerStatus").hidden = true;
         if ($("traceSummary")) $("traceSummary").hidden = true;
         $("questionInput").value = "";
         $("questionInput").focus();
@@ -3706,7 +3730,6 @@
         var attachmentsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         fetchJson(turnsUrl).then(function (turns) {
           renderTurns(turns);
-          $("answerPanel").hidden = true;
           loadAgentSessions();
         }).catch(function (err) {
           showAnswer([], err.message || String(err));
@@ -3725,15 +3748,22 @@
         var box = $("chatMessages");
         if (!box) return;
         box.replaceChildren();
+        if ($("answerHistory")) $("answerHistory").replaceChildren();
         if (!(turns || []).length) {
           showWelcome();
           return;
         }
-        turns.forEach(function (turn) {
-          // 工具内部输出（rag.answer 等证据转储）不进聊天流，只保留推理摘要
-          if (turn.role === "tool") return;
-          appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type, turn.citations);
+        // 恢复同一会话中的全部最终答案；用户问题和工具输出仍不进入答案区。
+        var finalTurns = turns.filter(function (turn) {
+          return turn.role === "agent" && turn.content;
         });
+        if (finalTurns.length) {
+          finalTurns.forEach(function (turn) {
+            showAnswer([], turn.content, turn.citations || []);
+          });
+        } else {
+          showWelcome();
+        }
       }
 
       function renderAttachments() {
@@ -3857,7 +3887,6 @@
         if (!question) return;
         $("sendButton").disabled = true;
         setResearchingState(true);
-        showAnswer([], "正在分析...");
         clearThinking();
         var task = $("queryMode").value === "agent" ? runAgent(question) : runRag(question);
         task.then(function () {
