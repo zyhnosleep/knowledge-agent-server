@@ -1,5 +1,46 @@
 # Knowledge Agent 工作记录
 
+## 2026-08-11/12 T1a/T1b/T2/T3 实现部署 + 前端三问题修复 + 布局 P0 剩余项
+
+### T1a/T1b/T2/T3 四个 ticket（已实现、已部署 8002、40 轮回归通过）
+
+- T1a 表格写回：canonical-v4 摄取把 parent table chunks 写回 `metadata_json.document_intelligence.tables`，并附 charmm36 存量迁移脚本（不重摄取）。
+- T1b 检索使用：指代查询放宽 `_table_block_matches_query` 过滤 + 轻量会话锚点（每轮记录引用表格标识、指代查询注入候选清单）。
+- T2 质量拦截：verify 启发式（n-gram 重复率/噪音比触发 retry warning）+ 空答案重试仍空时交付显式降级标记。
+- T3 生成约束：`prompt_rules.py` 统一四类约束——回答语言跟随用户问题（中文问题答中文）、禁止内部元数据输出（submission ID/地址/日期/版本号等，引用只用 [0]）、超出证据的推断显式标记（推测/推断/解读）、公式与力场术语输出可读 Unicode（χ₁、φ/ψ、Ala₃、≤、°），禁止 LaTeX 命令源码（`\mathrm{...}`、`\chi_{1}`、`$...$`）。
+- 本地全量测试通过（85 个 synthesizer 专项 + 前端静态回归）；40 题回归 40/40 completed，无 degraded、无模板化答案，用户确认"没有问题可以接受"。
+- 部署：`src/app/static/index.html`、`src/app/services/prompt_rules.py` 等 SHA-256 校验同步到 `/home/zhangyh/knowledge-agent-dev`，重启 `knowledge-agent-dev-api`（8002）active，HTTP 200。
+- 回归评估脚本：`D:/temp/claude/charmm36_chat_eval_regression*.py`（40 题七阶段：上下文建立、连续指代、侧链参数、表格连续追问、错误前提攻击、跨主题返回、长上下文一致性），远端 `CUDA_VISIBLE_DEVICES=0` 运行，报告输出到 `runtime/task15/charmm36-chat-eval-regression-*.json`。
+
+### 前端问题 1：聊天流隐藏工具消息（已部署）
+
+- `renderTurns` 跳过 `turn.role === "tool"`，`工具 · rag.answer …` 等证据转储不再进聊天流，只保留推理摘要。
+
+### 前端问题 3：LaTeX → 可读 Unicode（已部署）
+
+- 前端 `latexToReadable()`：链条紧凑（`\mathrm { A l a } _ { 3 }` → Ala₃）、纯数字下标转 Unicode（₃ ₁）、含字母下标保留下划线形态（`F_calc`、`C7_eq`）、希腊字母/符号表（`\chi`→χ、`\leq`→≤、`0^\circ`→0°）、数学模式标记清理（`\(\)`、`$`）、双反斜杠归一、数字前空格不压缩（保护 "Table 7"）。
+- 修复过程中踩过的坑：链条正则 D 分支误吞裸数字（`RMSD > 2.0` → `RMSD >2.0`）；`/` 与 `-` 的 lookahead 不消费字符导致双份符号；字母下标半转混搭（`Fcₐlc`）；`Table 7` 被空格压缩误伤；真实样本新形态（数学模式标记、双反斜杠、`\varphi`/`\circ`）。
+- 治本：`prompt_rules.py` 新增 LATEX_FREE_RULE（第 4 条），生成端直接输出可读 Unicode。
+- 验证：16/16 单元用例 + 13 轮含 LaTeX 真实答案转换验证 + 85 个后端测试通过。
+
+### 前端问题 2：聊天布局修缮（已部署，用户提供详细分析）
+
+- P0 底部输入框遮挡正文：`.chat-surface` 底部安全区 210px + `.chat-view::after` 150px 渐变遮罩（z-index 4 < composer 5），正文滚到底不被输入框盖住；welcome padding 同步调整。
+- 暗色滚动条：webkit `::-webkit-scrollbar` + `scrollbar-width: thin`，hover 增强。
+- 内容列 850→1020px、composer 820→900px；会话卡片红色删除按钮改为 hover/focus-within 才显示。
+- 品牌区压缩 64px（删冗余 product-name 行，wordmark small 改为 "RAG Research"）。
+- Agent 下拉改名"Agent 模式 / 标准 RAG"并加 title 说明；附件按钮 `⌕`→`＋`；topbar 进度线弱化；project-online 11px。
+
+### 布局 P0 剩余两项（2026-08-12 已部署，40 轮回归运行中）
+
+- 正文结构层级模块化（结论/证据/引用/不确定性分块）：
+  - 后端治本：`prompt_rules.py` 第 5 条 `answer_structure_rule`——较长答案用 `## 结论 / ## 证据 / ## 不确定性` 固定标题分节（中文问题中文标题、英文问题英文标题，如 `## Conclusion`；不适用的小节省略、简单问题无需标题）。
+  - 前端 `renderCitedText` 重构为轻量 markdown 渲染器：`## 标题` → 色条区块（结论=绿 / 证据=蓝 / 不确定性=琥珀 / 来源=紫 / 其他=灰），12px 等宽小标题；`**粗体**`、`-`/`1.` 列表正常渲染；`[N]` 引用上标与点击溯源交互保留；无标题答案保持平文本。
+  - node 单元测试 9 组全过（分块/分类/列表/粗体/LaTeX 集成）；踩坑：JS 字符串未知转义 `"\chi"` 会被丢弃反斜杠变成 `"chi"`（bash -e 内嵌字符串 + 测试字面量双陷阱，最终用文件调试脚本定位）。
+- 状态位置统一（用户选 topbar 左侧方案）：项目下拉 + `INDEX ONLINE` 从侧栏底部移到 topbar 左侧，服务健康 + 账号在右侧，侧栏回归纯会话列表；保留 `sidebarProjectSelect`/`sidebarProjectSwitcher` ID，JS 零改动；≤768px 隐藏 INDEX ONLINE、收窄下拉。
+- 本地验证：`test_agent_synthesizer.py` 85/85、`test_static_frontend.py` 78/78、全量 2091 passed（修复 2 个测试：品牌断言随设计更新删 "NIGHT RESEARCH INSTITUTE"；`test_inline_script_is_valid_javascript` 在 Windows GBK 下无法编码 Unicode 下标 `₀`，stdin 改 UTF-8）。
+- 已部署：SHA-256 校验一致，重启后 HTTP 200，页面含 27 处新标记（`topbar-project`、`answer-section` 等）；40 轮回归（sid `charmm36-chat-eval-regression-20260812-structure`）远端后台运行中，重点检查新答案是否带结构化标题、无降级/模板化。
+
 ## 2026-08-06 Task 9：主控续作、本地验证与 GPU0 candidate 同步
 
 - 按用户要求，本轮不再使用 `codex-with-cc` 或子智能体，全部由主控窗口执行；工作树为 `codex/internal-pilot`。
