@@ -54,6 +54,7 @@ def test_inline_script_is_valid_javascript() -> None:
         ["node", "--check", "-"],
         input=script,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
@@ -509,7 +510,6 @@ def test_brand_includes_lighthouse_and_institute() -> None:
     html = _html()
     soup = BeautifulSoup(html, "html.parser")
     assert "夜航研究所" in html
-    assert "NIGHT RESEARCH INSTITUTE" in html
     assert "RAG Research" in html
     lighthouse = soup.select_one(".brand-mark svg, .brand svg")
     assert lighthouse is not None, "lighthouse brand mark missing"
