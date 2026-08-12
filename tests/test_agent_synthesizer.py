@@ -292,11 +292,20 @@ def test_answer_rules_follow_query_language_and_ban_metadata(monkeypatch) -> Non
     assert "Never output internal document metadata" in chinese
     assert "submission IDs" in chinese
     assert "mark it explicitly as inference" in chinese
+    assert "readable Unicode text" in chinese
+    assert "never as LaTeX command source" in chinese
+    assert "## 结论" in chinese
+    assert "## 证据" in chinese
+    assert "## 不确定性" in chinese
 
     english = AgentSynthesizer._answer_rules("Why did the authors choose C36?")
     assert "Answer in English" in english
     assert "Answer in Chinese" not in english
     assert "Never output internal document metadata" in english
+    assert "## Conclusion" in english
+    assert "## Evidence" in english
+    assert "## Uncertainty" in english
+    assert "## 结论" not in english
 
 
 def test_ollama_synthesis_prompt_includes_t3_answer_rules(monkeypatch) -> None:

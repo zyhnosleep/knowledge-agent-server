@@ -50,13 +50,47 @@ INFERENCE_MARKING_RULE = (
     "evidence-stated facts."
 )
 
+# 数学可读性：公式与力场术语直接写成 Unicode 可读字符，
+# 不得输出 LaTeX 命令源码（前端无法渲染 LaTeX）。
+LATEX_FREE_RULE = (
+    "IMPORTANT: Write mathematical symbols, chemical formulas, and "
+    "force-field terms as readable Unicode text (e.g. χ₁, φ/ψ, Ala₃, "
+    "α_R, ≤, °) — never as LaTeX command source such as "
+    "\\mathrm{...}, \\chi_{1}, _ { 3 }, \\leq, or $...$ math markers."
+)
+
+
+# 答案结构：较长答案用固定小节标题分块（结论 / 证据 / 不确定性），
+# 前端按标题渲染为色条区块；不适用的小节省略，简单问题可无标题。
+def answer_structure_rule(query: str | None) -> str:
+    """返回一条跟随 *query* 语言的结构化约束指令。"""
+    if re.search(r"[一-鿿]", query or ""):
+        return (
+            "IMPORTANT: Organize longer answers into clear sections with "
+            "exact headings '## 结论', '## 证据', '## 不确定性' (omit any "
+            "section that does not apply; a simple direct answer needs no "
+            "headings). Keep the headings verbatim so the UI can render "
+            "them as sections."
+        )
+    return (
+        "IMPORTANT: Organize longer answers into clear sections with exact "
+        "headings '## Conclusion', '## Evidence', '## Uncertainty' (omit "
+        "any section that does not apply; a simple direct answer needs no "
+        "headings). Keep the headings verbatim so the UI can render them "
+        "as sections."
+    )
+
 
 def answer_rules(query: str | None) -> str:
-    """组装三条生成约束（T3），供 synthesize system prompt 整块插入。"""
+    """组装五条生成约束（T3 + LaTeX 可读性 + 答案结构），供 synthesize system prompt 整块插入。"""
     return (
         language_rule(query)
         + "\n"
         + METADATA_BAN_RULE
         + "\n"
         + INFERENCE_MARKING_RULE
+        + "\n"
+        + LATEX_FREE_RULE
+        + "\n"
+        + answer_structure_rule(query)
     )
