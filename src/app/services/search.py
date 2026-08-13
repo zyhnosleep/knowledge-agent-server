@@ -1242,6 +1242,7 @@ class QueryService:
                     contexts,
                     profile_terms,
                     limit=4 if self._is_scientific_evidence_query(question) else 2,
+                    question=question,
                 )
             )
         if not contexts and not document_ids and not is_overview:
@@ -2217,6 +2218,8 @@ class QueryService:
         contexts: list[RetrievedContext],
         profile_terms: list[str],
         limit: int = 2,
+        *,
+        question: str = "",
     ) -> list[RetrievedContext]:
         if not document_ids or not profile_terms:
             return []
@@ -2249,6 +2252,17 @@ class QueryService:
             ]
             if not matched_terms:
                 continue
+            # 2026-08-13：补充术语必须与当前问题相关，否则文档级 profile
+            # 术语表高频块（训练配置 Table 6/7 等）以 3.0+1.5n 的分数无
+            # 差别占位，压过向量检索命中的问题相关证据（Forward KL 查询：
+            # Table 6/7 以 12.0 排前二，证据包里无任何 KL 公式内容）。
+            # matched 术语与 query 词元零交集 → 该 chunk 与问题无语义
+            # 关联，跳过（"OPSD 用什么优化器" 这类查询的 profile 术语
+            # 与 query 有交集，仍可命中训练配置表）。
+            if question:
+                query_terms = self._tokenize(question)
+                if not any(self._tokenize(term) & query_terms for term in matched_terms):
+                    continue
             query_terms = self._tokenize(" ".join(matched_terms))
             excerpt = self._window_text(chunk.text, query_terms, max_chars=1000, question=" ".join(matched_terms))
             score = 3.0 + len(matched_terms) * 1.5
@@ -2451,12 +2465,20 @@ class QueryService:
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
-            rare_route_bonus = min(rare_route_overlap * 1.1, 3.0)
+            # 稀有 profile 术语在 chunk 中出现 ≠ 与当前问题相关：旧上限 3.0
+            # 足以把含多个稀有术语但与问题无关的 chunk（如训练配置正文）
+            # 推过纯向量分高的问题相关证据（2026-08-13 Forward KL 查询：
+            # 值函数 chunk 借 rare_route_bonus +3.0 压过向量分 6.13 的
+            # Table 3 与 5.21 的 KL(pT ∥pS) 正文，导致回答误报"证据无公式"）。
+            # 削减为 0.6/个、上限 1.2：保留"术语定义所在地"提权意图，但不
+            # 再主导排序。
+            rare_route_bonus = min(rare_route_overlap * 0.6, 1.2)
             if chunk.id in vector_scores_by_chunk_id:
                 score = vector_scores_by_chunk_id[chunk.id]
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
             elif question_vector and chunk.embedding:
-                score = cosine_similarity(question_vector, chunk.embedding)
+                # 与 _vector_distance_score 同尺度（10×cosine），两条向量路径可比。
+                score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
             else:
                 total_overlap = overlap + route_overlap
@@ -3151,7 +3173,12 @@ class QueryService:
 
     @staticmethod
     def _vector_distance_score(distance: float) -> float:
-        return 1.0 / (1.0 + max(float(distance), 0.0))
+        # 2026-08-13：旧式 1/(1+d) 把 0.61 与 0.25 的余弦相似度压缩成 0.72
+        # 与 0.57（全部命中挤在 ~0.09 宽区间），词法 bonus（≤2.0）主导排序，
+        # 语义相关证据（Forward KL 查询的 Table 3/formula/KL narrative，
+        # 相似度 0.59-0.61 全场最高）反而排不进证据包。改为 10×cosine
+        # 相似度拉开语义差距，词法 bonus 退居同档并列时的微调。
+        return max(0.0, 10.0 * (1.0 - max(float(distance), 0.0)))
 
     @staticmethod
     def _context_has_metric_numbers(text: str) -> bool:
