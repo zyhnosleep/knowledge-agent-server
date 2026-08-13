@@ -3495,16 +3495,61 @@ class QueryService:
                 context_text,
             ]
         )
+        def _accept_free_text_fallback(exc: BaseException) -> QueryAnswerPayload | None:
+            """schema 软约束下模型输出自然语言回答时，直接接受为答案。
+
+            ollama 对 qwen3.5:9b 的 format=schema 是提示式软约束（非硬
+            grammar），模型高频输出完整自然语言回答而非 JSON（2026-08-13
+            实测 10 次 draft 失败 9 次，原始输出为完整中文 markdown；
+            历史 Task 18 也记录过 ``[1]`` 数组输出）。解析失败异常携带
+            原始输出（ai.generate_structured 以 add_note 透传），此处
+            判定：合理自然语言（非空、非 ``[0, 3]`` 短数组垃圾）直接
+            包装为 QueryAnswerPayload，引用编号从文本 ``[n]`` 提取，
+            提取不到则全量引用（draft verify 会过滤）。
+            """
+            raw = None
+            for note in getattr(exc, "__notes__", []) or []:
+                if note.startswith("raw_content="):
+                    raw = note[len("raw_content="):]
+                    break
+            text = (raw or "").strip()
+            if len(text) < 30:
+                return None
+            # 拒绝纯数组形态（被挖出的 "[0, 3]" 类 JSON 片段）
+            if text.startswith("[") and text.endswith("]") and len(text) < 80:
+                return None
+            citations = [
+                int(m) for m in re.findall(r"\[(\d+)\]", text) if int(m) < len(contexts)
+            ]
+            if not citations:
+                citations = list(range(len(contexts)))
+            return QueryAnswerPayload(
+                answer_markdown=text,
+                citations=citations,
+                risk_level="high" if self._is_high_risk(question) else "normal",
+            )
+
         def generate_with_query_timeout() -> QueryAnswerPayload:
             original_timeout = getattr(self.ollama, "timeout", None)
             if original_timeout is not None:
                 self.ollama.timeout = min(float(original_timeout), QUERY_GENERATION_TIMEOUT_SECONDS)
             try:
-                return self.ollama.generate_structured(
-                    QueryAnswerPayload,
-                    system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
-                    user_prompt=prompt,
-                )
+                try:
+                    return self.ollama.generate_structured(
+                        QueryAnswerPayload,
+                        system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
+                        user_prompt=prompt,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    accepted = _accept_free_text_fallback(exc)
+                    if accepted is not None:
+                        logger.warning(
+                            "Draft schema failure; accepted free-text answer (%d chars, %d citations)",
+                            len(accepted.answer_markdown),
+                            len(accepted.citations),
+                        )
+                        return accepted
+                    raise
             finally:
                 if original_timeout is not None:
                     self.ollama.timeout = original_timeout

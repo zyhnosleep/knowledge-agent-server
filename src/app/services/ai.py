@@ -345,10 +345,14 @@ class OllamaClient:
         try:
             return self._parse_structured_content(schema, content)
         except Exception as exc:  # noqa: BLE001
+            # 模型原始输出随异常透传（调用方"自由文本接受"决策依据）：
+            # ollama 对 qwen3.5 的 format=schema 是提示式软约束，模型高频
+            # 输出自然语言回答而非 JSON，原始文本必须到达调用方才能被接受。
+            try:
+                exc.add_note(f"raw_content={str(content)[:6000]}")
+            except Exception:  # noqa: BLE001
+                pass
             # Schema 约束输出失败：退回宽松 JSON 模式重试
-            # 日志附带模型原始输出前 500 字符——诊断"输出被挖出证据编号数组"
-            # 类失败的关键证据（ollama 对 qwen3.5 的 format=schema 是软约束，
-            # 模型可能输出自由文本而非纯 JSON）。
             logger.warning(
                 "Structured schema response was invalid; retrying with JSON mode: %s (raw=%.500s)",
                 exc,
@@ -367,6 +371,10 @@ class OllamaClient:
             try:
                 return self._parse_structured_content(schema, retry_content)
             except Exception as retry_exc:  # noqa: BLE001
+                try:
+                    retry_exc.add_note(f"raw_content={str(retry_content)[:6000]}")
+                except Exception:  # noqa: BLE001
+                    pass
                 # JSON 模式重试也失败：记录原始输出后原样抛出（调用方重试/兜底）
                 logger.warning(
                     "JSON mode retry also failed for %s: %s (raw=%.500s)",
