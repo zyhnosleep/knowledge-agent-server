@@ -1740,6 +1740,11 @@ class IngestionPipeline:
         - 其余字段直接映射（含上下文前缀、上下文化模型/版本、切分器信息、
           语义边界分数、token 计数等）。
         """
+        # PostgreSQL text 字段不接受 NUL (0x00) 字节；PDF 解析产物偶含
+        # 二进制 NUL，写库前统一剔除，避免 index 阶段 DataError。
+        def _strip_nul(value):
+            return value.replace("\x00", "") if isinstance(value, str) else value
+
         contextualized_at = getattr(draft, "contextualized_at", None)
         if isinstance(contextualized_at, str):
             contextualized_at = datetime.fromisoformat(contextualized_at)
@@ -1759,14 +1764,14 @@ class IngestionPipeline:
             chunk_role=draft.chunk_role,
             block_type=draft.block_type,
             ordinal=draft.ordinal,
-            heading=draft.section_path[-1] if draft.section_path else None,
+            heading=_strip_nul(draft.section_path[-1] if draft.section_path else None),
             page_label=page_label,
             section_path=list(draft.section_path),
             source_block_ids=list(draft.source_block_ids),
             source_spans=source_spans,
-            text=draft.text,
-            contextual_prefix=getattr(draft, "contextual_prefix", None),
-            embedding_text=draft.embedding_text,
+            text=_strip_nul(draft.text),
+            contextual_prefix=_strip_nul(getattr(draft, "contextual_prefix", None)),
+            embedding_text=_strip_nul(draft.embedding_text),
             contextualization_model=getattr(draft, "contextualization_model", None),
             contextualization_version=getattr(draft, "contextualization_version", None),
             contextualization_prompt_version=getattr(

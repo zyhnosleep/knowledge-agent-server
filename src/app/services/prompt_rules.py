@@ -55,8 +55,11 @@ INFERENCE_MARKING_RULE = (
 LATEX_FREE_RULE = (
     "IMPORTANT: Write mathematical symbols, chemical formulas, and "
     "force-field terms as readable Unicode text (e.g. χ₁, φ/ψ, Ala₃, "
-    "α_R, ≤, °) — never as LaTeX command source such as "
-    "\\mathrm{...}, \\chi_{1}, _ { 3 }, \\leq, or $...$ math markers."
+    "α_R, ≤, °) — never as LaTeX source. In particular: no backslash "
+    "escapes of any kind (\\|, \\_, \\theta, \\mathrm), no _{...} / "
+    "^{...} / _ { ... } group syntax, and no $...$ math markers. Use "
+    "a plain underscore for subscripts (y_<n, p_T) and a plain "
+    "vertical bar for conditions (p_T(y_n | x))."
 )
 
 

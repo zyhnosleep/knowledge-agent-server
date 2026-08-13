@@ -2133,10 +2133,10 @@
         return null;
       }
 
-      var LATEX_SUB = { "0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉","+":"₊","-":"₋","a":"ₐ","e":"ₑ","i":"ᵢ","n":"ₙ","x":"ₓ" };
+      var LATEX_SUB = { "0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉","+":"₊","-":"₋","a":"ₐ","e":"ₑ","h":"ₕ","i":"ᵢ","j":"ⱼ","k":"ₖ","l":"ₗ","m":"ₘ","n":"ₙ","o":"ₒ","p":"ₚ","r":"ᵣ","s":"ₛ","t":"ₜ","u":"ᵤ","v":"ᵥ","x":"ₓ" };
       var LATEX_SUP = { "0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹","+":"⁺","-":"⁻","a":"ᵃ","b":"ᵇ","c":"ᶜ","d":"ᵈ","e":"ᵉ","n":"ⁿ","x":"ˣ" };
       var LATEX_GREEK = { "chi":"χ","alpha":"α","beta":"β","gamma":"γ","delta":"δ","epsilon":"ε","zeta":"ζ","eta":"η","theta":"θ","iota":"ι","kappa":"κ","lambda":"λ","mu":"μ","nu":"ν","xi":"ξ","pi":"π","rho":"ρ","sigma":"σ","tau":"τ","upsilon":"υ","phi":"φ","varphi":"φ","psi":"ψ","omega":"ω" };
-      var LATEX_SYM = { "leq":"≤","geq":"≥","times":"×","pm":"±","approx":"≈","sim":"≈","circ":"°","degree":"°","neq":"≠","rightarrow":"→","infty":"∞" };
+      var LATEX_SYM = { "leq":"≤","geq":"≥","times":"×","pm":"±","approx":"≈","sim":"≈","circ":"°","degree":"°","neq":"≠","rightarrow":"→","infty":"∞","mid":"|","vert":"|","parallel":"‖","Vert":"‖" };
 
       function mapLatexChars(chars, map) {
         return Array.prototype.map.call(chars, function (ch) {
@@ -2204,6 +2204,12 @@
         // 3. 无大括号的简单上下标：χ_1 → χ₁、E^2 → E²
         s = s.replace(/_(\d+)/g, function (match, digits) { return mapLatexChars(digits, LATEX_SUB); });
         s = s.replace(/\^(\d+)/g, function (match, digits) { return mapLatexChars(digits, LATEX_SUP); });
+        //    单字符字母下标转 Unicode（p_T → pₜ、y_n → yₙ、α_R → αᵣ）；
+        //    多字符下标（_OPSD、_<n、_eq）保持 _ 形态——后随字母/数字/尖括号时不转
+        s = s.replace(/_([a-zA-Z])(?![a-zA-Z0-9<])/g, function (match, ch) {
+          var u = LATEX_SUB[ch.toLowerCase()];
+          return u !== undefined ? u : match;
+        });
         // 4. 孤立命令（\chi → χ、\leq → ≤，其余命令名删除）、数学模式标记
         //    （\( \) \[ \] $）、残留花括号、孤立上标符、多余空格
         s = s.replace(/\\\\/g, "\\"); // 双反斜杠（转义来源）归一
@@ -2214,6 +2220,8 @@
           return "";
         });
         s = s.replace(/\\[\(\)\[\]]/g, "");
+        // 非字母转义符：剥反斜杠保留原字符（\| → |、\_ → _、\, → ,）
+        s = s.replace(/\\([^a-zA-Z]|$)/g, "$1");
         s = s.replace(/\$/g, "");
         s = s.replace(/[{}]/g, "");
         s = s.replace(/\^/g, "");
@@ -2221,7 +2229,7 @@
         // 5. 残留 LaTeX 源空格：下标/上标前空格（Ala ₃ → Ala₃）、
         //    连字符/斜杠前空格（J -耦合 → J-耦合、C22 / CMAP → C22/CMAP）。
         //    注意：数字前空格不压缩（Table 7、Figure 2 是普通文本，非 LaTeX 源）
-        s = s.replace(/([A-Za-z0-9])\s+(?=[₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹₊₋⁺⁻])/g, "$1");
+        s = s.replace(/([A-Za-z0-9])\s+(?=[₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹₊₋⁺⁻ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ])/g, "$1");
         s = s.replace(/([A-Za-z0-9])\s+-\s*/g, "$1-");
         s = s.replace(/([A-Za-z0-9])\s+\/\s*(?=[A-Za-z0-9])/g, "$1/");
         s = s.replace(/\/\s+(?=[A-Za-z0-9])/g, "/");
@@ -3124,14 +3132,16 @@
         });
       }
 
-      function loadPipelineDashboard() {
+      function loadPipelineDashboard(autoOpen) {
         return fetchJson("/api/pipeline/dashboard?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=200").then(function (data) {
           var activeTopic = (data.topics || [])[0];
           renderMetrics(data.totals || {});
           renderTopicCards(activeTopic);
           if (activeTopic) updateActiveTopicCard(activeTopic);
           renderRuns(data.runs || []);
-          if (!activeSourceDocumentId && data.runs && data.runs.length) {
+          // autoOpen=false（用户手动刷新）时不自动打开文档：避免每次刷新都
+          // 重建 source drawer 的数百个 chunk DOM + PDF iframe 造成卡顿。
+          if (autoOpen !== false && !activeSourceDocumentId && data.runs && data.runs.length) {
             var firstReady = data.runs.find(function (run) { return run.action_available && run.document_id; });
             if (firstReady) openSource(firstReady.document_id, true);
           }
@@ -3389,7 +3399,9 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.forEach(function (chunk, index) {
+        var CHUNK_PAGE_SIZE = 100;
+        var renderedCount = 0;
+        function appendChunkButton(chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";
@@ -3398,7 +3410,21 @@
           button.querySelector("span").textContent = (chunk.heading || data.document_title || "").slice(0, 80);
           button.addEventListener("click", function () { selectChunk(chunk, button); });
           list.appendChild(button);
-        });
+          renderedCount += 1;
+          return button;
+        }
+        chunks.slice(0, CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+        if (chunks.length > CHUNK_PAGE_SIZE) {
+          var more = document.createElement("button");
+          more.className = "chunk-option";
+          more.type = "button";
+          more.innerHTML = '<strong>显示全部 ' + chunks.length + ' 个</strong><span class="muted">当前展示前 ' + CHUNK_PAGE_SIZE + ' 个</span>';
+          more.addEventListener("click", function () {
+            chunks.slice(CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+            more.remove();
+          });
+          list.appendChild(more);
+        }
         selectChunk(chunks[0], list.querySelector(".chunk-option"));
       }
 
@@ -3482,7 +3508,9 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.forEach(function (chunk, index) {
+        var CHUNK_PAGE_SIZE = 100;
+        var renderedCount = 0;
+        function appendChunkButton(chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";
@@ -3491,7 +3519,21 @@
           button.querySelector("span").textContent = (chunk.heading || data.document_title || "").slice(0, 80);
           button.addEventListener("click", function () { selectChunk(chunk, button); });
           list.appendChild(button);
-        });
+          renderedCount += 1;
+          return button;
+        }
+        chunks.slice(0, CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+        if (chunks.length > CHUNK_PAGE_SIZE) {
+          var more = document.createElement("button");
+          more.className = "chunk-option";
+          more.type = "button";
+          more.innerHTML = '<strong>显示全部 ' + chunks.length + ' 个</strong><span class="muted">当前展示前 ' + CHUNK_PAGE_SIZE + ' 个</span>';
+          more.addEventListener("click", function () {
+            chunks.slice(CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+            more.remove();
+          });
+          list.appendChild(more);
+        }
         selectChunk(chunks[0], list.querySelector(".chunk-option"));
       }
 
@@ -3837,7 +3879,20 @@
         });
       });
 
-      $("refreshRunsButton").addEventListener("click", loadPipelineDashboard);
+      $("refreshRunsButton").addEventListener("click", function () {
+        var button = $("refreshRunsButton");
+        if (button.disabled) return;
+        button.disabled = true;
+        var originalText = button.textContent;
+        button.textContent = "刷新中…";
+        loadPipelineDashboard(false).then(function () {
+          button.disabled = false;
+          button.textContent = originalText;
+        }).catch(function () {
+          button.disabled = false;
+          button.textContent = originalText;
+        });
+      });
 
       $("viewParseMarkdownButton").addEventListener("click", function () {
         loadCanonicalMarkdown([], "Canonical Markdown");
