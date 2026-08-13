@@ -409,15 +409,28 @@ class OllamaClient:
     def embed(self, texts: list[str]) -> list[list[float]]:
         """批量计算文本嵌入向量。
 
-        POST ``/api/embed``，请求体带 ``keep_alive``（由
-        ``_with_keep_alive`` 注入）；返回 ``embeddings`` 数组。
+        POST ``/api/embed``；返回 ``embeddings`` 数组。
+
+        显存管理（与生成模型共卡的关键）：
+        - ``keep_alive=0``：嵌入模型用完即卸载，绝不驻留与生成模型
+          争抢显存（曾因 5m 驻留窗口挤掉生成模型导致 schema 输出崩坏）。
+        - ``options.num_ctx=4096``：嵌入模型不需要 32K 上下文，KV cache
+          从 4.5G 降到 ~0.8G；4096 覆盖摄取 chunk 的 p99.9（实测
+          chunk 长度 p95≈630 token，max≈4200 token）。注意此处
+          不走 ``_with_keep_alive``（全局配置会覆盖显式值），body
+          直接构造。
         """
         if not texts:
             return []
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(
                 f"{self.embedding_base_url}/api/embed",
-                json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": texts}),
+                json={
+                    "model": settings.ollama_embedding_model,
+                    "input": texts,
+                    "keep_alive": "0",
+                    "options": {"num_ctx": 4096},
+                },
             )
             response.raise_for_status()
             return response.json()["embeddings"]
