@@ -24,6 +24,7 @@ session_attachments.py —— 会话级临时附件（上传/解析/检索/删�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import Counter
@@ -45,11 +46,39 @@ from app.services.filesystem import (
     compute_sha256,
     safe_project_slug,
 )
-from app.services.parser import ParsedDocument, parse_document
+from app.services.parser import ParsedChunk, ParsedDocument, parse_document
 
 # 模块级日志器与配置单例
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def _parse_attachment_light(path: Path, display_name: str) -> ParsedDocument:
+    """轻量解析会话附件（PDF 走 pypdf 文本层，秒级完成）。
+
+    附件只是临时对话参考材料，不需要正式文档的深度解析链路
+    （MinerU / Document Intelligence 视觉模型逐页分析）——那条链路
+    逐页渲染 PNG 并同步调用视觉模型，分钟级阻塞。文本层提取足够
+    支撑附件检索；非 PDF 格式回退到 ``parse_document``。
+    """
+    from app.services import parser as parser_module
+
+    if path.suffix.lower() == ".pdf":
+        page_texts, _page_count, warnings = parser_module._extract_pdf_text_layer_best_effort(
+            path
+        )
+        chunks = [
+            ParsedChunk(ordinal=idx, text=text)
+            for idx, text in enumerate(page_texts)
+            if text and text.strip()
+        ]
+        return ParsedDocument(
+            title=Path(display_name).stem,
+            text="\n\n".join(chunk.text for chunk in chunks),
+            chunks=chunks,
+            metadata={"parser_source": "pypdf_text_layer", "warnings": warnings},
+        )
+    return parse_document(path)
 
 
 def session_attachment_dir(project_slug: str, session_id: str) -> Path:
@@ -141,9 +170,11 @@ async def save_session_attachment(
     finally:
         await upload.close()
 
-    # 计算内容哈希并解析文档（解析产物供入库与检索使用）
+    # 计算内容哈希并解析文档（解析产物供入库与检索使用）。
+    # 解析是同步重活（PDF 文本层提取），放线程池避免阻塞事件循环——
+    # 单 worker 下同步解析会把整站请求全部堵死。
     sha256 = compute_sha256(target_path)
-    parsed = parse_document(target_path)
+    parsed = await asyncio.to_thread(_parse_attachment_light, target_path, safe_filename)
 
     # 标题优先取解析出的标题，否则退回安全文件名
     title = parsed.title if parsed.title and parsed.title.strip() else safe_filename
