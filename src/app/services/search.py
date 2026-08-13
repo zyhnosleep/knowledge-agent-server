@@ -758,7 +758,14 @@ class QueryService:
 
     @classmethod
     def _determine_support_hint(cls, ctx: "RetrievedContext", question: str) -> str:
-        """Best-effort deterministic support quality label."""
+        """Best-effort deterministic support quality label.
+
+        注意（2026-08-13 code-review 收敛，既定规则非缺陷）：direct 只
+        保留给表格证据路径——表格上下文带 TABLE_CONTEXT_SCORE_BOOST=40
+        恒 ≥15；普通文字证据最高约 11.6（10×cosine + 词法 1.6）永远够
+        不到 15，最多标 contextual。这是有意为之：文字证据一律要求模型
+        综合理解，不贴 direct 防止照抄证据原文（此前出现过的质量事故）。
+        """
         score = ctx.citation.score
         if score >= 15.0:
             return "direct"
@@ -2259,6 +2266,11 @@ class QueryService:
             # matched 术语与 query 词元零交集 → 该 chunk 与问题无语义
             # 关联，跳过（"OPSD 用什么优化器" 这类查询的 profile 术语
             # 与 query 有交集，仍可命中训练配置表）。
+            # 注意（2026-08-13 code-review 收敛）：这是逐字交集过滤——
+            # 同义词/翻译/符号表达（"前向散度" vs forward_kl）零交集即
+            # 被跳过，是有意限制而非缺陷：放宽会重新引入 Table 6/7
+            # 占位问题，且语义兜底属于向量路径的职责（10×cosine 已把
+            # 语义相关证据排在前面）。等真实同义查询失败案例出现再处理。
             if question:
                 query_terms = self._tokenize(question)
                 if not any(self._tokenize(term) & query_terms for term in matched_terms):
@@ -2473,13 +2485,17 @@ class QueryService:
             # 削减为 0.6/个、上限 1.2：保留"术语定义所在地"提权意图，但不
             # 再主导排序。
             rare_route_bonus = min(rare_route_overlap * 0.6, 1.2)
+            # 通用词法 cap 0.8 → 0.4（2026-08-13 code-review 收敛）：与 rare
+            # 上限 1.2 合计最多 1.6（≈0.16 余弦）。向量分已改 10×cosine 拉开
+            # 语义差距，词法只保留"同档并列时的微调"，不再允许字面重合
+            # 反超语义差 0.16 余弦以上的证据。
             if chunk.id in vector_scores_by_chunk_id:
                 score = vector_scores_by_chunk_id[chunk.id]
-                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
             elif question_vector and chunk.embedding:
                 # 与 _vector_distance_score 同尺度（10×cosine），两条向量路径可比。
                 score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
-                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
             else:
                 total_overlap = overlap + route_overlap
                 if total_overlap:
@@ -3126,7 +3142,65 @@ class QueryService:
                 <= budget
             ):
                 selected.append(fallback)
+                continue
+            # 2026-08-13：excerpt 仍超预算的 chunk 不再直接丢弃 ——
+            # 95039e2 把向量分改成 10×cosine 后排序变化，含问题关键科学
+            # 短语的 chunk（ff99sb_disp_overview 的 "London dispersion" 所在
+            # chunk 从 index 4 掉到 8；f27e99b 时代 4/4 通过，现在 0/2 稳定
+            # 失败）在预算耗尽时被整块丢弃，模型 prompt 缺失术语字面 →
+            # 答案必然缺验收词。抢救：以 chunk 内首个科学短语为锚保留
+            # 最小窗口，术语字面必须进 prompt（_build_answer_constraints
+            # 的 evidence_phrases 据此注入 "Preserve ... exactly" 指令）。
+            rescue = self._rescue_term_window(context, question=question)
+            if rescue:
+                # _context_evidence_text 会追回 citation.excerpt（5720 行）：
+                # 不把 excerpt 一起清掉，400 字符窗口会被 2522 字符的原文
+                # 重新拼回，抢救等于没做（token 预算照样爆）。
+                rescue_context = replace(
+                    context,
+                    prompt_text=rescue,
+                    context_text=rescue,
+                    neighbor_text="",
+                    # Citation 是 pydantic BaseModel（非 dataclass）：
+                    citation=context.citation.model_copy(update={"excerpt": ""}),
+                )
+                rescue_candidate = [*selected, rescue_context]
+                if (
+                    self._count_retrieval_tokens(representation(rescue_candidate))
+                    <= budget
+                ):
+                    selected.append(rescue_context)
         return selected
+
+    @classmethod
+    def _rescue_term_window(
+        cls,
+        context: RetrievedContext,
+        *,
+        question: str = "",
+        max_chars: int = 400,
+    ) -> str:
+        """被 token 预算丢弃的 chunk 的最小抢救窗口（以科学短语为锚）。
+
+        返回覆盖 chunk 内首个 evidence-phrase 命中的短窗口；无短语命中
+        时返回空串（调用方照旧丢弃该 chunk）。
+        """
+        full = cls._context_evidence_text(context)
+        if not full:
+            return ""
+        lowered = full.lower()
+        positions = [
+            lowered.find(phrase.lower())
+            for phrase in cls._salient_evidence_phrases([context], limit=16)
+        ]
+        positions = [position for position in positions if position >= 0]
+        if not positions:
+            return ""
+        anchor = min(positions)
+        start = max(0, anchor - max_chars // 4)
+        end = min(len(full), start + max_chars)
+        start = max(0, end - max_chars)
+        return full[start:end]
 
     @classmethod
     def _remove_prompt_overlap(cls, text: str, previous_texts: list[str]) -> str:
@@ -3561,22 +3635,11 @@ class QueryService:
             if original_timeout is not None:
                 self.ollama.timeout = min(float(original_timeout), QUERY_GENERATION_TIMEOUT_SECONDS)
             try:
-                try:
-                    return self.ollama.generate_structured(
-                        QueryAnswerPayload,
-                        system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
-                        user_prompt=prompt,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    accepted = _accept_free_text_fallback(exc)
-                    if accepted is not None:
-                        logger.warning(
-                            "Draft schema failure; accepted free-text answer (%d chars, %d citations)",
-                            len(accepted.answer_markdown),
-                            len(accepted.citations),
-                        )
-                        return accepted
-                    raise
+                return self.ollama.generate_structured(
+                    QueryAnswerPayload,
+                    system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
+                    user_prompt=prompt,
+                )
             finally:
                 if original_timeout is not None:
                     self.ollama.timeout = original_timeout
@@ -3603,19 +3666,35 @@ class QueryService:
             return False
 
         def generate_with_query_retries() -> QueryAnswerPayload:
-            """Retry transient Ollama failures twice before returning fallback."""
+            """Retry transient Ollama failures twice; accept free-text only as a last resort."""
             for attempt in range(3):
                 try:
                     return generate_with_query_timeout()
                 except Exception as exc:  # noqa: BLE001
-                    if attempt >= 2 or not _is_retryable_draft_error(exc):
-                        raise
-                    logger.warning(
-                        "Transient RAG draft generation failure; retrying (%d/2): %s",
-                        attempt + 1,
-                        exc,
-                    )
-                    time.sleep(5)
+                    if attempt < 2 and _is_retryable_draft_error(exc):
+                        logger.warning(
+                            "Transient RAG draft generation failure; retrying (%d/2): %s",
+                            attempt + 1,
+                            exc,
+                        )
+                        time.sleep(5)
+                        continue
+                    # 3 轮重试（每轮都带 per-term coverage prompt）全部失败后，
+                    # 才把模型自由文本输出当作最后手段收下 —— bff69af 曾把
+                    # fallback 放在 retry 循环之前（内层 except 直接 return），
+                    # 导致重试被跳过：自由输出常省略字面术语（如 "dispersion
+                    # interactions" 而非 "London dispersion"），answer_required_terms
+                    # 匹配失败，Task 18 基线 30/30 掉到 28/30。重试优先恢复后，
+                    # 真正的 schema 崩坏仍能交付自由文本，而不是降级成原始证据。
+                    accepted = _accept_free_text_fallback(exc)
+                    if accepted is not None:
+                        logger.warning(
+                            "Draft schema failure after retries; accepted free-text answer (%d chars, %d citations)",
+                            len(accepted.answer_markdown),
+                            len(accepted.citations),
+                        )
+                        return accepted
+                    raise
             raise RuntimeError("unreachable RAG draft retry state")
 
         return safe_model_call(generate_with_query_retries, fallback)
