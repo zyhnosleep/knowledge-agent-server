@@ -3151,6 +3151,12 @@ class QueryService:
             # 答案必然缺验收词。抢救：以 chunk 内首个科学短语为锚保留
             # 最小窗口，术语字面必须进 prompt（_build_answer_constraints
             # 的 evidence_phrases 据此注入 "Preserve ... exactly" 指令）。
+            # 表格行不做窗口抢救：清空 citation.excerpt 会破坏答案引用的
+            # excerpt atoms（表格标签、数值行——internal_research_v1 的
+            # 表格 case 验收要求引用 excerpt 含这些字面）。表格行 excerpt
+            # 通常短，超预算场景罕见，保持原丢弃行为即可。
+            if is_table_child:
+                continue
             rescue = self._rescue_term_window(context, question=question)
             if rescue:
                 # _context_evidence_text 会追回 citation.excerpt（5720 行）：
@@ -3182,25 +3188,30 @@ class QueryService:
     ) -> str:
         """被 token 预算丢弃的 chunk 的最小抢救窗口（以科学短语为锚）。
 
-        返回覆盖 chunk 内首个 evidence-phrase 命中的短窗口；无短语命中
-        时返回空串（调用方照旧丢弃该 chunk）。
+        锚点优先选与问题词元有交集的短语命中位置（词元交集 → 短语与
+        查询相关），否则取首个短语命中；无任何短语命中时返回空串
+        （调用方照旧丢弃该 chunk）。
         """
         full = cls._context_evidence_text(context)
         if not full:
             return ""
         lowered = full.lower()
-        positions = [
-            lowered.find(phrase.lower())
-            for phrase in cls._salient_evidence_phrases([context], limit=16)
+        phrases = cls._salient_evidence_phrases([context], limit=16)
+        hits = [
+            (position, phrase)
+            for phrase in phrases
+            if (position := lowered.find(phrase.lower())) >= 0
         ]
-        positions = [position for position in positions if position >= 0]
-        if not positions:
+        if not hits:
             return ""
-        anchor = min(positions)
-        start = max(0, anchor - max_chars // 4)
-        end = min(len(full), start + max_chars)
-        start = max(0, end - max_chars)
-        return full[start:end]
+        query_terms = cls._tokenize(question)
+        question_hits = [
+            position
+            for position, phrase in hits
+            if cls._tokenize(phrase) & query_terms
+        ]
+        anchor = min(question_hits) if question_hits else min(p for p, _ in hits)
+        return cls._anchor_window(full, anchor, max_chars)
 
     @classmethod
     def _remove_prompt_overlap(cls, text: str, previous_texts: list[str]) -> str:
@@ -6858,6 +6869,11 @@ class QueryService:
 
         # Center the window around the anchor, but bias toward showing content
         # *after* the anchor (captions, table data, metric rows).
+        return cls._anchor_window(text, anchor, max_chars)
+
+    @staticmethod
+    def _anchor_window(text: str, anchor: int, max_chars: int) -> str:
+        """以锚点为中心、偏向后文的窗口；与 _rescue_term_window 共用。"""
         start = max(0, anchor - max_chars // 4)
         end = min(len(text), start + max_chars)
         start = max(0, end - max_chars)
