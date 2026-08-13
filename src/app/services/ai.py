@@ -414,11 +414,13 @@ class OllamaClient:
         显存管理（与生成模型共卡的关键）：
         - ``keep_alive=0``：嵌入模型用完即卸载，绝不驻留与生成模型
           争抢显存（曾因 5m 驻留窗口挤掉生成模型导致 schema 输出崩坏）。
-        - ``options.num_ctx=4096``：嵌入模型不需要 32K 上下文，KV cache
-          从 4.5G 降到 ~0.8G；4096 覆盖摄取 chunk 的 p99.9（实测
-          chunk 长度 p95≈630 token，max≈4200 token）。注意此处
-          不走 ``_with_keep_alive``（全局配置会覆盖显式值），body
-          直接构造。
+        - ``options.num_ctx=16384``：嵌入模型不需要 32K 上下文；16384
+          覆盖现存全部 chunk（实测 max 16859 字符的表格块，token 化
+          最坏情况接近 1 字符/token，仍需 8K+），KV cache ~3.2G，
+          与生成模型共存峰值 ~18G < 23G。若未来出现 >16K token 的
+          chunk，应修切块上限而非继续放大 num_ctx（超长 chunk 的
+          嵌入向量信息平均化，检索精度本就差）。注意此处不走
+          ``_with_keep_alive``（全局配置会覆盖显式值），body 直接构造。
         """
         if not texts:
             return []
