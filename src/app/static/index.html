@@ -1344,6 +1344,21 @@
         white-space: nowrap;
       }
 
+      .attachment-chip.pending {
+        border-style: dashed;
+        opacity: 0.75;
+      }
+
+      .attachment-chip.pending::after {
+        content: "…";
+        animation: pending-blink 1s steps(4) infinite;
+      }
+
+      @keyframes pending-blink {
+        0% { opacity: 0.2; }
+        100% { opacity: 1; }
+      }
+
       .attachment-chip button {
         width: 16px;
         height: 16px;
@@ -3848,7 +3863,19 @@
         var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         var data = new FormData();
         data.append("file", file);
+        // 上传/解析期间在附件条显示进行中提示（fetch 无进度事件，用状态 chip）
+        var bar = $("attachmentBar");
+        var pendingChip = null;
+        if (bar) {
+          pendingChip = document.createElement("div");
+          pendingChip.className = "attachment-chip pending";
+          pendingChip.innerHTML = "<span></span>";
+          pendingChip.querySelector("span").textContent = file.name + "（上传解析中）";
+          bar.hidden = false;
+          bar.appendChild(pendingChip);
+        }
         fetchJson(url, { method: "POST", body: data }).then(function (res) {
+          if (pendingChip) pendingChip.remove();
           if (res && res.attachment) {
             activeAttachments.push(res.attachment);
             renderAttachments();
@@ -3856,6 +3883,8 @@
             loadAgentSessions();
           }
         }).catch(function (err) {
+          if (pendingChip) pendingChip.remove();
+          if (bar && !activeAttachments.length) bar.hidden = true;
           alert(err.message || String(err));
         });
       }
