@@ -346,7 +346,14 @@ class OllamaClient:
             return self._parse_structured_content(schema, content)
         except Exception as exc:  # noqa: BLE001
             # Schema 约束输出失败：退回宽松 JSON 模式重试
-            logger.warning("Structured schema response was invalid; retrying with JSON mode: %s", exc)
+            # 日志附带模型原始输出前 500 字符——诊断"输出被挖出证据编号数组"
+            # 类失败的关键证据（ollama 对 qwen3.5 的 format=schema 是软约束，
+            # 模型可能输出自由文本而非纯 JSON）。
+            logger.warning(
+                "Structured schema response was invalid; retrying with JSON mode: %s (raw=%.500s)",
+                exc,
+                str(content)[:500],
+            )
             retry_payload = self._json_mode_payload(
                 schema=schema,
                 model=model_name,
@@ -356,7 +363,18 @@ class OllamaClient:
                 options=options,
             )
             retry_data = self._post_chat(retry_payload)
-            return self._parse_structured_content(schema, self._message_content(retry_data))
+            retry_content = self._message_content(retry_data)
+            try:
+                return self._parse_structured_content(schema, retry_content)
+            except Exception as retry_exc:  # noqa: BLE001
+                # JSON 模式重试也失败：记录原始输出后原样抛出（调用方重试/兜底）
+                logger.warning(
+                    "JSON mode retry also failed for %s: %s (raw=%.500s)",
+                    schema.__name__,
+                    retry_exc,
+                    str(retry_content)[:500],
+                )
+                raise
 
     def generate_structured_with_images(
         self,
