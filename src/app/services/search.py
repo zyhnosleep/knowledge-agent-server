@@ -7497,9 +7497,31 @@ class QueryService:
         substantive overview chunks only when a single document can be safely
         identified (exact/locked match or exactly one ready document).
         """
+        # Cross-turn contextualization wraps short follow-up queries as
+        # "previous-question: ... [newline] current-question: ..." (see
+        # _contextualize_retrieval_query in agent_executor). Only the
+        # current-turn portion may drive the overview verdict - overview
+        # trigger words left over from the previous question must not
+        # pollute this turn's routing.
+        if question.startswith("\u4e0a\u4e00\u8f6e\u95ee\u9898\uff1a"):
+            wrapper = "\n\u5f53\u524d\u8ffd\u95ee\uff1a"
+            if wrapper in question:
+                # rfind: if the previous-turn text itself contained the
+                # wrapper marker, only the last occurrence is the real split.
+                question = question[question.rfind(wrapper) + len(wrapper):]
         lowered = question.lower()
         chinese_overview = bool(
-            re.search(r"\u8fd9\u7bc7.{0,6}(?:\u6587\u7ae0|\u8bba\u6587|\u6587\u732e)", question)
+            re.search(
+                # "{0,20}?" bounds how far past the reference the intent
+                # phrase may sit: a close co-occurrence reads as the same
+                # clause, a distant one as a separate topic. Branch 2 below
+                # still backstops bare intent words anywhere in the question.
+                r"\u8fd9\u7bc7.{0,6}(?:\u6587\u7ae0|\u8bba\u6587|\u6587\u732e).{0,20}?"
+                r"(?:\u8bb2(?:\u4e86|\u4e9b)?(?:\u4ec0\u4e48|\u54ea\u4e9b\u5185\u5bb9)|\u4e3b\u8981\u5185\u5bb9"
+                r"|\u521b\u65b0\u70b9|\u8d21\u732e|\u662f\u5173\u4e8e"
+                r"|\u662f\u5e72\u4ec0\u4e48|\u7814\u7a76(?:\u4e86|\u4e9b)?\u4ec0\u4e48)",
+                question,
+            )
             or re.search(r"(?:\u603b\u7ed3|\u6982\u62ec|\u7b80\u8ff0|\u6982\u8ff0|\u4ecb\u7ecd|\u5927\u610f|\u4e3b\u65e8|\u4e3b\u9898)", question)
             or re.search(r"(?:\u8bb2|\u8bf4|\u8c08|\u5199).{0,2}\u4e86?\u4ec0\u4e48", question)
         )

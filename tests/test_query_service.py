@@ -8062,6 +8062,39 @@ def test_method_question_is_not_routed_as_generic_document_overview() -> None:
     )
 
 
+def test_overview_detection_strips_contextualization_wrapper() -> None:
+    """跨轮上下文化包装串只按当前追问判定——上一轮问题的概述触发词不污染本轮。"""
+    assert not QueryService._is_document_overview_query(
+        "上一轮问题：这篇论文讲了什么，他的创新点是什么\n当前追问：什么是forward KL"
+    )
+
+
+def test_overview_detection_keeps_wrapped_current_turn_verdict() -> None:
+    """包装串的当前追问本身是概述问题时，剥离包装后仍判定为概述。"""
+    assert QueryService._is_document_overview_query(
+        "上一轮问题：什么是forward KL\n当前追问：这篇论文讲了什么"
+    )
+
+
+def test_referential_mention_with_specific_question_is_not_overview() -> None:
+    """指代论文但问具体内容（GRPO 损失函数）不再误判为文档概述。"""
+    assert not QueryService._is_document_overview_query(
+        "在这篇论文中也提到了GRPO，GRPO的损失函数是什么"
+    )
+    assert not QueryService._is_document_overview_query("这篇论文")
+
+
+def test_overview_detection_requires_intent_phrase_after_reference() -> None:
+    """指代 + 概述意图词共现仍是概述。"""
+    assert QueryService._is_document_overview_query("这篇文章讲了什么")
+    assert QueryService._is_document_overview_query("这篇论文的主要内容")
+    assert QueryService._is_document_overview_query(
+        "这篇论文讲了什么，他的创新点是什么"
+    )
+    # "讲了哪些内容" 形式在指代收紧后仍保持概述路由（回归锁定）。
+    assert QueryService._is_document_overview_query("这篇文章主要讲了哪些内容")
+
+
 def test_overview_query_single_document_retrieves_substantive_chunks() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
