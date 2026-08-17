@@ -669,7 +669,8 @@ def test_source_drawer_does_not_truncate_chunk_navigation() -> None:
     html = _html()
 
     assert "chunks.slice(0, 8)" not in html
-    assert "chunks.forEach(function (chunk, index)" in html
+    assert "chunks.slice(0, CHUNK_PAGE_SIZE).forEach(appendChunkButton)" in html
+    assert "显示全部" in html
     assert "source-chunk-summary" in html
 
 

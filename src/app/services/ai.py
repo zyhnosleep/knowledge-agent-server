@@ -457,7 +457,7 @@ class OllamaClient:
                     "model": settings.ollama_embedding_model,
                     "input": texts,
                     "keep_alive": "0",
-                    "options": {"num_ctx": 4096},
+                    "options": {"num_ctx": 16384},
                 },
             )
             response.raise_for_status()

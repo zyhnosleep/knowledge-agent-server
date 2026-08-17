@@ -293,7 +293,7 @@ def test_answer_rules_follow_query_language_and_ban_metadata(monkeypatch) -> Non
     assert "submission IDs" in chinese
     assert "mark it explicitly as inference" in chinese
     assert "readable Unicode text" in chinese
-    assert "never as LaTeX command source" in chinese
+    assert "no backslash escapes of any kind" in chinese
     assert "## 结论" in chinese
     assert "## 证据" in chinese
     assert "## 不确定性" in chinese

@@ -341,7 +341,12 @@ def test_embed_sends_keep_alive_to_single_batch_embedding_request(monkeypatch) -
     monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
 
     assert client.embed(["alpha", "beta"]) == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
-    assert calls == [{"model": "fake-embedding", "input": ["alpha", "beta"], "keep_alive": 0}]
+    assert calls == [{
+        "model": "fake-embedding",
+        "input": ["alpha", "beta"],
+        "keep_alive": "0",
+        "options": {"num_ctx": 16384},
+    }]
 
 
 def test_unload_loaded_models_releases_each_resident_model_once(monkeypatch) -> None:
