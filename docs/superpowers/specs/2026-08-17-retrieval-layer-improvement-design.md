@@ -61,6 +61,7 @@ claim → _route_papers（纯词法路由）→ _build_rag_contexts → _search_
    `_search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS, question_vector=<复用>)`，
    并入 `contexts` → 现有 `_finalize_contexts` 统一排序截断（天然融合；两路候选的 chunk 重叠由 `_finalize_contexts` 现有 seen_keys 去重处理，search.py:7019-7025）。
    原 1255-1256 行"仅 contexts 为空时兜底"被此补充取代（同模式，逻辑统一为"总是"）。
+3. **补充路表格提权关闭**（2026-08-18 回归驱动修订，`_search_source_chunks` 新增参数 `table_promotion: bool = True`）：补充路由调用传 `table_promotion=False`——全库补充只做语义兜底，不给无关文档的表格 +40 `TABLE_CONTEXT_SCORE_BOOST` 与词法路表格平手竞争（内部回归 opls5_table_metrics 实测：平手时靠原始向量分把正确文档挤出 top-10）。flag 同时关闭 `_rank_blocks` 锚点 bonus（+6/+8 权重过大，会以更小尺度复刻同样挤占）。词法路表格检索默认行为不变。
 
 ### 4.2 边界条件（行为决策）
 

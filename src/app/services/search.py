@@ -1192,6 +1192,10 @@ class QueryService:
         is_overview = QueryService._is_document_overview_query(question)
         overview_document_ids = self._overview_document_ids(question, project_id, paper_matches, document_ids=document_ids) if is_overview else None
         contexts: list[RetrievedContext] = []
+        # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
+        # 全库向量补充路由共享的查询向量——先算一次，文档内检索与全库补充两处
+        # 复用，避免同一问题各 embed 一次（qwen3-embedding:4b 单次调用约秒级）。
+        question_vector: list[float] | None = None
         if overview_document_ids:
             contexts.extend(
                 self._search_document_overview_contexts(question, project_id, overview_document_ids, limit=MAX_CONTEXTS)
@@ -1233,6 +1237,7 @@ class QueryService:
                 figure_contexts = self._search_document_figure_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(figure_contexts)
         if derived_document_ids and not is_overview:
+            question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
             if self._is_scientific_evidence_query(question) and not (
                 self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
             ):
@@ -1241,7 +1246,7 @@ class QueryService:
                 contexts.extend(self._search_document_parameterization_contexts(question, project_id, derived_document_ids, limit=5))
                 contexts.extend(self._search_document_scientific_anchor_contexts(question, project_id, derived_document_ids, limit=8))
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, derived_document_ids, limit=min(3, MAX_CONTEXTS)))
-            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
+            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms, question_vector=question_vector))
             contexts.extend(
                 self._supplement_profile_term_contexts(
                     project_id,
@@ -1252,8 +1257,29 @@ class QueryService:
                     question=question,
                 )
             )
-        if not contexts and not document_ids and not is_overview:
-            contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
+        if not locked_document_ids and document_ids is None and not is_overview:
+            # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
+            # 全库向量补充路由——词法路由（_route_papers，PAPER_ROUTE_MIN_SCORE 阈值 +
+            # lock 分支）之外的语义兜底。SciFact 评测实测：词法路由对密集科学声明与
+            # 摘要的匹配是二值的（命中即第 1、miss 即完全不可见），候选生成在此被截断
+            # （avg 3.8 < top-10，56.7% 未召回）。此处总是并入一次全库向量检索结果，
+            # 由 _finalize_contexts 统一分数排序 + 去重 + 截断融合（重叠 chunk 高分保留）。
+            # 锁定场景（用户明确问某论文的表/数据）跳过——精确语义原样保留。
+            if question_vector is None:
+                question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+            contexts.extend(
+                self._search_source_chunks(
+                    question,
+                    project_id,
+                    [],
+                    limit=MAX_CONTEXTS,
+                    question_vector=question_vector,
+                    # 补充路不做表格提权（table_promotion=False）：+40 boost
+                    # 让无关文档的表格与词法路表格平手竞争，正确文档会被
+                    # 挤出 top-10（opls5_table_metrics 内部回归，2026-08-18）。
+                    table_promotion=False,
+                )
+            )
         return self._finalize_contexts(contexts, question=question)
 
     @staticmethod
@@ -2434,8 +2460,14 @@ class QueryService:
         document_ids: list[str],
         limit: int = 3,
         route_terms: list[str] | None = None,
+        question_vector: list[float] | None = None,
+        table_promotion: bool = True,
     ) -> list[RetrievedContext]:
-        question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+        # R1：调用方（如 _build_rag_contexts 的全库补充路由）可复用已算好的
+        # 查询向量，避免同一问题在文档内检索与全库补充两处各 embed 一次
+        # （qwen3-embedding:4b 单次调用约秒级，复用是 0 额外嵌入的关键）。
+        if question_vector is None:
+            question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
         vector_store = get_vector_store(self.db)
@@ -2513,7 +2545,17 @@ class QueryService:
                     # 避免中文序数指代全灭过滤掉候选表格。
                     if not QueryService._is_table_reference_query(question):
                         continue
-                score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
+                # 表格提权只属于"已路由文档内的表格检索"（table_promotion=True
+                # 默认）：全库补充路（document_ids=[]，table_promotion=False）
+                # 若同样 +40，无关文档的表格会与词法路表格在最终排序平手、
+                # 靠原始向量分把正确文档挤出 top-10——内部回归
+                # opls5_table_metrics 实测（2026-08-18 A/B）。补充只做语义
+                # 兜底，表格仍按 structure_priority（_finalize_contexts）上浮。
+                # 注意 flag 同时关掉 _rank_blocks 锚点 bonus（+6/+8 权重过大，
+                # 会让补充路表格以更小尺度复刻同样的平手挤占）——两效应捆绑
+                # 是刻意的：boost 与锚点 bonus 都是词法路表格检索的特权。
+                if table_promotion:
+                    score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
                 evidence_kind = "table"
             else:
                 evidence_kind = chunk.block_type if chunk.block_type in {"figure", "formula"} else None
