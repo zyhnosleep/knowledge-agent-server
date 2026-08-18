@@ -47,7 +47,7 @@
 - 改动（search.py，两函数）：`_build_rag_contexts` 在非 lock 且无显式 document_ids 时**总是**并入一次全库向量检索（`_search_source_chunks(question, [], limit=MAX_CONTEXTS, question_vector=复用)`），两路候选经 `_finalize_contexts` 统一排序截断融合；lock 场景跳过补充，精确语义原样保留。
 - 表格提权修正：补充路 `table_promotion=False`——全库补充只做语义兜底，不给无关文档的表格 +40 提权与词法路表格竞争（内部回归 opls5_table_metrics 驱动，见 §4）。
 
-## 2. Claim 相关性判定评测（300 dev claims）
+## 2. Claim 相关性判定评测（300 dev claims，2026-08-18 实测）
 
 > 说明：官方 SciFact 2021 版 claims 文件的 evidence/label 字段被清空（shared task 后），
 > S3 旧版不可达（3.7KB/s）。真值采用 `cited_doc_ids`（该 claim 引用的文档视为"相关"），
@@ -55,19 +55,22 @@
 
 | 指标 | 值 |
 |---|---|
-| 文档级判定准确率 | TBD（未跑） |
-| 相关判定 Precision / Recall / F1 | TBD（未跑） |
-| claim 级命中率（判定含 ≥1 cited 文档） | TBD（未跑） |
+| 文档级判定准确率 | **0.8763**（1,762 个判定，avg 5.9 docs/claim） |
+| 相关判定 Precision / Recall / F1 | **0.586 / 0.781 / 0.670** |
+| claim 级命中率（判定含 ≥1 cited 文档） | **0.6667**（200/300） |
 
-> 本次迭代未执行 claim 相关性判定评测（检索层改进不涉及判定链路），保留占位。
+**解读**：文档级判定准确率 87.6% 整体可靠，但相关判定 F1 0.67 呈"宽松"倾向（P 0.586 < R 0.781——宁可多判相关）；claim_hit 66.7% 低于检索层命中率（84%，§1.1 hit@10），说明约 1/5 的 claim 检索到了 cited 文档但被判定为不相关——判定层漏判与检索层漏召回叠加。真值注：1,762 个判定中仅 283 个为 cited 文档（cited_doc_ids 真值参与判定比例低），指标方差较大。
 
 ## 3. 结论与建议
 
 1. **检索层架构性差距已修**：词法路由漏召回 → 全库向量补充（零额外 embedding 调用，复用 question_vector）。nDCG@10 0.4422 → 0.8180（+85%），未召回率 56.7% → 16.0%，均超 spec §2 目标。
 2. **avg 证据数 6.1（目标 ~8）未达满**：补充路 limit=MAX_CONTEXTS=8 已给足，不足 8 的成因是语料文档体量小（title+abstract ≈ 1-2 chunk/篇，两路并集经 `_finalize_contexts` 去重后截断）——候选池已接近上限，不再单独优化。
-3. **残余差距（④ vs ②，0.058）**：纯向量全库上限 0.8757 仍高于混合路由。方向（记录在案，未实施）：
-   - 词法路候选在 `_finalize_contexts` 并集排序中可能挤占高向量分文档的 top-10 位置（词法低分噪声文档进入排序池）——可做并集后按向量分为主的二次混合；
-   - 全库 BM25 补充候选（当前补充路只取向量 top-k，BM25 补充可再兜词法面）。
+3. **残余差距（④ vs ②，0.058）——已诊断（2026-08-18 hybrid 实验）**：主因是补充路只取纯向量 top-8 + 融合方式，非嵌入模型上限。
+   - 实验：BM25 top-10 ∪ 纯向量 top-10，RRF 融合（文档级，独立于生产链路）：
+     - 对称 k=60：nDCG@10 **0.8691** / Recall 0.9667 / 未召回 48→**10**；
+     - 向量路 ×2.0：nDCG@10 **0.8751** / Recall 0.9500 / 未召回 15（追平纯向量上限 0.8757）。
+   - 逐 query 核对：④ 的 48 条未召回中 **38 条被 BM25∪向量救回**（嵌入模型能找到，词法面未参与）；两配置都救不回的 ~10 条为嵌入+词法双盲极限。
+   - 落地立项：`docs/superpowers/specs/2026-08-18-retrieval-supplement-bm25-vector-design.md`（补充路升级 BM25∪向量，目标 nDCG ≥ 0.86）。
 4. **内部 13 篇语料回归不回归**（硬约束，见 §4）：30 题 full-answer + retrieval cases 修复版全过，超扩库前基线（8/5 active 29/30）。
 5. 无重排层（cross-encoder）仍是 border case 区分度瓶颈，但非本次范围（spec §4.3 非目标）。
 

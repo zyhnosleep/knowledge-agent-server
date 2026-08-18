@@ -6,6 +6,9 @@
     vector : 纯向量全库检索（无路由、无词法 bonus），top-k 文档聚合
     routed : 系统检索链路（retrieve_evidence）——现状（旧代码）/ 改进后（新代码），
              即四路对照中的 ③ 与 ④（词法路由 ∪ 全库向量补充）
+    hybrid : BM25 top-k ∪ 纯向量 top-k，RRF（k=60）融合——残余差距诊断
+             （2026-08-18）：④ 距 ② 上限 0.058，验证词法/语义双路融合
+             能否逼近纯向量上限
 
 运行方式（服务器）：
     cd ~/knowledge-agent-dev && set -a && . runtime/app.env && set +a && \
@@ -142,7 +145,9 @@ def main() -> int:
     parser.add_argument("--split", default="test")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--limit", type=int, default=0, help="0 = 全部 claims")
-    parser.add_argument("--mode", default="routed", choices=["bm25", "vector", "routed"])
+    parser.add_argument("--mode", default="routed", choices=["bm25", "vector", "routed", "hybrid"])
+    parser.add_argument("--rrf-k", type=float, default=60.0, help="RRF 平滑常数（hybrid）")
+    parser.add_argument("--rrf-vec-weight", type=float, default=1.0, help="向量路 RRF 权重倍率（hybrid）")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
 
@@ -165,7 +170,7 @@ def main() -> int:
 
     service = QueryService(db)
     client = OllamaClient()
-    if args.mode == "bm25":
+    if args.mode in ("bm25", "hybrid"):
         doc_text = load_corpus(db)
         tokenized, idf, avgdl = build_bm25_index(doc_text)
     order = sorted(qrels.keys())
@@ -184,6 +189,18 @@ def main() -> int:
             n_evidence = len(ranked_pmids)
         elif args.mode == "vector":
             ranked_pmids = [doc_to_pmid.get(doc_id, "") for doc_id in vector_rank(db, client, claim, args.topk)]
+            ranked_pmids = [p for p in ranked_pmids if p]
+            n_evidence = len(ranked_pmids)
+        elif args.mode == "hybrid":
+            # BM25 top-k ∪ 纯向量 top-k，RRF 融合（k=60，BEIR 社区标准无参默认）。
+            # 两路各自 top-k，并集按 Σ 1/(60+rank) 排序取 top-k。
+            rrf: dict[str, float] = {}
+            for rank, doc_id in enumerate(bm25_rank(claim, tokenized, idf, avgdl, args.topk), 1):
+                rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (args.rrf_k + rank)
+            for rank, doc_id in enumerate(vector_rank(db, client, claim, args.topk), 1):
+                rrf[doc_id] = rrf.get(doc_id, 0.0) + args.rrf_vec_weight / (args.rrf_k + rank)
+            ranked_docs = [kv[0] for kv in sorted(rrf.items(), key=lambda kv: kv[1], reverse=True)[: args.topk]]
+            ranked_pmids = [doc_to_pmid.get(doc_id, "") for doc_id in ranked_docs]
             ranked_pmids = [p for p in ranked_pmids if p]
             n_evidence = len(ranked_pmids)
         else:  # routed：系统链路（旧代码=现状 ③，新代码=改进后 ④）
