@@ -208,6 +208,11 @@ def main() -> int:
             ranked_pmids = [doc_to_pmid.get(it.document_id or "") for it in pack.items]
             ranked_pmids = [p for p in ranked_pmids if p]
             n_evidence = len(pack.items)
+        # SciFact qrels 是文档级（PMID）：routed 模式一个文档可贡献多个 chunk
+        # context（补充路 BM25 更是整文档注入），直接打分会把同一 PMID 重复计数，
+        # nDCG 可超 1.0（R1 实测 24 行 >1、max 2.13——度量 bug，2026-08-18）。
+        # 按 PMID 去重（保留首次出现 = 最佳名次）才是文档级度量（BEIR 官方口径）。
+        ranked_pmids = list(dict.fromkeys(ranked_pmids))
         rel_scores = [1 if p in expected else 0 for p in ranked_pmids]
         hits = sum(rel_scores)
         ndcg = dcg_at_k(rel_scores, args.topk) / (dcg_at_k([1] * len(expected), args.topk) or 1.0)

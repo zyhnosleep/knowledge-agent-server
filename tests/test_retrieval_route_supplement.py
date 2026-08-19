@@ -455,9 +455,9 @@ def test_explicit_document_scope_skips_bm25_supplement(monkeypatch) -> None:
     bm25_calls: list[bool] = []
     original_bm25 = QueryService._bm25_supplement_candidates
 
-    def bm25_spy(self, question, project_id, limit):
+    def bm25_spy(self, question, project_id, limit, question_vector=None):
         bm25_calls.append(True)
-        return original_bm25(self, question, project_id, limit)
+        return original_bm25(self, question, project_id, limit, question_vector=question_vector)
 
     monkeypatch.setattr(QueryService, "_search_source_chunks", spy)
     monkeypatch.setattr(QueryService, "_bm25_supplement_candidates", bm25_spy)

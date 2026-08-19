@@ -1302,18 +1302,22 @@ class QueryService:
         # 跳过补充路——精确语义原样保留"在 prose 声明检索上被证伪为纯伤害：
         # 路由锁是 SciFact 唯一主导伤害源（noroute−routed = +0.1182，68/300
         # 帮倒忙、9 帮上忙，8 条 nDCG 1.0→0.0 全是 routed 单 PMID）。词法启发式
-        # 锁错论文时补充路被整体跳过，正确文档永远不可见。修复：路由锁定不再
-        # 跳过补充路（锁定文档 chunk 有词法 route bonus 占优，_finalize_contexts
-        # 分数融合后真相关仍排前）；显式作用域（document_ids 参数，API 语义
-        # lock-and-never-widen）与结构化查询（表/指标/图：锁定 = 用户明确要某
-        # 论文的表/图，混入其他文档的表格即表错论文，精确语义原样保留）仍跳过。
-        structured_query = (
-            self._is_table_query(question)
-            or self._is_metric_query(question)
-            or self._is_table_reference_query(question)
-            or self._is_figure_query(question)
-        )
-        if (not locked_document_ids or not structured_query) and document_ids is None and not is_overview:
+        # 锁错论文时补充路被整体跳过，正确文档永远不可见。修复后语义：路由锁定
+        # 本身（prose 声明）不再跳过补充路——锁定文档 chunk 有词法 route bonus
+        # 占优，_finalize_contexts 分数融合后真相关仍排前；仍跳过补充路的只有
+        # 显式作用域（document_ids 参数，API 语义 lock-and-never-widen）、
+        # overview、以及路由锁定 + 结构化查询（表/指标/图：锁定 = 用户明确要某
+        # 论文的表/图，混入其他文档的表格即表错论文，精确语义原样保留）。
+        # 注意结构化判断短路：document_ids / overview 场景无需算 4 个正则。
+        if document_ids is None and not is_overview and not (
+            locked_document_ids
+            and (
+                self._is_table_query(question)
+                or self._is_metric_query(question)
+                or self._is_table_reference_query(question)
+                or self._is_figure_query(question)
+            )
+        ):
             # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
             # 全库向量补充路由——词法路由（_route_papers，PAPER_ROUTE_MIN_SCORE 阈值 +
             # lock 分支）之外的语义兜底。SciFact 评测实测：词法路由对密集科学声明与
