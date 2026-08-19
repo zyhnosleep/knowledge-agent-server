@@ -20,12 +20,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -79,6 +81,50 @@ MAX_CONTEXTS = 8
 CANONICAL_TABLE_CONTEXT_LIMIT = 24
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
+# R2 补充路词法面（BM25）的分数天花板：max 归一化把同 query 最高分 BM25 文档
+# 顶到 10.0 时，词法像但无关的文档以满分与强向量命中（10×cosine 5-10）竞争，
+# 会挤掉真相关证据（SciFact r3 实测 12/50 退化、8 条 nDCG 1.0→0.0，
+# 2026-08-18）。BM25 是兜底不是主信号，天花板定在向量满分 10 之下，具体值
+# 由 sweep 校准（.task18-corpus/bm25_ceil_sweep.py）。
+BM25_SUPPLEMENT_SCORE_CEIL = 6.0
+
+
+@lru_cache(maxsize=8192)
+def _subject_lock_patterns(alias: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """每 alias 三组"锁定主体"正则预编译缓存。
+
+    2026-08-18 性能修复：_route_papers 对全库文档逐篇调用
+    _question_locks_document_subject，每个 alias 动态拼接 3 个正则再编译，
+    单 claim 编译约 5 千次（577 篇 × ~8.5），打穿 Python re 内部 512 条
+    缓存后每次重复编译 7-10ms（cProfile：re._compile 56,060 次 / 13.4s，
+    claim 1140 单次检索 28.3s）。文档静态 → lru_cache 跨 claim 全命中。
+    """
+    escaped = re.escape(alias)
+    return (
+        re.compile(
+            rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])\s*的\s*(?:表格|论文|文献)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])['’]s\s+(?:table|paper|article)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"^\s*{escaped}(?![A-Za-z0-9_/\-])\s*(?:相比|相对)",
+            re.IGNORECASE,
+        ),
+    )
+
+
+@lru_cache(maxsize=8192)
+def _selector_boundary_pattern(selector_text: str) -> re.Pattern:
+    """selector 边界正则预编译缓存（同 _subject_lock_patterns：per-doc 循环打穿缓存）。"""
+    return re.compile(
+        rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])",
+        re.IGNORECASE,
+    )
+
+
 # The table-answer repair prompt lists the selected evidence's canonical facts
 # as a deterministic, bounded inventory so the model can only report verbatim
 # values.  The cap keeps a wide table from ballooning the repair prompt.
@@ -1118,21 +1164,15 @@ class QueryService:
 
     @staticmethod
     def _question_locks_document_subject(question: str, aliases: list[str]) -> bool:
+        # 正则按 alias 预编译缓存（_subject_lock_patterns，2026-08-18 性能修复：
+        # 逐 alias 动态拼接编译在 _route_papers 全库循环里打穿 re 内部 512 缓存）。
         for alias in aliases:
             alias = str(alias or "").strip()
             if not alias:
                 continue
-            escaped = re.escape(alias)
-            if re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])\s*的\s*(?:表格|论文|文献)", question, re.IGNORECASE):
-                return True
-            if re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])['’]s\s+(?:table|paper|article)", question, re.IGNORECASE):
-                return True
-            if re.search(
-                rf"^\s*{escaped}(?![A-Za-z0-9_/\-])\s*(?:相比|相对)",
-                question,
-                re.IGNORECASE,
-            ):
-                return True
+            for pattern in _subject_lock_patterns(alias):
+                if pattern.search(question):
+                    return True
         return False
 
     @staticmethod
@@ -1257,14 +1297,29 @@ class QueryService:
                     question=question,
                 )
             )
-        if not locked_document_ids and document_ids is None and not is_overview:
+        # R3 归因（2026-08-19，.task18-corpus 归因实验，attribution-report-fixed.json）：
+        # 原语义"路由锁定（_locked_document_ids：词法路由 locked/exact_alias 分支）
+        # 跳过补充路——精确语义原样保留"在 prose 声明检索上被证伪为纯伤害：
+        # 路由锁是 SciFact 唯一主导伤害源（noroute−routed = +0.1182，68/300
+        # 帮倒忙、9 帮上忙，8 条 nDCG 1.0→0.0 全是 routed 单 PMID）。词法启发式
+        # 锁错论文时补充路被整体跳过，正确文档永远不可见。修复：路由锁定不再
+        # 跳过补充路（锁定文档 chunk 有词法 route bonus 占优，_finalize_contexts
+        # 分数融合后真相关仍排前）；显式作用域（document_ids 参数，API 语义
+        # lock-and-never-widen）与结构化查询（表/指标/图：锁定 = 用户明确要某
+        # 论文的表/图，混入其他文档的表格即表错论文，精确语义原样保留）仍跳过。
+        structured_query = (
+            self._is_table_query(question)
+            or self._is_metric_query(question)
+            or self._is_table_reference_query(question)
+            or self._is_figure_query(question)
+        )
+        if (not locked_document_ids or not structured_query) and document_ids is None and not is_overview:
             # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
             # 全库向量补充路由——词法路由（_route_papers，PAPER_ROUTE_MIN_SCORE 阈值 +
             # lock 分支）之外的语义兜底。SciFact 评测实测：词法路由对密集科学声明与
             # 摘要的匹配是二值的（命中即第 1、miss 即完全不可见），候选生成在此被截断
             # （avg 3.8 < top-10，56.7% 未召回）。此处总是并入一次全库向量检索结果，
             # 由 _finalize_contexts 统一分数排序 + 去重 + 截断融合（重叠 chunk 高分保留）。
-            # 锁定场景（用户明确问某论文的表/数据）跳过——精确语义原样保留。
             if question_vector is None:
                 question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
             contexts.extend(
@@ -1280,7 +1335,154 @@ class QueryService:
                     table_promotion=False,
                 )
             )
+            # R2（2026-08-18，spec 2026-08-18-retrieval-supplement-bm25-vector-design.md）：
+            # 补充路词法面——向量路漏掉的词法强相关文档由全库 BM25 兜底
+            # （hybrid 实验：④ 的 48 未召回中 38 条 BM25∪向量可救回）。
+            # 分数天花板归一化（BM25_SUPPLEMENT_SCORE_CEIL，兜底不压主信号），
+            # 每文档 1 chunk，_finalize_contexts 统一排序去重截断。无额外
+            # embedding 调用（question_vector 复用）。
+            contexts.extend(
+                self._bm25_supplement_candidates(
+                    question, project_id, MAX_CONTEXTS, question_vector=question_vector
+                )
+            )
         return self._finalize_contexts(contexts, question=question)
+
+    def _bm25_supplement_candidates(
+        self,
+        question: str,
+        project_id: str,
+        limit: int,
+        question_vector: list[float] | None = None,
+    ) -> list[RetrievedContext]:
+        """全库文档级 BM25 top-k → 每文档最佳 chunk（分数天花板归一化）。
+
+        R2（2026-08-18，spec 2026-08-18-retrieval-supplement-bm25-vector-design.md）：
+        补充路的词法面——向量路（_search_source_chunks document_ids=[]）漏掉的
+        词法强相关文档由 BM25 全库检索兜底。文档级文本口径与评测一致
+        （title + chunks 拼接；_tokenize 分词；K1=1.5 B=0.75 tf=1 文档级近似）。
+        无 embedding/LLM 调用（纯 CPU 词法；question_vector 由调用方复用）。
+        表格 chunk 只标 evidence_kind="table"（走 structure_priority 上浮），
+        不加 TABLE_CONTEXT_SCORE_BOOST——补充路语义，与向量补充一致。
+
+        R3 修正（2026-08-18，SciFact r3 实测退化驱动）：
+        1. 每文档至多 1 个 chunk（按 question_vector 余弦选最佳证据，无向量时
+           退化为词法重叠）——整文档注入把所有 chunk 以同一归一化分灌池，
+           _finalize_contexts 截断后 top-8 被单一文档占满、真相关命中整条
+           挤出（12/50 退化，8 条 nDCG 1.0→0.0）；
+        2. 分数天花板 BM25_SUPPLEMENT_SCORE_CEIL（默认 6.0）——max 归一化到
+           10.0 时词法像但无关的文档以满分与强向量命中竞争（兜底不是主信号，
+           具体值由 .task18-corpus/bm25_ceil_sweep.py 校准）。
+        """
+        docs = self.db.scalars(
+            select(Document).where(
+                Document.project_id == project_id,
+                Document.status == DocumentStatus.ready.value,
+            )
+        ).all()
+        if not docs:
+            return []
+        doc_text: dict[str, str] = {}
+        chunks_by_doc: dict[str, list[DocumentChunk]] = {}
+        for doc in docs:
+            chunks = self.db.scalars(
+                select(DocumentChunk)
+                .where(DocumentChunk.document_id == doc.id)
+                .order_by(DocumentChunk.ordinal)
+            ).all()
+            chunks_by_doc[doc.id] = chunks
+            doc_text[doc.id] = " ".join(
+                part
+                for part in [doc.title or "", *[str(c.text or "") for c in chunks]]
+                if part
+            )
+        tokenized = {doc_id: self._tokenize(text) for doc_id, text in doc_text.items()}
+        n_docs = len(tokenized) or 1
+        term_doc_count: Counter[str] = Counter()
+        for terms in tokenized.values():
+            term_doc_count.update(terms)
+        idf = {
+            term: math.log((n_docs - count + 0.5) / (count + 0.5) + 1.0)
+            for term, count in term_doc_count.items()
+        }
+        doc_lens = {doc_id: len(terms) for doc_id, terms in tokenized.items()}
+        avgdl = (sum(doc_lens.values()) / len(doc_lens)) if doc_lens else 1.0
+        query_terms = self._tokenize(question)
+        scored: list[tuple[float, str]] = []
+        for doc_id, terms in tokenized.items():
+            score = 0.0
+            dl = len(terms)
+            for term in query_terms & terms:
+                tf = 1  # _tokenize 返回集合，无词频；文档级近似 tf=1
+                score += idf.get(term, 0.0) * (tf * (1.5 + 1)) / (
+                    tf + 1.5 * (1 - 0.75 + 0.75 * dl / avgdl)
+                )
+            if score > 0:
+                scored.append((score, doc_id))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        max_score = scored[0][0] if scored else 0.0
+        contexts: list[RetrievedContext] = []
+        for bm25_score, doc_id in scored[:limit]:
+            norm = (
+                BM25_SUPPLEMENT_SCORE_CEIL * bm25_score / max_score
+                if max_score
+                else 0.0
+            )
+            chunks = chunks_by_doc[doc_id]
+            if not chunks:
+                continue
+            best_chunk = self._best_chunk_for_question(chunks, question_vector, query_terms)
+            excerpt = str(best_chunk.text or "")[:900]
+            if not excerpt:
+                continue
+            evidence_kind = (
+                "table"
+                if self._context_has_table_data(best_chunk.text)
+                else (
+                    best_chunk.block_type
+                    if best_chunk.block_type in {"figure", "formula"}
+                    else None
+                )
+            )
+            contexts.append(
+                RetrievedContext(
+                    citation=Citation(
+                        document_id=doc_id,
+                        chunk_id=best_chunk.id,
+                        score=norm,
+                        page_label=best_chunk.page_label,
+                        excerpt=excerpt,
+                    ),
+                    prompt_text=excerpt,
+                    score=norm,
+                    evidence_kind=evidence_kind,
+                )
+            )
+        return contexts
+
+    @staticmethod
+    def _best_chunk_for_question(
+        chunks: list[DocumentChunk],
+        question_vector: list[float] | None,
+        query_terms: set[str],
+    ) -> DocumentChunk:
+        """每文档证据 chunk 选择：question_vector 余弦最高，无向量退化为词法重叠。"""
+        if question_vector is not None:
+            best: DocumentChunk | None = None
+            best_score = -1.0
+            for chunk in chunks:
+                if not chunk.embedding:
+                    continue
+                score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
+                if score > best_score:
+                    best_score = score
+                    best = chunk
+            if best is not None:
+                return best
+        return max(
+            chunks,
+            key=lambda chunk: len(query_terms & QueryService._tokenize(chunk.text)),
+        )
 
     @staticmethod
     def _locked_document_ids(question: str, paper_matches: list[PaperMatch]) -> list[str]:
@@ -7797,7 +7999,9 @@ class QueryService:
         if selector_key == "gamma" and re.search(r"(?:γ|\bgamma\b|\bsurface\s+tension\b)", text, re.IGNORECASE):
             return True
         if re.fullmatch(r"[a-z][a-z0-9]*", selector_text):
-            return bool(re.search(rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])", text, re.IGNORECASE))
+            # 边界正则按 selector 预编译缓存（_selector_boundary_pattern，
+            # 2026-08-18 性能修复：per-doc 循环打穿 re 内部 512 缓存）。
+            return bool(_selector_boundary_pattern(selector_text).search(text))
         return selector_key in (normalized_text if normalized_text is not None else cls._normalize_selector(text))
 
     @classmethod
