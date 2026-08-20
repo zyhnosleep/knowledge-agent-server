@@ -113,6 +113,7 @@ spec R2 目标 ≥0.86 差 0.0097，属混合残余而非单点可修）。
    - 第二步（R3 归因，§1.4）：缺口 ~0.11 中**路由锁定占 +0.1182（唯一主导伤害源）**，融合/格式损耗共 ~−0.02 可忽略，BM25 净贡献 ≈0。修复路由锁定后 nDCG **0.8503**（+0.0872）；对照 noroute 上限 0.8813，残余 0.031 为混合残余（融合 + 格式损耗，无单点主因，不在本次继续拆）。
 4. **内部 13 篇语料回归不回归**（硬约束，见 §4）：30 题 full-answer + retrieval cases 修复版全过，超扩库前基线（8/5 active 29/30）。
 5. 无重排层（cross-encoder）仍是 border case 区分度瓶颈，但非本次范围（spec §4.3 非目标）。
+6. **BM25 补充路已删除（2026-08-19 双口径证伪，commit 36c1444）**：SciFact 归因 `bm25off` nDCG 0.8503→0.8503（+0.0009≈0）+ 内部 30 题 A/B（30/30 零依赖、5 题证据集变化全为去噪声）+ full-answer 28/30 与基线同量级（失败集互不相干，2 条措辞漂移重跑通过）。补充路回到纯向量 top-8，守卫保持 R3 修正版；删除后全量测试 2106 绿。
 
 ## 4. 内部回归记录（硬验收）
 
@@ -128,6 +129,10 @@ spec R2 目标 ≥0.86 差 0.0097，属混合残余而非单点可修）。
 - **R3 修复版（路由锁定不跳过补充路，2026-08-19 实测）**：full-answer 28/30（citation 1.0，p50 115s / p95 205s——服务器负载放大（load 126）约 3 倍）：
   - 2 条失败均为非检索回归，重跑通过（missing: []）：`ff14sb_overview` 超时（245s，答案完整 + 3 citations，基线 65s→负载放大）；`ff14sb_mechanism` 缺 "side chain"（答案写中文"侧链"——措辞漂移，非检索缺口）；
   - retrieval 全部正常（30/30 检索覆盖，citation 1.0）；与 8/5 基线（29/30）对比不回归。
+- **无 BM25 形态（2026-08-19/20 实测，删除验证链）**：
+  - A/B 检索对照（`.task18-corpus/bm25_ab_test.py`，同进程同 DB 双跑、embed 缓存）：30/30 判定口径全命中，`lost_without_bm25=[]`；5 题证据集变化（charmm36m_table_metrics / ff99sb_ildn_mechanism / oplsaa_overview / oplsaa_mechanism / opls4_overview）全为去噪声——BM25 把无关论文 chunk 经词法共享术语（"CHARMM36" 等出现在多篇正文）塞进证据池；
+  - full-answer 28/30（task16-agent-full30-20260819-nobm25.json，citation 1.0，p50 72.5s / p95 133s）：失败 2 条（charmm36_overview 缺 "QM"、ff99sb_ildn_mechanism 缺 "Boltzmann"）均为 required_terms 中文措辞判定，重跑 missing=[] 全过——定性生成漂移，非检索回归；与基线（route-lock-fix 28/30）同量级且失败集互不相干；
+  - 删除落地（commit 36c1444：常量/方法/调用点/import math/测试簇 5 个），全量测试 2106 绿，部署后 dev 保持服务启动。
 
 ## 复现命令
 

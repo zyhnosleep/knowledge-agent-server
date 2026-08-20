@@ -1,6 +1,6 @@
 # 检索层提升 R2：补充路 BM25 ∪ 向量（词法/语义双路兜底）
 
-> 日期：2026-08-18 | 状态：implemented（TDD 3 测试 RED→GREEN；R3 修正：分数天花板 6.0 + 每文档 1 chunk + 路由锁定守卫放宽，SciFact 0.8503 / recall 0.9437 / zero_hit 0，内部回归 30/30 检索正常）
+> 日期：2026-08-18 | 状态：implemented 后回撤——BM25 补充路已删除（2026-08-19 双口径证伪必要性，commit 36c1444；验证链见 §5 演进），当前补充路 = 全库向量 top-8 + R3 守卫（无 BM25）
 > 来源：R1 全库向量补充路由（2026-08-17 spec，已上线）后残余差距诊断——hybrid 实验（2026-08-18）
 > 上游：`docs/superpowers/specs/2026-08-17-retrieval-layer-improvement-design.md`（R1）
 
@@ -98,6 +98,34 @@
 
 - **性能**：每次问答补充路 +1 次 BM25 全库打分（~1200 chunks 文档级循环，毫秒级）+ 0 额外 embedding/LLM 调用。语料长大（扩到 150-200 篇 ~2-4 万 chunks）后 BM25 全库循环仍在毫秒-几十毫秒级，可接受；必要时后续做倒排缓存（非本 spec 范围）。
 - **风险**：BM25 归一化分与向量分尺度失配 → 调参回退（§2.3）；无关文档混入 → 分数排序 + MAX_CONTEXTS 截断兜底，内部回归验证；单点改动（一方法 + 一调用点），git 级回滚。
+
+## §5 演进：BM25 补充路删除（2026-08-19）
+
+**结论先行**：BM25 补充路在双口径下均被证伪必要性，代码已删除（commit 36c1444）。
+当前补充路 = `_search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS,
+question_vector=..., table_promotion=False)`（回到 R1 全库向量语义），
+守卫保持 R3 修正版（只有显式作用域 / overview / 锁定 + 结构化查询跳过补充路）。
+
+**证据链 1：SciFact 归因实验**（`.task18-corpus` 归因，attribution-report-fixed.json）
+- 六变体里 `bm25off` 相对生产（R3 含 BM25）：nDCG **+0.0009 ≈ 0**（0.8503→0.8503 量级噪声内）
+- 同期归因证实真正的主导伤害源是路由锁定（noroute−routed = +0.1182），与 BM25 无关
+
+**证据链 2：内部 30 题检索 A/B**（`.task18-corpus/bm25_ab_test.py`，同进程同 DB 双跑、embed 缓存）
+- 30/30 判定口径全命中：`without_bm25_hit = 30`，`lost_without_bm25 = []`
+- 5 题证据集变化（charmm36m_table_metrics / ff99sb_ildn_mechanism / oplsaa_overview /
+  oplsaa_mechanism / opls4_overview）全部为**去噪声**：BM25 把无关论文 chunk
+  经词法共享术语（如 "CHARMM36" 出现在多篇论文正文）塞进证据池，去掉后证据更纯
+
+**证据链 3：full-answer 端到端验证**（task16-agent-full30-20260819-nobm25.json）
+- 28/30 与基线（route-lock-fix 28/30）同量级，citation 通过率 1.0
+- 失败集互不相干：基线 = ff14sb_overview 超时 + ff14sb_mechanism 缺 side chain；
+  nobm25 = charmm36_overview 缺 "QM" + ff99sb_ildn_mechanism 缺 "Boltzmann"
+  （均为 required_terms 中文措辞判定，重跑 missing=[] 全过，定性生成漂移非检索回归）
+
+**删除范围**（commit 36c1444）：`BM25_SUPPLEMENT_SCORE_CEIL` 常量、
+`_bm25_supplement_candidates` 方法（1355-1465）、`_best_chunk_for_question`（1467-1489）、
+`_build_rag_contexts` 补充路调用点、`import math`、tests 里 BM25 测试簇 5 个 + 2 seed。
+删除前全量测试 2106 绿，删除后 2106 绿。
 
 ## 复现命令
 
