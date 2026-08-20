@@ -36,13 +36,20 @@ def _split_chat_ids(raw: str) -> list[str]:
 
 
 async def _on_event(handler: BotHandler, data: dict) -> None:
-    """ws 事件回调：解析 → 线程池处理（不阻塞收帧）。"""
+    """ws 事件回调：解析 → 线程池处理（不阻塞收帧）。
+
+    处理中的任何异常（如发消息失败）只记日志不冒泡——否则会断掉
+    健康的长连接并丢后续事件（飞书侧 3 秒未 ack 才会重推，无必要代价）。
+    """
     try:
         event = parse_message_event(data)
     except ValueError:
         logger.warning("feishu bot: unparseable event dropped: %r", str(data)[:200])
         return
-    await asyncio.to_thread(handler.handle, event)
+    try:
+        await asyncio.to_thread(handler.handle, event)
+    except Exception:
+        logger.exception("feishu bot: event handling failed (event_id=%s)", event.event_id)
 
 
 async def run_bot(

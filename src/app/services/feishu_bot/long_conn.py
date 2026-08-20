@@ -9,17 +9,20 @@ long_conn.py —— 飞书长连接（WebSocket）客户端
    - 收 ``{"type":"EVENT","client_msg_id":...,"data":{...}}`` → 先回 PONG ack
      （3 秒超时重推时限内必须应答），再把 ``data`` 交给 ``on_event`` 处理。
    - 其余帧类型忽略。
-3. 断线/异常 → 退避重连（``reconnect_delay`` 秒后重试），进程内永续。
+3. 断线/异常 → 指数退避重连（``reconnect_delay`` 起步、翻倍至
+   ``max_reconnect_delay`` 封顶；连接正常建立过一次后重置），进程内永续。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+from asyncio import sleep
 from collections.abc import Awaitable, Callable
 
 import websockets
+
+from app.services.feishu_bot.client import FeishuClientProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -30,18 +33,28 @@ class LongConnClient:
     """飞书长连接客户端。
 
     参数：
-    - ``feishu_client``：飞书 API 客户端（需具备 ``fetch_ws_url(region=...)``）。
+    - ``feishu_client``：飞书 API 客户端（FeishuClientProtocol，需 ``fetch_ws_url``）。
     - ``region``：端点区域（国内 cn）。
-    - ``reconnect_delay``：断线后的重连间隔秒数。
+    - ``reconnect_delay``：断线后的初始重连间隔秒数。
+    - ``max_reconnect_delay``：退避封顶秒数（默认 60s）。
     """
 
-    def __init__(self, feishu_client, *, region: str = "cn", reconnect_delay: float = 5.0) -> None:
+    def __init__(
+        self,
+        feishu_client: FeishuClientProtocol,
+        *,
+        region: str = "cn",
+        reconnect_delay: float = 5.0,
+        max_reconnect_delay: float = 60.0,
+    ) -> None:
         self._api = feishu_client
         self._region = region
         self._reconnect_delay = reconnect_delay
+        self._max_reconnect_delay = max_reconnect_delay
 
     async def run(self, on_event: OnEvent) -> None:
-        """长驻运行：连接 → 收帧分发；断线退避重连，直至被取消。"""
+        """长驻运行：连接 → 收帧分发；断线指数退避重连，直至被取消。"""
+        delay = self._reconnect_delay
         while True:
             try:
                 await self._connect_once(on_event)
@@ -49,9 +62,13 @@ class LongConnClient:
                 logger.warning(
                     "feishu long connection error: %r; reconnect in %.1fs",
                     exc,
-                    self._reconnect_delay,
+                    delay,
                 )
-                await asyncio.sleep(self._reconnect_delay)
+                await sleep(delay)
+                delay = min(delay * 2, self._max_reconnect_delay)
+            else:
+                # 连接曾正常建立（干净关闭）：重置退避，避免健康期后无谓长等
+                delay = self._reconnect_delay
 
     async def _connect_once(self, on_event: OnEvent) -> None:
         ws_url = self._api.fetch_ws_url(region=self._region)

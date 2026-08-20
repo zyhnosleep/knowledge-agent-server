@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.services.feishu_bot.client import FeishuClientProtocol
 from app.services.feishu_bot.events import MessageEvent
 
 # 文档状态终态：ready 可检索；各 failed 变体为失败终态
@@ -113,7 +114,7 @@ class InboxIngestor:
 
     def __init__(
         self,
-        feishu,
+        feishu: FeishuClientProtocol,
         api: ServerApi,
         *,
         inbox_project: str,

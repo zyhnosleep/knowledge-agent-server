@@ -9,7 +9,7 @@ query.py —— 文本问答链路（T3）：@ 提问 → agent query（固定�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.services.feishu_bot.inbox import ServerApi
 
@@ -23,12 +23,8 @@ class QueryResult:
 
     ok: bool
     answer: str | None = None
-    citations: list[str] = None  # type: ignore[assignment]
+    citations: list[str] = field(default_factory=list)
     error: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.citations is None:
-            self.citations = []
 
 
 def truncate_answer(text: str, limit: int = ANSWER_LIMIT) -> str:
@@ -64,11 +60,11 @@ class Answerer:
 
 
 def _unique_titles(citations: list[dict]) -> list[str]:
-    """按出现顺序去重引用文档标题。"""
+    """按出现顺序去重引用页面标题（Citation 形状：标题在 page_title）。"""
     seen: set[str] = set()
     titles: list[str] = []
     for citation in citations:
-        title = (citation or {}).get("document_title")
+        title = (citation or {}).get("page_title")
         if title and title not in seen:
             seen.add(title)
             titles.append(title)

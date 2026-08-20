@@ -7,7 +7,7 @@ import pytest
 
 from app.core.config import Settings
 from app.services.feishu_bot.client import FeishuClient
-from app.services.feishu_bot.entry import run_bot
+from app.services.feishu_bot.entry import _on_event, run_bot
 
 
 def _settings(**overrides) -> Settings:
@@ -44,3 +44,53 @@ def test_run_bot_exits_when_bot_info_unavailable():
     settings = _settings()
     with pytest.raises(SystemExit):
         asyncio.run(run_bot(settings=settings, client_factory=_bot_info_fails_client))
+
+
+def _event_payload() -> dict:
+    return {
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_1",
+            "event_type": "im.message.receive_v1",
+            "create_time": "0",
+            "token": "tok",
+            "app_id": "cli_app",
+            "tenant_key": "tenant_a",
+        },
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_user"}, "sender_type": "user", "tenant_key": "tenant_a"},
+            "message": {
+                "message_id": "om_1",
+                "create_time": "0",
+                "chat_id": "oc_group",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": '{"text":"@_user_1 hi"}',
+                "mentions": [{"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "x", "tenant_key": "tenant_a"}],
+            },
+        },
+    }
+
+
+class _BoomHandler:
+    """handle 必炸：模拟发消息失败等下游异常。"""
+
+    def handle(self, event) -> None:
+        raise RuntimeError("send failed")
+
+
+def test_on_event_swallows_handler_failures():
+    """handler.handle 抛异常（如 send_text 失败）不冒泡断链：记日志继续。"""
+    asyncio.run(_on_event(_BoomHandler(), _event_payload()))  # 不应抛异常
+
+
+def test_on_event_drops_unparseable_event():
+    """解析失败的帧被丢弃（不炸循环），也不调 handler。"""
+    handled = []
+
+    class Recorder(_BoomHandler):
+        def handle(self, event) -> None:
+            handled.append(event)
+
+    asyncio.run(_on_event(Recorder(), {"type": "EVENT", "data": {"garbage": 1}}))
+    assert handled == []

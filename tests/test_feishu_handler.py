@@ -108,8 +108,8 @@ def _handler(client=None, **kwargs):
 def test_handler_acks_when_mentioned_and_allowed():
     client = _FakeClient()
     _handler(client).handle(parse_message_event(_text_event()))
-    # T3 起文本场景：占位"处理中…"；无问答器时补"未启用"提示
-    assert client.sent == [("oc_group", "处理中…"), ("oc_group", "问答功能未启用")]
+    # T3 起文本场景：占位回执回显问题（"处理中：<问题>"）；无问答器时补"未启用"提示
+    assert client.sent == [("oc_group", "处理中：你好"), ("oc_group", "问答功能未启用")]
 
 
 def test_handler_silent_when_tenant_not_allowed():
@@ -202,7 +202,7 @@ def test_handler_file_ingestion_failure_reports_reason():
 def test_handler_text_without_querier_keeps_ack_receipt():
     client = _FakeClient()
     _handler(client).handle(parse_message_event(_text_event()))
-    assert client.sent == [("oc_group", "处理中…"), ("oc_group", "问答功能未启用")]
+    assert client.sent == [("oc_group", "处理中：你好"), ("oc_group", "问答功能未启用")]
 
 
 def test_handler_mention_only_asks_for_question():
@@ -219,10 +219,22 @@ def test_handler_text_question_sends_processing_then_answer_with_citations():
     querier = _FakeQuerier(QueryResult(ok=True, answer="结论是……", citations=["报告.pdf"]))
     _handler(client, querier=querier).handle(parse_message_event(_text_event()))
     assert client.sent == [
-        ("oc_group", "处理中…"),
+        ("oc_group", "处理中：你好"),
         ("oc_group", "结论是……\n\n参考：报告.pdf"),
     ]
     assert querier.questions == ["你好"]
+
+
+def test_handler_final_text_truncated_after_citations_appended():
+    """答案+引用拼接后再截断：总长度不超飞书限制。"""
+    client = _FakeClient()
+    querier = _FakeQuerier(
+        QueryResult(ok=True, answer="长" * 3990, citations=["报告.pdf", "附录.docx"])
+    )
+    _handler(client, querier=querier).handle(parse_message_event(_text_event()))
+    text = client.sent[-1][1]
+    assert len(text) <= 4000
+    assert "截断" in text
 
 
 def test_handler_text_question_failure_reports_reason():
@@ -230,7 +242,7 @@ def test_handler_text_question_failure_reports_reason():
     querier = _FakeQuerier(QueryResult(ok=False, error="问答超时"))
     _handler(client, querier=querier).handle(parse_message_event(_text_event()))
     assert client.sent == [
-        ("oc_group", "处理中…"),
+        ("oc_group", "处理中：你好"),
         ("oc_group", "问答失败：问答超时"),
     ]
 
@@ -275,12 +287,60 @@ def test_handler_mixed_file_then_question_answers_after_ingestion():
     # 消息序列：入库占位 → 问答占位 → 已入库 → 答案（含引用，命中刚入库文档）
     assert client.sent[:2] == [
         ("oc_group", "正在入库…"),
-        ("oc_group", "处理中…"),
+        ("oc_group", "处理中：你好"),
     ]
     assert client.sent[-2:] == [
         ("oc_group", "已入库 1 篇：报告.pdf"),
         ("oc_group", "基于刚入库文档的答案\n\n参考：报告.pdf"),
     ]
+
+
+def test_handler_question_waits_for_all_inflight_files():
+    """多文件同时入库：提问必须等全部入库完成（不只第一个）。"""
+    client = _FakeClient()
+    order: list[str] = []
+    release = threading.Event()
+    ingest_calls = 0
+
+    class MultiSlowIngestor(_FakeIngestor):
+        def ingest_file(self, event):
+            nonlocal ingest_calls
+            ingest_calls += 1
+            order.append(f"ingest-start-{ingest_calls}")
+            release.wait(3)
+            order.append(f"ingest-end-{ingest_calls}")
+            return IngestResult(ok=True, document_id=f"doc_{ingest_calls}", file_name=f"f{ingest_calls}.pdf")
+
+    class OrderedQuerier(_FakeQuerier):
+        def answer(self, question):
+            order.append("answer")
+            return QueryResult(ok=True, answer="答案")
+
+    handler = _handler(
+        client,
+        ingestor=MultiSlowIngestor(IngestResult(ok=True)),
+        querier=OrderedQuerier(QueryResult(ok=True)),
+    )
+
+    file_threads = [
+        threading.Thread(target=handler.handle, args=(parse_message_event(_file_event()),))
+        for _ in range(2)
+    ]
+    text_thread = threading.Thread(target=handler.handle, args=(parse_message_event(_text_event()),))
+    file_threads[0].start()
+    time.sleep(0.05)
+    file_threads[1].start()
+    time.sleep(0.05)
+    text_thread.start()
+    time.sleep(0.1)
+    release.set()
+    for t in file_threads:
+        t.join(3)
+    text_thread.join(3)
+
+    assert not any(t.is_alive() for t in file_threads) and not text_thread.is_alive()
+    # 问答严格发生在第二个文件也入库完成之后
+    assert order.index("answer") > order.index("ingest-end-2")
 
 
 def test_handler_question_alone_does_not_wait_for_previous_chat():

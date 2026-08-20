@@ -15,12 +15,29 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Protocol
 
 import httpx
 
 
 class FeishuApiError(Exception):
     """飞书开放平台业务错误：HTTP 200 但 ``code != 0``。"""
+
+
+class FeishuClientProtocol(Protocol):
+    """各编排模块（handler/inbox/long_conn）依赖的飞书 API 最小面。
+
+    鸭子类型参数显式化：实现方只需具备这四个方法（FeishuClient 天然满足，
+    测试替身按协议实现即可）。
+    """
+
+    def send_text(self, chat_id: str, text: str) -> None: ...
+
+    def download_file(self, message_id: str, file_key: str) -> bytes: ...
+
+    def fetch_ws_url(self, region: str = "cn") -> str: ...
+
+    def get_bot_open_id(self) -> str: ...
 
 
 class FeishuClient:
@@ -48,6 +65,12 @@ class FeishuClient:
         self._token: str | None = None
         self._token_expires_at: float = 0.0
 
+    @staticmethod
+    def _ensure_code(payload: dict, action: str) -> None:
+        """业务错误包络：``code != 0`` → FeishuApiError（含接口名便于排查）。"""
+        if payload.get("code") != 0:
+            raise FeishuApiError(f"{action} failed: {payload.get('msg')}")
+
     def _request_tenant_access_token(self) -> str:
         """POST /open-apis/auth/v3/tenant_access_token/internal 换 token。"""
         response = self._client.post(
@@ -56,8 +79,7 @@ class FeishuClient:
         )
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 0:
-            raise FeishuApiError(f"tenant_access_token failed: {payload.get('msg')}")
+        self._ensure_code(payload, "tenant_access_token")
         data = payload.get("data") or {}
         token = data.get("tenant_access_token")
         if not token:
@@ -87,8 +109,7 @@ class FeishuClient:
         )
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 0:
-            raise FeishuApiError(f"send message failed: {payload.get('msg')}")
+        self._ensure_code(payload, "send message")
 
     def download_file(self, message_id: str, file_key: str) -> bytes:
         """下载消息内文件资源（``?type=file``），返回原始字节。
@@ -102,9 +123,7 @@ class FeishuClient:
         )
         response.raise_for_status()
         if "json" in response.headers.get("content-type", ""):
-            payload = response.json()
-            if payload.get("code") != 0:
-                raise FeishuApiError(f"download file failed: {payload.get('msg')}")
+            self._ensure_code(response.json(), "download file")
         return response.content
 
     def fetch_ws_url(self, region: str = "cn") -> str:
@@ -119,8 +138,7 @@ class FeishuClient:
         )
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 0:
-            raise FeishuApiError(f"fetch ws endpoint failed: {payload.get('msg')}")
+        self._ensure_code(payload, "fetch ws endpoint")
         data = payload.get("data") or {}
         ws_url = data.get("ws_url")
         if not ws_url:
@@ -138,8 +156,7 @@ class FeishuClient:
         )
         response.raise_for_status()
         payload = response.json()
-        if payload.get("code") != 0:
-            raise FeishuApiError(f"get bot info failed: {payload.get('msg')}")
+        self._ensure_code(payload, "get bot info")
         bot = (payload.get("data") or {}).get("bot") or {}
         open_id = bot.get("open_id")
         if not open_id:

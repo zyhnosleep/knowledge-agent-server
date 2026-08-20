@@ -117,3 +117,37 @@ async def test_event_ack_before_slow_handler():
         task.cancel()
         server.close()
     assert order.index("ack") < order.index("handled")
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_doubles_on_repeated_failure(monkeypatch):
+    """连续断连时重连间隔指数退避（0.01 → 0.02 → 0.04），成功连接后重置。"""
+    fetched = asyncio.Event()
+    attempts = 0
+
+    class FlakyApi(_FakeApi):
+        def fetch_ws_url(self, region: str = "cn") -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4:
+                raise RuntimeError("endpoint down")
+            fetched.set()
+            return self.ws_url
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("app.services.feishu_bot.long_conn.sleep", fake_sleep)
+
+    server, ws_url = await _start_server(lambda ws: ws.recv())  # 挂着等取消
+    client = LongConnClient(FlakyApi(ws_url), reconnect_delay=0.01)
+    task = asyncio.create_task(client.run(lambda ev: None))
+    try:
+        await asyncio.wait_for(fetched.wait(), timeout=5)
+    finally:
+        task.cancel()
+        server.close()
+    # 三次失败对应三次退避：0.01、0.02（翻倍）、0.04（再翻倍）
+    assert sleeps == [0.01, 0.02, 0.04]

@@ -15,15 +15,16 @@ def _make_server_api(handler) -> ServerApi:
 
 
 def _completed_payload() -> dict:
+    # citations 是 Citation 形状（schemas/common.py）：页面标题在 page_title
     return {
         "request_id": "req_1",
         "session_id": "sess_1",
         "status": "completed",
         "final_answer": "结论是……",
         "citations": [
-            {"document_id": "doc_1", "document_title": "报告.pdf"},
-            {"document_id": "doc_1", "document_title": "报告.pdf"},
-            {"document_id": "doc_2", "document_title": "附录.docx"},
+            {"document_id": "doc_1", "page_title": "报告.pdf", "score": 0.9, "excerpt": "x"},
+            {"document_id": "doc_1", "page_title": "报告.pdf", "score": 0.8, "excerpt": "y"},
+            {"document_id": "doc_2", "page_title": "附录.docx", "score": 0.7, "excerpt": "z"},
         ],
         "steps": [],
         "usage": {},
