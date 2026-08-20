@@ -26,6 +26,10 @@ systemctl --user enable --now \
   knowledge-agent-test-tunnel.service
 ```
 
+飞书机器人（可选，dev 专属）：`knowledge-agent-dev-feishu-bot.service`
+依赖 dev API 在线（文件入库/问答都经 `FEISHU_BOT_API_BASE_URL` 走本地 API），
+启用前须先在 dev `runtime/app.env` 配好机器人配置（见 `docs/agents/feishu-bot-setup.md`）。
+
 两个 Ollama 服务共享只读模型缓存，但各自绑定 GPU 和端口。两边均使用 `qwen3.5:9b`、`qwen3-embedding:4b`、32K、Flash Attention、q8_0 KV Cache、并发 1 和 5 分钟闲置释放。
 
 ## 验收

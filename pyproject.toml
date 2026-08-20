@@ -24,6 +24,7 @@ dependencies = [
   "trafilatura>=1.12.2",
   "transformers>=4.51.0,<5.0",
   "uvicorn[standard]>=0.32.0",
+  "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
