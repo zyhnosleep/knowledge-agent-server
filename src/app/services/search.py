@@ -78,6 +78,13 @@ MAX_CONTEXTS = 8
 # names several tables), but the exact retrieval-token budget remains the
 # final bound on what reaches the answer prompt.
 CANONICAL_TABLE_CONTEXT_LIMIT = 24
+# 公式类问题（查询显式含 formula/equation/公式）的候选生成宽度。TeX 公式
+# chunk 与自然语言查询的向量相似度天然偏低（qwen3-embedding 对 TeX 符号的
+# 语义编码弱），窄候选（MAX_CONTEXTS=8）会把公式证据截断在 finalize 之前
+# （2026-08-24 Forward KL 查询实测：Eq 6/7 排 12-38 位）。放宽候选后由
+# _finalize_contexts 的公式结构提权接管排序，最终证据包仍受 context_limit
+# 约束，不会膨胀。
+FORMULA_SOURCE_CONTEXT_LIMIT = 24
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
 
@@ -1279,7 +1286,16 @@ class QueryService:
                 contexts.extend(self._search_document_parameterization_contexts(question, project_id, derived_document_ids, limit=5))
                 contexts.extend(self._search_document_scientific_anchor_contexts(question, project_id, derived_document_ids, limit=8))
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, derived_document_ids, limit=min(3, MAX_CONTEXTS)))
-            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms, question_vector=question_vector))
+            # 公式类问题放宽候选窗口：TeX 公式 chunk 向量分天然偏低，窄候选
+            # 会把公式证据截在 finalize 之前（2026-08-24 Forward KL 查询：
+            # Eq 6/7 排 12-38 位）。放宽只影响候选生成，最终证据包仍受
+            # context_limit 与公式结构提权（_finalize_contexts）约束。
+            source_context_limit = (
+                FORMULA_SOURCE_CONTEXT_LIMIT
+                if QueryService._is_formula_query(question)
+                else MAX_CONTEXTS
+            )
+            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=source_context_limit, route_terms=profile_terms, question_vector=question_vector))
             contexts.extend(
                 self._supplement_profile_term_contexts(
                     project_id,
@@ -1319,12 +1335,19 @@ class QueryService:
             # 由 _finalize_contexts 统一分数排序 + 去重 + 截断融合（重叠 chunk 高分保留）。
             if question_vector is None:
                 question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+            # 与文档内候选同规则：公式类问题放宽补充路候选窗口（同上原因，
+            # 保证跨文档/兜底场景的公式证据同样有机会进 finalize）。
+            supplement_context_limit = (
+                FORMULA_SOURCE_CONTEXT_LIMIT
+                if QueryService._is_formula_query(question)
+                else MAX_CONTEXTS
+            )
             contexts.extend(
                 self._search_source_chunks(
                     question,
                     project_id,
                     [],
-                    limit=MAX_CONTEXTS,
+                    limit=supplement_context_limit,
                     question_vector=question_vector,
                     # 补充路不做表格提权（table_promotion=False）：+40 boost
                     # 让无关文档的表格与词法路表格平手竞争，正确文档会被
@@ -7049,6 +7072,18 @@ class QueryService:
             """
 
             if not table_query:
+                # 非表格查询默认按原始分数排序；仅当查询显式问公式时对
+                # formula 证据结构提权。TeX 公式 chunk 向量分天然低于正文
+                # （qwen3-embedding 对 TeX 符号的语义编码弱），不提权则
+                # "公式是什么"类问题里最相关的公式证据被高分正文挤出
+                # （2026-08-24 Forward KL 查询：Eq 6/7 排 12-38 位、
+                # 候选截断前即出局）。提权只在公式类问题上生效，普通
+                # 查询不受影响。
+                if (
+                    self._context_evidence_kind(context) == "formula"
+                    and QueryService._is_formula_query(question)
+                ):
+                    return (4.0, 0.0, 0.0, context.score)
                 return (0.0, 0.0, 0.0, context.score)
             text = self._context_table_evidence_text(context)
             text_key = self._normalize_selector(text)
@@ -7076,13 +7111,9 @@ class QueryService:
                 and self._selector_matches_text(anchor, text, text_key)
                 for anchor in self._query_priority_anchors(question)["figure_table"]
             )
-            formula_query = bool(
-                re.search(r"\b(?:formula|equation|eq\.)\b", question, re.IGNORECASE)
-                or "公式" in question
-            )
             if evidence_kind == "figure" and figure_anchor_match:
                 structure_priority = 4.0
-            elif evidence_kind == "formula" and formula_query:
+            elif evidence_kind == "formula" and QueryService._is_formula_query(question):
                 structure_priority = 4.0
             elif evidence_kind == "table" and table_anchor_match:
                 structure_priority = 3.0
@@ -7516,6 +7547,18 @@ class QueryService:
                 lowered,
             )
             or pka_metric
+        )
+
+    @staticmethod
+    def _is_formula_query(question: str) -> bool:
+        """Detect questions explicitly asking for a formula/equation.
+
+        公式类问题的检索差异化：候选窗口放宽（FORMULA_SOURCE_CONTEXT_LIMIT）
+        与 _finalize_contexts 结构提权都以此判定为门。
+        """
+        return bool(
+            re.search(r"\b(?:formula|equation|eq\.)\b", question, re.IGNORECASE)
+            or "公式" in question
         )
 
     @classmethod
