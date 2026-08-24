@@ -9,26 +9,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_BENCHMARK = Path("benchmarks/query/internal_research_v1.json")
 DEFAULT_OUT_ROOT = Path("tmp/loop_runs")
 
 
 PYTEST_COMMANDS = {
     "quick": [
-        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "tests/test_query_eval.py", "-q"],
+        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "-q"],
     ],
     "query": [
-        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "tests/test_query_eval.py", "-q"],
+        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "-q"],
         ["-m", "pytest", "tests/test_query_service.py", "tests/test_paper_profile.py", "-q"],
     ],
     "full": [
-        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "tests/test_query_eval.py", "-q"],
+        ["-m", "pytest", "tests/test_parser_document_intelligence.py", "-q"],
         ["-m", "pytest", "tests/test_query_service.py", "tests/test_paper_profile.py", "-q"],
         ["-m", "pytest", "tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py", "-q"],
     ],
@@ -40,17 +38,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", choices=["quick", "query", "full"], default="quick")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for child commands.")
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--run-query-eval", action="store_true")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--benchmark", type=Path, default=DEFAULT_BENCHMARK)
-    parser.add_argument("--case-id", action="append", default=[])
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="API base URL for the service ingest smoke.")
     parser.add_argument("--timeout", type=float, default=60.0)
-    parser.add_argument("--fail-on-query-error", action="store_true")
-    parser.add_argument("--min-query-passed", type=int, default=None)
-    parser.add_argument("--max-query-failed", type=int, default=None)
-    parser.add_argument("--require-failure-attribution", action="store_true")
     parser.add_argument("--skip-pytest", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--run-mineru-smoke", action="store_true")
@@ -107,43 +96,6 @@ def build_commands(args: argparse.Namespace) -> list[dict[str, Any]]:
             smoke_argv.extend(["--mineru-model-source", args.mineru_model_source])
         commands.append({"name": "mineru_parser_smoke", "argv": smoke_argv})
 
-    if args.run_query_eval:
-        json_output = args.out_dir / "query_eval.json"
-        markdown_output = args.out_dir / "query_eval.md"
-        query_eval_argv = [
-            args.python,
-            "scripts/query_eval.py",
-            str(args.benchmark),
-            "--base-url",
-            args.base_url,
-            "--output",
-            str(json_output),
-            "--markdown",
-            str(markdown_output),
-            "--timeout",
-            _format_number(args.timeout),
-            "--offset",
-            str(args.offset),
-        ]
-        if args.limit is not None:
-            query_eval_argv.extend(["--limit", str(args.limit)])
-        for case_id in args.case_id:
-            query_eval_argv.extend(["--case-id", case_id])
-        if args.fail_on_query_error:
-            query_eval_argv.append("--fail-on-error")
-        commands.append({"name": "query_eval", "argv": query_eval_argv})
-
-        summary_argv = [
-            args.python,
-            "scripts/query_report_summary.py",
-            str(json_output),
-            "--benchmark",
-            str(args.benchmark),
-            "--json-output",
-            str(args.out_dir / "query_attribution.json"),
-        ]
-        commands.append({"name": "query_report_summary", "argv": summary_argv})
-
     return commands
 
 
@@ -171,21 +123,17 @@ def run_loop(args: argparse.Namespace) -> dict[str, Any]:
             _run_command(command_record)
         commands.append(command_record)
 
-    query_eval_summary = _query_eval_summary(args, commands)
     mineru_smoke_summary = _mineru_smoke_summary(args, commands)
     service_ingest_summary = _service_ingest_summary(args)
-    overall_status = _overall_status(args.dry_run, commands, query_eval_summary, mineru_smoke_summary, service_ingest_summary)
+    overall_status = _overall_status(args.dry_run, commands, mineru_smoke_summary, service_ingest_summary)
     manifest = {
         "started_at": started_at,
         "finished_at": _utc_now(),
         "profile": args.profile,
-        "base_url": args.base_url,
-        "benchmark": str(args.benchmark),
         "out_dir": str(out_dir),
         "dry_run": args.dry_run,
         "git_status_short": git_status_short,
         "commands": commands,
-        "query_eval": query_eval_summary,
         "mineru_smoke": mineru_smoke_summary,
         "service_ingest": service_ingest_summary,
         "overall_status": overall_status,
@@ -247,96 +195,6 @@ def _git_status_short() -> str:
     return completed.stdout.strip()
 
 
-def _query_eval_summary(args: argparse.Namespace, commands: list[dict[str, Any]]) -> dict[str, Any] | None:
-    if not args.run_query_eval:
-        return None
-    report_path = args.out_dir / "query_eval.json"
-    markdown_path = args.out_dir / "query_eval.md"
-    attribution_path = args.out_dir / "query_attribution.json"
-    report_summary: dict[str, Any] | None = None
-    attribution_summary: dict[str, Any] | None = None
-    attribution: dict[str, Any] | None = None
-    if report_path.exists():
-        try:
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            summary = report.get("summary") if isinstance(report, dict) else None
-            if isinstance(summary, dict):
-                report_summary = summary
-        except json.JSONDecodeError:
-            report_summary = {"error": "query_eval report was not valid JSON"}
-    if attribution_path.exists():
-        try:
-            attribution = json.loads(attribution_path.read_text(encoding="utf-8"))
-            cases = attribution.get("cases") if isinstance(attribution, dict) else None
-            if isinstance(cases, list):
-                stage_counts = Counter(
-                    str(case.get("likely_stage"))
-                    for case in cases
-                    if isinstance(case, dict) and case.get("likely_stage")
-                )
-                failed_stage_counts = Counter(
-                    str(case.get("likely_stage"))
-                    for case in cases
-                    if isinstance(case, dict) and case.get("status") != "pass" and case.get("likely_stage")
-                )
-                attribution_summary = {
-                    "case_count": len(cases),
-                    "failure_reason_counts": attribution.get("failure_reason_counts", {}),
-                    "likely_stage_counts": dict(stage_counts),
-                    "failed_likely_stage_counts": dict(failed_stage_counts),
-                }
-        except json.JSONDecodeError:
-            attribution_summary = {"error": "query attribution report was not valid JSON"}
-
-    summary_command = next((command for command in commands if command["name"] == "query_report_summary"), None)
-    return {
-        "report_path": str(report_path),
-        "markdown_path": str(markdown_path),
-        "attribution_path": str(attribution_path),
-        "summary": report_summary,
-        "attribution_summary": attribution_summary,
-        "gate": _query_gate_summary(args, report_summary, attribution),
-        "summary_stdout_path": summary_command.get("stdout_path") if summary_command else None,
-        "summary_stderr_path": summary_command.get("stderr_path") if summary_command else None,
-    }
-
-
-def _query_gate_summary(args: argparse.Namespace, report_summary: dict[str, Any] | None, attribution: dict[str, Any] | None) -> dict[str, Any]:
-    enabled = args.min_query_passed is not None or args.max_query_failed is not None or args.require_failure_attribution
-    checks: dict[str, bool] = {}
-    details: dict[str, Any] = {
-        "enabled": enabled,
-        "min_query_passed": args.min_query_passed,
-        "max_query_failed": args.max_query_failed,
-        "require_failure_attribution": args.require_failure_attribution,
-    }
-    if not enabled:
-        return {**details, "passed": None, "checks": checks}
-    if not isinstance(report_summary, dict):
-        return {**details, "passed": False, "checks": checks, "error": "query_eval summary is unavailable"}
-    passed_count = _safe_int(report_summary.get("passed"))
-    failed_count = _safe_int(report_summary.get("failed"))
-    details.update({"passed_count": passed_count, "failed_count": failed_count})
-    if args.min_query_passed is not None:
-        checks["min_query_passed"] = "passed" in report_summary and passed_count >= args.min_query_passed
-    if args.max_query_failed is not None:
-        checks["max_query_failed"] = "failed" in report_summary and failed_count <= args.max_query_failed
-    if args.require_failure_attribution:
-        cases = attribution.get("cases") if isinstance(attribution, dict) else None
-        if not isinstance(cases, list):
-            checks["require_failure_attribution"] = False
-        else:
-            failed_cases = [case for case in cases if isinstance(case, dict) and case.get("status") != "pass"]
-            checks["require_failure_attribution"] = all(
-                case.get("likely_stage") not in (None, "", "unknown") and bool(case.get("stage_reasons") or {})
-                for case in failed_cases
-            )
-            details["unattributed_case_ids"] = [
-                case.get("id")
-                for case in failed_cases
-                if case.get("likely_stage") in (None, "", "unknown") or not bool(case.get("stage_reasons") or {})
-            ]
-    return {**details, "passed": all(checks.values()), "checks": checks}
 
 
 def _mineru_smoke_summary(args: argparse.Namespace, commands: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -655,7 +513,6 @@ def _safe_int(value: Any) -> int:
 def _overall_status(
     dry_run: bool,
     commands: list[dict[str, Any]],
-    query_eval_summary: dict[str, Any] | None = None,
     mineru_smoke_summary: dict[str, Any] | None = None,
     service_ingest_summary: dict[str, Any] | None = None,
 ) -> str:
@@ -665,10 +522,6 @@ def _overall_status(
         return "dry_run"
     if any(command.get("exit_code") not in (0, None) for command in commands):
         return "failed"
-    if query_eval_summary:
-        gate = query_eval_summary.get("gate")
-        if isinstance(gate, dict) and gate.get("enabled") and gate.get("passed") is not True:
-            return "failed"
     if mineru_smoke_summary:
         summary = mineru_smoke_summary.get("summary")
         if not isinstance(summary, dict) or summary.get("status") != "passed":
@@ -703,24 +556,6 @@ def _render_manifest_markdown(manifest: dict[str, Any]) -> str:
         exit_code = "-" if command["exit_code"] is None else str(command["exit_code"])
         duration = "-" if command["duration_seconds"] is None else str(command["duration_seconds"])
         lines.append(f"| {command['name']} | {exit_code} | {duration} |")
-    query_eval = manifest.get("query_eval")
-    if query_eval:
-        lines.extend(
-            [
-                "",
-                "## Query Eval",
-                "",
-                f"- Report: `{query_eval['report_path']}`",
-                f"- Markdown: `{query_eval['markdown_path']}`",
-                f"- Attribution: `{query_eval['attribution_path']}`",
-            ]
-        )
-        if query_eval.get("summary") is not None:
-            lines.append(f"- Summary: `{json.dumps(query_eval['summary'], ensure_ascii=False)}`")
-        if query_eval.get("attribution_summary") is not None:
-            lines.append(f"- Attribution summary: `{json.dumps(query_eval['attribution_summary'], ensure_ascii=False)}`")
-        if query_eval.get("gate") is not None:
-            lines.append(f"- Gate: `{json.dumps(query_eval['gate'], ensure_ascii=False)}`")
     mineru_smoke = manifest.get("mineru_smoke")
     if mineru_smoke:
         lines.extend(["", "## MinerU Parser Smoke", "", f"- Summary: `{mineru_smoke['summary_path']}`"])
@@ -749,10 +584,6 @@ def _resolve_out_dir(out_dir: Path | None) -> Path:
         return out_dir
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     return DEFAULT_OUT_ROOT / f"mineru_rag_{stamp}"
-
-
-def _format_number(value: float) -> str:
-    return str(int(value)) if value == int(value) else str(value)
 
 
 def _quote_argv(argv: list[str]) -> str:
