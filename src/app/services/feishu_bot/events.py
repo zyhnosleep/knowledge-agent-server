@@ -25,6 +25,8 @@ class MessageEvent:
     message_id: str
     message_type: str
     sender_open_id: str
+    # 会话类型：group（群聊）/ p2p（单聊）
+    chat_type: str = "group"
     # 被 @ 的 open_id 列表（含机器人与他人）
     mentions: list[str] = field(default_factory=list)
     # 与 mentions 对应的 @ 标记字符串（如 "@_user_1"，用于从文本中剥离）
@@ -89,6 +91,7 @@ def parse_message_event(raw: dict) -> MessageEvent:
         message_id=message.get("message_id", ""),
         message_type=message.get("message_type", ""),
         sender_open_id=sender_id.get("open_id", ""),
+        chat_type=message.get("chat_type", "group"),
         mentions=mentions,
         mention_keys=mention_keys,
     )
@@ -121,5 +124,10 @@ class EventPolicy:
         return True
 
     def mentions_bot(self, event: MessageEvent, bot_open_id: str) -> bool:
-        """事件中是否 @ 了机器人（按 open_id 判断）。"""
+        """事件中是否 @ 了机器人（按 open_id 判断）。
+
+        私聊（p2p）单聊没有 @ 提及，且单聊里的消息必然是发给机器人的 → 直接放行。
+        """
+        if event.chat_type == "p2p":
+            return True
         return bot_open_id in event.mentions

@@ -159,3 +159,21 @@ def test_policy_no_mentions_is_not_bot():
     policy = EventPolicy(allowed_tenant=None, allowed_chat_ids=[])
     event = parse_message_event(_text_event(event={"message": {"mentions": []}}))
     assert not policy.mentions_bot(event, bot_open_id="ou_bot")
+
+
+def test_policy_p2p_without_mentions_counts_as_mentioned():
+    """私聊（p2p）没有 @ 提及，但单聊消息都是发给机器人的 → 应放行。"""
+    policy = EventPolicy(allowed_tenant=None, allowed_chat_ids=[])
+    event = parse_message_event(
+        _text_event(event={"message": {"chat_type": "p2p", "mentions": []}})
+    )
+    assert event.chat_type == "p2p"
+    assert policy.mentions_bot(event, bot_open_id="ou_bot")
+
+
+def test_policy_group_without_mentions_still_rejected():
+    """群聊里没 @ 机器人仍然不放行（防打扰）。"""
+    policy = EventPolicy(allowed_tenant=None, allowed_chat_ids=[])
+    event = parse_message_event(_text_event(event={"message": {"mentions": []}}))
+    assert event.chat_type == "group"
+    assert not policy.mentions_bot(event, bot_open_id="ou_bot")
