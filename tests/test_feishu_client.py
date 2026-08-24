@@ -22,10 +22,13 @@ def _make_client(handler) -> FeishuClient:
 
 
 def _token_payload(expire: int = 7200) -> dict:
+    # 飞书真实响应为平铺结构：tenant_access_token 在顶层，不在 data 里。
+    # （2026-08-24 现场修复：原 mock 用嵌套 data 结构，测试全绿但线上必挂）
     return {
         "code": 0,
         "msg": "ok",
-        "data": {"app_access_token": "", "tenant_access_token": "t-123", "expire": expire},
+        "tenant_access_token": "t-123",
+        "expire": expire,
     }
 
 
@@ -156,20 +159,23 @@ def test_fetch_ws_url_requests_endpoint():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path.endswith("tenant_access_token/internal"):
-            return httpx.Response(200, json=_token_payload())
+        # endpoint 接口用 AppID/AppSecret 直接鉴权，不请求 token
         assert request.method == "POST"
-        assert request.url.path == "/open-apis/ws/v1/endpoint"
-        assert request.url.params["region"] == "cn"
-        assert request.headers["Authorization"] == "Bearer t-123"
+        assert request.url.path == "/callback/ws/endpoint"
+        assert request.headers["locale"] == "zh"
+        assert json.loads(request.content) == {
+            "AppID": "cli_app",
+            "AppSecret": "secret",
+            "ClientAssertion": "",
+        }
         return httpx.Response(
             200,
-            json={"code": 0, "msg": "ok", "data": {"ws_url": "wss://ws.feishu.cn/x?service_id=s"}},
+            json={"code": 0, "msg": "ok", "data": {"URL": "wss://ws.feishu.cn/x?service_id=s"}},
         )
 
     client = _make_client(handler)
     assert client.fetch_ws_url() == "wss://ws.feishu.cn/x?service_id=s"
-    assert len(requests) == 2
+    assert len(requests) == 1
 
 
 def test_get_bot_open_id():
@@ -183,7 +189,7 @@ def test_get_bot_open_id():
         assert request.url.path == "/open-apis/bot/v3/info"
         assert request.headers["Authorization"] == "Bearer t-123"
         return httpx.Response(
-            200, json={"code": 0, "msg": "ok", "data": {"bot": {"open_id": "ou_bot_1"}}}
+            200, json={"code": 0, "msg": "ok", "bot": {"open_id": "ou_bot_1"}}
         )
 
     client = _make_client(handler)

@@ -80,13 +80,16 @@ class FeishuClient:
         response.raise_for_status()
         payload = response.json()
         self._ensure_code(payload, "tenant_access_token")
+        # 飞书实际响应为平铺结构（token 在顶层，不在 data 里）；
+        # 2026-08-24 现场修复（原按 data.tenant_access_token 读取必然失败）。
         data = payload.get("data") or {}
-        token = data.get("tenant_access_token")
+        token = data.get("tenant_access_token") or payload.get("tenant_access_token")
         if not token:
             raise FeishuApiError("tenant_access_token missing from response")
         self._token = token
         # expire 秒有效；留 60 秒余量提前刷新，避免临界期 401
-        self._token_expires_at = time.monotonic() + float(data.get("expire", 7200)) - 60
+        expire = data.get("expire") or payload.get("expire") or 7200
+        self._token_expires_at = time.monotonic() + float(expire) - 60
         return token
 
     def get_tenant_access_token(self) -> str:
@@ -127,20 +130,27 @@ class FeishuClient:
         return response.content
 
     def fetch_ws_url(self, region: str = "cn") -> str:
-        """获取长连接 WebSocket 地址（POST /open-apis/ws/v1/endpoint）。
+        """获取长连接 WebSocket 地址（POST /callback/ws/endpoint）。
 
-        返回 ``data.ws_url``（形如 ``wss://...?service_id=...&device_id=...``）。
+        2026-08-24 现场修复：飞书 endpoint 接口实为 ``/callback/ws/endpoint``，
+        body 直接携带 AppID/AppSecret 鉴权（非 Bearer），返回 ``data.URL``
+        （大写，形如 ``wss://...?service_id=...&device_id=...``）。
+        ``region`` 保留兼容参数（当前版本无需传）。
         """
         response = self._client.post(
-            "/open-apis/ws/v1/endpoint",
-            params={"region": region},
-            headers={"Authorization": f"Bearer {self.get_tenant_access_token()}"},
+            "/callback/ws/endpoint",
+            headers={"locale": "zh"},
+            json={
+                "AppID": self._app_id,
+                "AppSecret": self._app_secret,
+                "ClientAssertion": "",
+            },
         )
         response.raise_for_status()
         payload = response.json()
         self._ensure_code(payload, "fetch ws endpoint")
         data = payload.get("data") or {}
-        ws_url = data.get("ws_url")
+        ws_url = data.get("URL") or data.get("url") or data.get("ws_url")
         if not ws_url:
             raise FeishuApiError("ws_url missing from endpoint response")
         return ws_url
@@ -157,7 +167,8 @@ class FeishuClient:
         response.raise_for_status()
         payload = response.json()
         self._ensure_code(payload, "get bot info")
-        bot = (payload.get("data") or {}).get("bot") or {}
+        # 飞书实际响应 bot 在顶层（不在 data 里）；2026-08-24 现场修复。
+        bot = (payload.get("data") or {}).get("bot") or payload.get("bot") or {}
         open_id = bot.get("open_id")
         if not open_id:
             raise FeishuApiError("bot open_id missing from response")
