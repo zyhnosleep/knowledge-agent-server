@@ -46,6 +46,14 @@ async def _on_event(handler: BotHandler, data: dict) -> None:
     except ValueError:
         logger.warning("feishu bot: unparseable event dropped: %r", str(data)[:200])
         return
+    # 观测日志：事件到达即记录，便于区分"没推送"与"推送后过滤"
+    logger.info(
+        "feishu bot: event received: type=%s chat_type=%s chat_id=%s sender=%s",
+        event.message_type,
+        event.chat_type,
+        event.chat_id,
+        event.sender_open_id,
+    )
     try:
         await asyncio.to_thread(handler.handle, event)
     except Exception:

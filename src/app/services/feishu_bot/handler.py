@@ -14,12 +14,15 @@ handler.py —— 机器人事件处理入口（过滤 → @ 检查 → 分派�
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from app.services.feishu_bot.client import FeishuClientProtocol
 from app.services.feishu_bot.events import EventPolicy, MessageEvent
 from app.services.feishu_bot.inbox import InboxIngestor
 from app.services.feishu_bot.query import Answerer, truncate_answer
+
+logger = logging.getLogger(__name__)
 
 
 class BotHandler:
@@ -54,8 +57,14 @@ class BotHandler:
     def handle(self, event: MessageEvent) -> None:
         """处理一条消息事件；过滤不通过或未 @ 机器人则静默。"""
         if not self._policy.allow(event):
+            logger.info(
+                "feishu bot: event dropped by policy (chat_id=%s)", event.chat_id
+            )
             return
         if not self._policy.mentions_bot(event, self._bot_open_id):
+            logger.info(
+                "feishu bot: event dropped (bot not mentioned, chat_id=%s)", event.chat_id
+            )
             return
         self._dispatch(event)
 
