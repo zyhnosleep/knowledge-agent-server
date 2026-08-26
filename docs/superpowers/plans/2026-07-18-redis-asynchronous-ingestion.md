@@ -136,10 +136,10 @@ git push origin codex/internal-pilot
 ### Task 3: 在服务器部署 Redis 和开发 worker
 
 **Files:**
-- Server modify: `/home/zhangyh/knowledge-agent-dev/runtime/app.env`
-- Server install: `/home/zhangyh/.config/systemd/user/knowledge-agent-redis.service`
-- Server install: `/home/zhangyh/.config/systemd/user/knowledge-agent-dev-worker.service`
-- Server update: `/home/zhangyh/.config/systemd/user/knowledge-agent-dev-api.service`
+- Server modify: `/home/<user>/knowledge-agent-dev/runtime/app.env`
+- Server install: `/home/<user>/.config/systemd/user/knowledge-agent-redis.service`
+- Server install: `/home/<user>/.config/systemd/user/knowledge-agent-dev-worker.service`
+- Server update: `/home/<user>/.config/systemd/user/knowledge-agent-dev-api.service`
 
 - [ ] **Step 1: 更新开发代码并安装服务文件**
 
@@ -170,10 +170,10 @@ Expected: `PONG`，Redis 只映射 `127.0.0.1:6379`，开发 worker 为 active�
 ### Task 4: 在维护窗口迁移测试环境并启用测试 worker
 
 **Files:**
-- Server create: `/home/zhangyh/knowledge-agent-test/runtime/app.env`
-- Server install: `/home/zhangyh/.config/systemd/user/knowledge-agent-test-worker.service`
-- Server update: `/home/zhangyh/.config/systemd/user/knowledge-agent-test-api.service`
-- Backup create: `/home/zhangyh/knowledge-agent-backups/<timestamp>/`
+- Server create: `/home/<user>/knowledge-agent-test/runtime/app.env`
+- Server install: `/home/<user>/.config/systemd/user/knowledge-agent-test-worker.service`
+- Server update: `/home/<user>/.config/systemd/user/knowledge-agent-test-api.service`
+- Backup create: `/home/<user>/knowledge-agent-backups/<timestamp>/`
 
 - [ ] **Step 1: 使用 PostgreSQL 16 容器工具创建可恢复快照**
 
@@ -181,7 +181,7 @@ Expected: `PONG`，Redis 只映射 `127.0.0.1:6379`，开发 worker 为 active�
 
 - [ ] **Step 2: 创建测试数据库和新测试目录**
 
-从已推送提交克隆 `/home/zhangyh/knowledge-agent-test`，创建独立 `knowledge_agent_test` 角色/数据库，恢复 dump、复制数据并运行 Alembic 到 head。迁移后业务记录数必须与快照一致，pgvector 表应为 `vector(2560)` 空表。
+从已推送提交克隆 `/home/<user>/knowledge-agent-test`，创建独立 `knowledge_agent_test` 角色/数据库，恢复 dump、复制数据并运行 Alembic 到 head。迁移后业务记录数必须与快照一致，pgvector 表应为 `vector(2560)` 空表。
 
 - [ ] **Step 3: 启动 GPU1 Ollama、Redis DB 2 worker**
 

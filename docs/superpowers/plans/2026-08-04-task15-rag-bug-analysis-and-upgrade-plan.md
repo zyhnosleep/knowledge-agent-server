@@ -376,8 +376,8 @@ prompt 中同时提供原始表格事实、row label、column、value、source c
 
 **Files/Commands:**
 
-- Development only: `/home/zhangyh/knowledge-agent-dev`
-- Test environment: read-only `/home/zhangyh/knowledge-agent-test`
+- Development only: `/home/<user>/knowledge-agent-dev`
+- Test environment: read-only `/home/<user>/knowledge-agent-test`
 - GPU binding: every development command explicitly uses `CUDA_VISIBLE_DEVICES=0`; test commands, if later approved, use `CUDA_VISIBLE_DEVICES=1`.
 
 - [ ] **Step 1: 只同步已通过本地测试的文件**

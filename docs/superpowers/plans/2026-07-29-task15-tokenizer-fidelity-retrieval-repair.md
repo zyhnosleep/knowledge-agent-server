@@ -12,8 +12,8 @@
 
 ## Hard Boundaries
 
-- Work only in `D:/LLM_wiki/.worktrees/internal-pilot` locally and `/home/zhangyh/knowledge-agent-dev` remotely.
-- Do not modify, restart, migrate, or write into `/home/zhangyh/knowledge-agent-test`.
+- Work only in `D:/LLM_wiki/.worktrees/internal-pilot` locally and `/home/<user>/knowledge-agent-dev` remotely.
+- Do not modify, restart, migrate, or write into `/home/<user>/knowledge-agent-test`.
 - Do not delete legacy/V1/V2/V3/V4 chunks, vectors, parse versions, artifacts, MinerU output, or source files.
 - Development inference and rebuild commands must export `CUDA_VISIBLE_DEVICES=0`; GPU1 is out of scope.
 - Preserve Parent `500/1200/1800`, Child `180/400/600`, overlap `50`, and semantic break percentile `20` for the first comparison.
@@ -132,12 +132,12 @@
 ### Task 7: Development-Only Side-by-Side Rebuild and Acceptance
 
 **Files:**
-- Deploy only changed source/config files to `/home/zhangyh/knowledge-agent-dev`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/tokenizer-preflight.json`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/test-old-baseline-readonly.json`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-v4-tokenizer-rebuild.json`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/dev-new-tokenizer-retrieval.json`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/dev-new-tokenizer-full30.json`
+- Deploy only changed source/config files to `/home/<user>/knowledge-agent-dev`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/tokenizer-preflight.json`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/test-old-baseline-readonly.json`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-v4-tokenizer-rebuild.json`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/dev-new-tokenizer-retrieval.json`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/dev-new-tokenizer-full30.json`
 
 - [ ] Download the pinned tokenizer snapshot during deployment, then prove runtime loading is local-only and its revision/content hash match the ParseVersion snapshot.
 - [ ] Freeze development and test inventories; capture the identical 30 byte-matched cases from test into a read-only old-baseline artifact, and do not mutate test.

@@ -5,9 +5,9 @@
 ## 目录
 
 ```text
-/home/zhangyh/knowledge-agent-dev
-/home/zhangyh/knowledge-agent-test
-/home/zhangyh/knowledge-agent-models
+/home/<user>/knowledge-agent-dev
+/home/<user>/knowledge-agent-test
+/home/<user>/knowledge-agent-models
 ```
 
 从 `.env.development.example` 和 `.env.test.example` 创建各自的 `runtime/app.env`，设置权限为 `600`。测试配置包含认证 secret，禁止输出到日志或提交到 Git。

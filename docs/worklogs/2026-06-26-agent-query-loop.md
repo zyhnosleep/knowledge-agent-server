@@ -18,7 +18,7 @@ ssh -i <private-key-path> -p <public-port> <user>@<public-host>
 scp -i <private-key-path> -P <public-port> <files> <user>@<public-host>:<server-project>/tmp/
 ```
 
-The old `llm-wiki-server` alias points at the LAN address and can time out on public network.
+The old `<server-host>` alias points at the LAN address and can time out on public network.
 
 ## OCR And Parser State
 

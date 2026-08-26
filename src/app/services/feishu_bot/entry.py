@@ -13,8 +13,8 @@ entry.py —— 飞书机器人进程入口
 
 from __future__ import annotations
 
-import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 
 from app.core.config import Settings, get_settings
@@ -28,6 +28,7 @@ from app.services.feishu_bot.query import Answerer
 logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[str, str], FeishuClient]
+_EVENT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="feishu-bot")
 
 
 def _split_chat_ids(raw: str) -> list[str]:
@@ -35,8 +36,17 @@ def _split_chat_ids(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-async def _on_event(handler: BotHandler, data: dict) -> None:
-    """ws 事件回调：解析 → 线程池处理（不阻塞收帧）。
+def _handle_event(handler: BotHandler, event) -> None:
+    try:
+        handler.handle(event)
+    except Exception:
+        logger.exception(
+            "feishu bot: event handling failed (event_id=%s)", event.event_id
+        )
+
+
+def _on_event(handler: BotHandler, data: dict) -> None:
+    """SDK 事件回调：解析后交给线程池，立即返回以便 SDK ACK。
 
     处理中的任何异常（如发消息失败）只记日志不冒泡——否则会断掉
     健康的长连接并丢后续事件（飞书侧 3 秒未 ack 才会重推，无必要代价）。
@@ -54,13 +64,10 @@ async def _on_event(handler: BotHandler, data: dict) -> None:
         event.chat_id,
         event.sender_open_id,
     )
-    try:
-        await asyncio.to_thread(handler.handle, event)
-    except Exception:
-        logger.exception("feishu bot: event handling failed (event_id=%s)", event.event_id)
+    _EVENT_EXECUTOR.submit(_handle_event, handler, event)
 
 
-async def run_bot(
+def run_bot(
     settings: Settings | None = None,
     client_factory: ClientFactory = FeishuClient,
 ) -> None:
@@ -100,9 +107,9 @@ async def run_bot(
         ingestor=ingestor,
         querier=querier,
     )
-    conn = LongConnClient(client)
+    conn = LongConnClient(settings.feishu_app_id, settings.feishu_app_secret)
     logger.info("feishu bot starting (bot_open_id=%s)", bot_open_id)
-    await conn.run(lambda data: _on_event(handler, data))
+    conn.run(lambda data: _on_event(handler, data))
 
 
 def main() -> None:
@@ -112,7 +119,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
-        asyncio.run(run_bot())
+        run_bot()
     except KeyboardInterrupt:
         pass
 

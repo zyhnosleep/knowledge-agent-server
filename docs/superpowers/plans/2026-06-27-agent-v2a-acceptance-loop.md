@@ -634,8 +634,8 @@ Expected: `tmp/agent-v2a-sync-20260627.tgz` exists.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "mkdir -p ~/llm_wiki_server/tmp"
-scp -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -P 28294 tmp/agent-v2a-sync-20260627.tgz zhangyh@ffsampling.a1.luyouxia.net:~/llm_wiki_server/tmp/agent-v2a-sync-20260627.tgz
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "mkdir -p ~/llm_wiki_server/tmp"
+scp -i <identity-file> -o IdentitiesOnly=yes -P 28294 tmp/agent-v2a-sync-20260627.tgz <user>@<server-host>:~/llm_wiki_server/tmp/agent-v2a-sync-20260627.tgz
 ```
 
 Expected: upload succeeds.
@@ -645,7 +645,7 @@ Expected: upload succeeds.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && mkdir -p tmp/backup_agent_v2a_20260627 && tar -tzf tmp/agent-v2a-sync-20260627.tgz | while read f; do if [ -e \"$f\" ]; then mkdir -p \"tmp/backup_agent_v2a_20260627/$(dirname \"$f\")\"; cp -a \"$f\" \"tmp/backup_agent_v2a_20260627/$f\"; fi; done"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && mkdir -p tmp/backup_agent_v2a_20260627 && tar -tzf tmp/agent-v2a-sync-20260627.tgz | while read f; do if [ -e \"$f\" ]; then mkdir -p \"tmp/backup_agent_v2a_20260627/$(dirname \"$f\")\"; cp -a \"$f\" \"tmp/backup_agent_v2a_20260627/$f\"; fi; done"
 ```
 
 Expected: remote backup directory exists. Existing files are copied before replacement.
@@ -655,7 +655,7 @@ Expected: remote backup directory exists. Existing files are copied before repla
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && tar -xzf tmp/agent-v2a-sync-20260627.tgz"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && tar -xzf tmp/agent-v2a-sync-20260627.tgz"
 ```
 
 Expected: changed files are present on remote.
@@ -665,7 +665,7 @@ Expected: changed files are present on remote.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && .venv/bin/python -m pytest tests/test_agent_policy.py tests/test_answer_verifier.py tests/test_agent_executor.py tests/test_tool_registry.py tests/test_agent_routes.py -q"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && .venv/bin/python -m pytest tests/test_agent_policy.py tests/test_answer_verifier.py tests/test_agent_executor.py tests/test_tool_registry.py tests/test_agent_routes.py -q"
 ```
 
 Expected: all tests pass.
@@ -675,7 +675,7 @@ Expected: all tests pass.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && .venv/bin/python -m pytest tests/test_conversation_memory.py tests/test_rag_adapter.py tests/test_api_routes.py tests/test_query_service.py tests/test_paper_profile.py -q"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && .venv/bin/python -m pytest tests/test_conversation_memory.py tests/test_rag_adapter.py tests/test_api_routes.py tests/test_query_service.py tests/test_paper_profile.py -q"
 ```
 
 Expected: all tests pass.
@@ -685,7 +685,7 @@ Expected: all tests pass.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && pkill -f 'uvicorn app.main:app' || true; pkill -f 'python -m app.workers.runner' || true; ./scripts/start_api.sh; ./scripts/start_worker.sh; ./scripts/status.sh"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && pkill -f 'uvicorn app.main:app' || true; pkill -f 'python -m app.workers.runner' || true; ./scripts/start_api.sh; ./scripts/start_worker.sh; ./scripts/status.sh"
 ```
 
 Expected: API and worker are running.
@@ -695,7 +695,7 @@ Expected: API and worker are running.
 Run:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && curl -fsS http://127.0.0.1:8000/api/health && curl -fsS -X POST http://127.0.0.1:8000/api/agent/query -H 'Content-Type: application/json' -d '{\"project_slug\":\"internal-research\",\"query\":\"请总结当前知识库的核心主题\",\"session_id\":\"remote-agent-v2a-smoke\"}'"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && curl -fsS http://127.0.0.1:8000/api/health && curl -fsS -X POST http://127.0.0.1:8000/api/agent/query -H 'Content-Type: application/json' -d '{\"project_slug\":\"internal-research\",\"query\":\"请总结当前知识库的核心主题\",\"session_id\":\"remote-agent-v2a-smoke\"}'"
 ```
 
 Expected: health succeeds and Agent response contains `final_answer`, `steps`, `route`, and `warnings`.
@@ -705,7 +705,7 @@ Expected: health succeeds and Agent response contains `final_answer`, `steps`, `
 Run remote full30 gate only if Agent v2a touched shared RAG/query behavior or if smoke reveals quality drift. The command is:
 
 ```powershell
-ssh -i D:/codex_ssh/llm_wiki_server_ed25519 -o IdentitiesOnly=yes -p 28294 zhangyh@ffsampling.a1.luyouxia.net "cd ~/llm_wiki_server && .venv/bin/python scripts/run_mineru_rag_loop.py --profile query --python .venv/bin/python --run-query-eval --base-url http://127.0.0.1:8000 --timeout 120 --min-query-passed 24 --max-query-failed 6 --require-failure-attribution --out-dir tmp/full30_query_gate_agent_v2a_20260627"
+ssh -i <identity-file> -o IdentitiesOnly=yes -p 28294 <user>@<server-host> "cd ~/llm_wiki_server && .venv/bin/python scripts/run_mineru_rag_loop.py --profile query --python .venv/bin/python --run-query-eval --base-url http://127.0.0.1:8000 --timeout 120 --min-query-passed 24 --max-query-failed 6 --require-failure-attribution --out-dir tmp/full30_query_gate_agent_v2a_20260627"
 ```
 
 Expected: at least `24/30` pass, no timeout wave, and every failure has attribution.

@@ -328,7 +328,7 @@ Expected: FAIL，缺少新模板或仍显示旧产品名。
 
 - [ ] **Step 3: 创建五个 Systemd 服务和两套环境模板**
 
-开发服务目录使用 `/home/zhangyh/knowledge-agent-dev`，测试使用 `/home/zhangyh/knowledge-agent-test`。两套 API 的 `EnvironmentFile` 分别指向自身 `runtime/app.env`。Tunnel 只依赖并转发测试 API。Ollama 模型目录可共享 `/home/zhangyh/knowledge-agent-models`，其他运行目录不得共享。
+开发服务目录使用 `/home/<user>/knowledge-agent-dev`，测试使用 `/home/<user>/knowledge-agent-test`。两套 API 的 `EnvironmentFile` 分别指向自身 `runtime/app.env`。Tunnel 只依赖并转发测试 API。Ollama 模型目录可共享 `/home/<user>/knowledge-agent-models`，其他运行目录不得共享。
 
 - [ ] **Step 4: 更新活动品牌和部署文档**
 
@@ -393,13 +393,13 @@ Expected: 远程分支指向本地已验证提交。
 ### Task 8: 部署并验收 GPU 0 开发环境
 
 **Files:**
-- Server create: `/home/zhangyh/knowledge-agent-dev/runtime/app.env`
-- Server create: `/home/zhangyh/.config/systemd/user/knowledge-agent-dev-api.service`
-- Server create: `/home/zhangyh/.config/systemd/user/knowledge-agent-dev-ollama.service`
+- Server create: `/home/<user>/knowledge-agent-dev/runtime/app.env`
+- Server create: `/home/<user>/.config/systemd/user/knowledge-agent-dev-api.service`
+- Server create: `/home/<user>/.config/systemd/user/knowledge-agent-dev-ollama.service`
 
 - [ ] **Step 1: 克隆独立开发目录并创建空数据库**
 
-克隆指定提交到 `/home/zhangyh/knowledge-agent-dev`，创建 `knowledge_agent_dev` 数据库，安装现有锁定依赖。`runtime/app.env` 使用 8002、11435、GPU 0、开发数据库、独立 data/raw/cache/tmp，并设置 `AUTH_ENABLED=false`。
+克隆指定提交到 `/home/<user>/knowledge-agent-dev`，创建 `knowledge_agent_dev` 数据库，安装现有锁定依赖。`runtime/app.env` 使用 8002、11435、GPU 0、开发数据库、独立 data/raw/cache/tmp，并设置 `AUTH_ENABLED=false`。
 
 - [ ] **Step 2: 启动开发 Ollama 并验证 GPU 绑定**
 
@@ -418,7 +418,7 @@ Expected: Ollama 进程只出现在 GPU 0；9B 与 4B 均可用。
 Run:
 
 ```bash
-cd /home/zhangyh/knowledge-agent-dev
+cd /home/<user>/knowledge-agent-dev
 .venv/bin/alembic upgrade head
 systemctl --user enable --now knowledge-agent-dev-api.service
 curl -fsS http://127.0.0.1:8002/api/health
@@ -437,9 +437,9 @@ Expected: API `ok`，模型为 `ready|idle`，数据库向量表为 `vector(2560
 ### Task 9: 测试环境维护迁移与切换
 
 **Files:**
-- Server create: `/home/zhangyh/knowledge-agent-test/runtime/app.env`
-- Server create: `/home/zhangyh/.config/systemd/user/knowledge-agent-test-*.service`
-- Backup create: `/home/zhangyh/knowledge-agent-backups/<timestamp>/`
+- Server create: `/home/<user>/knowledge-agent-test/runtime/app.env`
+- Server create: `/home/<user>/.config/systemd/user/knowledge-agent-test-*.service`
+- Backup create: `/home/<user>/knowledge-agent-backups/<timestamp>/`
 
 - [ ] **Step 1: 采集旧 8B 固定题集基线**
 
@@ -455,7 +455,7 @@ Expected: API `ok`，模型为 `ready|idle`，数据库向量表为 `vector(2560
 
 - [ ] **Step 4: 建立新测试目录和数据库**
 
-将已批准提交克隆到 `/home/zhangyh/knowledge-agent-test`，恢复数据库到 `knowledge_agent_test`，复制正式数据到新目录并保持相对路径不变。运行 Alembic 到 head，确认业务表记录数与迁移前一致，新的 pgvector 表为空且为 2560 维。
+将已批准提交克隆到 `/home/<user>/knowledge-agent-test`，恢复数据库到 `knowledge_agent_test`，复制正式数据到新目录并保持相对路径不变。运行 Alembic 到 head，确认业务表记录数与迁移前一致，新的 pgvector 表为空且为 2560 维。
 
 - [ ] **Step 5: 启动 GPU 1 测试 Ollama**
 
@@ -466,7 +466,7 @@ Expected: API `ok`，模型为 `ready|idle`，数据库向量表为 `vector(2560
 Run:
 
 ```bash
-cd /home/zhangyh/knowledge-agent-test
+cd /home/<user>/knowledge-agent-test
 .venv/bin/python scripts/reindex_embeddings.py --all-projects --batch-size 16 --maintenance-confirmed --report runtime/reindex-report.json
 .venv/bin/python scripts/reindex_embeddings.py --all-projects --maintenance-confirmed --verify-only --report runtime/reindex-verify.json
 ```

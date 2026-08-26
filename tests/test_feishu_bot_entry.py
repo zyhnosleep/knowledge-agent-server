@@ -1,6 +1,6 @@
 """飞书机器人进程入口单测：配置缺失/机器人信息获取失败 → 退出（systemd 拉起重试）。"""
 
-import asyncio
+import threading
 
 import httpx
 import pytest
@@ -24,13 +24,13 @@ def _settings(**overrides) -> Settings:
 
 def test_run_bot_returns_when_disabled():
     settings = _settings(**{"FEISHU_BOT_ENABLED": False})
-    asyncio.run(run_bot(settings=settings))  # 应正常返回，不启动任何东西
+    run_bot(settings=settings)  # 应正常返回，不启动任何东西
 
 
 def test_run_bot_exits_without_credentials():
     settings = _settings(**{"FEISHU_APP_ID": None, "FEISHU_APP_SECRET": None})
     with pytest.raises(SystemExit):
-        asyncio.run(run_bot(settings=settings))
+        run_bot(settings=settings)
 
 
 def _bot_info_fails_client(app_id: str, app_secret: str) -> FeishuClient:
@@ -43,7 +43,7 @@ def _bot_info_fails_client(app_id: str, app_secret: str) -> FeishuClient:
 def test_run_bot_exits_when_bot_info_unavailable():
     settings = _settings()
     with pytest.raises(SystemExit):
-        asyncio.run(run_bot(settings=settings, client_factory=_bot_info_fails_client))
+        run_bot(settings=settings, client_factory=_bot_info_fails_client)
 
 
 def _event_payload() -> dict:
@@ -75,13 +75,20 @@ def _event_payload() -> dict:
 class _BoomHandler:
     """handle 必炸：模拟发消息失败等下游异常。"""
 
+    def __init__(self, called=None) -> None:
+        self.called = called
+
     def handle(self, event) -> None:
+        if self.called is not None:
+            self.called.set()
         raise RuntimeError("send failed")
 
 
 def test_on_event_swallows_handler_failures():
     """handler.handle 抛异常（如 send_text 失败）不冒泡断链：记日志继续。"""
-    asyncio.run(_on_event(_BoomHandler(), _event_payload()))  # 不应抛异常
+    called = threading.Event()
+    _on_event(_BoomHandler(called), _event_payload())  # 不应抛异常
+    assert called.wait(timeout=1)
 
 
 def test_on_event_drops_unparseable_event():
@@ -92,5 +99,5 @@ def test_on_event_drops_unparseable_event():
         def handle(self, event) -> None:
             handled.append(event)
 
-    asyncio.run(_on_event(Recorder(), {"type": "EVENT", "data": {"garbage": 1}}))
+    _on_event(Recorder(), {"type": "EVENT", "data": {"garbage": 1}})
     assert handled == []

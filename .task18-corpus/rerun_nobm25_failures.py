@@ -7,7 +7,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-CASES = Path("/home/zhangyh/knowledge-agent-dev/runtime/task15/internal-research-overlap30-full-answer-cases.json")
+CASES = Path("/home/<user>/knowledge-agent-dev/runtime/task15/internal-research-overlap30-full-answer-cases.json")
 API = "http://127.0.0.1:8002/api/agent/query"
 
 payload = json.loads(CASES.read_text(encoding="utf-8"))

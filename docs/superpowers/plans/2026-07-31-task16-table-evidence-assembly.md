@@ -127,8 +127,8 @@ Run `git diff --check` and inspect that only `search.py`, the focused test file,
 ## Task 5: Development-only shadow acceptance
 
 **Files/artifacts:**
-- Deploy only verified `search.py` and its tests to `/home/zhangyh/knowledge-agent-dev`.
-- Generate new staged shadow retrieval/full-answer reports under `/home/zhangyh/knowledge-agent-dev/runtime/task15/`.
+- Deploy only verified `search.py` and its tests to `/home/<user>/knowledge-agent-dev`.
+- Generate new staged shadow retrieval/full-answer reports under `/home/<user>/knowledge-agent-dev/runtime/task15/`.
 - Modify: `D:/LLM_wiki/.worktrees/internal-pilot/docs/work.md`
 
 - [ ] **Step 1: Preflight the development service and GPU boundary.**
