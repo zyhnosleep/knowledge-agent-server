@@ -1,5 +1,5 @@
 tunnel: REPLACE_WITH_TUNNEL_UUID
-credentials-file: /home/zhangyh/knowledge-agent-test/runtime/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+credentials-file: /home/<user>/knowledge-agent-test/runtime/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
 
 ingress:
   - hostname: research.example.com

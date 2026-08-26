@@ -451,7 +451,7 @@ Expected: GitHub `main` 指向本轮最后一个提交。
 
 - [ ] **Step 2: 同步服务器代码并重启 API**
 
-按照 `docs/deploy-no-docker.md` 的现有非 Docker 流程，在 `~/llm_wiki_server` 拉取对应提交、安装必要依赖并重启 `llm-wiki-server`。重启后检查：
+按照 `docs/deploy-no-docker.md` 的现有非 Docker 流程，在 `~/llm_wiki_server` 拉取对应提交、安装必要依赖并重启 `<server-host>`。重启后检查：
 
 ```bash
 curl -fsS http://127.0.0.1:8000/api/health

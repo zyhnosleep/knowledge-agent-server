@@ -387,6 +387,21 @@ class AgentExecutor:
                             evidence_pack = fallback_pack
                             effective_document_id = history_document_id
 
+                # T1b：表格指代查询（"第二张表/这张表"等）无法从自身词元
+                # 检索到表格内容（放宽过滤后拿到的是候选表，定位仍需历史
+                # 引用）；把会话历史最近轮次答案引用过的表格证据作为锚点
+                # 注入，模型结合上一轮内容选择具体表格。
+                # 注意：注入必须在文档回退之后执行，且不要求检索有 items——
+                # 检索 miss（如存量文档尚无 DI tables）时锚点恰是唯一可用
+                # 的表格证据，必须照样注入（2026-08-12 code review 修正：
+                # 原实现被 items 非空条件挡住，指代查询在 miss 时拿不到锚点）。
+                if evidence_pack and self._is_table_reference_query(request.query):
+                    anchors = self._memory.get_recent_table_anchors(session_id)
+                    if anchors:
+                        evidence_pack = self._merge_table_anchor_evidence(
+                            evidence_pack, anchors
+                        )
+
                 # ---- 合并当前会话的临时附件证据 ----
                 if session_attachment_pack is None:
                     session_attachment_pack = self._run_retrieve_session_attachments(
@@ -670,6 +685,9 @@ class AgentExecutor:
             # 空答案兜底（T3）：模型生成空/纯空白答案是不可交付的硬失败，
             # 无视路由 max_retries 配额强制重试一次（二次仍空才交付）。
             answer_is_empty = not (answer_text or "").strip()
+            # retry_ran：重试是否真的执行过（tool_calls/max_steps 耗尽时
+            # 重试会被跳过，降级 warning 措辞需如实区分）。
+            retry_ran = False
             if (
                 not attachment_only
                 and (
@@ -694,6 +712,7 @@ class AgentExecutor:
                     session_id,
                 )
                 if retry_calls > 0:
+                    retry_ran = True
                     tool_calls += retry_calls
                     if retry_answer.strip():
                         answer_text = retry_answer
@@ -729,6 +748,30 @@ class AgentExecutor:
                         and verify_result.get("result", {}).get(
                             "retry_recommended", False
                         )
+                    )
+
+            # ---- 空答案降级标记（T2）：重试后仍为空 = 不可交付，显式标记 ----
+            # 旧行为：空答案重试一次后仍空，直接交付空字符串，消费方无法
+            # 区分"无答案"与"正常空内容"。此处加显式 warning + finalize
+            # metadata + trace 标记，供上游拦截与人工核对。
+            # attachment_only 路径（仅附件会话）不参与：该路径不重试，
+            # 空答案属正常形态，避免误标。
+            # retry_ran 区分两种情形，warning 措辞如实说明：重试已执行仍空
+            # （硬失败）vs 重试被 tool_calls/max_steps 限流没能执行（软失败）。
+            degraded_empty_answer = (
+                not attachment_only
+                and answer_is_empty
+                and not (answer_text or "").strip()
+            )
+            if degraded_empty_answer:
+                if retry_ran:
+                    warnings.append(
+                        "Answer empty after retry — delivering degraded response"
+                    )
+                else:
+                    warnings.append(
+                        "Answer empty and retry could not run within limits — "
+                        "delivering degraded response"
                     )
 
 
@@ -772,6 +815,7 @@ class AgentExecutor:
                             else "unknown"
                         ),
                         "expected_facts_status": expected_facts_status,
+                        "degraded_empty_answer": degraded_empty_answer,
                     },
                 )
                 steps.append(finalize_step)
@@ -1554,6 +1598,58 @@ class AgentExecutor:
         if not previous_query or previous_query == normalized:
             return None
         return previous_query
+
+    @staticmethod
+    def _is_table_reference_query(query: str) -> bool:
+        """检测表格指代查询（"第二张表/这张表/刚才的表格"等）。
+
+        指代查询无法从自身词元检索到表格内容，需要放宽表格过滤 + 注入
+        会话锚点。实现委托共享模块 ``table_reference``（与 search
+        QueryService 同源，避免两处正则漂移）。
+        """
+        from app.services.table_reference import is_table_reference_query
+
+        return is_table_reference_query(query)
+
+    @staticmethod
+    def _merge_table_anchor_evidence(
+        evidence_pack: dict[str, Any],
+        anchors: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """把会话历史中的表格锚点（上一轮引用过的表格摘录）注入证据包。
+
+        表格指代查询（"第二张表"等）检索放宽后拿到候选表格，但定位需要
+        上一轮实际引用过的内容；finalize 已把引用 citations 持久化到会话
+        记忆，此处把表格类引用摘录作为补充证据（evidence_kind=table，
+        来源标记 session_table_anchor）。相同摘录不重复注入。
+        """
+        items = list(evidence_pack.get("items") or [])
+        existing_texts = {str(item.get("excerpt") or "").strip() for item in items}
+        # items 为空时（检索 miss、纯锚点注入）从 index 0 开始；
+        # 非空时接续现有最大 index。default=-1 让两种情形统一 +1。
+        next_index = max([int(item.get("index", 0)) for item in items], default=-1) + 1
+        for anchor in anchors:
+            excerpt = str(anchor.get("excerpt") or "").strip()
+            if not excerpt or excerpt in existing_texts:
+                continue
+            items.append(
+                {
+                    "index": next_index,
+                    "document_id": anchor.get("document_id"),
+                    "page_label": anchor.get("page_label"),
+                    "table_id": anchor.get("table_id"),
+                    "excerpt": excerpt,
+                    "context_text": excerpt,
+                    "block_type": "table",
+                    "evidence_kind": "table",
+                    "source_stage": "session_table_anchor",
+                    "support_hint": "contextual",
+                    "score": 0.9,
+                }
+            )
+            existing_texts.add(excerpt)
+            next_index += 1
+        return {**evidence_pack, "items": items}
 
     def _is_cross_turn_query(self, query: str, session_id: str | None) -> bool:
         """判断当前 query 是否为跨轮查询（第 2 轮起一律视为跨轮）。

@@ -194,6 +194,31 @@ def _is_footnote_only_chunk(metadata: Any) -> bool:
     return isinstance(metadata, dict) and "footnote_index" in metadata
 
 
+def canonical_tables_to_document_intelligence(tables: list[Any]) -> list[dict[str, str | None]]:
+    """把 CanonicalTable 列表组装为 ``document_intelligence.tables`` 条目。
+
+    检索表格证据（``QueryService._search_document_table_contexts``）只读取
+    ``documents.metadata_json["document_intelligence"]["tables"]``；canonical-v4
+    的表格数据以 table chunks 入库后从未写回该字段（2026-08-12 诊断：charmm36
+    文档该字段为空，导致表格查询全部拿不到表格证据）。此处与旧 DI/mineru
+    摄取路径（parser.py 的 tables 清单）保持一致：每项
+    ``{"markdown": ..., "page_label": ...}``，markdown 优先取 source_markdown
+    （caption + 规范化表体），退到 normalized_markdown。
+    """
+    entries: list[dict[str, str | None]] = []
+    for table in tables:
+        markdown = (table.source_markdown or table.normalized_markdown or "").strip()
+        if not markdown:
+            continue
+        page_label = None
+        for span in table.source_spans or []:
+            if getattr(span, "page_label", None):
+                page_label = str(span.page_label).strip()
+                break
+        entries.append({"markdown": markdown, "page_label": page_label})
+    return entries
+
+
 def _is_valid_row_index(value: Any) -> bool:
     """是否为合法的非负整数行下标。
 
@@ -676,7 +701,25 @@ class IngestionPipeline:
                 "input_fingerprint": input_fingerprint,
                 "quality": quality,
             }
-            context.document.metadata_json = metadata
+            # 表格证据写回：检索表格（_search_document_table_contexts）只读
+            # document_intelligence.tables；canonical-v4 的表格数据在
+            # document_chunks 中但从未写回该字段（2026-08-12 诊断：charmm36
+            # 文档该字段为空，R16-R23 表格查询全部拿不到表格证据）。
+            # 与旧 DI/mineru 摄取路径的 tables 格式保持一致。
+            # 覆盖保护（2026-08-12 code review）：canonical 解析未提取到任何
+            # 表格时不得用空列表覆盖已有 tables —— 文档可能由旧 DI/mineru
+            # 路径摄取的表格仍在（v4 重新解析失败/表格被过滤的降级场景），
+            # 保留旧表格证据比清空更安全。
+            canonical_tables = canonical_tables_to_document_intelligence(
+                canonical.tables
+            )
+            if canonical_tables:
+                intelligence = metadata.get("document_intelligence")
+                if not isinstance(intelligence, dict):
+                    intelligence = {}
+                intelligence["tables"] = canonical_tables
+                metadata["document_intelligence"] = intelligence
+                context.document.metadata_json = metadata
         return {
             "artifact_path": str(draft_path),
             "input_fingerprint": input_fingerprint,
@@ -1697,6 +1740,11 @@ class IngestionPipeline:
         - 其余字段直接映射（含上下文前缀、上下文化模型/版本、切分器信息、
           语义边界分数、token 计数等）。
         """
+        # PostgreSQL text 字段不接受 NUL (0x00) 字节；PDF 解析产物偶含
+        # 二进制 NUL，写库前统一剔除，避免 index 阶段 DataError。
+        def _strip_nul(value):
+            return value.replace("\x00", "") if isinstance(value, str) else value
+
         contextualized_at = getattr(draft, "contextualized_at", None)
         if isinstance(contextualized_at, str):
             contextualized_at = datetime.fromisoformat(contextualized_at)
@@ -1716,14 +1764,14 @@ class IngestionPipeline:
             chunk_role=draft.chunk_role,
             block_type=draft.block_type,
             ordinal=draft.ordinal,
-            heading=draft.section_path[-1] if draft.section_path else None,
+            heading=_strip_nul(draft.section_path[-1] if draft.section_path else None),
             page_label=page_label,
             section_path=list(draft.section_path),
             source_block_ids=list(draft.source_block_ids),
             source_spans=source_spans,
-            text=draft.text,
-            contextual_prefix=getattr(draft, "contextual_prefix", None),
-            embedding_text=draft.embedding_text,
+            text=_strip_nul(draft.text),
+            contextual_prefix=_strip_nul(getattr(draft, "contextual_prefix", None)),
+            embedding_text=_strip_nul(draft.embedding_text),
             contextualization_model=getattr(draft, "contextualization_model", None),
             contextualization_version=getattr(draft, "contextualization_version", None),
             contextualization_prompt_version=getattr(

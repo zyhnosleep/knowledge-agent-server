@@ -29,9 +29,9 @@ def test_profile_command_sets(monkeypatch, tmp_path) -> None:
 
     expected_pytest_counts = {"quick": 1, "query": 2, "full": 3}
     expected_last_tests = {
-        "quick": ["tests/test_parser_document_intelligence.py", "tests/test_query_eval.py"],
+        "quick": ["tests/test_parser_document_intelligence.py"],
         "query": ["tests/test_query_service.py", "tests/test_paper_profile.py"],
-            "full": ["tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py"],
+        "full": ["tests/test_pipeline_sac_kg.py", "tests/test_vector_retrieval.py"],
     }
 
     for profile, expected_count in expected_pytest_counts.items():
@@ -50,221 +50,6 @@ def test_profile_command_sets(monkeypatch, tmp_path) -> None:
         for test_path in expected_last_tests[profile]:
             assert test_path in command_argvs[-1]
         assert calls[0] == ["git", "status", "--short"]
-
-
-def test_query_eval_is_only_run_when_explicitly_enabled(monkeypatch, tmp_path) -> None:
-    calls: list[list[str]] = []
-    benchmark = tmp_path / "benchmark.json"
-    benchmark.write_text("[]", encoding="utf-8")
-
-    def fake_run(argv, capture_output, text, check, encoding=None, errors=None):
-        calls.append(argv)
-        if argv == ["git", "status", "--short"]:
-            return _completed()
-        if argv[1:] and argv[1] == "scripts/query_eval.py":
-            output_path = Path(argv[argv.index("--output") + 1])
-            output_path.write_text(
-                json.dumps(
-                    {
-                        "summary": {
-                            "total": 2,
-                            "selected": 1,
-                            "completed": 1,
-                            "remaining": 0,
-                            "passed": 1,
-                            "failed": 0,
-                        },
-                        "cases": [],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            markdown_path = Path(argv[argv.index("--markdown") + 1])
-            markdown_path.write_text("# report\n", encoding="utf-8")
-            return _completed(stdout="query eval ok\n")
-        if argv[1:] and argv[1] == "scripts/query_report_summary.py":
-            json_output = Path(argv[argv.index("--json-output") + 1])
-            json_output.write_text(
-                json.dumps(
-                    {
-                        "summary": {"passed": 1, "failed": 0},
-                        "failure_reason_counts": {},
-                        "cases": [{"id": "case-a", "status": "pass", "likely_stage": "unknown"}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return _completed(stdout="Summary: {'passed': 1}\n", stderr="summary stderr\n")
-        return _completed(stdout="pytest ok\n")
-
-    monkeypatch.setattr(run_mineru_rag_loop.subprocess, "run", fake_run)
-
-    no_eval_args = run_mineru_rag_loop.parse_args(["--out-dir", str(tmp_path / "no-eval"), "--python", "py"])
-    no_eval_manifest = run_mineru_rag_loop.run_loop(no_eval_args)
-    assert [command["name"] for command in no_eval_manifest["commands"]] == ["pytest_quick_1"]
-    assert no_eval_manifest["mineru_smoke"] is None
-
-    eval_args = run_mineru_rag_loop.parse_args(
-        [
-            "--out-dir",
-            str(tmp_path / "eval"),
-            "--python",
-            "py",
-            "--run-query-eval",
-            "--base-url",
-            "http://api.example",
-            "--benchmark",
-            str(benchmark),
-            "--case-id",
-            "case-a",
-            "--case-id",
-            "case-b",
-            "--offset",
-            "2",
-            "--limit",
-            "3",
-            "--timeout",
-            "12",
-            "--fail-on-query-error",
-        ]
-    )
-    eval_manifest = run_mineru_rag_loop.run_loop(eval_args)
-
-    query_eval = next(command for command in eval_manifest["commands"] if command["name"] == "query_eval")
-    summary = next(command for command in eval_manifest["commands"] if command["name"] == "query_report_summary")
-    assert query_eval["argv"] == [
-        "py",
-        "scripts/query_eval.py",
-        str(benchmark),
-        "--base-url",
-        "http://api.example",
-        "--output",
-        str(tmp_path / "eval" / "query_eval.json"),
-        "--markdown",
-        str(tmp_path / "eval" / "query_eval.md"),
-        "--timeout",
-        "12",
-        "--offset",
-        "2",
-        "--limit",
-        "3",
-        "--case-id",
-        "case-a",
-        "--case-id",
-        "case-b",
-        "--fail-on-error",
-    ]
-    assert summary["argv"] == [
-        "py",
-        "scripts/query_report_summary.py",
-        str(tmp_path / "eval" / "query_eval.json"),
-        "--benchmark",
-        str(benchmark),
-        "--json-output",
-        str(tmp_path / "eval" / "query_attribution.json"),
-    ]
-    assert eval_manifest["query_eval"]["summary"]["passed"] == 1
-    assert eval_manifest["query_eval"]["attribution_summary"] == {
-        "case_count": 1,
-        "failure_reason_counts": {},
-        "likely_stage_counts": {"unknown": 1},
-        "failed_likely_stage_counts": {},
-    }
-    assert eval_manifest["query_eval"]["gate"] == {
-        "enabled": False,
-        "min_query_passed": None,
-        "max_query_failed": None,
-        "require_failure_attribution": False,
-        "passed": None,
-        "checks": {},
-    }
-    assert Path(eval_manifest["query_eval"]["summary_stdout_path"]).read_text(encoding="utf-8").startswith("Summary:")
-    assert Path(eval_manifest["query_eval"]["summary_stderr_path"]).read_text(encoding="utf-8") == "summary stderr\n"
-
-
-def test_query_eval_gate_thresholds_can_fail_or_pass_loop(monkeypatch, tmp_path) -> None:
-    benchmark = tmp_path / "benchmark.json"
-    benchmark.write_text("[]", encoding="utf-8")
-
-    def fake_run(argv, capture_output, text, check, encoding=None, errors=None):
-        if argv == ["git", "status", "--short"]:
-            return _completed()
-        if argv[1:] and argv[1] == "scripts/query_eval.py":
-            output_path = Path(argv[argv.index("--output") + 1])
-            output_path.write_text(
-                json.dumps({"summary": {"total": 3, "selected": 3, "completed": 3, "remaining": 0, "passed": 2, "failed": 1}, "cases": []}),
-                encoding="utf-8",
-            )
-            markdown_path = Path(argv[argv.index("--markdown") + 1])
-            markdown_path.write_text("# report\n", encoding="utf-8")
-            return _completed()
-        if argv[1:] and argv[1] == "scripts/query_report_summary.py":
-            output_path = Path(argv[argv.index("--json-output") + 1])
-            output_path.write_text(
-                json.dumps(
-                    {
-                        "summary": {"passed": 2, "failed": 1},
-                        "failure_reason_counts": {"missing_expected_answer_text": 1},
-                        "cases": [
-                            {
-                                "id": "case-fail",
-                                "status": "fail",
-                                "likely_stage": "answer",
-                                "stage_reasons": {"missing_expected_answer_text": "answer"},
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return _completed()
-        return _completed()
-
-    monkeypatch.setattr(run_mineru_rag_loop.subprocess, "run", fake_run)
-    failing_args = run_mineru_rag_loop.parse_args(
-        [
-            "--out-dir",
-            str(tmp_path / "failing"),
-            "--python",
-            "py",
-            "--run-query-eval",
-            "--benchmark",
-            str(benchmark),
-            "--min-query-passed",
-            "3",
-            "--max-query-failed",
-            "0",
-            "--require-failure-attribution",
-        ]
-    )
-    passing_args = run_mineru_rag_loop.parse_args(
-        [
-            "--out-dir",
-            str(tmp_path / "passing"),
-            "--python",
-            "py",
-            "--run-query-eval",
-            "--benchmark",
-            str(benchmark),
-            "--min-query-passed",
-            "2",
-            "--max-query-failed",
-            "1",
-            "--require-failure-attribution",
-        ]
-    )
-
-    failing_manifest = run_mineru_rag_loop.run_loop(failing_args)
-    passing_manifest = run_mineru_rag_loop.run_loop(passing_args)
-
-    assert failing_manifest["overall_status"] == "failed"
-    assert failing_manifest["query_eval"]["gate"]["checks"] == {
-        "min_query_passed": False,
-        "max_query_failed": False,
-        "require_failure_attribution": True,
-    }
-    assert passing_manifest["overall_status"] == "passed"
-    assert passing_manifest["query_eval"]["gate"]["passed"] is True
 
 
 def test_mineru_smoke_is_only_run_when_explicitly_enabled(monkeypatch, tmp_path) -> None:
@@ -859,14 +644,14 @@ def test_dry_run_writes_manifest_and_does_not_execute(monkeypatch, tmp_path, cap
 
     monkeypatch.setattr(run_mineru_rag_loop.subprocess, "run", fake_run)
     args = run_mineru_rag_loop.parse_args(
-        ["--profile", "query", "--python", "py", "--out-dir", str(tmp_path), "--run-query-eval", "--dry-run"]
+        ["--profile", "query", "--python", "py", "--out-dir", str(tmp_path), "--dry-run"]
     )
 
     manifest = run_mineru_rag_loop.run_loop(args)
 
     captured = capsys.readouterr()
-    assert "py -m pytest tests/test_parser_document_intelligence.py tests/test_query_eval.py -q" in captured.out
-    assert "py scripts/query_eval.py" in captured.out
+    assert "py -m pytest tests/test_parser_document_intelligence.py -q" in captured.out
+    assert "py -m pytest tests/test_query_service.py tests/test_paper_profile.py -q" in captured.out
     assert manifest["overall_status"] == "dry_run"
     assert manifest["git_status_short"] == ""
     assert all(command["exit_code"] is None for command in manifest["commands"])

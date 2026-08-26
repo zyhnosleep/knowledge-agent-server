@@ -948,20 +948,26 @@
 
       .chat-view {
         height: calc(100dvh - 64px);
+        min-width: 0;
         min-height: 0;
         display: grid;
         grid-template-rows: minmax(0, 1fr) auto;
-        max-width: 1100px;
-        margin: 0 auto;
+        max-width: none;
+        width: 100%;
+        margin: 0;
         padding: 0 0 28px;
         overflow: hidden;
       }
 
       .chat-surface {
+        width: 100%;
+        min-width: 0;
         min-height: 0;
+        overflow-x: hidden;
         overflow-y: auto;
         display: flex;
         flex-direction: column;
+        align-items: stretch;
         gap: 16px;
         padding: 24px 8px 18px;
       }
@@ -1261,6 +1267,7 @@
         display: flex;
         align-items: center;
         gap: 8px;
+        min-width: 0;
       }
 
       .icon-action {
@@ -1335,6 +1342,21 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+
+      .attachment-chip.pending {
+        border-style: dashed;
+        opacity: 0.75;
+      }
+
+      .attachment-chip.pending::after {
+        content: "…";
+        animation: pending-blink 1s steps(4) infinite;
+      }
+
+      @keyframes pending-blink {
+        0% { opacity: 0.2; }
+        100% { opacity: 1; }
       }
 
       .attachment-chip button {
@@ -1539,19 +1561,24 @@
       /* Nocturne Research — production UI derived from the approved five-screen study. */
       :root { --solid-shadow: 0 24px 70px rgb(0 0 0 / 28%); }
       body { background: var(--night-950); color: var(--paper-100); }
+      /* 低对比度暗色滚动条：默认极淡，hover 时增强，避免白色系统条破坏深色界面 */
+      ::-webkit-scrollbar { width: 11px; height: 11px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 13%); border: 3px solid transparent; border-radius: 9px; background-clip: content-box; }
+      ::-webkit-scrollbar-thumb:hover { background-color: rgb(255 255 255 / 25%); }
+      * { scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 16%) transparent; }
       .topbar { height: 70px; }
       button, select, input, textarea { font: inherit; }
       button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
         outline: 2px solid var(--signal); outline-offset: 3px;
       }
-      .brand { height: 76px; display: flex; gap: 13px; padding: 8px 11px 4px; align-items: center; }
+      .brand { height: 64px; display: flex; gap: 13px; padding: 8px 11px 4px; align-items: center; }
       .sidebar { height: 100dvh; min-height: 0; overflow: hidden; }
-      .brand-lighthouse { width: 28px; height: 44px; fill: none; stroke: var(--paper-100); stroke-width: 1.4; }
+      .brand-lighthouse { width: 26px; height: 41px; fill: none; stroke: var(--paper-100); stroke-width: 1.4; }
       .brand-wordmark { display: grid; gap: 3px; }
-      .brand-wordmark strong { font-family: Georgia, "Noto Serif SC", serif; font-size: 16px; letter-spacing: .28em; white-space: nowrap; }
-      .brand-wordmark small { font: 7px/1.2 ui-monospace, monospace; letter-spacing: .13em; color: var(--paper-500); }
-      .product-name { padding: 0 13px 18px; font-size: 22px; font-weight: 650; letter-spacing: .02em; }
-      .nav { padding: 0 18px 24px; border-bottom: 1px solid var(--line-soft); }
+      .brand-wordmark strong { font-family: Georgia, "Noto Serif SC", serif; font-size: 15px; letter-spacing: .24em; white-space: nowrap; }
+      .brand-wordmark small { font: 8px/1.2 ui-monospace, monospace; letter-spacing: .13em; color: var(--paper-500); }
+      .nav { padding: 6px 18px 20px; border-bottom: 1px solid var(--line-soft); }
       .nav-button { min-height: 48px; border-radius: 7px; padding: 0 14px; gap: 12px; }
       .nav-button::before { width: 3px; left: 0; background: var(--paper-100); }
       .nav-button.active { background: #1a212a; }
@@ -1559,22 +1586,31 @@
       .nav-button small { display: none; }
       .session-list { padding: 15px 18px; flex: 1; min-height: 0; overflow: hidden; }
       .session-list-body { max-height: 100%; overflow-y: auto; scrollbar-width: thin; }
+      /* 会话卡片：删除按钮仅在 hover / 键盘聚焦时显示，避免红色 × 常驻干扰 */
+      .recent-session { position: relative; grid-template-columns: minmax(0, 1fr); }
+      .recent-session .recent-card { padding-right: 30px; }
+      .recent-session .danger-action { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); width: 26px; height: 26px; opacity: 0; transition: opacity 120ms ease, border-color 120ms ease, background 120ms ease; border-color: transparent; background: transparent; }
+      .recent-session:hover .danger-action,
+      .recent-session:focus-within .danger-action { opacity: 1; border-color: rgba(239, 68, 68, 0.34); background: var(--surface-soft); }
       .session-list-head { color: var(--paper-500); font-size: 12px; }
       .session-list-head button { color: var(--paper-300); }
       .profile { margin: auto 16px 16px; padding: 14px 16px; border: 1px solid var(--line); background: transparent; box-shadow: none; }
       .profile label { color: var(--paper-500); font-size: 10px; }
       .profile strong { color: var(--paper-300); }
-      .project-select-wrap { position: relative; margin-top: 9px; }
+      /* 项目选择器位于 topbar 左侧（全局状态区），在线状态随行 */
+      .topbar-project { display: flex; align-items: center; gap: 14px; }
+      .project-select-wrap { position: relative; }
       .project-select-wrap::before { content: ""; position: absolute; left: 11px; top: 50%; width: 6px; height: 6px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 9px rgb(169 239 88 / 48%); transform: translateY(-50%); pointer-events: none; z-index: 1; }
       .project-select-wrap::after { content: "⌄"; position: absolute; right: 11px; top: 50%; color: var(--paper-300); transform: translateY(-56%); pointer-events: none; }
-      #sidebarProjectSelect { width: 100%; min-height: 40px; appearance: none; border: 1px solid var(--line); border-radius: 5px; padding: 0 34px 0 28px; background: var(--night-900); color: var(--paper-100); font-size: 12px; }
+      #sidebarProjectSelect { width: 230px; min-height: 34px; appearance: none; border: 1px solid var(--line); border-radius: 5px; padding: 0 34px 0 28px; background: var(--night-900); color: var(--paper-100); font-size: 12px; }
       #sidebarProjectSwitcher[data-sync-state="syncing"] #sidebarProjectSelect { color: var(--paper-500); }
       .visually-hidden { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
-      .project-online { font: 9px ui-monospace, monospace; color: var(--paper-500); letter-spacing: .08em; }
+      .project-online { font: 11px ui-monospace, monospace; color: var(--paper-500); letter-spacing: .08em; white-space: nowrap; }
       .project-online i { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 10px var(--signal); }
-      .topbar { padding: 0 40px; border-bottom: 1px solid var(--line-soft); background: rgb(7 10 14 / 88%); }
+      .topbar { padding: 0 40px; border-bottom: 1px solid var(--line-soft); background: rgb(7 10 14 / 88%); justify-content: flex-start; }
+      .topbar-actions { margin-left: auto; }
       .topbar-label { display: flex; align-items: center; gap: 20px; color: var(--paper-500); font: 11px ui-monospace, monospace; letter-spacing: .12em; }
-      .topbar-label i { width: 190px; height: 1px; background: linear-gradient(90deg, var(--paper-300), transparent); position: relative; }
+      .topbar-label i { width: 190px; height: 1px; background: linear-gradient(90deg, rgb(255 255 255 / 13%), transparent); position: relative; }
       .topbar-label i::after { content: ""; position: absolute; right: 0; top: -3px; width: 5px; height: 5px; border: 1px solid var(--paper-500); border-radius: 50%; }
       .status-pill { background: none; border: 0; box-shadow: none; padding: 0; color: var(--paper-300); }
 
@@ -1586,8 +1622,10 @@
       .section-kicker { margin: 0 0 12px; font: 10px ui-monospace, monospace; letter-spacing: .16em; color: var(--paper-500); text-transform: uppercase; }
 
       .chat-view { height: calc(100vh - 70px); padding: 0; overflow: hidden; position: relative; }
-      .chat-surface { max-width: none; height: 100%; padding: 0; overflow: auto; }
-      .welcome-stage { min-height: 100%; display: grid; grid-template-columns: minmax(520px, 1.12fr) minmax(360px, .88fr) 145px; align-items: center; gap: 24px; padding: 44px 38px 170px 70px; background: radial-gradient(circle at 62% 40%, rgb(39 80 130 / 12%), transparent 32%); text-align: left; }
+      /* 滚动容器统一底部安全区：悬浮输入框（含 meta 提示行）不遮挡任何内容 */
+      .chat-view::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 150px; background: linear-gradient(180deg, transparent, rgb(5 8 12 / 90%)); pointer-events: none; z-index: 4; }
+      .chat-surface { width: 100%; min-width: 0; max-width: none; height: 100%; padding: 0 0 210px; overflow-x: hidden; overflow-y: auto; }
+      .welcome-stage { min-height: 100%; display: grid; grid-template-columns: minmax(520px, 1.12fr) minmax(360px, .88fr) 145px; align-items: center; gap: 24px; padding: 44px 38px 24px 70px; background: radial-gradient(circle at 62% 40%, rgb(39 80 130 / 12%), transparent 32%); text-align: left; }
       .welcome-copy { max-width: 610px; }
       .chat-welcome h1 { font-size: clamp(46px, 3.5vw, 58px); line-height: 1.16; margin: 0 0 24px; letter-spacing: -.035em; white-space: nowrap; }
       .welcome-lede { max-width: 480px; color: var(--paper-300); font-size: 15px; line-height: 1.9; }
@@ -1610,24 +1648,48 @@
       .project-overview dl div, .runs-overview-rail dl div { display: grid; gap: 6px; }
       .project-overview dt, .runs-overview-rail dt { color: var(--paper-500); font-size: 11px; }
       .project-overview dd, .runs-overview-rail dd { margin: 0; font-size: 22px; color: var(--paper-300); }
-      .composer { position: absolute; left: 50%; bottom: 22px; width: min(820px, calc(100% - 80px)); transform: translateX(-50%); padding: 0; z-index: 5; }
-      .composer-box { min-height: 112px; grid-template-columns: 44px 1fr auto; align-items: end; padding: 16px; background: rgb(18 25 33 / 93%); border: 1px solid #4c5863; border-radius: 10px; box-shadow: 0 22px 70px rgb(0 0 0 / 42%); backdrop-filter: blur(16px); }
+      .composer { position: absolute; left: 50%; bottom: 22px; width: min(1400px, calc(100% - 48px)); max-width: 100%; min-width: 0; transform: translateX(-50%); padding: 0; z-index: 5; }
+      .composer-box { width: 100%; min-width: 0; min-height: 112px; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: end; padding: 16px; background: rgb(18 25 33 / 93%); border: 1px solid #4c5863; border-radius: 10px; box-shadow: 0 22px 70px rgb(0 0 0 / 42%); backdrop-filter: blur(16px); }
       .composer-box textarea { align-self: start; padding: 6px 0; min-height: 50px; }
       .composer-actions { align-self: end; }
       .send-button { border-color: #4c7d32; background: transparent; color: var(--paper-100); min-width: 46px; }
       .composer-meta { padding: 10px 4px; font-style: italic; }
       .sample-prompt { border: 0; background: none; padding: 0; color: var(--paper-500); font-size: 11px; font-style: italic; cursor: pointer; }
       .sample-prompt:hover { color: var(--paper-300); }
-      .chat-messages, .answer, .thinking-feed { max-width: 850px; margin-left: 40px; }
-      .chat-messages { padding: 28px 0 150px; }
+      .chat-messages, .thinking-feed, .trace-summary, .answer-meta { display: none !important; }
+      .answer-history { display: grid; gap: 18px; width: 100%; min-width: 0; }
+      .answer-history:empty { display: none; }
+      .answer { width: min(1400px, calc(100% - 48px)); max-width: 100%; margin: 26px auto 10px; padding: 28px 32px 34px; border: 1px solid var(--line); border-radius: 16px; background: var(--night-850); box-shadow: var(--solid-shadow); }
+      .answer-status { width: min(1400px, calc(100% - 48px)); max-width: 100%; margin: 22px auto 0; padding: 8px 2px; color: var(--paper-500); font: 12px ui-monospace, monospace; }
+      .answer-status[hidden] { display: none; }
       .message { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; box-shadow: none; padding: 18px 0; }
-      .message.agent > div:not(.message-sources), .answer-text { font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
+      .message.agent > div:not(.message-sources), .answer-text { max-width: none; font-family: Georgia, "Noto Serif SC", serif; font-size: 17px; line-height: 1.95; }
       .citation-ref { color: #70a8ff; font: 11px ui-monospace, monospace; vertical-align: super; cursor: pointer; }
-      .thinking-feed { margin-top: 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); }
+      /* 正文结构层级：## 标题驱动的色条分块（结论/证据/不确定性/来源/其他） */
+      .answer-section { position: relative; margin: 20px 0 24px; padding-left: 18px; }
+      .answer-section::before { content: ""; position: absolute; left: 0; top: 3px; bottom: 3px; width: 3px; border-radius: 2px; background: var(--paper-500); }
+      .answer-section-conclusion::before { background: var(--signal); }
+      .answer-section-evidence::before { background: #4d8dff; }
+      .answer-section-uncertainty::before { background: #ffb64d; }
+      .answer-section-sources::before { background: #b48dff; }
+      .answer-section-head { margin: 0 0 9px; font: 12px ui-monospace, monospace; letter-spacing: .16em; color: var(--paper-500); }
+      .answer-section-conclusion .answer-section-head { color: var(--signal); }
+      .answer-section-evidence .answer-section-head { color: #8fb4ff; }
+      .answer-section-uncertainty .answer-section-head { color: #ffcf8a; }
+      .answer-section-sources .answer-section-head { color: #cbb0ff; }
+      .answer-section-body p { margin: 0 0 12px; }
+      .answer-section-body p:last-child { margin-bottom: 0; }
+      .answer-text ul { margin: 6px 0 14px; padding-left: 24px; }
+      .answer-text li { margin: 5px 0; }
       .thinking-step { border: 0; border-bottom: 1px solid var(--line-soft); background: none; }
-      .trace-summary { max-width: 850px; margin: 28px 0 0 40px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--night-850); color: var(--paper-300); }
       .chat-view.researching .topbar-label i, .chat-view.researching .thinking-feed { box-shadow: 0 0 18px rgb(77 141 255 / 28%); }
       .chat-view.researching .send-button { color: var(--signal); }
+
+      /* 只保留最终答案，避免用户问题、工具步骤和 trace 抢占正文宽度。 */
+      .answer-meta { min-height: 0; margin-bottom: 18px; }
+      .answer-meta:empty { display: none; }
+      .answer-text { overflow-wrap: anywhere; word-break: normal; }
+      .answer-sources { margin-top: 28px; }
 
       .files-layout { grid-template-columns: 242px minmax(0, 1fr); gap: 26px; margin-top: 28px; }
       .files-layout > *, .upload-form, .upload-form > label { min-width: 0; }
@@ -1693,11 +1755,14 @@
       .flow-card { display: none; }
 
       @media (max-width: 1200px) {
-        .welcome-stage { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding-left: 45px; }
+        .welcome-stage { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); padding-left: 45px; }
         .chat-welcome h1 { white-space: normal; }
         .project-overview { display: none; }
         .runs-layout { grid-template-columns: 1fr; }.runs-overview-rail { display: none; }
         .runs-layout.drawer-open { grid-template-columns: minmax(380px, .75fr) minmax(520px, 1.25fr); }
+        .composer { width: min(760px, calc(100% - 32px)); }
+        .composer-box { grid-template-columns: 40px minmax(0, 1fr); }
+        .composer-actions { grid-column: 1 / -1; justify-content: flex-end; }
       }
       @media (max-width: 900px) {
         .welcome-stage { grid-template-columns: 1fr; align-items: start; padding: 54px 34px 180px; }
@@ -1709,152 +1774,24 @@
       @media (max-width: 768px) {
         .shell { grid-template-columns: 1fr; }.sidebar { position: relative; width: auto; height: auto; min-height: 0; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
         .brand, .product-name, .session-list, .profile { display: none; }.nav { display: grid; grid-template-columns: repeat(3, 1fr); padding: 8px; border: 0; }.nav-button { justify-content: center; }
-        .topbar { padding: 0 18px; }.topbar-label i { width: 70px; }.view { padding: 24px 18px; }
+        .topbar { padding: 0 18px; }.topbar-label i { width: 70px; }.topbar-project .project-online { display: none; }#sidebarProjectSelect { width: 170px; }.view { padding: 24px 18px; }
         .chat-view { height: calc(100vh - 134px); }.welcome-stage { padding: 40px 22px 170px; }.chat-welcome h1 { font-size: 42px; }
         .composer { width: calc(100% - 28px); bottom: 10px; }.composer-meta { display: none; }
+        .answer, .answer-status { width: calc(100% - 28px); }
+        .answer { padding: 22px 18px 26px; }
         .files-layout { grid-template-columns: 1fr; }.files-rail { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 25px; }
         .project-switch-bar { gap: 10px; }.project-switch-label { padding-right: 14px; }.project-tab { padding: 0 16px; }.project-sync-status { display: none; }
         .document-columns { display: none; }.document-index, .document-list { min-width: 0; overflow: hidden; }.document-row { width: 100%; grid-template-columns: 28px minmax(0, 1fr); }.document-row > .muted { display: none; }.document-row .row-actions { grid-column: 2; flex-wrap: wrap; justify-content: flex-start; }
         .source-drawer { height: auto; max-height: none; min-height: 0; }.drawer-body { grid-template-columns: 1fr; overflow: auto; }.pdf-panel, .markdown-panel { grid-row: auto; height: min(68dvh, 620px); }.source-chunk-browser { height: min(68dvh, 620px); }.pdf-frame { min-height: 0; }
       }
       @media (max-width: 480px) {
-        .topbar-label i { display: none; }.status-pill { font-size: 10px; }.chat-welcome h1 { font-size: 34px; }.welcome-lede { font-size: 13px; }
+        .topbar-label i { display: none; }.topbar-project { gap: 8px; }#sidebarProjectSelect { width: 150px; }.status-pill { font-size: 10px; }.chat-welcome h1 { font-size: 34px; }.welcome-lede { font-size: 13px; }
         .research-index div { grid-template-columns: 26px 58px 1fr; }.composer-box { grid-template-columns: 36px 1fr; }.composer-actions { grid-column: 1 / -1; justify-content: flex-end; }
         .page-intro h1 { font-size: 36px; }.metrics { grid-template-columns: repeat(3, 1fr); }.metric { padding: 10px 5px; }.metric strong { font-size: 24px; }
         .run-table th:nth-child(2), .run-table td:nth-child(2), .run-table th:nth-child(4), .run-table td:nth-child(4) { display: none; }
       }
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
-      }
-
-      /* Answer-only conversation surface: keep the final answer readable and
-         remove internal execution details from the primary reading flow. */
-      .chat-view.answer-only .chat-surface {
-        width: 100%;
-        min-width: 0;
-        padding: 0 12px 170px;
-        overflow-x: hidden;
-      }
-
-      .chat-view.answer-only .chat-messages,
-      .chat-view.answer-only .thinking-feed,
-      .chat-view.answer-only .trace-summary {
-        display: none !important;
-      }
-
-      .chat-view.answer-only .answer {
-        display: block;
-        width: 100%;
-        max-width: 1400px;
-        min-width: 0;
-        margin: clamp(18px, 4vh, 48px) auto 170px;
-        padding: clamp(28px, 4vw, 58px) clamp(22px, 4vw, 56px);
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        background: var(--night-850);
-        box-shadow: 0 24px 70px rgb(0 0 0 / 24%);
-        line-height: 1.85;
-        overflow-wrap: anywhere;
-      }
-
-      .chat-view.answer-only .answer.pending {
-        max-width: 760px;
-        margin-top: clamp(18px, 5vh, 52px);
-        padding: 18px 22px;
-        border-radius: 10px;
-        background: var(--night-900);
-        box-shadow: none;
-      }
-
-      .chat-view.answer-only .answer.pending .answer-text {
-        max-width: none;
-        color: var(--paper-500);
-        font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-        font-size: 14px;
-        line-height: 1.5;
-      }
-
-      .chat-view.answer-only .answer-meta {
-        display: none;
-      }
-
-      .chat-view.answer-only .answer-text {
-        width: 100%;
-        max-width: 1280px;
-        margin: 0 auto;
-        font-family: Georgia, "Noto Serif SC", serif;
-        font-size: clamp(17px, 1.35vw, 21px);
-        line-height: 1.95;
-        overflow-wrap: anywhere;
-        white-space: pre-wrap;
-      }
-
-      .chat-view.answer-only .answer-sources {
-        width: 100%;
-        max-width: 1280px;
-        margin: 28px auto 0;
-      }
-
-      .chat-view.answer-only .composer {
-        width: min(1400px, calc(100% - 24px));
-      }
-
-      .chat-view.answer-only .composer-box {
-        width: 100%;
-        min-width: 0;
-        grid-template-columns: 44px minmax(0, 1fr) auto;
-      }
-
-      .chat-view.answer-only .composer textarea {
-        min-width: 0;
-      }
-
-      @media (max-width: 768px) {
-        .chat-view.answer-only .chat-surface {
-          padding: 0 12px 136px;
-        }
-
-        .chat-view.answer-only .answer {
-          margin-top: 12px;
-          margin-bottom: 136px;
-          padding: 24px 18px;
-          border-radius: 13px;
-        }
-
-        .chat-view.answer-only .answer-text {
-          font-size: 16px;
-          line-height: 1.85;
-        }
-
-        .chat-view.answer-only .composer {
-          width: calc(100% - 24px);
-        }
-
-        .chat-view.answer-only .composer-box {
-          min-height: 92px;
-          grid-template-columns: 36px minmax(0, 1fr) auto;
-          padding: 12px;
-        }
-
-        .chat-view.answer-only .composer textarea {
-          min-height: 48px;
-          font-size: 15px;
-        }
-      }
-
-      @media (max-width: 480px) {
-        .chat-view.answer-only .answer-text {
-          font-size: 15px;
-        }
-
-        .chat-view.answer-only .composer-box {
-          grid-template-columns: 36px minmax(0, 1fr);
-        }
-
-        .chat-view.answer-only .composer-actions {
-          grid-column: 1 / -1;
-          justify-content: flex-end;
-        }
       }
     </style>
   </head>
@@ -1871,9 +1808,8 @@
       <aside class="sidebar">
         <div class="brand">
           <svg class="brand-lighthouse" viewBox="0 0 28 44" aria-hidden="true"><path d="M10 40h9M12 35h5M9 35h11L17 15h-5L9 35ZM12 10h5l-1-5h-3l-1 5Zm-5 6 5-3m10 3-5-3M7 40h15"/></svg>
-          <span class="brand-wordmark"><strong>夜航研究所</strong><small>NIGHT RESEARCH INSTITUTE</small></span>
+          <span class="brand-wordmark"><strong>夜航研究所</strong><small>RAG Research</small></span>
         </div>
-        <div class="product-name">RAG Research</div>
 
         <nav class="nav" aria-label="主导航">
           <button class="nav-button" type="button" data-view-target="chat">
@@ -1899,18 +1835,17 @@
             <button class="recent-card active" type="button" id="newChatButton">新聊天</button>
           </div>
         </div>
-
-        <div class="profile project-switcher" id="sidebarProjectSwitcher" data-sync-state="idle">
-          <label for="sidebarProjectSelect">当前项目</label>
-          <div class="project-select-wrap"><select id="sidebarProjectSelect" aria-label="切换当前项目"></select></div>
-          <strong class="visually-hidden" id="activeProjectLabel">internal-research</strong>
-          <span class="project-online"><i></i> INDEX ONLINE</span>
-        </div>
       </aside>
 
       <main class="main">
         <header class="topbar">
           <div class="topbar-label"><span id="viewEyebrow">RESEARCH CONVERSATION / 01</span><i></i></div>
+          <div class="topbar-project" id="sidebarProjectSwitcher" data-sync-state="idle">
+            <label for="sidebarProjectSelect" class="visually-hidden">当前项目</label>
+            <div class="project-select-wrap"><select id="sidebarProjectSelect" aria-label="切换当前项目"></select></div>
+            <strong class="visually-hidden" id="activeProjectLabel">internal-research</strong>
+            <span class="project-online"><i></i> INDEX ONLINE</span>
+          </div>
           <div class="topbar-actions">
             <div class="status-pill" id="healthStatus"><span class="status-dot"></span><span>检查服务中</span></div>
             <div class="account-menu" id="accountMenu" hidden>
@@ -1921,7 +1856,7 @@
           </div>
         </header>
 
-        <section class="view chat-view answer-only" data-view="chat" hidden>
+        <section class="view chat-view" data-view="chat" hidden>
           <div class="chat-surface" id="chatSurface">
             <div class="chat-welcome" id="chatWelcome">
              <div class="welcome-stage">
@@ -1955,14 +1890,8 @@
             <div class="chat-messages" id="chatMessages" hidden></div>
             <div class="thinking-feed" id="thinkingFeed" hidden></div>
             <details class="trace-summary" id="traceSummary" hidden><summary>检索与推理已完成</summary><p>已完成检索、原文阅读与证据整理。</p></details>
-            <article class="answer" id="answerPanel" hidden>
-              <div class="answer-meta" id="answerMeta"></div>
-              <div class="answer-text" id="answerText"></div>
-              <div class="answer-sources" id="answerSources" hidden>
-                <h4>来源文献</h4>
-                <ul id="answerSourcesList"></ul>
-              </div>
-            </article>
+            <div class="answer-status" id="answerStatus" hidden aria-live="polite">正在检索、阅读并组织证据…</div>
+            <div class="answer-history" id="answerHistory" hidden></div>
           </div>
           <div class="composer">
             <div class="attachment-bar" id="attachmentBar" hidden></div>
@@ -1974,13 +1903,13 @@
               <button type="button" id="continueQueueButton">继续等待</button>
             </div>
             <form class="composer-box" id="queryForm">
-              <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件" aria-label="添加临时文件">⌕</button>
+              <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件（当前会话附件）" aria-label="添加临时文件">＋</button>
               <textarea id="questionInput" rows="1" aria-label="输入问题" placeholder="询问论文、附件或研究项目…"></textarea>
               <input id="attachmentInput" type="file" multiple hidden />
               <div class="composer-actions">
-                <select id="queryMode" aria-label="查询模式">
-                  <option value="agent">Agent</option>
-                  <option value="rag">普通 RAG</option>
+                <select id="queryMode" aria-label="查询模式" title="Agent 模式：检索 + 推理综合回答；标准 RAG：直接基于证据回答">
+                  <option value="agent">Agent 模式</option>
+                  <option value="rag">标准 RAG</option>
                 </select>
                 <button class="send-button" id="sendButton" type="submit" aria-label="发送问题">→</button>
               </div>
@@ -2219,14 +2148,149 @@
         return null;
       }
 
-      function renderCitedText(text, container, citations) {
-        container.replaceChildren();
-        var source = String(text || "");
+      var LATEX_SUB = { "0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉","+":"₊","-":"₋","a":"ₐ","e":"ₑ","h":"ₕ","i":"ᵢ","j":"ⱼ","k":"ₖ","l":"ₗ","m":"ₘ","n":"ₙ","o":"ₒ","p":"ₚ","r":"ᵣ","s":"ₛ","t":"ₜ","u":"ᵤ","v":"ᵥ","x":"ₓ" };
+      var LATEX_SUP = { "0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹","+":"⁺","-":"⁻","a":"ᵃ","b":"ᵇ","c":"ᶜ","d":"ᵈ","e":"ᵉ","n":"ⁿ","x":"ˣ" };
+      var LATEX_GREEK = { "chi":"χ","alpha":"α","beta":"β","gamma":"γ","delta":"δ","epsilon":"ε","zeta":"ζ","eta":"η","theta":"θ","iota":"ι","kappa":"κ","lambda":"λ","mu":"μ","nu":"ν","xi":"ξ","pi":"π","rho":"ρ","sigma":"σ","tau":"τ","upsilon":"υ","phi":"φ","varphi":"φ","psi":"ψ","omega":"ω" };
+      var LATEX_SYM = { "leq":"≤","geq":"≥","times":"×","pm":"±","approx":"≈","sim":"≈","circ":"°","degree":"°","neq":"≠","rightarrow":"→","infty":"∞","mid":"|","vert":"|","parallel":"‖","Vert":"‖" };
+
+      function mapLatexChars(chars, map) {
+        return Array.prototype.map.call(chars, function (ch) {
+          return map[ch] !== undefined ? map[ch] : ch;
+        }).join("");
+      }
+
+      function compactLatexChain(chain) {
+        // 链内已无必要空格（调用方先删除），这里做剥壳 + 上下标转换
+        var t = chain.replace(/\s+/g, "");
+        var guard = 0;
+        while (guard++ < 8) {
+          var prev = t;
+          t = t.replace(/\\[a-zA-Z]+\{([^{}]*)\}/g, function (match, inner) {
+            var cmd = match.match(/\\[a-zA-Z]+/)[0].slice(1);
+            if (LATEX_GREEK[cmd]) return LATEX_GREEK[cmd]; // \chi → χ
+            return inner; // \mathrm{...} / \mathbf{...} / \mathtt{...} → 内容
+          });
+          t = t.replace(/_{([^{}]*)}/g, function (match, inner) {
+            var clean = inner.replace(/\s+/g, "");
+            // 纯数字下标转 Unicode（₃ ₄），含字母则保留下划线形态（_eq、_R）
+            return /^\d+$/.test(clean) ? mapLatexChars(clean, LATEX_SUB) : "_" + clean;
+          });
+          t = t.replace(/\^{([^{}]*)}/g, function (match, inner) {
+            var clean = inner.replace(/\s+/g, "");
+            return /^\d+$/.test(clean) ? mapLatexChars(clean, LATEX_SUP) : "^" + clean;
+          });
+          if (t === prev) break;
+        }
+        return t;
+      }
+
+      function latexToReadable(text) {
+        var s = String(text || "");
+        // 1. 紧凑 LaTeX 链：\cmd{...}、_{...}、^{...} 及其后随数字段连续组合，
+        //    链内空格全部删除（\mathrm { A l a } _ { 3 } → Ala₃、\mathrm { C } 2 2 → C22）。
+        //    数字段不能作为链条起点（否则裸数字文本会被误吞）
+        s = s.replace(
+          /(?:\\[a-zA-Z]+\s*\{[^{}]*\}|\s*[_\^]\s*\{[^{}]*\}|\s*[_\^]\s*\d+)(?:\s*\d+|\s*[_\^]\s*\{[^{}]*\}|\s*[_\^]\s*\d+)*/g,
+          function (match) { return compactLatexChain(match); }
+        );
+        // 2. 迭代剥离残余嵌套（\mathbf { a _ { R } } 一类）
+        var guard = 0;
+        while (guard++ < 12) {
+          var prev = s;
+          s = s.replace(/\\[a-zA-Z]+\s*\{([^{}]*)\}/g, function (match, inner) {
+            var cmd = match.match(/\\[a-zA-Z]+/)[0].slice(1);
+            if (LATEX_GREEK[cmd]) return LATEX_GREEK[cmd];
+            var content = inner.trim();
+            if (/^(?:mathrm|mathbf|mathtt|mathit|textbf|textit|rm|bf|it|sf|tt)$/.test(cmd)) {
+              content = content.replace(/\s+/g, "");
+            }
+            return content;
+          });
+          s = s.replace(/(\S)\s*_\s*\{([^{}]*)\}/g, function (match, pre, inner) {
+            var clean = inner.trim().replace(/\s+/g, "");
+            return pre + (/^\d+$/.test(clean) ? mapLatexChars(clean, LATEX_SUB) : "_" + clean);
+          });
+          s = s.replace(/(\S)\s*\^\s*\{([^{}]*)\}/g, function (match, pre, inner) {
+            var clean = inner.trim().replace(/\s+/g, "");
+            return pre + (/^\d+$/.test(clean) ? mapLatexChars(clean, LATEX_SUP) : "^" + clean);
+          });
+          if (s === prev) break;
+        }
+        // 3. 无大括号的简单上下标：χ_1 → χ₁、E^2 → E²
+        s = s.replace(/_(\d+)/g, function (match, digits) { return mapLatexChars(digits, LATEX_SUB); });
+        s = s.replace(/\^(\d+)/g, function (match, digits) { return mapLatexChars(digits, LATEX_SUP); });
+        //    单字符字母下标转 Unicode（p_T → pₜ、y_n → yₙ、α_R → αᵣ）；
+        //    多字符下标（_OPSD、_<n、_eq）保持 _ 形态——后随字母/数字/尖括号时不转
+        s = s.replace(/_([a-zA-Z])(?![a-zA-Z0-9<])/g, function (match, ch) {
+          var u = LATEX_SUB[ch.toLowerCase()];
+          return u !== undefined ? u : match;
+        });
+        // 4. 孤立命令（\chi → χ、\leq → ≤，其余命令名删除）、数学模式标记
+        //    （\( \) \[ \] $）、残留花括号、孤立上标符、多余空格
+        s = s.replace(/\\\\/g, "\\"); // 双反斜杠（转义来源）归一
+        s = s.replace(/\\[a-zA-Z]+/g, function (m) {
+          var cmd = m.slice(1);
+          if (LATEX_GREEK[cmd] !== undefined) return LATEX_GREEK[cmd];
+          if (LATEX_SYM[cmd] !== undefined) return LATEX_SYM[cmd];
+          return "";
+        });
+        s = s.replace(/\\[\(\)\[\]]/g, "");
+        // 非字母转义符：剥反斜杠保留原字符（\| → |、\_ → _、\, → ,）
+        s = s.replace(/\\([^a-zA-Z]|$)/g, "$1");
+        s = s.replace(/\$/g, "");
+        s = s.replace(/[{}]/g, "");
+        s = s.replace(/\^/g, "");
+        s = s.replace(/ {2,}/g, " ");
+        // 5. 残留 LaTeX 源空格：下标/上标前空格（Ala ₃ → Ala₃）、
+        //    连字符/斜杠前空格（J -耦合 → J-耦合、C22 / CMAP → C22/CMAP）。
+        //    注意：数字前空格不压缩（Table 7、Figure 2 是普通文本，非 LaTeX 源）
+        s = s.replace(/([A-Za-z0-9])\s+(?=[₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹₊₋⁺⁻ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ])/g, "$1");
+        s = s.replace(/([A-Za-z0-9])\s+-\s*/g, "$1-");
+        s = s.replace(/([A-Za-z0-9])\s+\/\s*(?=[A-Za-z0-9])/g, "$1/");
+        s = s.replace(/\/\s+(?=[A-Za-z0-9])/g, "/");
+        return s;
+      }
+
+      var ANSWER_SECTION_HEAD_RE = /^#{1,3}\s+(.+)$/;
+
+      function classifyAnswerHead(head) {
+        var text = String(head).toLowerCase();
+        if (/(结论|conclusion)/.test(text)) return "conclusion";
+        if (/(证据|依据|evidence)/.test(text)) return "evidence";
+        if (/(不确定性|不确定|局限|限制|uncertainty|limitation)/.test(text)) return "uncertainty";
+        if (/(引用|参考文献|来源|references|sources)/.test(text)) return "sources";
+        return "generic";
+      }
+
+      function cleanAnswerHead(head) {
+        return String(head).replace(/\*\*/g, "").trim();
+      }
+
+      // 按 ## 标题切分答案为多个块（head 为 null 表示无标题的普通段落区）
+      function splitAnswerBlocks(source) {
+        var blocks = [];
+        var current = null;
+        source.split(/\r?\n/).forEach(function (line) {
+          var match = line.match(ANSWER_SECTION_HEAD_RE);
+          if (match) {
+            if (current) blocks.push(current);
+            current = { head: cleanAnswerHead(match[1]), lines: [] };
+          } else {
+            if (!current) current = { head: null, lines: [] };
+            current.lines.push(line);
+          }
+        });
+        if (current) blocks.push(current);
+        return blocks;
+      }
+
+      // [N] 引用 → sup 上标（保留点击溯源交互），其余文本原样追加
+      function appendCitedTextNodes(text, parent, citations) {
         var pattern = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
         var cursor = 0;
         var match;
-        while ((match = pattern.exec(source)) !== null) {
-          if (match.index > cursor) container.appendChild(document.createTextNode(source.slice(cursor, match.index)));
+        while ((match = pattern.exec(text)) !== null) {
+          if (match.index > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
           var reference = document.createElement("sup");
           reference.className = "citation-ref";
           reference.textContent = "[" + match[1] + "]";
@@ -2246,10 +2310,77 @@
               });
             })(citation);
           }
-          container.appendChild(reference);
+          parent.appendChild(reference);
           cursor = pattern.lastIndex;
         }
-        if (cursor < source.length) container.appendChild(document.createTextNode(source.slice(cursor)));
+        if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
+      }
+
+      // **粗体** → <strong>（分段后仍保留引用 sup 能力）
+      function appendInlineMarkdown(text, parent, citations) {
+        var parts = String(text).split(/\*\*(.+?)\*\*/);
+        parts.forEach(function (part, index) {
+          if (!part) return;
+          if (index % 2 === 1) {
+            var strong = document.createElement("strong");
+            appendCitedTextNodes(part, strong, citations);
+            parent.appendChild(strong);
+          } else {
+            appendCitedTextNodes(part, parent, citations);
+          }
+        });
+      }
+
+      // 块内行渲染：按空行分组 → 列表（- / * / 1. 开头）或段落
+      function renderMarkdownLines(lines, container, citations) {
+        var groups = [];
+        var current = [];
+        lines.forEach(function (line) {
+          if (!line.trim()) {
+            if (current.length) { groups.push(current); current = []; }
+          } else {
+            current.push(line);
+          }
+        });
+        if (current.length) groups.push(current);
+        groups.forEach(function (group) {
+          var isList = group.every(function (line) { return /^\s*(?:[-*]|\d+\.)\s+/.test(line); });
+          if (isList) {
+            var list = document.createElement("ul");
+            group.forEach(function (line) {
+              var item = document.createElement("li");
+              appendInlineMarkdown(line.replace(/^\s*(?:[-*]|\d+\.)\s+/, ""), item, citations);
+              list.appendChild(item);
+            });
+            container.appendChild(list);
+          } else {
+            var paragraph = document.createElement("p");
+            appendInlineMarkdown(group.join("\n"), paragraph, citations);
+            container.appendChild(paragraph);
+          }
+        });
+      }
+
+      function renderCitedText(text, container, citations) {
+        container.replaceChildren();
+        var source = latexToReadable(text);
+        splitAnswerBlocks(source).forEach(function (block) {
+          if (block.head) {
+            var section = document.createElement("section");
+            section.className = "answer-section answer-section-" + classifyAnswerHead(block.head);
+            var head = document.createElement("h3");
+            head.className = "answer-section-head";
+            head.textContent = block.head;
+            section.appendChild(head);
+            var body = document.createElement("div");
+            body.className = "answer-section-body";
+            renderMarkdownLines(block.lines, body, citations);
+            section.appendChild(body);
+            container.appendChild(section);
+          } else {
+            renderMarkdownLines(block.lines, container, citations);
+          }
+        });
       }
 
       function getSourceKey(citation) {
@@ -2406,6 +2537,8 @@
       function showWelcome() {
         $("chatWelcome").hidden = false;
         $("chatMessages").hidden = true;
+        if ($("answerHistory")) $("answerHistory").hidden = true;
+        if ($("answerStatus")) $("answerStatus").hidden = true;
       }
 
       function showMessages() {
@@ -2419,48 +2552,48 @@
         if ($("sendButton")) $("sendButton").textContent = active ? "···" : "→";
         if ($("composerHint")) $("composerHint").textContent = active ? "正在检索、阅读并组织证据…" : "可尝试：“比较不同力场的适用范围”";
         if ($("stopGenerationButton")) $("stopGenerationButton").hidden = !active;
+        if (active && $("chatWelcome")) $("chatWelcome").hidden = true;
+        if ($("answerStatus")) {
+          $("answerStatus").hidden = !active;
+          if (active) $("answerStatus").textContent = "正在检索、阅读并组织证据…";
+        }
         if (!active) setQueueChoice(null);
       }
 
       function showAnswer(meta, text, citations) {
-        var answerPanel = $("answerPanel");
-        var answerText = String(text || "").trim();
-        var isPending = /^(正在分析|正在生成)/.test(answerText) && !(citations || []).length;
-        answerPanel.hidden = false;
-        answerPanel.classList.toggle("pending", isPending);
-        if ($("traceSummary")) $("traceSummary").hidden = false;
-        $("answerMeta").replaceChildren();
+        $("chatWelcome").hidden = true;
+        $("chatMessages").hidden = true;
+        if ($("answerStatus")) $("answerStatus").hidden = true;
+        if ($("thinkingFeed")) $("thinkingFeed").hidden = true;
+        if ($("traceSummary")) $("traceSummary").hidden = true;
+        var history = $("answerHistory");
+        if (!history) return;
+        history.hidden = false;
+        var panel = document.createElement("article");
+        panel.className = "answer";
+        var metaBox = document.createElement("div");
+        metaBox.className = "answer-meta";
+        var textBox = document.createElement("div");
+        textBox.className = "answer-text";
+        var sourcesBox = document.createElement("div");
+        sourcesBox.className = "answer-sources";
+        sourcesBox.hidden = true;
+        panel.appendChild(metaBox);
+        panel.appendChild(textBox);
+        panel.appendChild(sourcesBox);
         (meta || []).forEach(function (item) {
           var chip = document.createElement("span");
           chip.textContent = item;
-          $("answerMeta").appendChild(chip);
+          metaBox.appendChild(chip);
         });
-        renderCitedText(text, $("answerText"), citations);
-        renderSources(citations, $("answerSources"));
+        renderCitedText(text, textBox, citations);
+        renderSources(citations, sourcesBox);
+        history.appendChild(panel);
       }
 
       function appendMessage(role, content, meta, citations) {
-        var box = $("chatMessages");
-        if (!box) return;
-        showMessages();
-        var div = document.createElement("div");
-        div.className = "message " + role;
-        var label = document.createElement("strong");
-        var roleNames = { user: "你", agent: "回答", tool: "工具" };
-        var roleName = roleNames[role] || role;
-        label.textContent = meta ? roleName + " · " + meta : roleName;
-        var body = document.createElement("div");
-        renderCitedText(content || "", body, citations);
-        div.appendChild(label);
-        div.appendChild(body);
-        if ((role === "agent" || role === "tool") && citations && citations.length) {
-          var sourcesBox = document.createElement("div");
-          sourcesBox.className = "message-sources";
-          renderSources(citations, sourcesBox);
-          div.appendChild(sourcesBox);
-        }
-        box.appendChild(div);
-        box.scrollTop = box.scrollHeight;
+        // 问题、工具步骤和中间回答不进入正文，只在最终答案卡中呈现结果。
+        return;
       }
 
       function clearThinking() {
@@ -2523,7 +2656,10 @@
           var streamedCitations = [];
           var streamMeta = [];
           clearThinking();
-          showAnswer([], "正在分析...");
+          if ($("answerStatus")) {
+            $("answerStatus").hidden = false;
+            $("answerStatus").textContent = "正在分析…";
+          }
 
           function read() {
             return reader.read().then(function (result) {
@@ -2535,7 +2671,10 @@
                 var event = parseSSE(part);
                 if (!event) return;
                 if (event.name === "start") {
-                  showAnswer([], "正在分析...");
+                  if ($("answerStatus")) {
+                    $("answerStatus").hidden = false;
+                    $("answerStatus").textContent = "正在分析…";
+                  }
                 }
                 if (event.name === "route") {
                   var routeMeta = event.data && event.data.metadata ? event.data.metadata : {};
@@ -2553,12 +2692,12 @@
                 if (event.name === "token") {
                   setQueueChoice(null);
                   streamedAnswer += event.data && event.data.delta ? event.data.delta : "";
-                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
+                  if ($("answerStatus")) $("answerStatus").textContent = "正在生成最终答案…";
                 }
                 if (event.name === "citation") {
                   var citationIndex = event.data && Number.isInteger(event.data.index) ? event.data.index : streamedCitations.length;
                   streamedCitations[citationIndex] = event.data;
-                  showAnswer(streamMeta, streamedAnswer || "正在生成…", streamedCitations.filter(Boolean));
+                  if ($("answerStatus")) $("answerStatus").textContent = "正在整理来源…";
                 }
                 if (event.name === "final") finalData = event.data;
                 if (event.name === "error") {
@@ -2584,7 +2723,6 @@
             var citations = data && Array.isArray(data.citations) ? data.citations : [];
             var modelMeta = data && data.model ? [data.model] : streamMeta;
             showAnswer(modelMeta, answer, citations);
-            appendMessage("agent", answer, data && data.model ? data.model : null, citations);
             if (data && data.session_id) {
               activeSessionId = data.session_id;
               loadAgentSessions();
@@ -2607,7 +2745,6 @@
       }
 
       function runRag(question) {
-        appendMessage("user", question);
         var payload = { project_slug: activeProjectSlug, question: question, save_answer: true };
         if (activeDocumentId) {
           payload.document_id = activeDocumentId;
@@ -2620,7 +2757,6 @@
           var answer = data.answer_markdown || "未返回答案。";
           var citations = data.citations || [];
           showAnswer([], answer, citations);
-          appendMessage("agent", answer, null, citations);
         });
       }
 
@@ -2916,7 +3052,8 @@
       function resetChatSurface() {
         var box = $("chatMessages");
         if (box) box.replaceChildren();
-        $("answerPanel").hidden = true;
+        if ($("answerHistory")) $("answerHistory").replaceChildren();
+        if ($("answerStatus")) $("answerStatus").hidden = true;
         if ($("traceSummary")) $("traceSummary").hidden = true;
         $("questionInput").value = "";
         $("questionInput").focus();
@@ -3010,14 +3147,16 @@
         });
       }
 
-      function loadPipelineDashboard() {
+      function loadPipelineDashboard(autoOpen) {
         return fetchJson("/api/pipeline/dashboard?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=200").then(function (data) {
           var activeTopic = (data.topics || [])[0];
           renderMetrics(data.totals || {});
           renderTopicCards(activeTopic);
           if (activeTopic) updateActiveTopicCard(activeTopic);
           renderRuns(data.runs || []);
-          if (!activeSourceDocumentId && data.runs && data.runs.length) {
+          // autoOpen=false（用户手动刷新）时不自动打开文档：避免每次刷新都
+          // 重建 source drawer 的数百个 chunk DOM + PDF iframe 造成卡顿。
+          if (autoOpen !== false && !activeSourceDocumentId && data.runs && data.runs.length) {
             var firstReady = data.runs.find(function (run) { return run.action_available && run.document_id; });
             if (firstReady) openSource(firstReady.document_id, true);
           }
@@ -3275,7 +3414,9 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.forEach(function (chunk, index) {
+        var CHUNK_PAGE_SIZE = 100;
+        var renderedCount = 0;
+        function appendChunkButton(chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";
@@ -3284,7 +3425,21 @@
           button.querySelector("span").textContent = (chunk.heading || data.document_title || "").slice(0, 80);
           button.addEventListener("click", function () { selectChunk(chunk, button); });
           list.appendChild(button);
-        });
+          renderedCount += 1;
+          return button;
+        }
+        chunks.slice(0, CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+        if (chunks.length > CHUNK_PAGE_SIZE) {
+          var more = document.createElement("button");
+          more.className = "chunk-option";
+          more.type = "button";
+          more.innerHTML = '<strong>显示全部 ' + chunks.length + ' 个</strong><span class="muted">当前展示前 ' + CHUNK_PAGE_SIZE + ' 个</span>';
+          more.addEventListener("click", function () {
+            chunks.slice(CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+            more.remove();
+          });
+          list.appendChild(more);
+        }
         selectChunk(chunks[0], list.querySelector(".chunk-option"));
       }
 
@@ -3368,7 +3523,9 @@
           $("sourceDrawerFoot").textContent = data.document_title + (chunk.page_label ? " · page " + chunk.page_label : "");
         }
 
-        chunks.forEach(function (chunk, index) {
+        var CHUNK_PAGE_SIZE = 100;
+        var renderedCount = 0;
+        function appendChunkButton(chunk, index) {
           var button = document.createElement("button");
           button.className = "chunk-option" + (index === 0 ? " active" : "");
           button.type = "button";
@@ -3377,7 +3534,21 @@
           button.querySelector("span").textContent = (chunk.heading || data.document_title || "").slice(0, 80);
           button.addEventListener("click", function () { selectChunk(chunk, button); });
           list.appendChild(button);
-        });
+          renderedCount += 1;
+          return button;
+        }
+        chunks.slice(0, CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+        if (chunks.length > CHUNK_PAGE_SIZE) {
+          var more = document.createElement("button");
+          more.className = "chunk-option";
+          more.type = "button";
+          more.innerHTML = '<strong>显示全部 ' + chunks.length + ' 个</strong><span class="muted">当前展示前 ' + CHUNK_PAGE_SIZE + ' 个</span>';
+          more.addEventListener("click", function () {
+            chunks.slice(CHUNK_PAGE_SIZE).forEach(appendChunkButton);
+            more.remove();
+          });
+          list.appendChild(more);
+        }
         selectChunk(chunks[0], list.querySelector(".chunk-option"));
       }
 
@@ -3616,7 +3787,6 @@
         var attachmentsUrl = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         fetchJson(turnsUrl).then(function (turns) {
           renderTurns(turns);
-          $("answerPanel").hidden = true;
           loadAgentSessions();
         }).catch(function (err) {
           showAnswer([], err.message || String(err));
@@ -3635,18 +3805,21 @@
         var box = $("chatMessages");
         if (!box) return;
         box.replaceChildren();
+        if ($("answerHistory")) $("answerHistory").replaceChildren();
         if (!(turns || []).length) {
           showWelcome();
           return;
         }
-        turns.forEach(function (turn) {
-          appendMessage(turn.role, turn.content, turn.tool_name || turn.step_type, turn.citations);
+        // 恢复同一会话中的全部最终答案；用户问题和工具输出仍不进入答案区。
+        var finalTurns = turns.filter(function (turn) {
+          return turn.role === "agent" && turn.content;
         });
-        var latestAnswer = (turns || []).slice().reverse().find(function (turn) {
-          return turn && turn.role === "agent" && String(turn.content || "").trim();
-        });
-        if (latestAnswer) {
-          showAnswer([], latestAnswer.content, Array.isArray(latestAnswer.citations) ? latestAnswer.citations : []);
+        if (finalTurns.length) {
+          finalTurns.forEach(function (turn) {
+            showAnswer([], turn.content, turn.citations || []);
+          });
+        } else {
+          showWelcome();
         }
       }
 
@@ -3690,7 +3863,19 @@
         var url = "/api/agent/sessions/" + encodeURIComponent(sessionId) + "/attachments?" + scopeQueryParams();
         var data = new FormData();
         data.append("file", file);
+        // 上传/解析期间在附件条显示进行中提示（fetch 无进度事件，用状态 chip）
+        var bar = $("attachmentBar");
+        var pendingChip = null;
+        if (bar) {
+          pendingChip = document.createElement("div");
+          pendingChip.className = "attachment-chip pending";
+          pendingChip.innerHTML = "<span></span>";
+          pendingChip.querySelector("span").textContent = file.name + "（上传解析中）";
+          bar.hidden = false;
+          bar.appendChild(pendingChip);
+        }
         fetchJson(url, { method: "POST", body: data }).then(function (res) {
+          if (pendingChip) pendingChip.remove();
           if (res && res.attachment) {
             activeAttachments.push(res.attachment);
             renderAttachments();
@@ -3698,6 +3883,8 @@
             loadAgentSessions();
           }
         }).catch(function (err) {
+          if (pendingChip) pendingChip.remove();
+          if (bar && !activeAttachments.length) bar.hidden = true;
           alert(err.message || String(err));
         });
       }
@@ -3721,7 +3908,20 @@
         });
       });
 
-      $("refreshRunsButton").addEventListener("click", loadPipelineDashboard);
+      $("refreshRunsButton").addEventListener("click", function () {
+        var button = $("refreshRunsButton");
+        if (button.disabled) return;
+        button.disabled = true;
+        var originalText = button.textContent;
+        button.textContent = "刷新中…";
+        loadPipelineDashboard(false).then(function () {
+          button.disabled = false;
+          button.textContent = originalText;
+        }).catch(function () {
+          button.disabled = false;
+          button.textContent = originalText;
+        });
+      });
 
       $("viewParseMarkdownButton").addEventListener("click", function () {
         loadCanonicalMarkdown([], "Canonical Markdown");
@@ -3771,7 +3971,6 @@
         if (!question) return;
         $("sendButton").disabled = true;
         setResearchingState(true);
-        showAnswer([], "正在分析...");
         clearThinking();
         var task = $("queryMode").value === "agent" ? runAgent(question) : runRag(question);
         task.then(function () {

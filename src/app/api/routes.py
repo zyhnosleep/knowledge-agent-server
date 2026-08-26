@@ -291,29 +291,26 @@ def _active_parse_or_404(
     document_id: str,
     project_slug: str,
 ) -> tuple[Document, DocumentParseVersion]:
-    """按项目获取文档及其活动解析版本；缺失时返回 404。
+    """按文档获取活动解析版本；缺失时返回 404。
 
     参数：
         db (Session): 数据库会话。
         document_id (str): 文档 ID。
-        project_slug (str): 项目 slug（会被规范化校验）。
+        project_slug (str): 项目 slug（仅做格式校验；不校验文档归属——
+            与 source/get_document 端点一致，前端多项目切换打开文档时
+            不能因调用方项目上下文误判 404）。
 
     返回：
         tuple[Document, DocumentParseVersion]: (文档, 活动解析版本)。
 
     异常：
-        HTTPException(404): 文档不存在、不属于该项目、没有活动解析版本、
+        HTTPException(404): 文档不存在、没有活动解析版本、
             或活动解析版本记录缺失。
     """
-    safe_slug = _validated_project_slug(project_slug)
+    _validated_project_slug(project_slug)
     document = db.get(Document, document_id)
-    # 文档必须存在、属于该项目，且设置了活动解析版本。
-    if (
-        document is None
-        or document.project is None
-        or document.project.slug != safe_slug
-        or not document.active_parse_version
-    ):
+    # 文档必须存在，且设置了活动解析版本。
+    if document is None or not document.active_parse_version:
         raise HTTPException(status_code=404, detail="Active parse not found.")
     # 按 version_key 精确查找活动解析版本记录。
     version = db.scalar(
@@ -909,6 +906,10 @@ def _delete_document_resources(db: Session, document: Document) -> dict:
     runs_deleted = db.execute(delete(PipelineRun).where(PipelineRun.document_id == document_id)).rowcount or 0
     # 删除该文档的全部对话会话。
     sessions_deleted = ConversationMemory(db).delete_sessions_for_document(document_id)
+    # 先以 SQL 批量删除 parse_versions/chunks，避开 ORM 级联对 chunk
+    # 自引用外键（parent/prev/next）的删除排序——会抛 CircularDependencyError。
+    db.execute(delete(DocumentParseVersion).where(DocumentParseVersion.document_id == document_id))
+    db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
     db.delete(document)
     db.flush()
     return {

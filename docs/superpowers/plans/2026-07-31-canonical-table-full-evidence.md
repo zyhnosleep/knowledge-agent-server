@@ -459,9 +459,9 @@ git add src tests scripts
 git commit -m "feat: add complete table evidence path"
 ~~~
 
-- [ ] **Step 4: Sync only verified development files to \`/home/zhangyh/knowledge-agent-dev\`**
+- [ ] **Step 4: Sync only verified development files to \`/home/<user>/knowledge-agent-dev\`**
 
-Use the existing development deployment procedure with \`CUDA_VISIBLE_DEVICES=0\`. Do not write to \`/home/zhangyh/knowledge-agent-test\`, do not change its active pointer, and do not delete old data.
+Use the existing development deployment procedure with \`CUDA_VISIBLE_DEVICES=0\`. Do not write to \`/home/<user>/knowledge-agent-test\`, do not change its active pointer, and do not delete old data.
 
 - [ ] **Step 5: Run staged retrieval-only first**
 

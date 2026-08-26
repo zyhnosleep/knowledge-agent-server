@@ -249,6 +249,16 @@ class Settings(BaseSettings):
     )
     feishu_allowed_tenant: str | None = Field(default=None, alias="FEISHU_ALLOWED_TENANT")
 
+    # ---- 飞书机器人（长连接群聊，独立进程） ----
+    feishu_bot_enabled: bool = Field(default=False, alias="FEISHU_BOT_ENABLED")
+    feishu_bot_allowed_chat_ids: str = Field(default="", alias="FEISHU_BOT_ALLOWED_CHAT_IDS")
+    feishu_bot_inbox_project: str = Field(
+        default="feishu-inbox", alias="FEISHU_BOT_INBOX_PROJECT"
+    )
+    feishu_bot_api_base_url: str = Field(
+        default="http://127.0.0.1:8002", alias="FEISHU_BOT_API_BASE_URL"
+    )
+
     @model_validator(mode="after")
     def validate_semantic_token_limits(self) -> Settings:
         """校验语义分块的 token 上下限：min <= target <= max，且 overlap < min。"""

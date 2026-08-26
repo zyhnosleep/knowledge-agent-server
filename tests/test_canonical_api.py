@@ -439,7 +439,7 @@ def test_parse_artifacts_reject_linked_bundle(
     assert response.status_code == 404
 
 
-def test_all_canonical_routes_require_matching_project_slug(
+def test_all_canonical_routes_accept_cross_project_slug(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -466,9 +466,11 @@ def test_all_canonical_routes_require_matching_project_slug(
         f"/api/documents/{document.id}/citations/{chunk.id}/location",
     ]
 
+    # 0726ab4 起 _active_parse_or_404 只做格式校验、不校验文档归属，
+    # 跨项目文档访问返回 200（文档存在且有 active parse）。
     for path in paths:
         assert client.get(path).status_code == 422
-        assert client.get(_project_url(path, "other")).status_code == 404
+        assert client.get(_project_url(path, "other")).status_code == 200
         assert client.get(_project_url(path, "../demo")).status_code == 400
 
 

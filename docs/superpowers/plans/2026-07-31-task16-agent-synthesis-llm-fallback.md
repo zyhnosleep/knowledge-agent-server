@@ -56,7 +56,7 @@
 
 - [ ] 本地全量测试通过
 - [ ] `git diff --check` 无空白错误
-- [ ] 同步所有变更到服务器 `/home/zhangyh/knowledge-agent-dev`
+- [ ] 同步所有变更到服务器 `/home/<user>/knowledge-agent-dev`
 - [ ] 更新 `runtime/app.env`（`AGENT_SYNTHESIS_PROVIDER=ollama`）
 - [ ] 重启服务
 - [ ] 运行 full30：

@@ -26,6 +26,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -77,8 +78,53 @@ MAX_CONTEXTS = 8
 # names several tables), but the exact retrieval-token budget remains the
 # final bound on what reaches the answer prompt.
 CANONICAL_TABLE_CONTEXT_LIMIT = 24
+# 公式类问题（查询显式含 formula/equation/公式）的候选生成宽度。TeX 公式
+# chunk 与自然语言查询的向量相似度天然偏低（qwen3-embedding 对 TeX 符号的
+# 语义编码弱），窄候选（MAX_CONTEXTS=8）会把公式证据截断在 finalize 之前
+# （2026-08-24 Forward KL 查询实测：Eq 6/7 排 12-38 位）。放宽候选后由
+# _finalize_contexts 的公式结构提权接管排序，最终证据包仍受 context_limit
+# 约束，不会膨胀。
+FORMULA_SOURCE_CONTEXT_LIMIT = 24
 TABLE_CONTEXT_SCORE_BOOST = 40.0
 PAPER_ROUTE_MIN_SCORE = 2.0
+
+
+@lru_cache(maxsize=8192)
+def _subject_lock_patterns(alias: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """每 alias 三组"锁定主体"正则预编译缓存。
+
+    2026-08-18 性能修复：_route_papers 对全库文档逐篇调用
+    _question_locks_document_subject，每个 alias 动态拼接 3 个正则再编译，
+    单 claim 编译约 5 千次（577 篇 × ~8.5），打穿 Python re 内部 512 条
+    缓存后每次重复编译 7-10ms（cProfile：re._compile 56,060 次 / 13.4s，
+    claim 1140 单次检索 28.3s）。文档静态 → lru_cache 跨 claim 全命中。
+    """
+    escaped = re.escape(alias)
+    return (
+        re.compile(
+            rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])\s*的\s*(?:表格|论文|文献)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])['’]s\s+(?:table|paper|article)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"^\s*{escaped}(?![A-Za-z0-9_/\-])\s*(?:相比|相对)",
+            re.IGNORECASE,
+        ),
+    )
+
+
+@lru_cache(maxsize=8192)
+def _selector_boundary_pattern(selector_text: str) -> re.Pattern:
+    """selector 边界正则预编译缓存（同 _subject_lock_patterns：per-doc 循环打穿缓存）。"""
+    return re.compile(
+        rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])",
+        re.IGNORECASE,
+    )
+
+
 # The table-answer repair prompt lists the selected evidence's canonical facts
 # as a deterministic, bounded inventory so the model can only report verbatim
 # values.  The cap keeps a wide table from ballooning the repair prompt.
@@ -758,7 +804,14 @@ class QueryService:
 
     @classmethod
     def _determine_support_hint(cls, ctx: "RetrievedContext", question: str) -> str:
-        """Best-effort deterministic support quality label."""
+        """Best-effort deterministic support quality label.
+
+        注意（2026-08-13 code-review 收敛，既定规则非缺陷）：direct 只
+        保留给表格证据路径——表格上下文带 TABLE_CONTEXT_SCORE_BOOST=40
+        恒 ≥15；普通文字证据最高约 11.6（10×cosine + 词法 1.6）永远够
+        不到 15，最多标 contextual。这是有意为之：文字证据一律要求模型
+        综合理解，不贴 direct 防止照抄证据原文（此前出现过的质量事故）。
+        """
         score = ctx.citation.score
         if score >= 15.0:
             return "direct"
@@ -1111,21 +1164,15 @@ class QueryService:
 
     @staticmethod
     def _question_locks_document_subject(question: str, aliases: list[str]) -> bool:
+        # 正则按 alias 预编译缓存（_subject_lock_patterns，2026-08-18 性能修复：
+        # 逐 alias 动态拼接编译在 _route_papers 全库循环里打穿 re 内部 512 缓存）。
         for alias in aliases:
             alias = str(alias or "").strip()
             if not alias:
                 continue
-            escaped = re.escape(alias)
-            if re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])\s*的\s*(?:表格|论文|文献)", question, re.IGNORECASE):
-                return True
-            if re.search(rf"(?<![A-Za-z0-9_/\-]){escaped}(?![A-Za-z0-9_/\-])['’]s\s+(?:table|paper|article)", question, re.IGNORECASE):
-                return True
-            if re.search(
-                rf"^\s*{escaped}(?![A-Za-z0-9_/\-])\s*(?:相比|相对)",
-                question,
-                re.IGNORECASE,
-            ):
-                return True
+            for pattern in _subject_lock_patterns(alias):
+                if pattern.search(question):
+                    return True
         return False
 
     @staticmethod
@@ -1185,13 +1232,24 @@ class QueryService:
         is_overview = QueryService._is_document_overview_query(question)
         overview_document_ids = self._overview_document_ids(question, project_id, paper_matches, document_ids=document_ids) if is_overview else None
         contexts: list[RetrievedContext] = []
+        # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
+        # 全库向量补充路由共享的查询向量——先算一次，文档内检索与全库补充两处
+        # 复用，避免同一问题各 embed 一次（qwen3-embedding:4b 单次调用约秒级）。
+        question_vector: list[float] | None = None
         if overview_document_ids:
             contexts.extend(
                 self._search_document_overview_contexts(question, project_id, overview_document_ids, limit=MAX_CONTEXTS)
             )
             if contexts:
                 return self._finalize_contexts(contexts, question=question)
-        if self._is_table_query(question) or self._is_metric_query(question):
+        if (
+            self._is_table_query(question)
+            or self._is_metric_query(question)
+            # 表格指代查询（"展开第二张"等）不含"表"字时 _is_table_query
+            # 失配，但必须走表格检索路径才能拿到候选表格（2026-08-12 回归
+            # R18"现在展开第二张"因此只命中 profile-term）。
+            or self._is_table_reference_query(question)
+        ):
             table_limit = (
                 CANONICAL_TABLE_CONTEXT_LIMIT
                 if self._is_table_query(question) or self._is_metric_query(question)
@@ -1219,6 +1277,7 @@ class QueryService:
                 figure_contexts = self._search_document_figure_contexts(question, project_id, [], limit=MAX_CONTEXTS)
             contexts.extend(figure_contexts)
         if derived_document_ids and not is_overview:
+            question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
             if self._is_scientific_evidence_query(question) and not (
                 self._is_table_query(question) or self._is_metric_query(question) or self._is_figure_query(question)
             ):
@@ -1227,7 +1286,16 @@ class QueryService:
                 contexts.extend(self._search_document_parameterization_contexts(question, project_id, derived_document_ids, limit=5))
                 contexts.extend(self._search_document_scientific_anchor_contexts(question, project_id, derived_document_ids, limit=8))
             contexts.extend(self._search_claim_evidence_contexts(question, project_id, derived_document_ids, limit=min(3, MAX_CONTEXTS)))
-            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=MAX_CONTEXTS, route_terms=profile_terms))
+            # 公式类问题放宽候选窗口：TeX 公式 chunk 向量分天然偏低，窄候选
+            # 会把公式证据截在 finalize 之前（2026-08-24 Forward KL 查询：
+            # Eq 6/7 排 12-38 位）。放宽只影响候选生成，最终证据包仍受
+            # context_limit 与公式结构提权（_finalize_contexts）约束。
+            source_context_limit = (
+                FORMULA_SOURCE_CONTEXT_LIMIT
+                if QueryService._is_formula_query(question)
+                else MAX_CONTEXTS
+            )
+            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=source_context_limit, route_terms=profile_terms, question_vector=question_vector))
             contexts.extend(
                 self._supplement_profile_term_contexts(
                     project_id,
@@ -1235,10 +1303,58 @@ class QueryService:
                     contexts,
                     profile_terms,
                     limit=4 if self._is_scientific_evidence_query(question) else 2,
+                    question=question,
                 )
             )
-        if not contexts and not document_ids and not is_overview:
-            contexts.extend(self._search_source_chunks(question, project_id, [], limit=MAX_CONTEXTS))
+        # R3 归因（2026-08-19，.task18-corpus 归因实验，attribution-report-fixed.json）：
+        # 原语义"路由锁定（_locked_document_ids：词法路由 locked/exact_alias 分支）
+        # 跳过补充路——精确语义原样保留"在 prose 声明检索上被证伪为纯伤害：
+        # 路由锁是 SciFact 唯一主导伤害源（noroute−routed = +0.1182，68/300
+        # 帮倒忙、9 帮上忙，8 条 nDCG 1.0→0.0 全是 routed 单 PMID）。词法启发式
+        # 锁错论文时补充路被整体跳过，正确文档永远不可见。修复后语义：路由锁定
+        # 本身（prose 声明）不再跳过补充路——锁定文档 chunk 有词法 route bonus
+        # 占优，_finalize_contexts 分数融合后真相关仍排前；仍跳过补充路的只有
+        # 显式作用域（document_ids 参数，API 语义 lock-and-never-widen）、
+        # overview、以及路由锁定 + 结构化查询（表/指标/图：锁定 = 用户明确要某
+        # 论文的表/图，混入其他文档的表格即表错论文，精确语义原样保留）。
+        # 注意结构化判断短路：document_ids / overview 场景无需算 4 个正则。
+        if document_ids is None and not is_overview and not (
+            locked_document_ids
+            and (
+                self._is_table_query(question)
+                or self._is_metric_query(question)
+                or self._is_table_reference_query(question)
+                or self._is_figure_query(question)
+            )
+        ):
+            # R1（2026-08-17，spec 2026-08-17-retrieval-layer-improvement-design.md）：
+            # 全库向量补充路由——词法路由（_route_papers，PAPER_ROUTE_MIN_SCORE 阈值 +
+            # lock 分支）之外的语义兜底。SciFact 评测实测：词法路由对密集科学声明与
+            # 摘要的匹配是二值的（命中即第 1、miss 即完全不可见），候选生成在此被截断
+            # （avg 3.8 < top-10，56.7% 未召回）。此处总是并入一次全库向量检索结果，
+            # 由 _finalize_contexts 统一分数排序 + 去重 + 截断融合（重叠 chunk 高分保留）。
+            if question_vector is None:
+                question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+            # 与文档内候选同规则：公式类问题放宽补充路候选窗口（同上原因，
+            # 保证跨文档/兜底场景的公式证据同样有机会进 finalize）。
+            supplement_context_limit = (
+                FORMULA_SOURCE_CONTEXT_LIMIT
+                if QueryService._is_formula_query(question)
+                else MAX_CONTEXTS
+            )
+            contexts.extend(
+                self._search_source_chunks(
+                    question,
+                    project_id,
+                    [],
+                    limit=supplement_context_limit,
+                    question_vector=question_vector,
+                    # 补充路不做表格提权（table_promotion=False）：+40 boost
+                    # 让无关文档的表格与词法路表格平手竞争，正确文档会被
+                    # 挤出 top-10（opls5_table_metrics 内部回归，2026-08-18）。
+                    table_promotion=False,
+                )
+            )
         return self._finalize_contexts(contexts, question=question)
 
     @staticmethod
@@ -1354,7 +1470,13 @@ class QueryService:
                 if not block or not self._context_has_table_data(block):
                     continue
                 if not self._table_block_matches_query(question, block):
-                    continue
+                    # 表格指代查询（"第二张表/这张表"等）无法从自身词元
+                    # 匹配表格内容（中文序数与英文表格文本无 token 交集），
+                    # 全灭过滤会让模型拿不到任何候选表（2026-08-12 回归
+                    # R17/R18/R20/R22）；放宽为返回候选表格，由会话锚点
+                    # 与模型结合历史选择。
+                    if not QueryService._is_table_reference_query(question):
+                        continue
                 block_score = self._rank_blocks(question, [block])[0][1]
                 score = TABLE_CONTEXT_SCORE_BOOST + block_score + max(0.0, 2.0 - ordinal * 0.01)
                 excerpt = self._table_citation_excerpt(block, question)
@@ -2204,6 +2326,8 @@ class QueryService:
         contexts: list[RetrievedContext],
         profile_terms: list[str],
         limit: int = 2,
+        *,
+        question: str = "",
     ) -> list[RetrievedContext]:
         if not document_ids or not profile_terms:
             return []
@@ -2236,6 +2360,22 @@ class QueryService:
             ]
             if not matched_terms:
                 continue
+            # 2026-08-13：补充术语必须与当前问题相关，否则文档级 profile
+            # 术语表高频块（训练配置 Table 6/7 等）以 3.0+1.5n 的分数无
+            # 差别占位，压过向量检索命中的问题相关证据（Forward KL 查询：
+            # Table 6/7 以 12.0 排前二，证据包里无任何 KL 公式内容）。
+            # matched 术语与 query 词元零交集 → 该 chunk 与问题无语义
+            # 关联，跳过（"OPSD 用什么优化器" 这类查询的 profile 术语
+            # 与 query 有交集，仍可命中训练配置表）。
+            # 注意（2026-08-13 code-review 收敛）：这是逐字交集过滤——
+            # 同义词/翻译/符号表达（"前向散度" vs forward_kl）零交集即
+            # 被跳过，是有意限制而非缺陷：放宽会重新引入 Table 6/7
+            # 占位问题，且语义兜底属于向量路径的职责（10×cosine 已把
+            # 语义相关证据排在前面）。等真实同义查询失败案例出现再处理。
+            if question:
+                query_terms = self._tokenize(question)
+                if not any(self._tokenize(term) & query_terms for term in matched_terms):
+                    continue
             query_terms = self._tokenize(" ".join(matched_terms))
             excerpt = self._window_text(chunk.text, query_terms, max_chars=1000, question=" ".join(matched_terms))
             score = 3.0 + len(matched_terms) * 1.5
@@ -2395,8 +2535,14 @@ class QueryService:
         document_ids: list[str],
         limit: int = 3,
         route_terms: list[str] | None = None,
+        question_vector: list[float] | None = None,
+        table_promotion: bool = True,
     ) -> list[RetrievedContext]:
-        question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+        # R1：调用方（如 _build_rag_contexts 的全库补充路由）可复用已算好的
+        # 查询向量，避免同一问题在文档内检索与全库补充两处各 embed 一次
+        # （qwen3-embedding:4b 单次调用约秒级，复用是 0 额外嵌入的关键）。
+        if question_vector is None:
+            question_vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
         is_table_query = self._is_table_query(question)
         needs_table_first = is_table_query or self._is_metric_query(question)
         vector_store = get_vector_store(self.db)
@@ -2438,13 +2584,25 @@ class QueryService:
             overlap = len(base_query_terms & chunk_terms)
             route_overlap = len(route_query_terms & chunk_terms)
             rare_route_overlap = len(rare_route_terms & chunk_terms)
-            rare_route_bonus = min(rare_route_overlap * 1.1, 3.0)
+            # 稀有 profile 术语在 chunk 中出现 ≠ 与当前问题相关：旧上限 3.0
+            # 足以把含多个稀有术语但与问题无关的 chunk（如训练配置正文）
+            # 推过纯向量分高的问题相关证据（2026-08-13 Forward KL 查询：
+            # 值函数 chunk 借 rare_route_bonus +3.0 压过向量分 6.13 的
+            # Table 3 与 5.21 的 KL(pT ∥pS) 正文，导致回答误报"证据无公式"）。
+            # 削减为 0.6/个、上限 1.2：保留"术语定义所在地"提权意图，但不
+            # 再主导排序。
+            rare_route_bonus = min(rare_route_overlap * 0.6, 1.2)
+            # 通用词法 cap 0.8 → 0.4（2026-08-13 code-review 收敛）：与 rare
+            # 上限 1.2 合计最多 1.6（≈0.16 余弦）。向量分已改 10×cosine 拉开
+            # 语义差距，词法只保留"同档并列时的微调"，不再允许字面重合
+            # 反超语义差 0.16 余弦以上的证据。
             if chunk.id in vector_scores_by_chunk_id:
                 score = vector_scores_by_chunk_id[chunk.id]
-                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
             elif question_vector and chunk.embedding:
-                score = cosine_similarity(question_vector, chunk.embedding)
-                score += min(overlap * 0.05 + route_overlap * 0.08, 0.8) + rare_route_bonus
+                # 与 _vector_distance_score 同尺度（10×cosine），两条向量路径可比。
+                score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
+                score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
             else:
                 total_overlap = overlap + route_overlap
                 if total_overlap:
@@ -2458,8 +2616,21 @@ class QueryService:
                 continue
             if needs_table_first and has_table_data:
                 if not self._table_block_matches_query(question, chunk.text):
-                    continue
-                score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
+                    # 与 _search_document_table_contexts 相同：指代查询放宽，
+                    # 避免中文序数指代全灭过滤掉候选表格。
+                    if not QueryService._is_table_reference_query(question):
+                        continue
+                # 表格提权只属于"已路由文档内的表格检索"（table_promotion=True
+                # 默认）：全库补充路（document_ids=[]，table_promotion=False）
+                # 若同样 +40，无关文档的表格会与词法路表格在最终排序平手、
+                # 靠原始向量分把正确文档挤出 top-10——内部回归
+                # opls5_table_metrics 实测（2026-08-18 A/B）。补充只做语义
+                # 兜底，表格仍按 structure_priority（_finalize_contexts）上浮。
+                # 注意 flag 同时关掉 _rank_blocks 锚点 bonus（+6/+8 权重过大，
+                # 会让补充路表格以更小尺度复刻同样的平手挤占）——两效应捆绑
+                # 是刻意的：boost 与锚点 bonus 都是词法路表格检索的特权。
+                if table_promotion:
+                    score += TABLE_CONTEXT_SCORE_BOOST + self._rank_blocks(question, [chunk.text])[0][1]
                 evidence_kind = "table"
             else:
                 evidence_kind = chunk.block_type if chunk.block_type in {"figure", "formula"} else None
@@ -3088,7 +3259,76 @@ class QueryService:
                 <= budget
             ):
                 selected.append(fallback)
+                continue
+            # 2026-08-13：excerpt 仍超预算的 chunk 不再直接丢弃 ——
+            # 95039e2 把向量分改成 10×cosine 后排序变化，含问题关键科学
+            # 短语的 chunk（ff99sb_disp_overview 的 "London dispersion" 所在
+            # chunk 从 index 4 掉到 8；f27e99b 时代 4/4 通过，现在 0/2 稳定
+            # 失败）在预算耗尽时被整块丢弃，模型 prompt 缺失术语字面 →
+            # 答案必然缺验收词。抢救：以 chunk 内首个科学短语为锚保留
+            # 最小窗口，术语字面必须进 prompt（_build_answer_constraints
+            # 的 evidence_phrases 据此注入 "Preserve ... exactly" 指令）。
+            # 表格行不做窗口抢救：清空 citation.excerpt 会破坏答案引用的
+            # excerpt atoms（表格标签、数值行——internal_research_v1 的
+            # 表格 case 验收要求引用 excerpt 含这些字面）。表格行 excerpt
+            # 通常短，超预算场景罕见，保持原丢弃行为即可。
+            if is_table_child:
+                continue
+            rescue = self._rescue_term_window(context, question=question)
+            if rescue:
+                # _context_evidence_text 会追回 citation.excerpt（5720 行）：
+                # 不把 excerpt 一起清掉，400 字符窗口会被 2522 字符的原文
+                # 重新拼回，抢救等于没做（token 预算照样爆）。
+                rescue_context = replace(
+                    context,
+                    prompt_text=rescue,
+                    context_text=rescue,
+                    neighbor_text="",
+                    # Citation 是 pydantic BaseModel（非 dataclass）：
+                    citation=context.citation.model_copy(update={"excerpt": ""}),
+                )
+                rescue_candidate = [*selected, rescue_context]
+                if (
+                    self._count_retrieval_tokens(representation(rescue_candidate))
+                    <= budget
+                ):
+                    selected.append(rescue_context)
         return selected
+
+    @classmethod
+    def _rescue_term_window(
+        cls,
+        context: RetrievedContext,
+        *,
+        question: str = "",
+        max_chars: int = 400,
+    ) -> str:
+        """被 token 预算丢弃的 chunk 的最小抢救窗口（以科学短语为锚）。
+
+        锚点优先选与问题词元有交集的短语命中位置（词元交集 → 短语与
+        查询相关），否则取首个短语命中；无任何短语命中时返回空串
+        （调用方照旧丢弃该 chunk）。
+        """
+        full = cls._context_evidence_text(context)
+        if not full:
+            return ""
+        lowered = full.lower()
+        phrases = cls._salient_evidence_phrases([context], limit=16)
+        hits = [
+            (position, phrase)
+            for phrase in phrases
+            if (position := lowered.find(phrase.lower())) >= 0
+        ]
+        if not hits:
+            return ""
+        query_terms = cls._tokenize(question)
+        question_hits = [
+            position
+            for position, phrase in hits
+            if cls._tokenize(phrase) & query_terms
+        ]
+        anchor = min(question_hits) if question_hits else min(p for p, _ in hits)
+        return cls._anchor_window(full, anchor, max_chars)
 
     @classmethod
     def _remove_prompt_overlap(cls, text: str, previous_texts: list[str]) -> str:
@@ -3135,7 +3375,12 @@ class QueryService:
 
     @staticmethod
     def _vector_distance_score(distance: float) -> float:
-        return 1.0 / (1.0 + max(float(distance), 0.0))
+        # 2026-08-13：旧式 1/(1+d) 把 0.61 与 0.25 的余弦相似度压缩成 0.72
+        # 与 0.57（全部命中挤在 ~0.09 宽区间），词法 bonus（≤2.0）主导排序，
+        # 语义相关证据（Forward KL 查询的 Table 3/formula/KL narrative，
+        # 相似度 0.59-0.61 全场最高）反而排不进证据包。改为 10×cosine
+        # 相似度拉开语义差距，词法 bonus 退居同档并列时的微调。
+        return max(0.0, 10.0 * (1.0 - max(float(distance), 0.0)))
 
     @staticmethod
     def _context_has_metric_numbers(text: str) -> bool:
@@ -3479,6 +3724,40 @@ class QueryService:
                 context_text,
             ]
         )
+        def _accept_free_text_fallback(exc: BaseException) -> QueryAnswerPayload | None:
+            """schema 软约束下模型输出自然语言回答时，直接接受为答案。
+
+            ollama 对 qwen3.5:9b 的 format=schema 是提示式软约束（非硬
+            grammar），模型高频输出完整自然语言回答而非 JSON（2026-08-13
+            实测 10 次 draft 失败 9 次，原始输出为完整中文 markdown；
+            历史 Task 18 也记录过 ``[1]`` 数组输出）。解析失败异常携带
+            原始输出（ai.generate_structured 以 add_note 透传），此处
+            判定：合理自然语言（非空、非 ``[0, 3]`` 短数组垃圾）直接
+            包装为 QueryAnswerPayload，引用编号从文本 ``[n]`` 提取，
+            提取不到则全量引用（draft verify 会过滤）。
+            """
+            raw = None
+            for note in getattr(exc, "__notes__", []) or []:
+                if note.startswith("raw_content="):
+                    raw = note[len("raw_content="):]
+                    break
+            text = (raw or "").strip()
+            if len(text) < 30:
+                return None
+            # 拒绝纯数组形态（被挖出的 "[0, 3]" 类 JSON 片段）
+            if text.startswith("[") and text.endswith("]") and len(text) < 80:
+                return None
+            citations = [
+                int(m) for m in re.findall(r"\[(\d+)\]", text) if int(m) < len(contexts)
+            ]
+            if not citations:
+                citations = list(range(len(contexts)))
+            return QueryAnswerPayload(
+                answer_markdown=text,
+                citations=citations,
+                risk_level="high" if self._is_high_risk(question) else "normal",
+            )
+
         def generate_with_query_timeout() -> QueryAnswerPayload:
             original_timeout = getattr(self.ollama, "timeout", None)
             if original_timeout is not None:
@@ -3515,19 +3794,35 @@ class QueryService:
             return False
 
         def generate_with_query_retries() -> QueryAnswerPayload:
-            """Retry transient Ollama failures twice before returning fallback."""
+            """Retry transient Ollama failures twice; accept free-text only as a last resort."""
             for attempt in range(3):
                 try:
                     return generate_with_query_timeout()
                 except Exception as exc:  # noqa: BLE001
-                    if attempt >= 2 or not _is_retryable_draft_error(exc):
-                        raise
-                    logger.warning(
-                        "Transient RAG draft generation failure; retrying (%d/2): %s",
-                        attempt + 1,
-                        exc,
-                    )
-                    time.sleep(5)
+                    if attempt < 2 and _is_retryable_draft_error(exc):
+                        logger.warning(
+                            "Transient RAG draft generation failure; retrying (%d/2): %s",
+                            attempt + 1,
+                            exc,
+                        )
+                        time.sleep(5)
+                        continue
+                    # 3 轮重试（每轮都带 per-term coverage prompt）全部失败后，
+                    # 才把模型自由文本输出当作最后手段收下 —— bff69af 曾把
+                    # fallback 放在 retry 循环之前（内层 except 直接 return），
+                    # 导致重试被跳过：自由输出常省略字面术语（如 "dispersion
+                    # interactions" 而非 "London dispersion"），answer_required_terms
+                    # 匹配失败，Task 18 基线 30/30 掉到 28/30。重试优先恢复后，
+                    # 真正的 schema 崩坏仍能交付自由文本，而不是降级成原始证据。
+                    accepted = _accept_free_text_fallback(exc)
+                    if accepted is not None:
+                        logger.warning(
+                            "Draft schema failure after retries; accepted free-text answer (%d chars, %d citations)",
+                            len(accepted.answer_markdown),
+                            len(accepted.citations),
+                        )
+                        return accepted
+                    raise
             raise RuntimeError("unreachable RAG draft retry state")
 
         return safe_model_call(generate_with_query_retries, fallback)
@@ -3570,12 +3865,20 @@ class QueryService:
         evidence_acronyms = self._salient_evidence_acronyms(contexts)
         evidence_phrases = self._salient_evidence_phrases(contexts)
 
-        # Figure/Table constraint: if context has them, don't say "not included".
-        if self._is_chinese_question(question):
-            parts.append(
-                "IMPORTANT: Answer in Chinese because the user's question is written in Chinese. "
-                "Keep table labels, dataset names, model names, and metric names verbatim when needed."
-            )
+        # T3（2026-08-12 回归 R29/R38/R36/R26）：语言必须跟随用户问题
+        # （旧约束只在中文问题下给中文指示，且 synthesize 路径完全缺失），
+        # 元数据禁止输出（R36 泄漏"关联地址为 21201 及 48824"），
+        # 推断需显式标记（R26 未区分证据事实与作者取舍的解读）。
+        # 三条文本来自共享模块 prompt_rules（与 synthesize 同源，防漂移）。
+        from app.services.prompt_rules import (
+            INFERENCE_MARKING_RULE,
+            METADATA_BAN_RULE,
+            language_rule,
+        )
+
+        parts.append(language_rule(question))
+        parts.append(METADATA_BAN_RULE)
+        parts.append(INFERENCE_MARKING_RULE)
         if evidence_acronyms:
             parts.append(
                 "IMPORTANT: Preserve these source acronyms/model or method names exactly when they are relevant: "
@@ -6683,6 +6986,11 @@ class QueryService:
 
         # Center the window around the anchor, but bias toward showing content
         # *after* the anchor (captions, table data, metric rows).
+        return cls._anchor_window(text, anchor, max_chars)
+
+    @staticmethod
+    def _anchor_window(text: str, anchor: int, max_chars: int) -> str:
+        """以锚点为中心、偏向后文的窗口；与 _rescue_term_window 共用。"""
         start = max(0, anchor - max_chars // 4)
         end = min(len(text), start + max_chars)
         start = max(0, end - max_chars)
@@ -6764,6 +7072,18 @@ class QueryService:
             """
 
             if not table_query:
+                # 非表格查询默认按原始分数排序；仅当查询显式问公式时对
+                # formula 证据结构提权。TeX 公式 chunk 向量分天然低于正文
+                # （qwen3-embedding 对 TeX 符号的语义编码弱），不提权则
+                # "公式是什么"类问题里最相关的公式证据被高分正文挤出
+                # （2026-08-24 Forward KL 查询：Eq 6/7 排 12-38 位、
+                # 候选截断前即出局）。提权只在公式类问题上生效，普通
+                # 查询不受影响。
+                if (
+                    self._context_evidence_kind(context) == "formula"
+                    and QueryService._is_formula_query(question)
+                ):
+                    return (4.0, 0.0, 0.0, context.score)
                 return (0.0, 0.0, 0.0, context.score)
             text = self._context_table_evidence_text(context)
             text_key = self._normalize_selector(text)
@@ -6791,13 +7111,9 @@ class QueryService:
                 and self._selector_matches_text(anchor, text, text_key)
                 for anchor in self._query_priority_anchors(question)["figure_table"]
             )
-            formula_query = bool(
-                re.search(r"\b(?:formula|equation|eq\.)\b", question, re.IGNORECASE)
-                or "公式" in question
-            )
             if evidence_kind == "figure" and figure_anchor_match:
                 structure_priority = 4.0
-            elif evidence_kind == "formula" and formula_query:
+            elif evidence_kind == "formula" and QueryService._is_formula_query(question):
                 structure_priority = 4.0
             elif evidence_kind == "table" and table_anchor_match:
                 structure_priority = 3.0
@@ -7184,8 +7500,26 @@ class QueryService:
             or "diagram" in lowered
         )
 
-    @staticmethod
-    def _is_table_query(question: str) -> bool:
+    @classmethod
+    def _is_table_reference_query(cls, question: str) -> bool:
+        """检测表格指代查询（"第二张表/这张表/刚才的表格"等）。
+
+        指代查询无法从自身词元匹配表格内容——中文序数词与英文表格文本
+        没有 token 交集，``_table_block_matches_query`` 会全灭过滤
+        （2026-08-12 锁定回归实测 R17/R18/R20/R22 因此拿不到任何表格
+        证据）。指代查询的表格检索必须放宽：返回候选表格让模型结合
+        会话历史选择，定位由会话锚点（``get_recent_table_anchors``）
+        辅助。
+
+        实现委托共享模块 ``table_reference``（与 AgentExecutor 同源，
+        避免两处正则漂移）。
+        """
+        from app.services.table_reference import is_table_reference_query
+
+        return is_table_reference_query(question)
+
+    @classmethod
+    def _is_table_query(cls, question: str) -> bool:
         """Detect questions asking about specific tables or tabular data."""
         lowered = question.lower()
         return bool(
@@ -7213,6 +7547,18 @@ class QueryService:
                 lowered,
             )
             or pka_metric
+        )
+
+    @staticmethod
+    def _is_formula_query(question: str) -> bool:
+        """Detect questions explicitly asking for a formula/equation.
+
+        公式类问题的检索差异化：候选窗口放宽（FORMULA_SOURCE_CONTEXT_LIMIT）
+        与 _finalize_contexts 结构提权都以此判定为门。
+        """
+        return bool(
+            re.search(r"\b(?:formula|equation|eq\.)\b", question, re.IGNORECASE)
+            or "公式" in question
         )
 
     @classmethod
@@ -7288,9 +7634,31 @@ class QueryService:
         substantive overview chunks only when a single document can be safely
         identified (exact/locked match or exactly one ready document).
         """
+        # Cross-turn contextualization wraps short follow-up queries as
+        # "previous-question: ... [newline] current-question: ..." (see
+        # _contextualize_retrieval_query in agent_executor). Only the
+        # current-turn portion may drive the overview verdict - overview
+        # trigger words left over from the previous question must not
+        # pollute this turn's routing.
+        if question.startswith("\u4e0a\u4e00\u8f6e\u95ee\u9898\uff1a"):
+            wrapper = "\n\u5f53\u524d\u8ffd\u95ee\uff1a"
+            if wrapper in question:
+                # rfind: if the previous-turn text itself contained the
+                # wrapper marker, only the last occurrence is the real split.
+                question = question[question.rfind(wrapper) + len(wrapper):]
         lowered = question.lower()
         chinese_overview = bool(
-            re.search(r"\u8fd9\u7bc7.{0,6}(?:\u6587\u7ae0|\u8bba\u6587|\u6587\u732e)", question)
+            re.search(
+                # "{0,20}?" bounds how far past the reference the intent
+                # phrase may sit: a close co-occurrence reads as the same
+                # clause, a distant one as a separate topic. Branch 2 below
+                # still backstops bare intent words anywhere in the question.
+                r"\u8fd9\u7bc7.{0,6}(?:\u6587\u7ae0|\u8bba\u6587|\u6587\u732e).{0,20}?"
+                r"(?:\u8bb2(?:\u4e86|\u4e9b)?(?:\u4ec0\u4e48|\u54ea\u4e9b\u5185\u5bb9)|\u4e3b\u8981\u5185\u5bb9"
+                r"|\u521b\u65b0\u70b9|\u8d21\u732e|\u662f\u5173\u4e8e"
+                r"|\u662f\u5e72\u4ec0\u4e48|\u7814\u7a76(?:\u4e86|\u4e9b)?\u4ec0\u4e48)",
+                question,
+            )
             or re.search(r"(?:\u603b\u7ed3|\u6982\u62ec|\u7b80\u8ff0|\u6982\u8ff0|\u4ecb\u7ecd|\u5927\u610f|\u4e3b\u65e8|\u4e3b\u9898)", question)
             or re.search(r"(?:\u8bb2|\u8bf4|\u8c08|\u5199).{0,2}\u4e86?\u4ec0\u4e48", question)
         )
@@ -7524,7 +7892,9 @@ class QueryService:
         if selector_key == "gamma" and re.search(r"(?:γ|\bgamma\b|\bsurface\s+tension\b)", text, re.IGNORECASE):
             return True
         if re.fullmatch(r"[a-z][a-z0-9]*", selector_text):
-            return bool(re.search(rf"(?<![A-Za-z0-9-]){re.escape(selector_text)}(?![A-Za-z0-9-])", text, re.IGNORECASE))
+            # 边界正则按 selector 预编译缓存（_selector_boundary_pattern，
+            # 2026-08-18 性能修复：per-doc 循环打穿 re 内部 512 缓存）。
+            return bool(_selector_boundary_pattern(selector_text).search(text))
         return selector_key in (normalized_text if normalized_text is not None else cls._normalize_selector(text))
 
     @classmethod

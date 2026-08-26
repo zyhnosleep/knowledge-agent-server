@@ -361,8 +361,8 @@ strict_pass = false
 评测文件：
 
 ```text
-/home/zhangyh/knowledge-agent-dev/runtime/task9-agent-direct-routing-full30-20260807.json
-/home/zhangyh/knowledge-agent-dev/runtime/task9-agent-direct-routing-full30-20260807.log
+/home/<user>/knowledge-agent-dev/runtime/task9-agent-direct-routing-full30-20260807.json
+/home/<user>/knowledge-agent-dev/runtime/task9-agent-direct-routing-full30-20260807.log
 ```
 
 因此当前不能激活 candidate。下一步应定位 Agent 超时发生在 `retrieve`、`rag.answer`、verify 还是 HTTP/队列等待，再针对性修复后重跑验收。

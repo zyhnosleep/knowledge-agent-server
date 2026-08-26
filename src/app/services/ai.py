@@ -345,8 +345,19 @@ class OllamaClient:
         try:
             return self._parse_structured_content(schema, content)
         except Exception as exc:  # noqa: BLE001
+            # 模型原始输出随异常透传（调用方"自由文本接受"决策依据）：
+            # ollama 对 qwen3.5 的 format=schema 是提示式软约束，模型高频
+            # 输出自然语言回答而非 JSON，原始文本必须到达调用方才能被接受。
+            try:
+                exc.add_note(f"raw_content={str(content)[:6000]}")
+            except Exception:  # noqa: BLE001
+                pass
             # Schema 约束输出失败：退回宽松 JSON 模式重试
-            logger.warning("Structured schema response was invalid; retrying with JSON mode: %s", exc)
+            logger.warning(
+                "Structured schema response was invalid; retrying with JSON mode: %s (raw=%.500s)",
+                exc,
+                str(content)[:500],
+            )
             retry_payload = self._json_mode_payload(
                 schema=schema,
                 model=model_name,
@@ -356,7 +367,22 @@ class OllamaClient:
                 options=options,
             )
             retry_data = self._post_chat(retry_payload)
-            return self._parse_structured_content(schema, self._message_content(retry_data))
+            retry_content = self._message_content(retry_data)
+            try:
+                return self._parse_structured_content(schema, retry_content)
+            except Exception as retry_exc:  # noqa: BLE001
+                try:
+                    retry_exc.add_note(f"raw_content={str(retry_content)[:6000]}")
+                except Exception:  # noqa: BLE001
+                    pass
+                # JSON 模式重试也失败：记录原始输出后原样抛出（调用方重试/兜底）
+                logger.warning(
+                    "JSON mode retry also failed for %s: %s (raw=%.500s)",
+                    schema.__name__,
+                    retry_exc,
+                    str(retry_content)[:500],
+                )
+                raise
 
     def generate_structured_with_images(
         self,
@@ -409,15 +435,30 @@ class OllamaClient:
     def embed(self, texts: list[str]) -> list[list[float]]:
         """批量计算文本嵌入向量。
 
-        POST ``/api/embed``，请求体带 ``keep_alive``（由
-        ``_with_keep_alive`` 注入）；返回 ``embeddings`` 数组。
+        POST ``/api/embed``；返回 ``embeddings`` 数组。
+
+        显存管理（与生成模型共卡的关键）：
+        - ``keep_alive=0``：嵌入模型用完即卸载，绝不驻留与生成模型
+          争抢显存（曾因 5m 驻留窗口挤掉生成模型导致 schema 输出崩坏）。
+        - ``options.num_ctx=16384``：嵌入模型不需要 32K 上下文；16384
+          覆盖现存全部 chunk（实测 max 16859 字符的表格块，token 化
+          最坏情况接近 1 字符/token，仍需 8K+），KV cache ~3.2G，
+          与生成模型共存峰值 ~18G < 23G。若未来出现 >16K token 的
+          chunk，应修切块上限而非继续放大 num_ctx（超长 chunk 的
+          嵌入向量信息平均化，检索精度本就差）。注意此处不走
+          ``_with_keep_alive``（全局配置会覆盖显式值），body 直接构造。
         """
         if not texts:
             return []
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(
                 f"{self.embedding_base_url}/api/embed",
-                json=self._with_keep_alive({"model": settings.ollama_embedding_model, "input": texts}),
+                json={
+                    "model": settings.ollama_embedding_model,
+                    "input": texts,
+                    "keep_alive": "0",
+                    "options": {"num_ctx": 16384},
+                },
             )
             response.raise_for_status()
             return response.json()["embeddings"]

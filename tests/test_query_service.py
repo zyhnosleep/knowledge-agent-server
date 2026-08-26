@@ -728,6 +728,69 @@ def test_rag_captionless_document_table_citation_is_labeled_as_table_evidence() 
     assert "91.2" in contexts[0].citation.excerpt
 
 
+def test_table_reference_query_detection() -> None:
+    """表格指代检测：序数指代/指示代词命中，列举型问题不命中。"""
+    for question in (
+        "只展开你刚才列出的第一张表，给出行名、列名、数值和单位。",
+        "现在展开第二张，但不要重复第一张的内容。",
+        "你刚才第二张表里提到的第一个数值是多少？",
+        "回到第一张表。它与第二张表共享了哪些评价对象？",
+        "把这张表的数据列出来。",
+        "这个表是验证什么误差的？",
+        "刚才的表格统计误差是多少？",
+    ):
+        assert QueryService._is_table_reference_query(question), question
+    for question in (
+        "论文中有哪些表格用于比较 CHARMM36 与旧参数？列出表号和每张表验证的指标。",
+        "这个数值的实验参考值是什么？如果表中没有实验列，就直接说没有。",
+        "论文中的方法是什么？",
+    ):
+        assert not QueryService._is_table_reference_query(question), question
+
+
+def test_table_reference_query_returns_candidate_tables_without_term_match() -> None:
+    """指代查询（中文序数，与英文表格文本无 token 交集）必须拿到候选表格。
+
+    回归背景（2026-08-12）：R17/R18/R20/R22 这类"展开第二张"查询被
+    ``_table_block_matches_query`` 全灭过滤，检索结果 0 table evidence，
+    模型只能编造表格内容。放宽后返回候选表格（按文档序），由会话锚点
+    与模型结合历史选择。
+    """
+    from app.services.search import QueryService
+
+    db = make_session()
+    project = Project(id="p1", slug="demo", name="Demo")
+    document = make_table_document(
+        id="d1",
+        title="CHARMM36 force field",
+        source_slug="sources/charmm36",
+        page_label="31",
+        table_markdown=(
+            "Table 3: Average and RMS differences in kcal/mol.\n"
+            "|  | a | β | aL | All |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| C22/CMAP | 1.80 | 0.74 | 3.72 | 2.09 |\n"
+            "| C36 | 1.12 | 0.68 | 2.94 | 1.73 |"
+        ),
+        raw_text="CHARMM36 force field refinement for proteins.",
+    )
+    db.add_all([project, document])
+    db.commit()
+
+    # 同一查询：没有放宽时 _table_block_matches_query（中文 vs 英文表格）
+    # 会全灭过滤；放宽后表格证据必须返回。
+    contexts = QueryService(db)._build_rag_contexts(
+        "现在展开第二张，但不要重复第一张的内容。",
+        "p1",
+        [PaperMatch(document=document, score=20, exact_alias=True)],
+        document_ids=[document.id],
+    )
+    assert contexts, "table reference query must return candidate tables"
+    table_contexts = [c for c in contexts if c.evidence_kind == "table"]
+    assert table_contexts, "candidate tables must be present for reference query"
+    assert "C22/CMAP" in table_contexts[0].citation.excerpt
+
+
 def test_charmm36m_table_query_locks_scope_and_preserves_document_source_slug() -> None:
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
@@ -3621,6 +3684,33 @@ def test_build_answer_constraints_figure_query_with_context() -> None:
     constraints = service._build_answer_constraints("Figure 1 灞曠ず浜嗕粈涔堬紵", [ctx])
     assert "Do NOT say" in constraints
     assert "Figure" in constraints
+
+
+def test_build_answer_constraints_language_follows_question() -> None:
+    """T3：语言约束无条件跟随问题语言（R29/R38 中文问题回英文的回归）。"""
+    db = make_session()
+    service = QueryService(db)
+    chinese_constraints = service._build_answer_constraints(
+        "论文中哪些部分被修改了？", []
+    )
+    assert "Answer in Chinese" in chinese_constraints
+    assert "简体中文" in chinese_constraints
+
+    english_constraints = service._build_answer_constraints(
+        "What parts of the paper were modified?", []
+    )
+    assert "Answer in English" in english_constraints
+
+
+def test_build_answer_constraints_ban_metadata_and_mark_inference() -> None:
+    """T3：元数据禁止输出（R36）+ 推断显式标记（R26）。"""
+    db = make_session()
+    service = QueryService(db)
+    constraints = service._build_answer_constraints("为什么作者选择了 C36？", [])
+    assert "Never output internal document metadata" in constraints
+    assert "submission IDs" in constraints
+    assert "mark it explicitly as inference" in constraints
+    assert "推测" in constraints
 
 
 def test_context_evidence_text_handles_context_without_citation() -> None:
@@ -7970,6 +8060,39 @@ def test_method_question_is_not_routed_as_generic_document_overview() -> None:
     assert not QueryService._is_document_overview_query(
         "What methodology does this paper use?"
     )
+
+
+def test_overview_detection_strips_contextualization_wrapper() -> None:
+    """跨轮上下文化包装串只按当前追问判定——上一轮问题的概述触发词不污染本轮。"""
+    assert not QueryService._is_document_overview_query(
+        "上一轮问题：这篇论文讲了什么，他的创新点是什么\n当前追问：什么是forward KL"
+    )
+
+
+def test_overview_detection_keeps_wrapped_current_turn_verdict() -> None:
+    """包装串的当前追问本身是概述问题时，剥离包装后仍判定为概述。"""
+    assert QueryService._is_document_overview_query(
+        "上一轮问题：什么是forward KL\n当前追问：这篇论文讲了什么"
+    )
+
+
+def test_referential_mention_with_specific_question_is_not_overview() -> None:
+    """指代论文但问具体内容（GRPO 损失函数）不再误判为文档概述。"""
+    assert not QueryService._is_document_overview_query(
+        "在这篇论文中也提到了GRPO，GRPO的损失函数是什么"
+    )
+    assert not QueryService._is_document_overview_query("这篇论文")
+
+
+def test_overview_detection_requires_intent_phrase_after_reference() -> None:
+    """指代 + 概述意图词共现仍是概述。"""
+    assert QueryService._is_document_overview_query("这篇文章讲了什么")
+    assert QueryService._is_document_overview_query("这篇论文的主要内容")
+    assert QueryService._is_document_overview_query(
+        "这篇论文讲了什么，他的创新点是什么"
+    )
+    # "讲了哪些内容" 形式在指代收紧后仍保持概述路由（回归锁定）。
+    assert QueryService._is_document_overview_query("这篇文章主要讲了哪些内容")
 
 
 def test_overview_query_single_document_retrieves_substantive_chunks() -> None:

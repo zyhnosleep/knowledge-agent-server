@@ -57,6 +57,58 @@ def _make_txt_upload(name: str, content: str) -> tuple[bytes, str]:
     return (content.encode("utf-8"), name)
 
 
+def _pdf_with_nul_text() -> bytes:
+    """构造文本层含 NUL (0x00) 的最小单页 PDF（与 test_parser_errors 同构）。"""
+    content = b"BT /F1 12 Tf 72 720 Td (alpha\x00beta) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    body = b"%PDF-1.4\n"
+    offsets: list[int] = []
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(body))
+        body += b"%d 0 obj\n" % index + obj + b"\nendobj\n"
+    xref_offset = len(body)
+    xref = b"xref\n0 %d\n" % (len(objects) + 1)
+    xref += b"0000000000 65535 f \n"
+    for off in offsets:
+        xref += b"%010d 00000 n \n" % off
+    trailer = b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    return body + xref + trailer + b"startxref\n%d\n%%%%EOF\n" % xref_offset
+
+
+def test_upload_pdf_attachment_with_nul_bytes_strips_before_store(tmp_path) -> None:
+    """含 NUL 文本层的 PDF 附件上传必须成功，chunk 文本不含 NUL。
+
+    线上故障复现：pypdf 文本层含 0x00 → INSERT 报
+    ``PostgreSQL text fields cannot contain NUL (0x00) bytes``。
+    """
+    db = make_db()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.commit()
+
+    settings = get_settings()
+    settings.raw_dir = tmp_path / "raw"
+
+    client = make_client(db)
+    response = client.post(
+        "/api/agent/sessions/sess-nul/attachments?project_slug=demo",
+        files={"file": ("nul.pdf", io.BytesIO(_pdf_with_nul_text()), "application/pdf")},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["attachment"]["file_name"] == "nul.pdf"
+    assert payload["chunks"]
+    for chunk in payload["chunks"]:
+        assert "\x00" not in chunk["text"]
+    assert "alphabeta" in payload["chunks"][0]["text"]
+
+
 def test_upload_creates_session_and_attachment(tmp_path) -> None:
     db = make_db()
     project = Project(id="p1", slug="demo", name="Demo")

@@ -22,6 +22,7 @@ import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from app.models.records import Document, DocumentChunk
 from app.services.filesystem import slugify, strip_upload_prefix
@@ -268,13 +269,27 @@ def _clean_title(value: str) -> str:
     return text or value
 
 
+@lru_cache(maxsize=8192)
+def _alias_boundary_pattern(alias: str) -> re.Pattern:
+    """alias 独立词边界正则预编译缓存。
+
+    2026-08-18 性能修复：_route_papers 对全库文档逐篇调用 _question_has_exact_alias
+    → alias_in_text，每个 alias 动态拼接正则再编译，打穿 Python re 内部 512 条
+    缓存后每 claim 重复编译数千次（cProfile：re._compile 56,060 次 / 13.4s）。
+    文档静态 → lru_cache 跨 claim 全命中。
+    """
+    return re.compile(
+        rf"(?<![A-Za-z0-9_\-]){re.escape(alias)}(?![A-Za-z0-9_\-])",
+        re.IGNORECASE,
+    )
+
+
 def alias_in_text(alias: str, text: str) -> bool:
     """判断别名是否作为独立词出现在文本中。"""
     alias = str(alias or "").strip()
     if not alias or not text:
         return False
-    escaped = re.escape(alias)
-    return bool(re.search(rf"(?<![A-Za-z0-9_\-]){escaped}(?![A-Za-z0-9_\-])", text, re.IGNORECASE))
+    return bool(_alias_boundary_pattern(alias).search(text))
 
 
 def _title_aliases(title: str) -> list[str]:

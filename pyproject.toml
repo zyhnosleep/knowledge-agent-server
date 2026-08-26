@@ -9,6 +9,7 @@ dependencies = [
   "beautifulsoup4>=4.12.3",
   "fastapi>=0.115.0",
   "httpx>=0.28.0",
+  "lark-oapi>=1.7.3,<2.0",
   "minio>=7.2.8",
   "openai>=1.54.0",
   "psycopg[binary]>=3.2.3",
@@ -24,6 +25,7 @@ dependencies = [
   "trafilatura>=1.12.2",
   "transformers>=4.51.0,<5.0",
   "uvicorn[standard]>=0.32.0",
+  "websockets>=13.0",
 ]
 
 [project.optional-dependencies]

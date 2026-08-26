@@ -12,7 +12,7 @@
 
 ## Hard Boundaries
 
-- Modify and run only development: `/home/zhangyh/knowledge-agent-dev`, API `8002`, Ollama `11435`, database `knowledge_agent_dev`.
+- Modify and run only development: `/home/<user>/knowledge-agent-dev`, API `8002`, Ollama `11435`, database `knowledge_agent_dev`.
 - Test remains the unchanged old-version baseline at API `8001` and database `knowledge_agent_test`.
 - Development uses GPU0 only. Do not stop, inspect through intrusive tooling, or schedule work on GPU1.
 - Preserve every `canonical-v1` parse version, chunk, vector, artifact, MinerU output, and source file.
@@ -329,12 +329,12 @@ Expected: all tests pass and no whitespace errors exist.
 ### Task 6: Deploy Development Only And Re-run `ff14sb`
 
 **Files:**
-- Deploy only changed source/script files to `/home/zhangyh/knowledge-agent-dev`
-- Generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`
+- Deploy only changed source/script files to `/home/<user>/knowledge-agent-dev`
+- Generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`
 
 - [ ] **Step 1: Capture and compare deployment hashes**
 
-Record local SHA-256 values for every changed source and script. Copy only those files to development, then require remote hashes to match. Do not copy to `/home/zhangyh/knowledge-agent-test`.
+Record local SHA-256 values for every changed source and script. Copy only those files to development, then require remote hashes to match. Do not copy to `/home/<user>/knowledge-agent-test`.
 
 - [ ] **Step 2: Run focused tests on development**
 
@@ -347,7 +347,7 @@ Require no rebuild process, development worker `CUDA_VISIBLE_DEVICES=0`, test co
 - [ ] **Step 4: Run the clean V4 canary on GPU0**
 
 ```bash
-cd /home/zhangyh/knowledge-agent-dev
+cd /home/<user>/knowledge-agent-dev
 set -a
 . runtime/app.env
 set +a

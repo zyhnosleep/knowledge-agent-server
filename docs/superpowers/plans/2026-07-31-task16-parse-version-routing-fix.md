@@ -52,7 +52,7 @@
 
 ## Task 4: Re-run the acceptance comparison with correct routing
 
-- [x] Sync only the verified `search.py` change and its tests to `/home/zhangyh/knowledge-agent-dev`.
+- [x] Sync only the verified `search.py` change and its tests to `/home/<user>/knowledge-agent-dev`.
 - [x] Restart only the development API if required; do not modify the test environment and keep GPU1 unused.
 - [x] Run the staged full30 evaluation with the parse-version map and save a new report: `runtime/task15/dev-new-tokenizer-full30-v4-shadow-fixed.json`.
 - [ ] Run the active-pointer baseline through the same code path and save `runtime/task15/dev-new-tokenizer-full30-v4-active-baseline.json`.

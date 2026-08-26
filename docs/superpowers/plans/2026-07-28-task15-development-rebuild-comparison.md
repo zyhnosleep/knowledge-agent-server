@@ -12,8 +12,8 @@
 
 ## Hard Boundaries
 
-- Development: `/home/zhangyh/knowledge-agent-dev`, API `8002`, Ollama `11435`, database `knowledge_agent_dev`.
-- Test: `/home/zhangyh/knowledge-agent-test`, API `8001`, Ollama `11436`, database `knowledge_agent_test`.
+- Development: `/home/<user>/knowledge-agent-dev`, API `8002`, Ollama `11435`, database `knowledge_agent_dev`.
+- Test: `/home/<user>/knowledge-agent-test`, API `8001`, Ollama `11436`, database `knowledge_agent_test`.
 - Development may use GPU0 only. GPU1 is outside Task 15.
 - Do not update, migrate, restart, or write into the test environment.
 - Do not use `--delete-old-after-acceptance` or `--confirm-delete-old-data`.
@@ -38,7 +38,7 @@
 ### Task 1: Freeze the Pre-Resume State
 
 **Files:**
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/pre-resume-state-20260728.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/pre-resume-state-20260728.json`
 
 - [ ] Confirm `pgrep -af '[r]ebuild_canonical_index.py'` returns no process.
 - [ ] Record both checkout HEADs, Alembic heads, service states, maintenance mode, MinerU settings, models, dimensions, document/chunk/vector/parse-version counts, and source SHA-256 values.
@@ -64,12 +64,12 @@
 ### Task 3: Run the Clean `ff14sb` V4 Canary
 
 **Files:**
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`
 
 - [x] Run this development-only command:
 
 ```bash
-cd /home/zhangyh/knowledge-agent-dev
+cd /home/<user>/knowledge-agent-dev
 set -a
 . runtime/app.env
 set +a
@@ -89,7 +89,7 @@ PYTHONPATH=src .venv/bin/python scripts/rebuild_canonical_index.py --resume \
 ### Task 4: Run the `opls5` Table Canary
 
 **Files:**
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-opls5-v4.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canary-opls5-v4.json`
 
 - [x] Repeat Task 3 with document ID `1180eb94-80d3-4fca-be00-ca4b53268747` and report `runtime/task15/canary-opls5-v4.json`.
 - [x] Require the same strict report fields and `ready_for_acceptance=true`.
@@ -99,8 +99,8 @@ PYTHONPATH=src .venv/bin/python scripts/rebuild_canonical_index.py --resume \
 ### Task 5: Rebuild All 17 Development Documents
 
 **Files:**
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-rebuild-dry-run.json`
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-rebuild-report.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-rebuild-dry-run.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-rebuild-report.json`
 
 - [x] Run a fresh dry-run with explicit GPU0 binding; require 17/17 sources present and zero failures.
 - [x] Run the full command:
@@ -120,7 +120,7 @@ PYTHONPATH=src .venv/bin/python scripts/rebuild_canonical_index.py --resume \
 **Files:**
 - Read: `benchmarks/query/internal_research_v1.json`
 - Read: `docs/query_acceptance/canonical_ingestion_v1.json`
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/comparison-case-audit.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/comparison-case-audit.json`
 
 - [x] Resolve every expected stable source identity in both environments.
 - [x] Classify each case as `overlap`, `development-only`, or `missing`.
@@ -131,10 +131,10 @@ PYTHONPATH=src .venv/bin/python scripts/rebuild_canonical_index.py --resume \
 ### Task 7: Compare Old Test with New Development
 
 **Files:**
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/test-old-full30/`
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/dev-new-full30/`
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-acceptance.json`
-- Server generate: `/home/zhangyh/knowledge-agent-dev/runtime/task15/old-vs-new-comparison.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/test-old-full30/`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/dev-new-full30/`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-acceptance.json`
+- Server generate: `/home/<user>/knowledge-agent-dev/runtime/task15/old-vs-new-comparison.json`
 
 - [ ] Capture the old baseline through test API `8001`, but write every report under the development runtime directory.
 - [ ] Do not change test code, database, files, environment, or services during baseline capture.

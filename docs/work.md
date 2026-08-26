@@ -1,12 +1,88 @@
 # Knowledge Agent 工作记录
 
+## 2026-08-24 飞书机器人：部署、私聊支持、事件推送排查（进行中）
+
+### 今日已完成
+
+- **公式修复 + query_eval 删除已同步 dev/test**：`search.py`（df0801b 公式检索提权）与 query_eval 删除经 git bundle 中转同步到服务器（服务器 GitHub 被 GFW 路径级阻断，走 bundle + 最小同步，不动用户工作树）。
+- **飞书机器人部署到 test**（`knowledge-agent-test-feishu-bot.service`，systemd user service）：
+  - 长连接模式：POST `/callback/ws/endpoint`（body AppID/AppSecret/ClientAssertion，header locale:zh）拿 `data.URL`（大写），连接 `wss://msg-frontier.feishu.cn/ws/v2`。
+  - 修复 client.py 三接口响应结构（commit `8422059`）：tenant_access_token 在顶层（非 data 内）、ws endpoint 用新路径 + AppID 鉴权、bot info 的 bot 在顶层。66 个 feishu 测试通过。
+  - 事件过滤：`EventPolicy.allow`（allowed_tenant + 空 chat whitelist=不限）+ `mentions_bot`（bot_open_id in mentions）。
+- **p2p 私聊支持**（commit `d9b9995`）：`MessageEvent` 新增 `chat_type` 字段（缺省 group）；`mentions_bot` 对 p2p 直接放行（单聊消息必然发给机器人）。TDD：2 失败测试 → 实现 → 27 个 feishu 测试绿 → 全量 2153 绿 → 推送 → scp 同步 test 服务器（服务器 git 对象库无 8422059，git show 不可行，改直接 scp 文件）→ 重启 service 验证长连接重建。
+- **事件观测日志**（commit `e3061e0`）：`entry._on_event` 收到事件打 `event received: type/chat_type/chat_id/sender`；`handler.handle` 过滤不通过打 `dropped by policy` / `dropped (bot not mentioned)`。用于区分"未推送"与"推送后过滤"。
+- **协议发现（重要）**：飞书长连接帧协议为 **protobuf 二进制**（`Frame{seq_id/log_id/service/method/headers/payload}`，method 0=control 1=data），非 JSON 文本帧；心跳 PING 由**客户端主动发**（SDK 默认 120s），收到 EVENT 需回 ACK 帧（3 秒未 ack 触发重推，间隔 15s/5min/1h/6h 共 4 次）。已从 lark_oapi 1.7.3 wheel 源码（/tmp/lark_sdk）确认。
+- **long_conn.py 已重写为官方 SDK 适配**（磁盘已改、未提交）：`LongConnClient(app_id, app_secret)` 内部用 `lark.ws.Client` + `EventDispatcherHandler` 注册 `p2_im_message_receive_v1`，事件经 `lark.JSON.marshal` 转 dict 交给上层；`entry.py` 同步改为 `LongConnClient(settings.feishu_app_id, settings.feishu_app_secret)` + `_EVENT_EXECUTOR` 线程池处理（不阻塞 SDK ACK）。
+
+### 事件推送问题排查过程（未解决，进行中）
+
+**现象**：用户私聊/群聊 @机器人 发消息，机器人无任何响应；服务器日志（含 `event received` 观测）零事件。
+
+**已确认的配置全对**（后台 <feishu-app-id> =「测试机器人」）：
+- 订阅方式：长连接（后台「验证连接状态」显示已连接）
+- 已订阅事件：`im.message.receive_v1`（接收消息，v2.0），所需权限已开通
+- 配置已保存；正式版本 **1.0.4 已发布**（2026-08-24 15:59 通过，发布人张宇恒）
+- 机器人能力已开启，activate_status=2；权限：获取与发送单聊/群组消息、以应用身份发消息、获取群组中其他机器人和用户@当前机器人的消息
+
+**排查手段与结论**：
+1. 服务器日志零事件 → 加了事件观测日志（`event received`）→ 仍零事件。
+2. 加 ws 帧级日志 → 16:01:08 连接建立后无任何帧（当时结论"僵尸连接"——**后经 SDK 源码修正**：服务端本就不主动发帧，ping 是客户端发，无帧属正常，该结论作废）。
+3. **对照实验**：停掉自研 service，用官方 SDK（lark_oapi 1.7.3）在服务器跑最小 demo（`/tmp/feishu_demo.py`，nohup 输出 `/tmp/feishu_demo.log`，PID 进程 16:11:09 connected）→ 用户发消息 → **SDK demo 同样 0 事件**。
+4. 应用身份核对：bot/v3/info 返回 app_name=「测试机器人」与用户 @ 的机器人一致；用户确认后台 AppID = <feishu-app-id>。
+5. 版本核对：正式版 1.0.4 已发布（15:59），配置快照应含事件订阅。
+
+**当前状态**：官方 SDK 也收不到事件 → 问题收敛到平台侧推送链路。待办：① 后台重新保存「事件与回调」配置（飞书保存时会检测长连接，保存时若无连接配置可能未生效；现在有连接，重存+重发布 1.0.5）；② 飞书调试台（open.feishu.cn/tool/debugger）模拟 `im.message.receive_v1` 验证推送链路；③ 查后台「推送记录」。服务器当前跑着 SDK demo（service 已停），验证完恢复 service。
+
+**遗留未提交改动**：`entry.py` + `long_conn.py` 的官方 SDK 适配（工作区已改，未 commit/push）。
+
+## 2026-08-11/12 T1a/T1b/T2/T3 实现部署 + 前端三问题修复 + 布局 P0 剩余项
+
+### T1a/T1b/T2/T3 四个 ticket（已实现、已部署 8002、40 轮回归通过）
+
+- T1a 表格写回：canonical-v4 摄取把 parent table chunks 写回 `metadata_json.document_intelligence.tables`，并附 charmm36 存量迁移脚本（不重摄取）。
+- T1b 检索使用：指代查询放宽 `_table_block_matches_query` 过滤 + 轻量会话锚点（每轮记录引用表格标识、指代查询注入候选清单）。
+- T2 质量拦截：verify 启发式（n-gram 重复率/噪音比触发 retry warning）+ 空答案重试仍空时交付显式降级标记。
+- T3 生成约束：`prompt_rules.py` 统一四类约束——回答语言跟随用户问题（中文问题答中文）、禁止内部元数据输出（submission ID/地址/日期/版本号等，引用只用 [0]）、超出证据的推断显式标记（推测/推断/解读）、公式与力场术语输出可读 Unicode（χ₁、φ/ψ、Ala₃、≤、°），禁止 LaTeX 命令源码（`\mathrm{...}`、`\chi_{1}`、`$...$`）。
+- 本地全量测试通过（85 个 synthesizer 专项 + 前端静态回归）；40 题回归 40/40 completed，无 degraded、无模板化答案，用户确认"没有问题可以接受"。
+- 部署：`src/app/static/index.html`、`src/app/services/prompt_rules.py` 等 SHA-256 校验同步到 `/home/<user>/knowledge-agent-dev`，重启 `knowledge-agent-dev-api`（8002）active，HTTP 200。
+- 回归评估脚本：`D:/temp/claude/charmm36_chat_eval_regression*.py`（40 题七阶段：上下文建立、连续指代、侧链参数、表格连续追问、错误前提攻击、跨主题返回、长上下文一致性），远端 `CUDA_VISIBLE_DEVICES=0` 运行，报告输出到 `runtime/task15/charmm36-chat-eval-regression-*.json`。
+
+### 前端问题 1：聊天流隐藏工具消息（已部署）
+
+- `renderTurns` 跳过 `turn.role === "tool"`，`工具 · rag.answer …` 等证据转储不再进聊天流，只保留推理摘要。
+
+### 前端问题 3：LaTeX → 可读 Unicode（已部署）
+
+- 前端 `latexToReadable()`：链条紧凑（`\mathrm { A l a } _ { 3 }` → Ala₃）、纯数字下标转 Unicode（₃ ₁）、含字母下标保留下划线形态（`F_calc`、`C7_eq`）、希腊字母/符号表（`\chi`→χ、`\leq`→≤、`0^\circ`→0°）、数学模式标记清理（`\(\)`、`$`）、双反斜杠归一、数字前空格不压缩（保护 "Table 7"）。
+- 修复过程中踩过的坑：链条正则 D 分支误吞裸数字（`RMSD > 2.0` → `RMSD >2.0`）；`/` 与 `-` 的 lookahead 不消费字符导致双份符号；字母下标半转混搭（`Fcₐlc`）；`Table 7` 被空格压缩误伤；真实样本新形态（数学模式标记、双反斜杠、`\varphi`/`\circ`）。
+- 治本：`prompt_rules.py` 新增 LATEX_FREE_RULE（第 4 条），生成端直接输出可读 Unicode。
+- 验证：16/16 单元用例 + 13 轮含 LaTeX 真实答案转换验证 + 85 个后端测试通过。
+
+### 前端问题 2：聊天布局修缮（已部署，用户提供详细分析）
+
+- P0 底部输入框遮挡正文：`.chat-surface` 底部安全区 210px + `.chat-view::after` 150px 渐变遮罩（z-index 4 < composer 5），正文滚到底不被输入框盖住；welcome padding 同步调整。
+- 暗色滚动条：webkit `::-webkit-scrollbar` + `scrollbar-width: thin`，hover 增强。
+- 内容列 850→1020px、composer 820→900px；会话卡片红色删除按钮改为 hover/focus-within 才显示。
+- 品牌区压缩 64px（删冗余 product-name 行，wordmark small 改为 "RAG Research"）。
+- Agent 下拉改名"Agent 模式 / 标准 RAG"并加 title 说明；附件按钮 `⌕`→`＋`；topbar 进度线弱化；project-online 11px。
+
+### 布局 P0 剩余两项（2026-08-12 已部署，40 轮回归运行中）
+
+- 正文结构层级模块化（结论/证据/引用/不确定性分块）：
+  - 后端治本：`prompt_rules.py` 第 5 条 `answer_structure_rule`——较长答案用 `## 结论 / ## 证据 / ## 不确定性` 固定标题分节（中文问题中文标题、英文问题英文标题，如 `## Conclusion`；不适用的小节省略、简单问题无需标题）。
+  - 前端 `renderCitedText` 重构为轻量 markdown 渲染器：`## 标题` → 色条区块（结论=绿 / 证据=蓝 / 不确定性=琥珀 / 来源=紫 / 其他=灰），12px 等宽小标题；`**粗体**`、`-`/`1.` 列表正常渲染；`[N]` 引用上标与点击溯源交互保留；无标题答案保持平文本。
+  - node 单元测试 9 组全过（分块/分类/列表/粗体/LaTeX 集成）；踩坑：JS 字符串未知转义 `"\chi"` 会被丢弃反斜杠变成 `"chi"`（bash -e 内嵌字符串 + 测试字面量双陷阱，最终用文件调试脚本定位）。
+- 状态位置统一（用户选 topbar 左侧方案）：项目下拉 + `INDEX ONLINE` 从侧栏底部移到 topbar 左侧，服务健康 + 账号在右侧，侧栏回归纯会话列表；保留 `sidebarProjectSelect`/`sidebarProjectSwitcher` ID，JS 零改动；≤768px 隐藏 INDEX ONLINE、收窄下拉。
+- 本地验证：`test_agent_synthesizer.py` 85/85、`test_static_frontend.py` 78/78、全量 2091 passed（修复 2 个测试：品牌断言随设计更新删 "NIGHT RESEARCH INSTITUTE"；`test_inline_script_is_valid_javascript` 在 Windows GBK 下无法编码 Unicode 下标 `₀`，stdin 改 UTF-8）。
+- 已部署：SHA-256 校验一致，重启后 HTTP 200，页面含 27 处新标记（`topbar-project`、`answer-section` 等）；40 轮回归（sid `charmm36-chat-eval-regression-20260812-structure`）远端后台运行中，重点检查新答案是否带结构化标题、无降级/模板化。
+
 ## 2026-08-06 Task 9：主控续作、本地验证与 GPU0 candidate 同步
 
 - 按用户要求，本轮不再使用 `codex-with-cc` 或子智能体，全部由主控窗口执行；工作树为 `codex/internal-pilot`。
-- 昨日 RAG candidate 的最终报告已核实：`/home/zhangyh/knowledge-agent-dev/runtime/task15/task15-rag-candidate-direct-full30-20260805-f496859-activation-cleanup.json`，`route_identity=candidate`、`case_count=30`、`passed_cases=30`、`answer_pass_rate=1.0`、`citation_pass_rate=1.0`、`strict_pass=true`。25/30、29/30 等是旧重试报告，不覆盖该最终基线；本轮不重复运行 RAG 30/30。
+- 昨日 RAG candidate 的最终报告已核实：`/home/<user>/knowledge-agent-dev/runtime/task15/task15-rag-candidate-direct-full30-20260805-f496859-activation-cleanup.json`，`route_identity=candidate`、`case_count=30`、`passed_cases=30`、`answer_pass_rate=1.0`、`citation_pass_rate=1.0`、`strict_pass=true`。25/30、29/30 等是旧重试报告，不覆盖该最终基线；本轮不重复运行 RAG 30/30。
 - Task 9 本地主控验证：专项测试 `453 passed`；全量测试 `2025 passed, 3 skipped`；目标文件 `py_compile` 通过；`git diff --check` 通过。这里未把 collected 数量写成 passed 数量。
-- 服务器预检：`192.168.31.20` 上 candidate API/worker/Ollama（8002）健康，隔离 test 服务保持 active；active/GPU1（8001）未写入、未切换、未删除。
-- 仅同步了 5 个 Task 9 文件到 `/home/zhangyh/knowledge-agent-dev`：`agent_executor.py`、`agent_synthesizer.py`、`schemas/agent.py`、`search.py`、`tool_registry.py`。同步前备份保存在 `/home/zhangyh/knowledge-agent-dev/runtime/task9-backups/20260806-main-control/`；同步后远端 SHA-256 与本地完全一致。仅重启 candidate API/worker，首次立即健康检查因端口尚未监听失败，等待后恢复为 `status=ok`。
+- 服务器预检：`<server-ip>` 上 candidate API/worker/Ollama（8002）健康，隔离 test 服务保持 active；active/GPU1（8001）未写入、未切换、未删除。
+- 仅同步了 5 个 Task 9 文件到 `/home/<user>/knowledge-agent-dev`：`agent_executor.py`、`agent_synthesizer.py`、`schemas/agent.py`、`search.py`、`tool_registry.py`。同步前备份保存在 `/home/<user>/knowledge-agent-dev/runtime/task9-backups/20260806-main-control/`；同步后远端 SHA-256 与本地完全一致。仅重启 candidate API/worker，首次立即健康检查因端口尚未监听失败，等待后恢复为 `status=ok`。
 - 曾启动一次 Agent 30 题评测，但用户随后要求只保留同步，因此已终止唯一评测进程（PID `1819020`），未生成最终报告，不能将其视为 Agent 验收结果。第 1 题 `charmm36_overview` 已通过，用时约 `29125 ms`；第 2 题尚未完成。
 - 按用户要求补做 1 题 candidate 实测（问题与第 1 题相同）：API 总耗时约 `37 s`；`retrieve=17261 ms`、`rag.answer=18627 ms`、`answer.verify retry=false`、`synthesis_skipped=true`、`answer_model=rag-direct`、2 个 citations，答案通过。旧 RAG 最终报告的 P50 为 retrieval `16869 ms` + answer `17942 ms`，但 P95 answer 达 `145980 ms`，因此过去出现单题约 1 分钟属于尾延迟/模型队列或重试情况，并非每题固定 1 分钟；本次直通跳过了 Agent 第二次综合。
 
@@ -20,7 +96,7 @@
 - PDF 文本层逐页审计新增低覆盖率诊断：`coverage_ratio < 0.90` 的页面写入 `text_layer_low_coverage_page_indices` 并产生页级 warning；该阈值只用于告警，不替代“任意连续缺失达到 80 个规范化字符即恢复”的主规则。
 - 两轮独立审查的结果已全部处理：无 Critical；审查提出的最终 prompt overlap、HTML span、mixed header、跨页 header、Figure nearby、表格脚注、中文 tokenizer overlap 和低页面覆盖率问题均已有回归测试。
 - 最新本地验证：四个核心模块 `220 passed`；Task 15 扩大回归 `702 passed`；完整测试 `1778 passed`、0 failed；`python -m compileall -q src/app scripts` 通过；`git diff --check` 无 whitespace error，仅有工作区已有 LF/CRLF 提示。首次全量运行因测试进程 `PATH` 找不到 Conda Node 出现 1 个环境错误，加入既有 `/home/zyh/miniconda3/bin` 后完整重跑通过，未为此修改仓库。
-- 本轮修复尚未同步服务器，也未启动新 rebuild、未修改 active pointer、未执行 cleanup。2026-07-30 本地门禁完成后，只读内网 SSH 在握手阶段被 `192.168.31.20:22` 直接关闭；既有公网入口又因 DNS 无法解析而失败，因此已停在同步前，没有重试轰炸、没有终止未知 SSH 进程。SSH 恢复后的下一步仅向 `/home/zhangyh/knowledge-agent-dev` 精确同步生产/config 变更，先对文档 `3f783e8e-b28f-4d5d-9425-bbf948ea224a`（`114110_1_5.0197592.pdf`）执行 GPU0 staged canary；测试环境保持旧版本只读，GPU1 不使用，canary 不激活。确认 pages 26-29 补齐、TABLE III/IV 无视觉 LLM repair 即通过且状态为 `ready_to_activate` 后，才使用新 config hash/suffix 运行全部 17 篇。旧 chunks、vectors、ParseVersions、MinerU 输出、artifacts 和源文件全部保留。
+- 本轮修复尚未同步服务器，也未启动新 rebuild、未修改 active pointer、未执行 cleanup。2026-07-30 本地门禁完成后，只读内网 SSH 在握手阶段被 `<server-ip>:22` 直接关闭；既有公网入口又因 DNS 无法解析而失败，因此已停在同步前，没有重试轰炸、没有终止未知 SSH 进程。SSH 恢复后的下一步仅向 `/home/<user>/knowledge-agent-dev` 精确同步生产/config 变更，先对文档 `3f783e8e-b28f-4d5d-9425-bbf948ea224a`（`114110_1_5.0197592.pdf`）执行 GPU0 staged canary；测试环境保持旧版本只读，GPU1 不使用，canary 不激活。确认 pages 26-29 补齐、TABLE III/IV 无视觉 LLM repair 即通过且状态为 `ready_to_activate` 后，才使用新 config hash/suffix 运行全部 17 篇。旧 chunks、vectors、ParseVersions、MinerU 输出、artifacts 和源文件全部保留。
 
 ## 2026-07-29 Task 15：Tokenizer fidelity 与批量原子激活（本地完成）
 
@@ -35,7 +111,7 @@
 
 ### 剩余 Task 7：开发环境 staged 对比与验收
 
-- 只同步新代码和配置到 `/home/zhangyh/knowledge-agent-dev`；测试环境 `/home/zhangyh/knowledge-agent-test` 保持旧版本、只读且不重启、不迁移、不写入。所有开发重建/推理命令必须设置 `CUDA_VISIBLE_DEVICES=0`，不得使用 GPU1。
+- 只同步新代码和配置到 `/home/<user>/knowledge-agent-dev`；测试环境 `/home/<user>/knowledge-agent-test` 保持旧版本、只读且不重启、不迁移、不写入。所有开发重建/推理命令必须设置 `CUDA_VISIBLE_DEVICES=0`，不得使用 GPU1。
 - 先下载并校验固定 tokenizer snapshot，生成 tokenizer preflight；冻结开发/测试文档清单与 source SHA，并从旧测试版本保存同一组 30 个 byte-matched case 的只读 baseline。
 - 在开发环境为 17 篇文档并行数据版本做 side-by-side rebuild，但全部只到 `ready_to_activate`。在所有文档 source fidelity、structured limit、config identity、source/version identity、embedding、vector、artifact 等严格指标均为 `1.0` 前，不切换任何 active pointer。
 - 使用 staged `parse_version_map` 先跑不生成答案的 30 题 shadow retrieval：要求 Recall@5=`1.0`、Recall@10=`1.0`、source identity validity=`1.0`，且每个相同 case 不得低于旧测试 baseline；失败即停止，不进入答案测试。
@@ -45,8 +121,8 @@
 
 - 服务器自动升级 NVIDIA 驱动后曾出现内核模块 `580.159.03` 与 NVML `580.173.02` 不一致；经用户确认重启后，内核模块与用户态库均为 `580.173.02`。重启同时暴露 pgvector 容器 `llm-wiki-pgvector-rehearsal` 的 restart policy 为 `no`，已仅恢复该既有容器及原服务，未修改数据库配置或数据。
 - 全量续跑发现两个真实阻断并以测试驱动修复：其一，repair 生成模型默认驻留 5 分钟，与下一篇 MinerU 解析模型叠加导致 GPU0 OOM；重建脚本现在每篇文档结束后查询开发 Ollama `/api/ps` 并对实际驻留模型发送 `keep_alive=0`。其二，摘要检测器能识别标题/作者后的 `Abstract`，但抽取器只检查候选首行，导致 `abstract_missing` 错误依赖视觉修复；现在抽取器扫描候选任意行，PDF audit 仅在摘要为空时从前两页 pypdf 文本层确定性补齐文档级摘要，MinerU blocks、tables 和主解析器身份保持不变。聚焦回归 `158 passed`。
-- 修复后的 `ff99sb-ildn` 定向报告 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff99sb-ildn-v4.json` 与 `114110_1_5.0197592` 定向报告 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-114110-v4.json` 均为 1/1 成功、0 失败、全部严格指标 `1.0`、`ready_for_acceptance=true`。每篇完成后 GPU0/GPU1 均回落到 15 MiB，GPU1 全程无计算进程。
-- 正式全量报告 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-rebuild-report.json` 已通过：17/17 文档成功、0 失败，3029 个 Child 全部完成原文直嵌入和 pgvector 索引；`contextualization_eligible_children=0`、`contextualized_children=0`，parse、contextual prefix 空集、plain embedding、embedding、pgvector、table、source span、artifact 指标全部为 `1.0`，`ready_for_acceptance=true`。
+- 修复后的 `ff99sb-ildn` 定向报告 `/home/<user>/knowledge-agent-dev/runtime/task15/canary-ff99sb-ildn-v4.json` 与 `114110_1_5.0197592` 定向报告 `/home/<user>/knowledge-agent-dev/runtime/task15/canary-114110-v4.json` 均为 1/1 成功、0 失败、全部严格指标 `1.0`、`ready_for_acceptance=true`。每篇完成后 GPU0/GPU1 均回落到 15 MiB，GPU1 全程无计算进程。
+- 正式全量报告 `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-rebuild-report.json` 已通过：17/17 文档成功、0 失败，3029 个 Child 全部完成原文直嵌入和 pgvector 索引；`contextualization_eligible_children=0`、`contextualized_children=0`，parse、contextual prefix 空集、plain embedding、embedding、pgvector、table、source span、artifact 指标全部为 `1.0`，`ready_for_acceptance=true`。
 - 数据库逐行复核：3029/3029 Child 满足 `embedding_text == text`、无任何 contextual 字段且具有 2560 维 JSON embedding；1011/1011 Parent 均未嵌入。17/17 active version 均为 `canonical-v4-*`，17/17 开发源文件 SHA-256 匹配。旧 legacy/V1/V2/V3 共 6 个 inactive parse version、旧 chunk/vector、21 个历史/active artifact 目录和 MinerU 产物继续保留，未执行任何删除参数。
 - 测试环境复核仍为 HEAD `e40425c5e559e3cb5af04f2e390f20c6e6de8ef3`、15 文档、1628 chunks、15/15 源文件 SHA-256 匹配；服务状态恢复到冻结快照（test API/Ollama active、test worker inactive）。下一步只生成公平重叠题集审计，之后才进行旧测试版与新开发版的同题检索对比。
 
@@ -60,9 +136,9 @@
 - `ff14sb` V3 dry-run 选择 `canonical-v3-45f41d8c39a2` 且零源文件错误；正式 canary 在 GPU0 上运行，GPU1 无计算进程。表格退出 LLM 后，contextualization 候选从 295 个降为 8 个（5 figure、3 formula）。
 - V3 canary 三次均在 contextualize 严格门禁停止，未进入 embed/index/activate，旧 active 数据未替换。根因证据显示 `qwen3.5:9b` 对 figure 响应不稳定遵循 JSON schema，会交替输出 `relations/relation_description`、`items/relation_summary`、顶层数组、`relation_explanation` 或 `{child_id: prefix}`；部分前缀引用论文名 `ff14sb` 时又与当前数字标识校验冲突。
 - 用户最终批准彻底移除 ingestion-time LLM contextualization。V4 将 `narrative/table/figure/formula/caption/appendix` 全部设为直接 Child embedding，要求 `embedding_text == text` 且无 contextual 字段；contextual eligible/contextualized 固定为 0。新策略使用 `canonical-v4-<sha>`，不复用或覆盖 V1/V2/V3 checkpoint。本地聚焦回归 `194 passed`，等待全量测试和开发 V4 canary。
-- `ff14sb` V4 canary 已在开发环境 GPU0 成功完成并激活 `canonical-v4-45f41d8c39a2`；报告位于 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`。本次 1/1 文档成功、0 失败，共生成 395 个可检索 Child（100 narrative、287 table、5 figure、3 formula）；`contextualization_eligible_children=0`、`contextualized_children=0`、`plain_embedding_children=395`，全部 Child 均满足 `embedding_text == text`、无 contextual 字段且具有有效向量。`contextual_prefix_completeness`、`plain_embedding_completeness`、embedding、pgvector、table、source span 和 artifact 指标均为 `1.0`，`ready_for_acceptance=true`。MinerU 仍为主解析器，50/50 页覆盖；仅第 7、8、9、15、16、45、46、48、50 页以 `pypdf_text_layer` 补齐，原因均为 `mineru_page_missing`。运行期间 GPU1 保持 22 MiB 且无计算进程，结束后无重建残留进程。
-- `opls5` V4 表格 canary 已在开发环境 GPU0 成功完成并激活 `canonical-v4-c0948ba8a49a`；报告位于 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canary-opls5-v4.json`。本次 1/1 文档成功、0 失败，共 156 个 Child（89 narrative、57 table、7 figure、3 formula），156/156 均满足 `embedding_text == text`、无 contextual 字段且向量维度有效。10/10 张 canonical 表格状态均为 `accepted_mineru`，全部具有非空 `normalized_markdown` 和有效 source span，且无 `validation_failed`；所有严格完整性指标均为 `1.0`，`ready_for_acceptance=true`。旧 `canonical-v1-c0948ba8a49a` 失败版本继续保留且未激活；测试环境复核仍为 15 文档/1628 chunks。运行期间仅 GPU0 有计算进程，GPU1 保持 22 MiB，完成后无重建残留进程。
-- 全量 V4 dry-run 报告 `/home/zhangyh/knowledge-agent-dev/runtime/task15/canonical-rebuild-dry-run.json` 已通过：17/17 源文件存在、0 失败，计划版本全部以 `canonical-v4-` 开头。随后启动正式全量重建；按用户 2026-07-28 当日暂停要求，以 SIGINT 安全中断在 `ff99sb-ildn`（文档 `1b4c28ed-2954-4b06-b858-ac544e819c0e`）的 `repair` 阶段。当前 `ff14sb` 与 `opls5` 两个 V4 版本保持 active；`ff99sb-ildn` 的 parse 已完成，repair checkpoint 状态为 running/attempt 1，明日等待 lease 过期后使用同一命令和 `--resume` 续跑。中断后确认无 `rebuild_canonical_index.py` 残留进程，未开始 retrieval/full30/citation 对比，也未删除或覆盖任何旧数据。
+- `ff14sb` V4 canary 已在开发环境 GPU0 成功完成并激活 `canonical-v4-45f41d8c39a2`；报告位于 `/home/<user>/knowledge-agent-dev/runtime/task15/canary-ff14sb-v4.json`。本次 1/1 文档成功、0 失败，共生成 395 个可检索 Child（100 narrative、287 table、5 figure、3 formula）；`contextualization_eligible_children=0`、`contextualized_children=0`、`plain_embedding_children=395`，全部 Child 均满足 `embedding_text == text`、无 contextual 字段且具有有效向量。`contextual_prefix_completeness`、`plain_embedding_completeness`、embedding、pgvector、table、source span 和 artifact 指标均为 `1.0`，`ready_for_acceptance=true`。MinerU 仍为主解析器，50/50 页覆盖；仅第 7、8、9、15、16、45、46、48、50 页以 `pypdf_text_layer` 补齐，原因均为 `mineru_page_missing`。运行期间 GPU1 保持 22 MiB 且无计算进程，结束后无重建残留进程。
+- `opls5` V4 表格 canary 已在开发环境 GPU0 成功完成并激活 `canonical-v4-c0948ba8a49a`；报告位于 `/home/<user>/knowledge-agent-dev/runtime/task15/canary-opls5-v4.json`。本次 1/1 文档成功、0 失败，共 156 个 Child（89 narrative、57 table、7 figure、3 formula），156/156 均满足 `embedding_text == text`、无 contextual 字段且向量维度有效。10/10 张 canonical 表格状态均为 `accepted_mineru`，全部具有非空 `normalized_markdown` 和有效 source span，且无 `validation_failed`；所有严格完整性指标均为 `1.0`，`ready_for_acceptance=true`。旧 `canonical-v1-c0948ba8a49a` 失败版本继续保留且未激活；测试环境复核仍为 15 文档/1628 chunks。运行期间仅 GPU0 有计算进程，GPU1 保持 22 MiB，完成后无重建残留进程。
+- 全量 V4 dry-run 报告 `/home/<user>/knowledge-agent-dev/runtime/task15/canonical-rebuild-dry-run.json` 已通过：17/17 源文件存在、0 失败，计划版本全部以 `canonical-v4-` 开头。随后启动正式全量重建；按用户 2026-07-28 当日暂停要求，以 SIGINT 安全中断在 `ff99sb-ildn`（文档 `1b4c28ed-2954-4b06-b858-ac544e819c0e`）的 `repair` 阶段。当前 `ff14sb` 与 `opls5` 两个 V4 版本保持 active；`ff99sb-ildn` 的 parse 已完成，repair checkpoint 状态为 running/attempt 1，明日等待 lease 过期后使用同一命令和 `--resume` 续跑。中断后确认无 `rebuild_canonical_index.py` 残留进程，未开始 retrieval/full30/citation 对比，也未删除或覆盖任何旧数据。
 
 ## 2026-07-28 Canonical Contextual RAG：Task 14
 
@@ -124,7 +200,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 
 ### 开发环境
 
-- 目录：`/home/zhangyh/knowledge-agent-dev`
+- 目录：`/home/<user>/knowledge-agent-dev`
 - API：`127.0.0.1:8002`，仅通过 SSH 转发访问
 - 数据库：`knowledge_agent_dev`，空开发数据集
 - Redis：`redis://127.0.0.1:6379/1`
@@ -135,7 +211,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 
 ### 测试环境
 
-- 目录：`/home/zhangyh/knowledge-agent-test`
+- 目录：`/home/<user>/knowledge-agent-test`
 - API：`127.0.0.1:8001`
 - 数据库：`knowledge_agent_test`
 - Redis：`redis://127.0.0.1:6379/2`
@@ -146,19 +222,19 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - 检索基线：旧 8B `recall@5=1.0`、引用有效率 100%、P95 846 ms。
 - 新模型验收：4B `recall@5=1.0`、引用有效率 100%、P95 1098 ms，验收通过。
 - 公网验收：未授权 401、授权页面 200、异步上传完成、Agent 回答与引用有效、PDF Range 返回 206。
-- 新上传文件写入 `/home/zhangyh/knowledge-agent-test/runtime/data/raw/...`，不写入迁移备份目录。
+- 新上传文件写入 `/home/<user>/knowledge-agent-test/runtime/data/raw/...`，不写入迁移备份目录。
 - 队列验收：DB 2 排队、运行中、失败任务均为 0，注册 worker 为 1。
 - 空闲释放：停止模型请求约 5 分钟后，开发与测试 `/api/ps` 均为空；GPU 1 回落到 22 MiB，GPU 0 仅保留既有 ComfyUI 的 256 MiB。
 
 ### 公共运行组件与备份
 
 - Redis 服务：`knowledge-agent-redis.service`
-- Redis 版本：服务器现有 Redis 7.4，仅监听 `127.0.0.1:6379`，AOF 位于 `/home/zhangyh/knowledge-agent-runtime/redis`
-- 共享依赖运行时：`/home/zhangyh/knowledge-agent-runtime/.venv`
-- 共享 Ollama 模型实体目录：`/home/zhangyh/knowledge-agent-models`，不再依赖旧目录软链接
-- 迁移前备份：`/home/zhangyh/knowledge-agent-backups/20260718T015755Z`
-- 重建报告：`/home/zhangyh/knowledge-agent-test/runtime/reindex-report.json`
-- 重建校验：`/home/zhangyh/knowledge-agent-test/runtime/reindex-verify.json`
+- Redis 版本：服务器现有 Redis 7.4，仅监听 `127.0.0.1:6379`，AOF 位于 `/home/<user>/knowledge-agent-runtime/redis`
+- 共享依赖运行时：`/home/<user>/knowledge-agent-runtime/.venv`
+- 共享 Ollama 模型实体目录：`/home/<user>/knowledge-agent-models`，不再依赖旧目录软链接
+- 迁移前备份：`/home/<user>/knowledge-agent-backups/20260718T015755Z`
+- 重建报告：`/home/<user>/knowledge-agent-test/runtime/reindex-report.json`
+- 重建校验：`/home/<user>/knowledge-agent-test/runtime/reindex-verify.json`
 - 固定题集与报告：备份目录下 `acceptance/knowledge_agent_retrieval_v1.json`、`baseline-8b.json`、`new-4b.json`
 
 ### 旧版本清理
@@ -168,12 +244,12 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - 删除三个旧 API/Ollama systemd 服务及其 unit 文件。
 - 删除旧代码与运行目录。
 - 删除旧应用数据库；PostgreSQL 仅保留 `knowledge_agent_dev` 和 `knowledge_agent_test`。
-- 公网 Caddy 配置迁移到 `/home/zhangyh/knowledge-agent-test/runtime/tunnel`，原 Cloudflare Quick Tunnel 进程保持运行，因此临时网址不变。
+- 公网 Caddy 配置迁移到 `/home/<user>/knowledge-agent-test/runtime/tunnel`，原 Cloudflare Quick Tunnel 进程保持运行，因此临时网址不变。
 - 删除服务器主目录下剩余的 6 个 `llm_wiki*` 旧仓库与历史备份目录，释放约 11.56 GB；检查确认无活动服务、进程或软链接引用。
 - 将约 38 GB 模型实体原地迁移到 `knowledge-agent-models`，删除旧 `llm_runtime` 缓存、临时文件和日志，额外释放约 3.62 GB；开发、测试两端均通过 2560 维 embedding 与 9B 生成实测。
 - 删除 0 字节的失败备份 `20260718T014131Z`，仅保留已验证可恢复的 `20260718T015755Z`。
 
-本次未授权删除的 14B/27B/8B 模型和 108 MB 迁移前备份继续保留。若需要回滚数据，应从 `/home/zhangyh/knowledge-agent-backups/20260718T015755Z` 恢复到新建数据库，不再依赖已删除的旧服务或旧目录。
+本次未授权删除的 14B/27B/8B 模型和 108 MB 迁移前备份继续保留。若需要回滚数据，应从 `/home/<user>/knowledge-agent-backups/20260718T015755Z` 恢复到新建数据库，不再依赖已删除的旧服务或旧目录。
 
 ## 2026-07-20 至 2026-07-27 Canonical Contextual RAG 升级进展
 
@@ -249,7 +325,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 
 ### 下一步
 
-- 在开发服务器恢复后，仅将已验证的 `search.py` 同步到 `/home/zhangyh/knowledge-agent-dev`，所有运行命令显式使用 `CUDA_VISIBLE_DEVICES=0`。
+- 在开发服务器恢复后，仅将已验证的 `search.py` 同步到 `/home/<user>/knowledge-agent-dev`，所有运行命令显式使用 `CUDA_VISIBLE_DEVICES=0`。
 - 先跑 staged retrieval-only 30 题；Recall、citation、source location 或 parse-version isolation 任何回退都停止，不进入 full-answer 评测。通过后再跑 staged full-answer，对比旧 test baseline；staged 保持 inactive。
 
 ## 2026-07-31 Task 16 follow-up: canonical table evidence regression fixed
@@ -260,7 +336,7 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - Canonical table assembly remains version-scoped by `document_id + parse_version + table_id`; full table facts remain lossless and every Child keeps its own citation/source spans. No parser, MinerU, chunk boundary, tokenizer, embedding, active pointer, test data, or server test environment was changed.
 - Current state: development server sync and staged retrieval/full-answer evaluation are still pending. The staged version remains inactive; old data is retained; any server command must explicitly set `CUDA_VISIBLE_DEVICES=0`.
 - Full local suite after the regression fix: `1805 passed, 3 skipped` (187.18s). `git diff --check` reports no whitespace errors.
-- Server preflight was attempted read-only with passwordless SSH: `llm-wiki-server` (`192.168.31.20:22`) timed out and `ffsampling-public` was refused. No files, services, databases, pointers, or GPU workloads were changed remotely.
+- Server preflight was attempted read-only with passwordless SSH: `<server-host>` (`<server-ip>:22`) timed out and `<server-host>` was refused. No files, services, databases, pointers, or GPU workloads were changed remotely.
 
 ## 2026-08-03 Task 16：Agent 表格引用桥接、首次合成精确性与开发同步
 
@@ -273,15 +349,15 @@ GitHub 仓库已重命名为 `zyhnosleep/knowledge-agent-server`；本地和两�
 - 本地 TDD/回归：新增 fallback 重试、Ollama coverage retry、首次精确 prompt 测试；聚焦回归 `299 passed`，全量回归 `1832 passed, 3 skipped`，`py_compile` 通过，`git diff --check` 无空白错误。
 - 开发环境已同步最终 `search.py` 与 `agent_synthesizer.py`，远程 SHA-256 分别为 `01cc4025525591cd58bea49e6cfd0185f15eac954b597b5cf5368a13ef3c53ca`、`ee94644580dd620c14254b633a8684beaa4b37f2c1402f7073e9cf966bbc559f`；API 已于 18:07 重启并监听 `127.0.0.1:8002`，API/Worker/Ollama 均 active。
 - 开发 Ollama 已确认启用推理加速：`OLLAMA_FLASH_ATTENTION=1`、`OLLAMA_KV_CACHE_TYPE=q8_0`、`OLLAMA_NUM_PARALLEL=1`、`CUDA_VISIBLE_DEVICES=0`、`OLLAMA_KEEP_ALIVE=5m`；GPU1 全程未参与计算。
-- 评测记录：旧版（coverage retry 前）完整 30 题报告保留在 `/home/zhangyh/knowledge-agent-dev/runtime/task15/task16-agent-full30-pre-ollama-coverage-retry-20260803.json`，结果为 `passed_cases=5/30`、`answer_pass_rate=0.1667`、`citation_pass_rate=1.0`、`synthesis_applied_rate=1.0`；第二轮已按用户要求在第 3 题前停止，部分日志保留在 `/home/zhangyh/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260803-partial-coverage-retry-20260803.log`，未生成最终报告。
+- 评测记录：旧版（coverage retry 前）完整 30 题报告保留在 `/home/<user>/knowledge-agent-dev/runtime/task15/task16-agent-full30-pre-ollama-coverage-retry-20260803.json`，结果为 `passed_cases=5/30`、`answer_pass_rate=0.1667`、`citation_pass_rate=1.0`、`synthesis_applied_rate=1.0`；第二轮已按用户要求在第 3 题前停止，部分日志保留在 `/home/<user>/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260803-partial-coverage-retry-20260803.log`，未生成最终报告。
 - 当前状态：最终 prompt 修复已同步但尚未重新跑完整 30 题评测；staged 保持 inactive，test 环境未同步/未重启，旧数据未删除。明日第一步是在现有 GPU0 加速配置下重新运行完整 Agent 30 题，并比较旧报告与新报告的 answer/citation/synthesis/latency 指标。
 
 ## 2026-08-04 Task 16：最终 Agent 30 题评测已完成（未通过）
 
 - 只读预检确认开发 API（8002）、RQ Worker 和开发 Ollama 均为 user-level systemd `active`；测试 API/Ollama 仍隔离，staged 保持 inactive，旧数据未删除。
 - 开发 Ollama 使用 `127.0.0.1:11435`、`qwen3.5:9b`，`CUDA_VISIBLE_DEVICES=0`、Flash Attention、`q8_0` KV cache、单并发；Worker 同样绑定 GPU0。启动时 GPU1 保持空闲。
-- 已启动最终 prompt 版本的完整 30 题 Agent 评测，远端进程 PID 为 `1308723`；日志为 `/home/zhangyh/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.log`，最终报告为 `/home/zhangyh/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.json`。
-- 最终报告已生成：`/home/zhangyh/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.json`；评测进程已结束，30/30 题均已记录。
+- 已启动最终 prompt 版本的完整 30 题 Agent 评测，远端进程 PID 为 `1308723`；日志为 `/home/<user>/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.log`，最终报告为 `/home/<user>/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.json`。
+- 最终报告已生成：`/home/<user>/knowledge-agent-dev/runtime/task15/task16-agent-full30-20260804.json`；评测进程已结束，30/30 题均已记录。
 - 最终指标：`passed_cases=3/30`、`answer_pass_rate=0.1`、`citation_pass_rate=0.8667`、`synthesis_applied_rate=0.8667`、`p50_latency_ms=147404`、`p95_latency_ms=300100`，`strict_pass=false`。与旧版 `5/30`、`0.1667`、`1.0`、`1.0` 相比，本轮整体回退，不能进入激活或生产更新。
 - 状态分布：`completed=23`、`timeout=3`、`error=4`；3 个完全通过题为 `charmm36idpsff_overview`、`charmm36m_table_metrics`、`ff99sb_disp_table_metrics`。
 - 失败分组：4 个 `error`（`charmm36_overview`、`charmm36_table_metrics`、`ff14sb_table_metrics`、`ff99sb_ildn_table_parameters`）同时缺答案和 citation；3 个 `timeout`（`charmm36idpsff_table_metrics`、`oplsaa_overview`、`oplsaa_table_metrics`）；另有 20 个已完成合成但遗漏一个或多个问题要求的精确术语/数字。总计 `27` 个 answer 失败、`4` 个 citation 失败、`7` 个 agent status 失败。

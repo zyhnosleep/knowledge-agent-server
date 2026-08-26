@@ -241,6 +241,16 @@ def _validate_pdf_basic(path: Path) -> int:
     return len(_open_pdf_pages(path))
 
 
+def _strip_nul_bytes(text: str) -> str:
+    """去掉文本中的 NUL (0x00) 字节。
+
+    PostgreSQL text 字段禁止 0x00 字节，而 PDF 文本层常见 NUL
+    （字体编码占位/填充），不清理则入库直接报
+    ``PostgreSQL text fields cannot contain NUL (0x00) bytes``。
+    """
+    return text.replace("\x00", "")
+
+
 def _extract_pdf_text_layer_best_effort(path: Path) -> tuple[list[str], int, list[str]]:
     """尽力提取 PDF 文本层：逐页提取，失败页置空并记录警告。
 
@@ -255,7 +265,7 @@ def _extract_pdf_text_layer_best_effort(path: Path) -> tuple[list[str], int, lis
     warnings: list[str] = []
     for index, page in enumerate(pages):
         try:
-            page_texts.append((page.extract_text() or "").strip())
+            page_texts.append(_strip_nul_bytes(page.extract_text() or "").strip())
         except Exception as exc:  # noqa: BLE001
             # 单页提取失败不中断，置空并由警告说明
             page_texts.append("")

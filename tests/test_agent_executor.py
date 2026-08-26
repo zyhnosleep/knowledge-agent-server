@@ -708,6 +708,53 @@ def test_non_empty_answer_does_not_extra_retry_on_simple_rag() -> None:
     )
 
 
+def test_empty_answer_after_retry_marks_degraded_delivery() -> None:
+    """空答案重试后仍空 → 显式降级标记（warning + finalize metadata，T2）。
+
+    回归背景（2026-08-12）：R40 空答案重试一次后仍空，直接交付空字符串，
+    消费方无法区分"无答案"与正常内容。降级标记让上游可拦截、人工可核对。
+    """
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor(db, rag_answer_text="")
+    request = AgentQueryRequest(project_slug="demo", query="general question")
+    response = executor.execute(request)
+
+    assert response.status == "completed"
+    assert any(
+        "empty after retry" in w.lower() and "degraded" in w.lower()
+        for w in response.warnings
+    ), f"expected degraded-empty warning, got warnings={response.warnings}"
+
+    finalize_steps = [s for s in response.steps if s.step_type == "finalize"]
+    assert finalize_steps, "finalize step must exist"
+    assert finalize_steps[-1].metadata.get("degraded_empty_answer") is True, (
+        f"finalize metadata must flag degraded empty answer, "
+        f"got {finalize_steps[-1].metadata}"
+    )
+
+
+def test_ok_answer_not_marked_degraded() -> None:
+    """正常答案不得打降级标记。"""
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    executor = make_executor(db, rag_answer_text="test answer")
+    request = AgentQueryRequest(project_slug="demo", query="general question")
+    response = executor.execute(request)
+
+    finalize_steps = [s for s in response.steps if s.step_type == "finalize"]
+    assert finalize_steps[-1].metadata.get("degraded_empty_answer") is False
+    assert not any(
+        "degraded" in w.lower() for w in response.warnings
+    ), response.warnings
+
+
 def test_max_tool_calls_limit_respected() -> None:
     """Agent never exceeds constraints.max_tool_calls."""
     db = make_db()
@@ -1884,6 +1931,165 @@ def test_retarget_citation_markers_after_synthesis_filtering() -> None:
     assert "[1]" in retargeted
     assert "[0]" in retargeted
     assert "[2]" not in retargeted
+
+
+def test_table_reference_query_injects_anchors_even_when_retrieval_empty() -> None:
+    """检索 0 items 时，表格指代查询仍必须注入会话锚点（T1b code review 修正）。
+
+    回归场景：存量文档尚无 DI tables（迁移前）→ 放宽过滤仍拿不到任何
+    候选表格；此时会话锚点是唯一可用的表格证据。旧实现被
+    ``evidence_pack.get("items")`` 非空条件挡住，miss 时锚点全部丢失。
+    """
+    db = make_db()
+    project = Project(id="p1", slug="demo", name="Demo")
+    db.add(project)
+    db.commit()
+
+    # 会话历史：第 1 轮提问 + 第 1 轮 finalize 引用过表格。
+    # 第 1 轮 user turn 使本轮成为第 2 轮 → synthesize 路径（锚点注入
+    # 的效果在 synthesize step 的 evidence metadata 中可见）。
+    memory = ConversationMemory(db)
+    memory.add_turn(
+        "s_anchor",
+        role="user",
+        content="第一张表验证了什么？",
+        step_type="user_query",
+    )
+    memory.add_turn(
+        "s_anchor",
+        role="agent",
+        content="第一张表的数值是 C22/CMAP 1.80 0.74 3.72 2.09。",
+        step_type="finalize",
+        citations=[
+            {
+                "block_type": "table",
+                "excerpt": "| C22/CMAP | 1.80 | 0.74 | 3.72 | 2.09 |",
+                "document_id": "d1",
+                "page_label": "31",
+            }
+        ],
+    )
+    db.commit()
+
+    captured_tool_args: dict = {}
+
+    class StubRAGWithRetrieve:
+        def answer(self, db, project_slug, question, document_id=None):
+            from app.schemas.common import QueryResponse, Citation
+
+            return QueryResponse(
+                answer_markdown="answer",
+                citations=[
+                    Citation(
+                        document_id="d1",
+                        chunk_id="c1",
+                        score=0.92,
+                        excerpt="sample excerpt",
+                    )
+                ],
+                verification_status="local-only",
+            )
+
+        def retrieve_evidence(self, db, project_slug, question, limit=15, document_id=None):
+            from app.schemas.agent import EvidencePack
+
+            return EvidencePack(status="empty", items=[])
+
+    rag = StubRAGWithRetrieve()
+    tools = ToolRegistry()
+    tools._register_builtins(rag)
+
+    original_call_tool = tools.call_tool
+
+    def capturing_call_tool(name, args=None, *, ctx=None):
+        if name == "answer.synthesize" and args:
+            captured_tool_args.update(args)
+        return original_call_tool(name, args=args, ctx=ctx)
+
+    tools.call_tool = capturing_call_tool  # type: ignore[method-assign]
+
+    trace_store = AgentTraceStore(db)
+    executor = AgentExecutor(
+        rag=rag, tools=tools, memory=ConversationMemory(db), db=db, trace_store=trace_store
+    )
+    request = AgentQueryRequest(
+        project_slug="demo",
+        query="现在展开第二张，但不要重复第一张的内容。",
+        session_id="s_anchor",
+    )
+    response = executor.execute(request)
+
+    assert response.status == "completed"
+    assert "evidence_pack" in captured_tool_args, (
+        f"synthesize tool args keys: {list(captured_tool_args.keys())}"
+    )
+    ep = captured_tool_args["evidence_pack"]
+    items = ep.get("items") or []
+    assert any(
+        item.get("source_stage") == "session_table_anchor"
+        and "C22/CMAP" in item.get("excerpt", "")
+        for item in items
+    ), f"锚点必须注入空检索结果，got items={items}"
+
+
+def test_merge_table_anchor_evidence_injects_anchors_and_dedupes() -> None:
+    """会话锚点注入为补充证据；与已有证据重复的摘录不重复注入。"""
+    evidence_pack = {
+        "items": [
+            {
+                "index": 0,
+                "document_id": "doc-1",
+                "evidence_kind": "table",
+                "excerpt": "| C36 | 1.12 |",
+                "score": 0.95,
+            }
+        ]
+    }
+    anchors = [
+        {
+            "excerpt": "| C22/CMAP | 1.80 | 0.74 | 3.72 | 2.09 |",
+            "document_id": "doc-1",
+            "page_label": "31",
+            "table_id": "table-3",
+            "turn_index": 1,
+        },
+        # 与既有证据相同 → 跳过
+        {"excerpt": "| C36 | 1.12 |", "document_id": "doc-1", "turn_index": 0},
+        # 空摘录 → 跳过
+        {"excerpt": "", "document_id": "doc-1", "turn_index": 0},
+    ]
+
+    augmented = AgentExecutor._merge_table_anchor_evidence(evidence_pack, anchors)
+
+    items = augmented["items"]
+    assert len(items) == 2
+    injected = items[1]
+    assert injected["index"] == 1
+    assert injected["evidence_kind"] == "table"
+    assert injected["source_stage"] == "session_table_anchor"
+    assert injected["support_hint"] == "contextual"
+    assert injected["score"] == 0.9
+    assert injected["excerpt"] == "| C22/CMAP | 1.80 | 0.74 | 3.72 | 2.09 |"
+    assert injected["document_id"] == "doc-1"
+    assert injected["page_label"] == "31"
+    assert injected["table_id"] == "table-3"
+
+
+def test_merge_table_anchor_evidence_no_anchors_keeps_pack_unchanged() -> None:
+    """无锚点时空跑：原证据包原样返回（字段共享但 items 一致）。"""
+    evidence_pack = {
+        "items": [
+            {
+                "index": 0,
+                "document_id": "doc-1",
+                "evidence_kind": "paragraph",
+                "excerpt": "prose",
+                "score": 0.8,
+            }
+        ]
+    }
+    augmented = AgentExecutor._merge_table_anchor_evidence(evidence_pack, [])
+    assert augmented["items"] == evidence_pack["items"]
 
 
 def test_table_evidence_items_are_added_to_synthesis_citations() -> None:

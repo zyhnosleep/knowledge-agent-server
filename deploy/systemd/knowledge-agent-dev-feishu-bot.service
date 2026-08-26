@@ -1,0 +1,18 @@
+[Unit]
+Description=Knowledge Agent dev Feishu bot (long connection)
+After=network-online.target knowledge-agent-dev-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/knowledge-agent-dev
+EnvironmentFile=%h/knowledge-agent-dev/runtime/app.env
+Environment=PYTHONPATH=%h/knowledge-agent-dev/src
+# 启动期失败（网络/机器人信息不可得）退出码 1 → on-failure 拉起重试
+ExecStart=%h/knowledge-agent-dev/.venv/bin/python -m app.services.feishu_bot.entry
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -21,7 +21,7 @@
 
 | 资源 | 开发环境 | 测试环境 |
 |---|---|---|
-| 服务器目录 | `/home/zhangyh/knowledge-agent-dev` | `/home/zhangyh/knowledge-agent-test` |
+| 服务器目录 | `/home/<user>/knowledge-agent-dev` | `/home/<user>/knowledge-agent-test` |
 | API 服务 | `knowledge-agent-dev-api` | `knowledge-agent-test-api` |
 | Ollama 服务 | `knowledge-agent-dev-ollama` | `knowledge-agent-test-ollama` |
 | PostgreSQL 数据库 | `knowledge_agent_dev` | `knowledge_agent_test` |

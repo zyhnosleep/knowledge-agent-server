@@ -392,15 +392,15 @@ $env:PYTHONPATH='src'
 
 **Files/Environment:**
 
-- Server: 192.168.31.20 / SSH alias llm-wiki-server
+- Server: <server-ip> / SSH alias <server-host>
 - Working directory: ~/knowledge-agent-dev
-- Candidate API（服务器内执行评测时）：http://127.0.0.1:8002；从内网主机预检时对应 http://192.168.31.20:8002
+- Candidate API（服务器内执行评测时）：http://127.0.0.1:8002；从内网主机预检时对应 http://<server-ip>:8002
 - Active/old baseline: http://127.0.0.1:8001，只读，不修改
 - Script: scripts/evaluate_agent_full.py
 
 - [ ] **Step 1: 用户同步后执行服务器预检**
 
-确认服务加载的是 candidate 代码和 candidate parse_version_map，并记录 active/candidate 身份；评测请求只能指向 `192.168.31.20:8002`，不得误指向 `:8001`；不执行 active pointer 切换，不重建 GPU1 数据。
+确认服务加载的是 candidate 代码和 candidate parse_version_map，并记录 active/candidate 身份；评测请求只能指向 `<server-ip>:8002`，不得误指向 `:8001`；不执行 active pointer 切换，不重建 GPU1 数据。
 
 - [ ] **Step 2: 运行完整 Agent 评测**
 
