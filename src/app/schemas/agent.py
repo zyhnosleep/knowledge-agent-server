@@ -49,6 +49,22 @@ class AgentQueryRequest(BaseModel):
     query: str  # 用户查询内容（必填）
     session_id: str | None = None  # 会话 ID（可空；为空时由服务端创建新会话）
     document_id: str | None = None  # 限定检索范围的文档 ID（可空）
+    compare_document_ids: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description=(
+            "Optional explicit comparison scope. When provided, retrieval is "
+            "strictly limited to these 1-5 ready documents."
+        ),
+    )
+    compare_dimensions: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description=(
+            "Optional comparison dimensions. Empty means the bounded default "
+            "dimension set is used."
+        ),
+    )
     constraints: AgentConstraints = Field(default_factory=AgentConstraints)  # 执行约束（默认取 AgentConstraints 默认值）
 
 
@@ -177,6 +193,7 @@ class AgentQueryResponse(BaseModel):
     trace_id: str | None = None  # 轨迹 ID（可空）
     answer_provider: str = "local"  # 生成回答的模型提供商（默认 "local"）
     answer_model: str = "local-fallback"  # 生成回答的模型名（默认 "local-fallback"）
+    comparison: "ComparisonPack | None" = None
 
 
 class EvidenceItem(BaseModel):
@@ -224,6 +241,68 @@ class EvidenceItem(BaseModel):
     evidence_kind: str | None = None  # 证据种类（可空）
     source_stage: str = "unknown"  # 产出该证据的检索路径（默认 "unknown"）
     support_hint: str = "weak"  # 支持程度提示（默认 "weak"）
+    comparison_paper_id: str | None = None
+    comparison_dimension: str | None = None
+
+
+COMPARISON_DIMENSIONS: tuple[str, ...] = (
+    "method/architecture",
+    "retrieval unit/data representation",
+    "training objective",
+    "datasets/tasks",
+    "metrics/results",
+    "limitations/use cases",
+)
+
+
+class ComparisonPaper(BaseModel):
+    document_id: str
+    title: str
+    ordinal: int = 0
+
+
+class ComparisonEvidenceCell(BaseModel):
+    paper_id: str
+    paper_title: str
+    dimension: str
+    status: Literal["supported", "missing", "conflict"] = "missing"
+    evidence_indexes: list[int] = Field(default_factory=list)
+    citation_indexes: list[int] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    notes: list[str] = Field(default_factory=list)
+
+
+class ComparisonEdge(BaseModel):
+    id: str | None = None
+    source_type: str
+    source_id: str
+    relation_type: str
+    target_type: str
+    target_id: str
+    document_id: str | None = None
+    parse_version: str | None = None
+    evidence_chunk_id: str | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class ComparisonPack(BaseModel):
+    mode: Literal["cross_paper", "intra_paper", "candidate_selection"] = "cross_paper"
+    explicit_scope: bool = False
+    papers: list[ComparisonPaper] = Field(default_factory=list)
+    dimensions: list[str] = Field(default_factory=list)
+    cells: list[ComparisonEvidenceCell] = Field(default_factory=list)
+    edges: list[ComparisonEdge] = Field(default_factory=list)
+    missing_cells: list[str] = Field(default_factory=list)
+    conflict_cells: list[str] = Field(default_factory=list)
+    candidate_document_ids: list[str] = Field(default_factory=list)
+    status: Literal["ready", "partial", "needs_selection"] = "ready"
+
+
+# ``AgentQueryResponse`` is declared before the comparison models for API
+# documentation readability.  Resolve that forward reference once the models
+# are available so non-null comparison payloads validate on every Pydantic
+# version used by the service and test suite.
+AgentQueryResponse.model_rebuild()
 
 
 class TableFactEvidence(BaseModel):
@@ -294,6 +373,7 @@ class EvidencePack(BaseModel):
     inventory: list[TableCoverage] = Field(default_factory=list)
     coverage_status: str = "unknown"  # complete | partial | unknown
     coverage_missing_tables: list[str] = Field(default_factory=list)
+    comparison: ComparisonPack | None = None
 
 
 class ToolSpec(BaseModel):

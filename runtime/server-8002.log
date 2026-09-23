@@ -1,0 +1,19 @@
+INFO:     127.0.0.1:51675 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61616 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60619 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55667 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63304 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58994 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63909 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57988 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56400 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50874 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58185 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53385 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53394 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58643 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63046 - "POST /api/agent/query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51850 - "GET /health HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:51851 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51731 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51737 - "GET /api/documents?project_slug=internal-research&limit=5 HTTP/1.1" 200 OK

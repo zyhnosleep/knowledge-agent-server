@@ -1,7 +1,8 @@
 """模型就绪状态检查：探测配置的 Ollama 模型是否可用/已加载。
 
 本模块提供 :class:`ModelReadiness`，用于健康检查与诊断——判断配置的
-生成/嵌入模型在 Ollama 服务中的就绪状态，而不对模型造成加载负担。
+本地 Ollama 模型，或远程 DeepSeek/Qwen API 是否已配置，
+而不对模型造成加载负担或消耗 API 额度。
 
 探测方式：调用 Ollama 的两个轻量只读端点——
 - ``GET /api/tags``：列出服务端已知的模型（可部署的模型集合）；
@@ -77,31 +78,109 @@ class ModelReadiness:
             return result
 
     def _probe(self) -> dict[str, Any]:
-        """探测一次 Ollama 端点，并汇总各配置模型的就绪状态。"""
-        runtime = self._probe_endpoint(self._settings.ollama_generation_base_url)
+        """探测一次运行时并汇总各配置模型的就绪状态。
+
+        OpenAI-compatible embedding providers intentionally use a
+        configuration-only check.  Calling ``/embeddings`` here would consume
+        provider quota and would not be portable across vendors; the first
+        real ingestion/query call remains the authoritative connectivity check.
+        """
+        generation_provider = str(
+            getattr(self._settings, "generation_provider", "ollama")
+        ).strip().lower()
+        embedding_provider = self._settings.active_embedding_provider
+
         # 分别评估生成模型与嵌入模型；metadata（context_length / dimensions）
-        # 一并带入，便于前端展示模型能力。
-        profiles = {
-            "generation": self._model_status(
-                runtime,
+        # 一并带入，便于前端展示模型能力。远程 provider 只做配置检查。
+        if generation_provider == "deepseek":
+            generation = self._remote_generation_status()
+            generation_runtime = None
+        else:
+            generation_runtime = self._probe_endpoint(
+                self._settings.ollama_generation_base_url
+            )
+            generation = self._model_status(
+                generation_runtime,
                 self._settings.ollama_generation_model,
                 context_length=self._settings.ollama_generation_context_length,
-            ),
-            "embedding": self._model_status(
-                runtime,
+            )
+        if embedding_provider == "openai-compatible":
+            embedding = self._remote_embedding_status()
+        else:
+            # If generation is remote, the embedding model may still live on a
+            # separate local Ollama endpoint, so probe that endpoint explicitly.
+            embedding_runtime = generation_runtime
+            if embedding_runtime is None or (
+                self._settings.ollama_embedding_base_url.rstrip("/")
+                != self._settings.ollama_generation_base_url.rstrip("/")
+            ):
+                embedding_runtime = self._probe_endpoint(
+                    self._settings.ollama_embedding_base_url
+                )
+            embedding = self._model_status(
+                embedding_runtime,
                 self._settings.ollama_embedding_model,
-                dimensions=self._settings.ollama_embedding_dimensions,
-            ),
+                dimensions=self._settings.active_embedding_dimensions,
+            )
+        profiles = {
+            "generation": generation,
+            "embedding": embedding,
         }
         # 总体判定：所有模型状态都属于 {ready, idle}（即均可用于推理）才算 ok，
         # 否则整体降级为 degraded（例如模型缺失或服务不可达）。
-        healthy_statuses = {"ready", "idle"}
+        healthy_statuses = {"ready", "idle", "configured"}
         overall = (
             "ok"
             if all(item["status"] in healthy_statuses for item in profiles.values())
             else "degraded"
         )
         return {"status": overall, "models": profiles}
+
+    def _remote_generation_status(self) -> dict[str, Any]:
+        """Report DeepSeek generation configuration without making a call."""
+        base_url = (getattr(self._settings, "deepseek_base_url", "") or "").strip()
+        api_key = (getattr(self._settings, "deepseek_api_key", "") or "").strip()
+        result: dict[str, Any] = {
+            "provider": "deepseek",
+            "model": getattr(self._settings, "deepseek_model", "deepseek-chat"),
+            "probe": "configuration-only",
+        }
+        if not base_url or not api_key or api_key.upper() in {"CHANGE_ME", "YOUR_API_KEY"}:
+            result["status"] = "missing"
+            result["error"] = (
+                "DEEPSEEK_BASE_URL and DEEPSEEK_API_KEY are required "
+                "for the configured DeepSeek provider."
+            )
+        else:
+            result["status"] = "configured"
+        return result
+
+    def _remote_embedding_status(self) -> dict[str, Any]:
+        """Report remote embedding configuration without making a paid call."""
+        base_url = (self._settings.embedding_api_base_url or "").strip()
+        api_key = (self._settings.embedding_api_key or "").strip()
+        result: dict[str, Any] = {
+            "provider": self._settings.active_embedding_provider,
+            "model": self._settings.active_embedding_model,
+            "dimensions": self._settings.active_embedding_dimensions,
+            "probe": "configuration-only",
+        }
+        if (
+            not base_url
+            or not api_key
+            or api_key.upper() in {"CHANGE_ME", "YOUR_API_KEY"}
+        ):
+            result["status"] = "missing"
+            result["error"] = (
+                "EMBEDDING_API_BASE_URL and EMBEDDING_API_KEY are required "
+                "for the configured remote embedding provider."
+            )
+        else:
+            # ``configured`` means credentials and endpoint are present; it is
+            # deliberately distinct from ``ready`` because no quota-consuming
+            # embedding request was made by the health check.
+            result["status"] = "configured"
+        return result
 
     def _probe_endpoint(self, base_url: str) -> dict[str, Any]:
         """调用 /api/tags 与 /api/ps 两个只读端点，返回可用/已加载模型集合。

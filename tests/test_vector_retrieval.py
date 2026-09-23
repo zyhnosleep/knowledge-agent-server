@@ -432,6 +432,63 @@ def test_search_source_chunks_prefers_sqlite_vec_hits(monkeypatch) -> None:
     assert [context.citation.chunk_id for context in contexts] == ["semantic"]
 
 
+def test_search_source_chunks_page_backstop_recovers_exact_phrase(monkeypatch) -> None:
+    """A page-level exact term survives a misleading embedding top-k."""
+    db = make_session()
+    db.add(Project(id="p1", slug="demo", name="Demo"))
+    db.add(
+        Document(
+            id="d1",
+            project_id="p1",
+            title="RAG paper",
+            file_name="rag.pdf",
+            sha256="abc",
+            raw_path="raw/rag.pdf",
+            status="ready",
+        )
+    )
+    db.add_all(
+        [
+            DocumentChunk(
+                id="vector-page",
+                document_id="d1",
+                ordinal=0,
+                text="A generic retrieval discussion without the requested formulation.",
+                page_label="7",
+                embedding=None,
+            ),
+            DocumentChunk(
+                id="exact-page",
+                document_id="d1",
+                ordinal=1,
+                text="RAG-Sequence uses one document for the whole sequence, whereas RAG-Token can select a different document for each token.",
+                page_label="3",
+                embedding=None,
+            ),
+        ]
+    )
+    db.commit()
+
+    class MisleadingVectorStore:
+        def search(self, embedding: list[float], *, limit: int, document_ids: list[str] | None = None) -> list[VectorHit]:
+            return [VectorHit(chunk_id="vector-page", distance=0.0)]
+
+    import app.services.search as search_module
+
+    monkeypatch.setattr(search_module, "get_vector_store", lambda _db: MisleadingVectorStore())
+    service = QueryService(db)
+    service.ollama = EmbedOnlyOllama([1.0, 0.0])
+
+    contexts = service._search_source_chunks(
+        "What is the difference between RAG-Sequence and RAG-Token?",
+        "p1",
+        ["d1"],
+        limit=5,
+    )
+
+    assert "exact-page" in [context.citation.chunk_id for context in contexts]
+
+
 def test_search_source_chunks_passes_shadow_map_to_vector_store(monkeypatch) -> None:
     db = make_session()
     db.add(Project(id="p1", slug="demo", name="Demo"))

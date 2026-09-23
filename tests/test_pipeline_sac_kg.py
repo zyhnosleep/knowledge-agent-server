@@ -19,6 +19,7 @@ from app.models.records import (
     RunType,
 )
 from app.services.ai import DocumentAnalysisPayload, DocumentExtraction, ExtractedClaim, GeneratedTriple, HeadAnalysisPayload, VerificationPayload
+from app.services import pipeline as pipeline_module
 from app.services.parser import ParsedChunk, ParsedDocument
 from app.services.pipeline import IngestionPipeline
 
@@ -80,10 +81,51 @@ class FakeEmbeddingOllama:
         return [[1.0, 0.0] for _ in texts]
 
 
+class FakeDeepSeekStructured:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate_structured(self, schema, *, system_prompt: str, user_prompt: str, model: str | None = None):
+        self.calls.append(
+            {
+                "schema": schema,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "model": model,
+            }
+        )
+        return HeadAnalysisPayload(head_entity="DeepSeek head", summary="remote", triples=[])
+
+
 def make_session() -> Session:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)()
+
+
+def test_sac_kg_structured_generation_switches_to_deepseek_without_using_ollama(monkeypatch) -> None:
+    db = make_session()
+    pipeline = IngestionPipeline(db)
+    fake_deepseek = FakeDeepSeekStructured()
+    pipeline.deepseek = fake_deepseek
+
+    class ExplodingOllama:
+        def generate_structured(self, *args, **kwargs):
+            raise AssertionError("Ollama generation must not be used for DeepSeek SAC-KG mode")
+
+    pipeline.ollama = ExplodingOllama()
+    monkeypatch.setattr(pipeline_module.settings, "generation_provider", "deepseek")
+    monkeypatch.setattr(pipeline_module.settings, "deepseek_model", "deepseek-test")
+
+    result = pipeline._generate_sac_kg_structured(
+        HeadAnalysisPayload,
+        system_prompt="system",
+        user_prompt="user",
+        model="ignored-local-model",
+    )
+
+    assert result.head_entity == "DeepSeek head"
+    assert fake_deepseek.calls[0]["model"] == "deepseek-test"
 
 
 

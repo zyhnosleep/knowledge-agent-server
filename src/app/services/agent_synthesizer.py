@@ -31,7 +31,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
-from app.services.ai import OllamaClient
+from app.services.ai import DeepSeekClient, OllamaClient
 from app.services.agent_model_router import InferenceTarget
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
-from app.services.ai import OllamaClient
+from app.services.ai import DeepSeekClient, OllamaClient
 from app.services.agent_model_router import InferenceTarget
 
 logger = logging.getLogger(__name__)
@@ -87,18 +87,17 @@ class SynthesisPayload(BaseModel):
 
 
 class AgentSynthesizer:
-    """Evidence synthesis using Ollama, an external API, or safe fallback.
+    """Evidence synthesis using Ollama, DeepSeek, or safe fallback.
 
-    Allowed synthesis providers are ``auto``, ``external_api``, and ``local``.
-    When the provider is ``auto``, the external API is only used when
-    ``EXTERNAL_API_ENABLED=true`` and an API key is configured.
+    Allowed synthesis providers are ``auto``, ``deepseek``, ``external_api``,
+    and ``local``. ``external_api`` remains for backwards compatibility.
 
     External synthesis prompts the model to synthesize from evidence
     (not concatenate paragraphs) and to cite only from provided citations.
     """
 
     # 合法的 synthesis provider：auto 会根据配置自动选择。
-    VALID_PROVIDERS = {"auto", "external_api", "local", "ollama"}
+    VALID_PROVIDERS = {"auto", "deepseek", "external_api", "local", "ollama"}
 
     # evidence_pack 在 prompt 中的上限：最多 10 条，每条摘录最多 300 字符。
     MAX_EVIDENCE_PACK_ITEMS = 10
@@ -163,6 +162,16 @@ class AgentSynthesizer:
                 evidence_pack=evidence_pack,
                 narrow_context=narrow_context,
             )
+        elif provider == "deepseek":
+            result = self._deepseek_synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                narrow_context=narrow_context,
+            )
         else:
             # external_api path
             result = self._external_synthesize(
@@ -186,10 +195,63 @@ class AgentSynthesizer:
             evidence_pack=evidence_pack,
             synthesized_answer=result["answer_markdown"],
             warnings=result.get("warnings", []),
+            fallback_provider=(
+                result.get("provider")
+                if result.get("provider") == "deepseek"
+                else None
+            ),
+            fallback_model=(
+                result.get("model")
+                if result.get("provider") == "deepseek"
+                else None
+            ),
             guard_meta=guard_meta,
         )
         # 9.8：需求侧期望状态随结果透出（直通 trace 可审计）
         if guard is not None:
+            # In a remote-only deployment the RAG layer intentionally skips
+            # local Ollama generation and returns a degraded evidence marker.
+            # Falling back to that marker plus raw excerpts after a fidelity
+            # rejection is worse than asking DeepSeek once to repair the
+            # rejected answer. Keep this retry scoped to the remote degraded
+            # path; local synthesis retains the historical hard fallback.
+            if (
+                result.get("provider") == "deepseek"
+                and self._is_degraded_rag_answer(rag_answer)
+            ):
+                revised = self._revise_deepseek_after_guard(
+                    query=query,
+                    route=route,
+                    conversation_summary=conversation_summary,
+                    rag_answer=rag_answer,
+                    citations=citations,
+                    evidence_pack=evidence_pack,
+                    narrow_context=narrow_context,
+                    rejected_answer=str(result.get("answer_markdown") or ""),
+                    guard_warnings=guard.get("warnings", []),
+                )
+                if revised is not None:
+                    revised_guard_meta: dict[str, Any] = {}
+                    revised_guard = self._apply_fidelity_guards(
+                        question=query,
+                        rag_answer=rag_answer,
+                        citations=citations,
+                        evidence_pack=evidence_pack,
+                        synthesized_answer=revised["answer_markdown"],
+                        warnings=revised.get("warnings", []),
+                        fallback_provider=revised.get("provider"),
+                        fallback_model=revised.get("model"),
+                        guard_meta=revised_guard_meta,
+                    )
+                    if revised_guard is None:
+                        revised.setdefault("warnings", []).append(
+                            "DeepSeek synthesis was revised once after a fidelity guard."
+                        )
+                        revised.setdefault(
+                            "expected_facts_status",
+                            revised_guard_meta.get("expected_facts_status"),
+                        )
+                        return revised
             guard.setdefault(
                 "expected_facts_status", guard_meta.get("expected_facts_status")
             )
@@ -275,7 +337,11 @@ class AgentSynthesizer:
                     event_sink("token", {"delta": delta, "model": model})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Streaming local Ollama synthesis failed: %s", exc)
-            result = self._local_fallback(rag_answer, citations)
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+            )
             result["warnings"].append(
                 f"Local Ollama synthesis failed; using evidence fallback: {exc}"
             )
@@ -390,29 +456,113 @@ class AgentSynthesizer:
         if configured == "external_api":
             return "external_api"
 
-        # "auto": prefer external API when available, otherwise use the
-        # existing local Ollama generation path.  The explicit ``ollama``
-        # provider is reserved for structured synthesis via
-        # ``_ollama_synthesize``.
-        if self._settings.external_api_enabled and bool(self._settings.external_api_key):
+        if configured == "deepseek":
+            return "deepseek"
+
+        # "auto": prefer explicitly configured DeepSeek, then the legacy
+        # external API path, otherwise use the existing local Ollama path.
+        generation_provider = str(
+            getattr(self._settings, "generation_provider", "ollama")
+        ).strip().lower()
+        deepseek_key = getattr(self._settings, "deepseek_api_key", None)
+        if generation_provider == "deepseek" and self._has_secret(deepseek_key):
+            return "deepseek"
+        if self._settings.external_api_enabled and self._has_secret(
+            self._settings.external_api_key
+        ):
             return "external_api"
         return "local"
 
+    @staticmethod
+    def _has_secret(value: str | None) -> bool:
+        """Treat example placeholders as missing credentials."""
+        return bool(value and value.strip() and value.strip().upper() not in {
+            "CHANGE_ME",
+            "YOUR_API_KEY",
+        })
+
+    @staticmethod
+    def _fallback_label(evidence_pack: dict[str, Any] | None) -> str:
+        """Return an auditable name for the fallback actually being used."""
+        if isinstance((evidence_pack or {}).get("comparison"), dict):
+            return "structured comparison matrix fallback"
+        return "grounded RAG fallback"
+
+    @staticmethod
+    def _is_degraded_rag_answer(answer: str) -> bool:
+        """Whether the RAG layer returned a remote-only failure marker.
+
+        A degraded marker is not a semantic draft: it is followed by copied
+        evidence excerpts and may contain unrelated anchors or table labels.
+        It is therefore suitable as audit context, but not as a fidelity
+        baseline for deciding whether a remote synthesis must be discarded.
+        """
+        degraded_markers = (
+            "llm 生成暂时失败",
+            "llm generation temporarily failed",
+            "以下为原始检索证据",
+            "following is raw retrieval evidence",
+            "根据表格证据，下面逐项列出",
+            "以下内容可直接作为答案依据",
+        )
+        folded = str(answer or "").casefold()
+        return any(marker in folded for marker in degraded_markers)
+
     def _local_fallback(
-        self, rag_answer: str, citations: list[dict[str, Any]]
+        self,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """安全回退：当本地/外部综合失败或没有证据时，直接返回 RAG 原答案。
 
         这不是“agent 再生成一遍”的路径，而是兜底，确保用户始终有答案可看。
         """
+        answer = str(rag_answer or "")
+        # A comparison fallback must *always* remain structured.  Reusing the
+        # RAG answer is unsafe here: ``rag.answer`` is allowed to return a
+        # legacy flat draft (or a very large table dump), and that draft can
+        # silently mix the two paper sides after a DeepSeek parse/transport
+        # failure.  The matrix is the authoritative, side-aware fallback and
+        # already carries the missing/conflict markers required by v1.
+        comparison = (evidence_pack or {}).get("comparison")
+        if comparison:
+            try:
+                from app.services.comparison import ComparisonService
+
+                items = (evidence_pack or {}).get("items") or []
+                structured = ComparisonService.render_draft(comparison, items)
+                if structured.strip():
+                    answer = structured
+            except Exception:  # pragma: no cover - defensive fallback only
+                logger.exception("Failed to render comparison fallback")
         return {
-            "answer_markdown": rag_answer,
+            "answer_markdown": answer,
             "cited_indexes": list(range(len(citations))),
             "warnings": [],
             "confidence": 1.0,
             "provider": "local",
             "model": "local-fallback",
         }
+
+    def _comparison_fallback(
+        self,
+        *,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None,
+        warning: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        result = self._local_fallback(rag_answer, citations, evidence_pack)
+        if provider:
+            result["provider"] = provider
+        if model:
+            result["model"] = model
+        if warning:
+            result.setdefault("warnings", []).append(warning)
+        return result
 
     def _local_synthesize(
         self,
@@ -555,6 +705,8 @@ class AgentSynthesizer:
             )
         table_facts_text = self._format_table_facts_section(evidence_pack)
         precision_rules = self._precision_rules(route)
+        comparison_text = self._format_comparison_section(evidence_pack, citations)
+        comparison_rules = self._comparison_rules(evidence_pack)
 
         system_prompt = (
             "You are an evidence-grounded knowledge-base assistant. Answer the user's "
@@ -567,6 +719,7 @@ class AgentSynthesizer:
             "what cannot be established. Evidence-pack item labels are retrieval metadata, "
             "not citation indexes; cite only indexes listed under Citation excerpts.\n"
             + precision_rules
+            + comparison_rules
         )
         user_prompt = (
             f"User question: {query}\n"
@@ -576,6 +729,7 @@ class AgentSynthesizer:
             f"Citation excerpts:\n{evidence_text}\n\n"
             + (f"{table_facts_text}\n\n" if table_facts_text else "")
             + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + (f"{comparison_text}\n\n" if comparison_text else "")
             + precision_rules
             + "\nReturn a concise final answer grounded only in this evidence, preserving every "
             "supported exact value and term, and match the question's language."
@@ -708,6 +862,173 @@ class AgentSynthesizer:
         return header + "\n" + "\n".join(lines) + suffix
 
     @staticmethod
+    def _format_comparison_section(
+        evidence_pack: dict[str, Any] | None,
+        citations: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Render the side-aware comparison matrix for synthesis prompts.
+
+        The ordinary evidence-pack section is intentionally flat for legacy
+        RAG calls.  Comparison synthesis receives this additional bounded
+        section so a model can never mistake evidence from the left paper for
+        evidence from the right paper.  Cell statuses are authoritative:
+        ``missing`` and ``conflict`` must be reflected rather than filled in
+        from model priors.
+        """
+        if not evidence_pack:
+            return ""
+        comparison = evidence_pack.get("comparison")
+        if not isinstance(comparison, dict):
+            return ""
+        papers = comparison.get("papers") or []
+        cells = comparison.get("cells") or []
+        items = evidence_pack.get("items") or []
+        citations = citations or []
+
+        paper_labels: dict[str, str] = {}
+        for paper in papers:
+            if not isinstance(paper, dict):
+                continue
+            paper_id = str(paper.get("document_id") or "")
+            if paper_id:
+                paper_labels[paper_id] = str(
+                    paper.get("title") or paper_id
+                )
+
+        def item_for(index: Any) -> dict[str, Any] | None:
+            try:
+                numeric = int(index)
+            except (TypeError, ValueError):
+                return None
+            if 0 <= numeric < len(items) and isinstance(items[numeric], dict):
+                return items[numeric]
+            # Some older EvidencePack producers expose one-based ``index``
+            # values.  Resolve that representation without changing the wire
+            # schema used by the current producer.
+            for candidate in items:
+                if isinstance(candidate, dict) and candidate.get("index") == numeric:
+                    return candidate
+            return None
+
+        def citation_indexes_for(cell: dict[str, Any], refs: list[Any]) -> list[int]:
+            values: list[int] = []
+            raw = cell.get("citation_indexes") or []
+            for value in raw:
+                try:
+                    candidate = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= candidate < len(citations) and candidate not in values:
+                    values.append(candidate)
+            # Fall back to source identity matching when the matrix was built
+            # before citation indexes were materialized.
+            paper_id = str(cell.get("paper_id") or "")
+            for ref in refs:
+                item = item_for(ref)
+                if not item:
+                    continue
+                chunk_id = item.get("chunk_id")
+                for idx, citation in enumerate(citations):
+                    if idx in values:
+                        continue
+                    if (
+                        str(citation.get("document_id") or "") == paper_id
+                        and (not chunk_id or str(citation.get("chunk_id") or "") == str(chunk_id))
+                    ):
+                        values.append(idx)
+            return values
+
+        lines = [
+            "Comparison evidence matrix (authoritative; page-level evidence only):",
+            f"Mode: {comparison.get('mode', 'cross_paper')}; "
+            f"scope={'explicit' if comparison.get('explicit_scope') else 'auto-routed'}",
+        ]
+        if paper_labels:
+            lines.append(
+                "Papers: "
+                + " | ".join(
+                    f"{index + 1}. {title} (paper_id={paper_id})"
+                    for index, (paper_id, title) in enumerate(paper_labels.items())
+                )
+            )
+        if not cells:
+            if comparison.get("status") == "needs_selection":
+                lines.append(
+                    "Status: needs_selection — no cross-paper conclusion may be generated."
+                )
+            return "\n".join(lines)
+
+        lines.append("Cells (one row per paper × dimension):")
+        for cell in cells[:60]:
+            if not isinstance(cell, dict):
+                continue
+            paper_id = str(cell.get("paper_id") or "")
+            paper_title = str(
+                cell.get("paper_title") or paper_labels.get(paper_id) or paper_id
+            )
+            dimension = str(cell.get("dimension") or "")
+            status = str(cell.get("status") or "missing")
+            refs = list(cell.get("evidence_indexes") or [])
+            citation_indexes = citation_indexes_for(cell, refs)
+            citation_hint = (
+                ", ".join(f"citation[{idx}]" for idx in citation_indexes)
+                if citation_indexes
+                else "no citation"
+            )
+            lines.append(
+                f"- paper={paper_id} ({paper_title}); dimension={dimension}; "
+                f"status={status}; {citation_hint}"
+            )
+            if status in {"missing", "conflict"}:
+                notes = "; ".join(str(note) for note in (cell.get("notes") or []))
+                lines.append(
+                    f"  -> {status.upper()}: {notes or 'do not infer or merge across papers.'}"
+                )
+                continue
+            # Include at most two short excerpts per cell.  The citation
+            # excerpt block remains the canonical text; this line is a side /
+            # dimension binding, not a second citation namespace.
+            for ref in refs[:2]:
+                item = item_for(ref)
+                if not item:
+                    continue
+                excerpt = re.sub(r"\s+", " ", str(item.get("excerpt") or "")).strip()
+                if len(excerpt) > 240:
+                    excerpt = excerpt[:240] + "…"
+                if excerpt:
+                    page = item.get("page_label") or item.get("page_title") or "page ?"
+                    lines.append(
+                        f"  -> evidence-item={ref}; page={page}; "
+                        f"citation={citation_hint}; excerpt={excerpt}"
+                    )
+
+        missing = comparison.get("missing_cells") or []
+        conflicts = comparison.get("conflict_cells") or []
+        if missing:
+            lines.append("Missing cells (must be stated explicitly): " + ", ".join(map(str, missing)))
+        if conflicts:
+            lines.append("Conflict cells (report both claims and citations): " + ", ".join(map(str, conflicts)))
+        lines.append(
+            "Comparison output contract: organize the answer by dimension, keep each "
+            "paper's evidence on its own side, cite the correct paper for every claim, "
+            "and write '证据缺失/insufficient evidence' for missing cells. Never infer "
+            "a value or resolve a conflict without page evidence."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _comparison_rules(evidence_pack: dict[str, Any] | None) -> str:
+        if not isinstance((evidence_pack or {}).get("comparison"), dict):
+            return ""
+        return (
+            "Comparison rules (mandatory): treat the comparison evidence matrix as "
+            "authoritative; cover every listed dimension for every listed paper; "
+            "do not use Paper A evidence as Paper B evidence; preserve page citations; "
+            "mark missing cells and conflicts explicitly instead of guessing. "
+            "Return a structured comparison by dimension, not a flat evidence dump.\n"
+        )
+
+    @staticmethod
     def _format_table_facts_section(
         evidence_pack: dict[str, Any] | None,
     ) -> str:
@@ -835,6 +1156,8 @@ class AgentSynthesizer:
         evidence_text = "\n\n".join(evidence_parts) if evidence_parts else "(no evidence)"
         table_facts_text = self._format_table_facts_section(evidence_pack)
         precision_rules = self._precision_rules(route)
+        comparison_text = self._format_comparison_section(evidence_pack, citations)
+        comparison_rules = self._comparison_rules(evidence_pack)
 
         system_prompt = (
             "You are an evidence synthesis assistant. Your task is to synthesize "
@@ -842,6 +1165,7 @@ class AgentSynthesizer:
             "You MUST synthesize - do NOT simply concatenate paragraphs. "
             "Only cite sources that are present in the provided evidence.\n"
             + precision_rules
+            + comparison_rules
             + "\n"
             + self._answer_rules(query)
         )
@@ -853,6 +1177,7 @@ class AgentSynthesizer:
             f"RAG answer: {rag_answer}\n\n"
             f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
             + (f"{table_facts_text}\n\n" if table_facts_text else "")
+            + (f"{comparison_text}\n\n" if comparison_text else "")
             + precision_rules
             + "\nSynthesize a final answer from the above evidence. "
             "Return a JSON object with: answer_markdown, cited_indexes, warnings, confidence."
@@ -977,6 +1302,8 @@ class AgentSynthesizer:
             "" if narrow_context else self._format_evidence_pack_section(evidence_pack)
         )
         table_facts_text = self._format_table_facts_section(evidence_pack)
+        comparison_text = self._format_comparison_section(evidence_pack, citations)
+        comparison_rules = self._comparison_rules(evidence_pack)
         missing_list = ", ".join(missing[:12])
         system_prompt = (
             "You are an evidence synthesis assistant revising an incomplete answer. "
@@ -1131,6 +1458,8 @@ class AgentSynthesizer:
         evidence_pack: dict[str, Any] | None,
         synthesized_answer: str,
         warnings: list[str],
+        fallback_provider: str | None = None,
+        fallback_model: str | None = None,
         guard_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """依次执行 fidelity 守卫，任一失败返回 RAG-draft 回退，全部通过返回 None。
@@ -1150,13 +1479,43 @@ class AgentSynthesizer:
         expected_status, _ = self._expected_facts_status(question, evidence_pack)
         if guard_meta is not None:
             guard_meta["expected_facts_status"] = expected_status
-        guard = self._draft_fidelity_fallback(
-            rag_answer=rag_answer,
-            citations=citations,
+        comparison_failures = self._comparison_guard_failures(
             evidence_pack=evidence_pack,
+            citations=citations,
             synthesized_answer=synthesized_answer,
-            warnings=warnings,
         )
+        if comparison_failures:
+            return self._fidelity_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                warnings=warnings,
+                provider=fallback_provider,
+                model=fallback_model,
+                reason=(
+                    "Comparison fidelity guard failed; returned the structured evidence matrix: "
+                    + "; ".join(comparison_failures)
+                ),
+            )
+        # A comparison draft is an evidence matrix, not a prose answer.  Its
+        # excerpts intentionally contain bibliography, OCR fragments, and
+        # repeated anchors that a good synthesis should compress rather than
+        # repeat verbatim.  The side-aware comparison guard above already
+        # enforces paper/citation coverage; applying the generic draft-anchor
+        # guard here would reject grounded paraphrases and return the matrix
+        # unnecessarily.  Keep the stricter anchor check for legacy routes.
+        if isinstance((evidence_pack or {}).get("comparison"), dict):
+            guard = None
+        else:
+            guard = self._draft_fidelity_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                synthesized_answer=synthesized_answer,
+                warnings=warnings,
+                fallback_provider=fallback_provider,
+                fallback_model=fallback_model,
+            )
         if guard is not None:
             return guard
         unsupported = self._synthesis_unsupported_numbers(
@@ -1168,7 +1527,10 @@ class AgentSynthesizer:
             return self._fidelity_fallback(
                 rag_answer=rag_answer,
                 citations=citations,
+                evidence_pack=evidence_pack,
                 warnings=warnings,
+                provider=fallback_provider,
+                model=fallback_model,
                 reason=(
                     "Synthesized answer introduced numbers not supported by the evidence "
                     f"({', '.join(sorted(unsupported))}); using the RAG draft to avoid "
@@ -1180,16 +1542,34 @@ class AgentSynthesizer:
             evidence_pack=evidence_pack,
             citations=citations,
         )
-        if dropped_labels:
+        remote_degraded_draft = (
+            fallback_provider == "deepseek"
+            and self._is_degraded_rag_answer(rag_answer)
+        )
+        comparison_route = isinstance((evidence_pack or {}).get("comparison"), dict)
+        if dropped_labels and not remote_degraded_draft and not comparison_route:
             return self._fidelity_fallback(
                 rag_answer=rag_answer,
                 citations=citations,
+                evidence_pack=evidence_pack,
                 warnings=warnings,
+                provider=fallback_provider,
+                model=fallback_model,
                 reason=(
                     "Synthesized answer dropped evidence table labels "
                     f"({', '.join(sorted(dropped_labels))}); using the RAG draft to "
                     "preserve the table references."
                 ),
+            )
+        if dropped_labels and (remote_degraded_draft or comparison_route):
+            # The remote-only RAG placeholder often contains bibliography and
+            # unrelated table labels. Requiring a synthesis to repeat every
+            # one would reject a focused answer for the wrong reason. The same
+            # applies to a comparison matrix: page citations and the
+            # side-aware guard are authoritative; numeric and structured-fact
+            # guards below still enforce grounding.
+            warnings.append(
+                "Comparison/remote draft table labels were not used as a synthesis requirement."
             )
         # 9.3.2b 期望 facts 遗漏校验：draft 覆盖的 table_facts 字段
         # （value/term/unit）在合成答案中缺失 → 回退。对照结构化 facts
@@ -1204,7 +1584,10 @@ class AgentSynthesizer:
             return self._fidelity_fallback(
                 rag_answer=rag_answer,
                 citations=citations,
+                evidence_pack=evidence_pack,
                 warnings=warnings,
+                provider=fallback_provider,
+                model=fallback_model,
                 reason=(
                     "Synthesized answer omitted expected fact fields "
                     f"({', '.join(sorted(missing_fields))}); using the RAG draft to "
@@ -1213,18 +1596,129 @@ class AgentSynthesizer:
             )
         return None
 
+    @staticmethod
+    def _comparison_guard_failures(
+        *,
+        evidence_pack: dict[str, Any] | None,
+        citations: list[dict[str, Any]],
+        synthesized_answer: str,
+    ) -> list[str]:
+        """Validate the non-negotiable side/coverage invariants for v1.
+
+        This guard intentionally does not judge scientific truth.  It only
+        checks that the synthesized response still has a citation path for
+        every supported paper-side cell and that missing/conflict cells are
+        not silently presented as facts.  If the model omitted inline markers
+        altogether, the existing citation-array contract remains authoritative
+        and we do not reject the answer solely for formatting.
+        """
+        comparison = (evidence_pack or {}).get("comparison")
+        if not isinstance(comparison, dict):
+            return []
+        items = evidence_pack.get("items") or []
+        failures: list[str] = []
+        paper_ids = {
+            str(paper.get("document_id") or "")
+            for paper in (comparison.get("papers") or [])
+            if isinstance(paper, dict) and paper.get("document_id")
+        }
+
+        def source_for_ref(ref: Any) -> str:
+            try:
+                idx = int(ref)
+            except (TypeError, ValueError):
+                return ""
+            item = None
+            if 0 <= idx < len(items) and isinstance(items[idx], dict):
+                item = items[idx]
+            if item is None:
+                item = next(
+                    (
+                        candidate
+                        for candidate in items
+                        if isinstance(candidate, dict) and candidate.get("index") == idx
+                    ),
+                    None,
+                )
+            return str((item or {}).get("document_id") or "")
+
+        for cell in comparison.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            paper_id = str(cell.get("paper_id") or "")
+            dimension = str(cell.get("dimension") or "")
+            status = str(cell.get("status") or "missing")
+            refs = list(cell.get("citation_indexes") or cell.get("evidence_indexes") or [])
+            if status == "supported" and refs:
+                if not any(
+                    source_for_ref(ref) == paper_id
+                    or (
+                        isinstance(ref, int)
+                        and 0 <= ref < len(citations)
+                        and str(citations[ref].get("document_id") or "") == paper_id
+                    )
+                    for ref in refs
+                ):
+                    failures.append(f"{paper_id}:{dimension} has no same-paper citation")
+            elif status == "supported" and not refs:
+                failures.append(f"{paper_id}:{dimension} has no evidence reference")
+
+        answer_lower = str(synthesized_answer or "").casefold()
+        if comparison.get("missing_cells"):
+            missing_tokens = ("missing", "insufficient evidence", "证据缺失", "缺少证据", "无法确定")
+            if not any(token in answer_lower for token in missing_tokens):
+                failures.append("missing cells were not acknowledged")
+        if comparison.get("conflict_cells"):
+            conflict_tokens = ("conflict", "contradict", "冲突", "不一致", "差异")
+            if not any(token in answer_lower for token in conflict_tokens):
+                failures.append("conflict cells were not acknowledged")
+
+        # When inline markers are present, every selected paper must have at
+        # least one marker resolving to that paper.  This catches the common
+        # failure where the model answers both sides but cites only Paper A.
+        marker_indexes = [
+            int(value)
+            for value in re.findall(r"\[(\d+)\]", str(synthesized_answer or ""))
+            if 0 <= int(value) < len(citations)
+        ]
+        if marker_indexes and len(paper_ids) >= 2:
+            cited_papers = {
+                str(citations[index].get("document_id") or "")
+                for index in marker_indexes
+            }
+            for paper_id in sorted(paper_ids):
+                if paper_id not in cited_papers:
+                    failures.append(f"paper {paper_id} has no inline citation")
+        return failures[:8]
+
     def _fidelity_fallback(
         self,
         *,
         rag_answer: str,
         citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
         warnings: list[str],
         reason: str,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """构造 RAG-draft 回退结果，保留原 warnings 并追加守卫失败原因。"""
-        fallback = self._local_fallback(rag_answer, citations)
+        fallback = self._local_fallback(rag_answer, citations, evidence_pack)
+        # A rejected DeepSeek synthesis is still a DeepSeek request whose
+        # grounded draft was retained.  Do not report it as an Ollama/local
+        # model fallback: that makes provider regressions impossible to audit
+        # and incorrectly suggests the local model was called.
+        if provider:
+            fallback["provider"] = provider
+            fallback["model"] = model or fallback["model"]
         fallback["warnings"] = list(warnings)
         fallback["warnings"].append(reason)
+        if provider == "deepseek":
+            fallback["warnings"].append(
+                "DeepSeek synthesis was rejected by a fidelity guard; returned the "
+                + self._fallback_label(evidence_pack)
+                + "."
+            )
         return fallback
 
     @staticmethod
@@ -1651,6 +2145,12 @@ class AgentSynthesizer:
         （``\\s*`` 支持 "Table7"，``(?:\\d+(?:\\.\\d+)?)`` 覆盖 "Table 7.5"）。
         """
         text = re.sub(r"\[\s*\d+\s*\]", " ", answer_markdown)
+        # Paper identifiers such as ``arXiv:2401.15884`` are metadata, not
+        # scientific measurements.  The suffix would otherwise be parsed as a
+        # fabricated number (``15884``) when a synthesis repeats a paper title.
+        # Allow a title stem/underscore immediately before the identifier
+        # (e.g. ``selfrag_2310.11511``) as well as the usual ``arXiv:`` form.
+        text = re.sub(r"\d{4}\.\d{4,6}", " ", text)
         text = re.sub(
             r"\btable\s*(?:s\s*)?\d+(?:\.\d+)?\b",
             " ",
@@ -1708,6 +2208,8 @@ class AgentSynthesizer:
         evidence_pack: dict[str, Any] | None,
         synthesized_answer: str,
         warnings: list[str],
+        fallback_provider: str | None = None,
+        fallback_model: str | None = None,
     ) -> dict[str, Any] | None:
         """Return a RAG-draft fallback when a synthesis drops draft-covered anchors.
 
@@ -1718,6 +2220,16 @@ class AgentSynthesizer:
         are extractable, or the synthesis covers at least as many as the draft,
         ``None`` is returned and the synthesized answer is kept.
         """
+        # In remote-only deployments the RAG layer may intentionally return a
+        # raw-evidence placeholder instead of attempting local Ollama.  That
+        # placeholder is not a semantic draft: its copied evidence can contain
+        # unrelated anchors (for example bibliography terms) that a valid,
+        # concise DeepSeek answer should not be forced to repeat.  Keep the
+        # provider-uniform numeric/table guards below, but do not reject the
+        # remote synthesis solely because it does not echo those placeholder
+        # anchors.
+        if self._is_degraded_rag_answer(rag_answer):
+            return None
         anchors = self._extract_evidence_anchors(evidence_pack, citations)
         if not anchors:
             return None
@@ -1730,7 +2242,10 @@ class AgentSynthesizer:
         return self._fidelity_fallback(
             rag_answer=rag_answer,
             citations=citations,
+            evidence_pack=evidence_pack,
             warnings=warnings,
+            provider=fallback_provider,
+            model=fallback_model,
             reason=(
                 "Synthesized answer lost evidence-anchor coverage present in the RAG draft "
                 f"(draft covered {draft_covered}/{len(anchors)} anchors, synthesis covered "
@@ -1738,6 +2253,333 @@ class AgentSynthesizer:
                 "evidence terms."
             ),
         )
+
+
+    def _revise_deepseek_after_guard(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None,
+        narrow_context: bool,
+        rejected_answer: str,
+        guard_warnings: Any,
+    ) -> dict[str, Any] | None:
+        """Ask DeepSeek once to repair a rejected remote synthesis.
+
+        The normal DeepSeek path already has a grounded JSON contract. This
+        helper only adds the concrete fidelity failure (unsupported number,
+        dropped table label, or missing fact) and the previous answer to the
+        prompt. It intentionally reuses ``_deepseek_synthesize`` so parsing,
+        citation-index normalisation, and provider accounting stay identical.
+        """
+        reasons = guard_warnings if isinstance(guard_warnings, list) else [guard_warnings]
+        reason_text = "\n".join(
+            f"- {str(reason).strip()}" for reason in reasons if str(reason).strip()
+        )
+        revision_draft = (
+            "The remote RAG draft is unavailable; the following answer was a first "
+            "DeepSeek synthesis that failed a groundedness guard. Rewrite it from "
+            "the evidence and return a complete answer to the original question. "
+            "Do not mention this repair process in the answer.\n\n"
+            f"First synthesis:\n{rejected_answer}\n\n"
+            f"Guard findings:\n{reason_text or '- fidelity guard rejected the first synthesis'}\n\n"
+            "Rules for this revision: preserve every supported numeric value and "
+            "table label needed by the question; remove unsupported numbers; cite "
+            "only the supplied evidence indexes; if a required fact is absent, "
+            "state that limitation explicitly instead of guessing."
+        )
+        try:
+            revised = self._deepseek_synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=revision_draft,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                narrow_context=narrow_context,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the original guard fallback
+            logger.warning("DeepSeek fidelity revision failed: %s", exc)
+            return None
+        answer = str(revised.get("answer_markdown") or "").strip()
+        if not answer or answer == revision_draft:
+            return None
+        revised.setdefault("warnings", []).append(
+            "DeepSeek first synthesis failed a fidelity guard; a grounded revision was requested."
+        )
+        return revised
+
+    def _deepseek_synthesize(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
+        narrow_context: bool = False,
+    ) -> dict[str, Any]:
+        """Synthesize through the configured DeepSeek API.
+
+        DeepSeek is kept separate from the legacy ``external_api`` path so its
+        retry budget, model identity, and usage accounting are explicit.  A
+        failed/empty/malformed response always returns the grounded RAG draft
+        with ``provider=deepseek`` and an actionable warning.
+        """
+        api_key = getattr(self._settings, "deepseek_api_key", None)
+        if not self._has_secret(api_key):
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                provider="deepseek",
+                model=getattr(self._settings, "deepseek_model", "deepseek-chat"),
+            )
+            result["warnings"].append(
+                "DeepSeek synthesis requested but DEEPSEEK_API_KEY is not configured; "
+                f"using {self._fallback_label(evidence_pack)}."
+            )
+            return result
+
+        evidence_parts: list[str] = []
+        for index, citation in enumerate(citations):
+            excerpt = citation.get("excerpt", "")
+            title = citation.get("page_title") or citation.get("document_id", "")
+            if excerpt:
+                evidence_parts.append(f"[{index}] {title}: {excerpt}")
+        evidence_text = "\n\n".join(evidence_parts) if evidence_parts else "(no evidence)"
+        evidence_pack_text = (
+            "" if narrow_context else self._format_evidence_pack_section(evidence_pack)
+        )
+        table_facts_text = self._format_table_facts_section(evidence_pack)
+        comparison_text = self._format_comparison_section(evidence_pack, citations)
+        comparison_rules = self._comparison_rules(evidence_pack)
+        system_prompt = (
+            "You are an evidence synthesis assistant. Synthesize a final answer "
+            "from the provided RAG answer and evidence excerpts. Do not invent "
+            "facts or citations. Return a JSON object with keys: "
+            "answer_markdown (string), cited_indexes (array of valid integers), "
+            "warnings (array of strings), confidence (number 0.0-1.0).\n"
+            + comparison_rules
+            + self._answer_rules(query)
+        )
+        user_prompt = (
+            f"Original query: {query}\n"
+            f"Route type: {route}\n"
+            f"Conversation context: {conversation_summary or '(none)'}\n\n"
+            f"RAG answer: {rag_answer}\n\n"
+            f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
+            + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + (f"{table_facts_text}\n\n" if table_facts_text else "")
+            + (f"{comparison_text}\n\n" if comparison_text else "")
+            + "Return only the JSON object."
+        )
+        client = DeepSeekClient(
+            base_url=getattr(self._settings, "deepseek_base_url", None),
+            api_key=api_key,
+            model=getattr(self._settings, "deepseek_model", "deepseek-chat"),
+            timeout=getattr(self._settings, "generation_timeout_seconds", 90),
+            max_retries=getattr(self._settings, "generation_max_retries", 1),
+            retry_backoff_seconds=getattr(
+                self._settings, "generation_retry_backoff_seconds", 0.5
+            ),
+        )
+        try:
+            generated = client.generate_chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_output_tokens=getattr(
+                    self._settings, "generation_max_output_tokens", 2048
+                ),
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DeepSeek synthesis API call failed: %s", exc)
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                provider="deepseek",
+                model=client.model,
+            )
+            result["warnings"].append(
+                f"DeepSeek synthesis failed ({type(exc).__name__}), using "
+                f"{self._fallback_label(evidence_pack)}: {exc}"
+            )
+            return result
+
+        content = str(generated.get("content") or "").strip()
+        parse_retry_used = False
+        try:
+            parsed = self._parse_deepseek_json(content)
+            # A few OpenAI-compatible gateways wrap the requested object in a
+            # singleton JSON array even when ``response_format=json_object``
+            # is set.  Accept that lossless wrapper, but keep rejecting arrays
+            # containing multiple/ non-object values because they do not have
+            # an unambiguous synthesis contract.
+            if (
+                isinstance(parsed, list)
+                and len(parsed) == 1
+                and isinstance(parsed[0], dict)
+            ):
+                parsed = parsed[0]
+            if not isinstance(parsed, dict):
+                raise ValueError("DeepSeek synthesis JSON must be an object")
+        except Exception as exc:  # noqa: BLE001
+            # JSON-mode gateways occasionally return a prose-wrapped array or
+            # otherwise malformed payload even though the transport succeeded.
+            # Retry the same bounded request once with an explicit single-object
+            # reminder before falling back to the structured matrix.
+            try:
+                retry_generated = client.generate_chat(
+                    messages=[
+                        {"role": "system", "content": system_prompt + "\nReturn exactly one JSON object, not an array."},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_output_tokens=getattr(
+                        self._settings, "generation_max_output_tokens", 2048
+                    ),
+                    response_format={"type": "json_object"},
+                )
+                retry_content = str(retry_generated.get("content") or "").strip()
+                retry_parsed = self._parse_deepseek_json(retry_content)
+                if (
+                    isinstance(retry_parsed, list)
+                    and len(retry_parsed) == 1
+                    and isinstance(retry_parsed[0], dict)
+                ):
+                    retry_parsed = retry_parsed[0]
+                if not isinstance(retry_parsed, dict):
+                    raise ValueError("DeepSeek synthesis JSON must be an object")
+                generated = retry_generated
+                parsed = retry_parsed
+                parse_retry_used = True
+            except Exception as retry_exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to parse DeepSeek synthesis response after retry: %s",
+                    retry_exc,
+                )
+                result = self._comparison_fallback(
+                    rag_answer=rag_answer,
+                    citations=citations,
+                    evidence_pack=evidence_pack,
+                    provider="deepseek",
+                    model=str(generated.get("model") or client.model),
+                )
+                result["warnings"].append(
+                    f"DeepSeek returned an invalid synthesis response, using "
+                    f"{self._fallback_label(evidence_pack)}: {exc}"
+                )
+                return result
+
+        max_index = len(citations)
+        raw_indexes = parsed.get("cited_indexes", [])
+        cited_indexes: list[int] = []
+        if isinstance(raw_indexes, list):
+            for index in raw_indexes:
+                try:
+                    normalized_index = int(index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= normalized_index < max_index and normalized_index not in cited_indexes:
+                    cited_indexes.append(normalized_index)
+        answer_markdown = str(parsed.get("answer_markdown") or "").strip()
+        if not answer_markdown:
+            # A few OpenAI-compatible gateways rename this field to ``answer``
+            # when they post-process JSON mode.  Accept the alias without
+            # weakening the grounded fallback for a genuinely empty response.
+            answer_markdown = str(parsed.get("answer") or parsed.get("content") or "").strip()
+        warnings = [str(item) for item in (parsed.get("warnings") or [])]
+        if isinstance(parsed.get("warnings"), str):
+            warnings = [str(parsed["warnings"])]
+        if parse_retry_used:
+            warnings.append("DeepSeek JSON parse retry performed.")
+        if not answer_markdown:
+            answer_markdown = (
+                self._local_fallback(rag_answer, citations, evidence_pack)["answer_markdown"]
+                if isinstance((evidence_pack or {}).get("comparison"), dict)
+                else rag_answer
+            )
+            warnings.append(
+                "DeepSeek returned an empty answer; using "
+                f"{self._fallback_label(evidence_pack)}."
+            )
+        if not cited_indexes and max_index:
+            # Do not discard all source citations just because the gateway
+            # omitted the optional array.  Prefer explicit inline markers;
+            # otherwise select citations whose excerpts share a supported
+            # evidence anchor with the answer.  The executor still treats an
+            # empty list as "keep all" for the final response.
+            cited_indexes = self._extract_cited_indexes(answer_markdown, max_index)
+            if not cited_indexes:
+                anchors = self._extract_evidence_anchors(evidence_pack, citations)
+                cited_indexes = [
+                    index
+                    for index, citation in enumerate(citations)
+                    if any(
+                        anchor.casefold() in answer_markdown.casefold()
+                        and anchor.casefold() in str(citation.get("excerpt") or "").casefold()
+                        for anchor in anchors
+                    )
+                ]
+        try:
+            confidence = float(parsed.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        return {
+            "answer_markdown": answer_markdown,
+            "cited_indexes": cited_indexes,
+            "warnings": warnings,
+            "confidence": confidence,
+            "provider": "deepseek",
+            "model": str(generated.get("model") or client.model),
+            "usage": generated.get("usage"),
+            "usage_source": generated.get("usage_source", "unknown"),
+        }
+
+    @staticmethod
+    def _parse_deepseek_json(content: str) -> Any:
+        """Parse JSON returned by DeepSeek/OpenAI-compatible gateways.
+
+        JSON mode is not consistently preserved by every proxy: some return a
+        fenced object, prepend a short explanation or ``<think>`` block, and
+        a few double-encode the object as a JSON string.  Keep parsing local
+        and deterministic; a malformed response still follows the grounded
+        DeepSeek fallback path in ``_deepseek_synthesize``.
+        """
+        cleaned = str(content or "").strip()
+        if not cleaned:
+            raise ValueError("DeepSeek synthesis response was empty")
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+        candidates = [cleaned]
+        if cleaned.startswith("```"):
+            unfenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+            candidates.insert(0, unfenced)
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        # Reuse the robust balanced-value scanner already used by the local
+        # Ollama client for prose-wrapped and fenced responses.
+        parsed = OllamaClient._extract_first_json_value(cleaned)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        return parsed
 
 
     def _external_synthesize(
@@ -1757,7 +2599,11 @@ class AgentSynthesizer:
         items 摘录，只保留 citations 与结构化 table_facts。
         """
         if not self._settings.external_api_enabled or not bool(self._settings.external_api_key):
-            result = self._local_fallback(rag_answer, citations)
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+            )
             result["warnings"].append(
                 "External synthesis requested but API is not configured; "
                 "using local fallback."
@@ -1778,6 +2624,8 @@ class AgentSynthesizer:
             "" if narrow_context else self._format_evidence_pack_section(evidence_pack)
         )
         table_facts_text = self._format_table_facts_section(evidence_pack)
+        comparison_text = self._format_comparison_section(evidence_pack, citations)
+        comparison_rules = self._comparison_rules(evidence_pack)
 
         system_prompt = (
             "You are an evidence synthesis assistant. Your task is to synthesize "
@@ -1787,6 +2635,7 @@ class AgentSynthesizer:
             "Return a JSON object with keys: answer_markdown (string), "
             "cited_indexes (array of integers, only valid indexes from the evidence), "
             "warnings (array of strings), confidence (number 0.0-1.0).\n"
+            + comparison_rules
             + self._answer_rules(query)
         )
 
@@ -1798,6 +2647,7 @@ class AgentSynthesizer:
             f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
             + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
             + (f"{table_facts_text}\n\n" if table_facts_text else "")
+            + (f"{comparison_text}\n\n" if comparison_text else "")
             + "Synthesize a final answer from the above evidence. "
             "Return only a JSON object."
         )
@@ -1825,8 +2675,12 @@ class AgentSynthesizer:
                 data = response.json()
         except Exception as exc:
             logger.warning("External synthesis API call failed: %s", exc)
-            result = self._local_fallback(rag_answer, citations)
-            result["provider"] = "external_api"
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                provider="external_api",
+            )
             result["warnings"].append(
                 f"External synthesis API call failed, using local fallback: {exc}"
             )
@@ -1837,8 +2691,12 @@ class AgentSynthesizer:
             parsed = json.loads(content)
         except (KeyError, json.JSONDecodeError, IndexError) as exc:
             logger.warning("Failed to parse external synthesis response: %s", exc)
-            result = self._local_fallback(rag_answer, citations)
-            result["provider"] = "external_api"
+            result = self._comparison_fallback(
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                provider="external_api",
+            )
             result["warnings"].append(
                 f"Failed to parse external synthesis response, using local fallback: {exc}"
             )

@@ -635,7 +635,7 @@ class PGVectorStore:
             for vector in vectors
             if self._valid_embedding(vector.embedding)
             for embedding in [self._normalize_embedding(vector.embedding)]
-            if len(embedding) == settings.ollama_embedding_dimensions
+            if len(embedding) == settings.active_embedding_dimensions
         ]
         if not self.available():
             return
@@ -706,7 +706,7 @@ class PGVectorStore:
             return []
         normalized = self._normalize_embedding(embedding)
         # pgvector 表结构固定,维度必须与配置一致。
-        if len(normalized) != settings.ollama_embedding_dimensions:
+        if len(normalized) != settings.active_embedding_dimensions:
             return []
         # 归一化文档范围过滤条件。
         scoped_document_ids = [

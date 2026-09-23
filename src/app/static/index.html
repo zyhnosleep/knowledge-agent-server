@@ -1314,6 +1314,27 @@
         font-size: 12px;
       }
 
+      .comparison-workbench { margin: 0 0 10px; padding: 12px 14px; border: 1px solid #394857; border-radius: 10px; background: rgb(13 20 27 / 90%); color: var(--paper-300); }
+      .comparison-workbench-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .comparison-workbench-head > div { display: grid; gap: 3px; }
+      .comparison-workbench-head strong { font-size: 13px; letter-spacing: .04em; }
+      .comparison-workbench-head small { color: var(--paper-500); font-size: 10px; }
+      .comparison-picker, .comparison-dimensions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+      .comparison-option { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid #3c4b58; border-radius: 999px; color: var(--paper-400); font-size: 11px; cursor: pointer; }
+      .comparison-option:has(input:checked) { border-color: var(--signal); color: var(--paper-100); background: rgb(74 116 66 / 25%); }
+      .comparison-option input { accent-color: var(--signal); }
+      .comparison-result { margin: 22px 0 4px; overflow-x: auto; border-top: 1px solid var(--line); padding-top: 16px; }
+      .comparison-result h3 { margin: 0 0 10px; font: 12px ui-monospace, monospace; letter-spacing: .12em; color: var(--signal); }
+      .comparison-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 12px; }
+      .comparison-table th, .comparison-table td { padding: 10px; border: 1px solid var(--line); vertical-align: top; text-align: left; }
+      .comparison-table th { color: var(--paper-400); font: 10px ui-monospace, monospace; letter-spacing: .08em; }
+      .comparison-cell-supported { color: #9ae6a8; }.comparison-cell-missing { color: #ffd48a; }.comparison-cell-conflict { color: #ff9c9c; }
+      .comparison-cell small { display: block; margin-top: 5px; color: var(--paper-500); line-height: 1.5; }
+      .comparison-cell-evidence { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+      .comparison-citation-action { padding: 3px 6px; font-size: 10px; }
+      .comparison-unresolved { display: grid; gap: 5px; margin-top: 12px; padding: 10px 12px; border: 1px solid #394857; border-radius: 8px; color: var(--paper-400); font-size: 11px; }
+      .comparison-unresolved ul { margin: 0 0 4px 18px; padding: 0; color: var(--paper-500); }
+
       .attachment-bar {
         display: flex;
         flex-wrap: wrap;
@@ -1902,6 +1923,14 @@
               <span id="queueMessage">回答模型正在排队</span>
               <button type="button" id="continueQueueButton">继续等待</button>
             </div>
+            <section class="comparison-workbench" id="comparisonWorkbench" aria-label="跨论文比较工作台">
+              <div class="comparison-workbench-head">
+                <div><span class="section-kicker">COMPARE WORKBENCH / GRAPH-LITE</span><strong>跨论文比较</strong><small>选择 2–5 篇已索引论文；留空则按问题自动路由。</small></div>
+                <button class="table-action" id="clearComparisonButton" type="button">清空</button>
+              </div>
+              <div class="comparison-picker" id="comparisonDocumentsBox"><span class="muted">正在读取文档…</span></div>
+              <div class="comparison-dimensions" id="comparisonDimensionsBox"></div>
+            </section>
             <form class="composer-box" id="queryForm">
               <button class="icon-action" type="button" id="attachmentButton" title="添加临时文件（当前会话附件）" aria-label="添加临时文件">＋</button>
               <textarea id="questionInput" rows="1" aria-label="输入问题" placeholder="询问论文、附件或研究项目…"></textarea>
@@ -2062,6 +2091,17 @@
       var activeSessionId = null;
       var activeDocumentId = null;
       var activeDocumentTitle = null;
+      var compareDocumentIds = [];
+      var compareDimensions = [];
+      var comparisonDocuments = [];
+      var comparisonDimensionOptions = [
+        ["method/architecture", "方法 / 架构"],
+        ["retrieval unit/data representation", "检索对象 / 表示"],
+        ["training objective", "训练目标"],
+        ["datasets/tasks", "数据集 / 任务"],
+        ["metrics/results", "指标 / 结果"],
+        ["limitations/use cases", "局限 / 适用场景"]
+      ];
       var activeSourceDocumentId = null;
       var activeSourceData = null;
       var activeParseStatus = null;
@@ -2079,6 +2119,73 @@
 
       function $(id) {
         return document.getElementById(id);
+      }
+
+      function clearComparisonSelection() {
+        compareDocumentIds = [];
+        compareDimensions = [];
+        renderComparisonPicker(comparisonDocuments);
+      }
+
+      function renderComparisonPicker(docs) {
+        comparisonDocuments = Array.isArray(docs) ? docs : [];
+        var box = $("comparisonDocumentsBox");
+        var dimensionsBox = $("comparisonDimensionsBox");
+        if (!box || !dimensionsBox) return;
+        box.replaceChildren();
+        var readyDocs = comparisonDocuments.filter(function (doc) {
+          return ["ready", "completed", "indexed"].indexOf(doc.status) >= 0;
+        });
+        if (!readyDocs.length) {
+          var empty = document.createElement("span");
+          empty.className = "muted";
+          empty.textContent = "暂无已索引论文；未选择时仍可使用自动路由。";
+          box.appendChild(empty);
+        } else {
+          readyDocs.forEach(function (doc) {
+            var label = document.createElement("label");
+            label.className = "comparison-option";
+            var input = document.createElement("input");
+            input.type = "checkbox";
+            input.value = doc.id;
+            input.checked = compareDocumentIds.indexOf(doc.id) >= 0;
+            input.addEventListener("change", function () {
+              if (input.checked) {
+                if (compareDocumentIds.length >= 5) {
+                  input.checked = false;
+                  alert("最多选择 5 篇论文。");
+                  return;
+                }
+                compareDocumentIds.push(doc.id);
+              } else {
+                compareDocumentIds = compareDocumentIds.filter(function (id) { return id !== doc.id; });
+              }
+            });
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(doc.title || doc.file_name || doc.id));
+            box.appendChild(label);
+          });
+        }
+        dimensionsBox.replaceChildren();
+        var hint = document.createElement("span");
+        hint.className = "muted";
+        hint.textContent = "维度（不选则使用基础维度全集）";
+        dimensionsBox.appendChild(hint);
+        comparisonDimensionOptions.forEach(function (entry) {
+          var label = document.createElement("label");
+          label.className = "comparison-option";
+          var input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = entry[0];
+          input.checked = compareDimensions.indexOf(entry[0]) >= 0;
+          input.addEventListener("change", function () {
+            if (input.checked) compareDimensions.push(entry[0]);
+            else compareDimensions = compareDimensions.filter(function (value) { return value !== entry[0]; });
+          });
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(entry[1]));
+          dimensionsBox.appendChild(label);
+        });
       }
 
       function setQueueChoice(data) {
@@ -2502,7 +2609,7 @@
           $("healthStatus").innerHTML = '<span class="status-dot"></span><span>服务未连接</span>';
           $("healthStatus").style.color = "var(--red)";
         });
-        loadProjects();
+        loadProjects().then(function () { return loadDocuments(); });
         setView((location.hash || "#chat").slice(1));
       }
 
@@ -2560,7 +2667,108 @@
         if (!active) setQueueChoice(null);
       }
 
-      function showAnswer(meta, text, citations) {
+      function renderComparisonResult(comparison, citations, panel) {
+        if (!comparison || !Array.isArray(comparison.cells) || !comparison.cells.length) return;
+        var section = document.createElement("section");
+        section.className = "comparison-result";
+        var heading = document.createElement("h3");
+        heading.textContent = comparison.mode === "intra_paper" ? "论文内对比证据矩阵" : "跨论文比较证据矩阵";
+        section.appendChild(heading);
+        var table = document.createElement("table");
+        table.className = "comparison-table";
+        var head = document.createElement("thead");
+        var headRow = document.createElement("tr");
+        ["比较维度"].concat((comparison.papers || []).map(function (paper) { return paper.title || paper.document_id; })).forEach(function (label) {
+          var th = document.createElement("th");
+          th.textContent = label;
+          headRow.appendChild(th);
+        });
+        head.appendChild(headRow);
+        table.appendChild(head);
+        var body = document.createElement("tbody");
+        var papers = comparison.papers || [];
+        var sourceCitations = Array.isArray(citations) ? citations : [];
+        (comparison.dimensions || []).forEach(function (dimension) {
+          var row = document.createElement("tr");
+          var dimensionCell = document.createElement("th");
+          dimensionCell.textContent = dimension;
+          row.appendChild(dimensionCell);
+          papers.forEach(function (paper) {
+            var cell = (comparison.cells || []).find(function (candidate) {
+              return candidate.paper_id === paper.document_id && candidate.dimension === dimension;
+            });
+            var td = document.createElement("td");
+            if (!cell) {
+              td.textContent = "证据缺失";
+              td.className = "comparison-cell-missing";
+            } else {
+              var status = cell.status || "missing";
+              td.className = "comparison-cell-" + status;
+              var statusLine = document.createElement("strong");
+              statusLine.textContent = status === "supported" ? "已支持" : (status === "conflict" ? "冲突" : "证据缺失");
+              td.appendChild(statusLine);
+              var refs = Array.isArray(cell.citation_indexes) ? cell.citation_indexes : [];
+              if (refs.length) {
+                var evidenceBox = document.createElement("div");
+                evidenceBox.className = "comparison-cell-evidence";
+                refs.forEach(function (index) {
+                  var citation = sourceCitations[Number(index)];
+                  if (!citation) return;
+                  var button = document.createElement("button");
+                  button.type = "button";
+                  button.className = "source-citation-action comparison-citation-action";
+                  button.textContent = "查看证据 [" + index + "]" + (citation.page_label ? " · p." + citation.page_label : "");
+                  button.title = String(citation.excerpt || "").slice(0, 240);
+                  button.addEventListener("click", function () { openCitationLocation(citation); });
+                  evidenceBox.appendChild(button);
+                });
+                if (evidenceBox.childNodes.length) td.appendChild(evidenceBox);
+                var firstCitation = sourceCitations[Number(refs[0])];
+                if (firstCitation && firstCitation.excerpt) {
+                  var excerpt = document.createElement("small");
+                  excerpt.textContent = String(firstCitation.excerpt).replace(/\s+/g, " ").slice(0, 180);
+                  if (String(firstCitation.excerpt).length > 180) excerpt.textContent += "…";
+                  td.appendChild(excerpt);
+                }
+              } else {
+                var note = document.createElement("small");
+                note.textContent = (cell.notes || []).join("；") || "不可推断";
+                td.appendChild(note);
+              }
+            }
+            row.appendChild(td);
+          });
+          body.appendChild(row);
+        });
+        table.appendChild(body);
+        section.appendChild(table);
+        var missing = comparison.missing_cells || [];
+        var conflicts = comparison.conflict_cells || [];
+        if (missing.length || conflicts.length) {
+          var unresolved = document.createElement("div");
+          unresolved.className = "comparison-unresolved";
+          if (missing.length) {
+            var missingTitle = document.createElement("strong");
+            missingTitle.textContent = "证据缺失（不可推断）";
+            unresolved.appendChild(missingTitle);
+            var missingList = document.createElement("ul");
+            missing.forEach(function (value) { var li = document.createElement("li"); li.textContent = value; missingList.appendChild(li); });
+            unresolved.appendChild(missingList);
+          }
+          if (conflicts.length) {
+            var conflictTitle = document.createElement("strong");
+            conflictTitle.textContent = "冲突证据（需并列核验）";
+            unresolved.appendChild(conflictTitle);
+            var conflictList = document.createElement("ul");
+            conflicts.forEach(function (value) { var li = document.createElement("li"); li.textContent = value; conflictList.appendChild(li); });
+            unresolved.appendChild(conflictList);
+          }
+          section.appendChild(unresolved);
+        }
+        panel.appendChild(section);
+      }
+
+      function showAnswer(meta, text, citations, comparison) {
         $("chatWelcome").hidden = true;
         $("chatMessages").hidden = true;
         if ($("answerStatus")) $("answerStatus").hidden = true;
@@ -2587,6 +2795,7 @@
           metaBox.appendChild(chip);
         });
         renderCitedText(text, textBox, citations);
+        renderComparisonResult(comparison, citations, panel);
         renderSources(citations, sourcesBox);
         history.appendChild(panel);
       }
@@ -2638,6 +2847,8 @@
           session_id: sessionId,
           constraints: { max_steps: 8, max_tool_calls: 5, budget_tokens: 20000, timeout_seconds: 180 }
         };
+        if (compareDocumentIds.length) payload.compare_document_ids = compareDocumentIds.slice(0, 5);
+        if (compareDimensions.length) payload.compare_dimensions = compareDimensions.slice(0, 12);
         if (activeDocumentId) {
           payload.document_id = activeDocumentId;
         }
@@ -2722,7 +2933,7 @@
             }
             var citations = data && Array.isArray(data.citations) ? data.citations : [];
             var modelMeta = data && data.model ? [data.model] : streamMeta;
-            showAnswer(modelMeta, answer, citations);
+            showAnswer(modelMeta, answer, citations, data && data.comparison);
             if (data && data.session_id) {
               activeSessionId = data.session_id;
               loadAgentSessions();
@@ -2941,6 +3152,8 @@
         activeDocumentTitle = null;
         activeSessionId = null;
         activeAttachments = [];
+        compareDocumentIds = [];
+        compareDimensions = [];
         storeActiveProjectSlug(activeProjectSlug);
         renderAttachments();
         resetSourceDrawer();
@@ -2983,6 +3196,8 @@
           if (project.slug === activeProjectSlug) {
             activeSessionId = null;
             activeAttachments = [];
+            compareDocumentIds = [];
+            compareDimensions = [];
             renderAttachments();
             resetSourceDrawer();
           }
@@ -3554,6 +3769,7 @@
 
       function loadDocuments() {
         return fetchJson("/api/documents?project_slug=" + encodeURIComponent(activeProjectSlug) + "&limit=50").then(function (docs) {
+          renderComparisonPicker(docs);
           var box = $("documentsBox");
           box.replaceChildren();
           if (!Array.isArray(docs) || !docs.length) {
@@ -3946,6 +4162,8 @@
       $("stopGenerationButton").addEventListener("click", function () {
         if (activeAgentAbortController) activeAgentAbortController.abort();
       });
+
+      $("clearComparisonButton").addEventListener("click", clearComparisonSelection);
 
       $("attachmentButton").addEventListener("click", function () {
         $("attachmentInput").click();

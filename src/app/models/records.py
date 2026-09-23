@@ -360,6 +360,50 @@ class Claim(Base, TimestampMixin):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)  # 任意附加元数据（JSON）
 
 
+class KnowledgeEdge(Base, TimestampMixin):
+    """轻量知识关系边（``knowledge_edges``）。
+
+    这是 SAC-KG 的可审计扩展，不是独立的图数据库：边两端可以是论文、实体、
+    论断或证据块，且始终绑定项目、解析版本和可选的原文证据。比较工作台只在
+    查询涉及的文档范围内按需写入/复用这些边；当 SAC-KG 关闭时，仅允许记录
+    不含语义推断的论文配对 ``compared_with`` 元关系。
+    """
+
+    __tablename__ = "knowledge_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "source_type",
+            "source_id",
+            "relation_type",
+            "target_type",
+            "target_id",
+            "parse_version",
+            name="uq_knowledge_edges_identity",
+        ),
+        Index("ix_knowledge_edges_project_relation", "project_id", "relation_type"),
+        Index("ix_knowledge_edges_document_version", "document_id", "parse_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    source_type: Mapped[str] = mapped_column(String(40))
+    source_id: Mapped[str] = mapped_column(String(255))
+    relation_type: Mapped[str] = mapped_column(String(60))
+    target_type: Mapped[str] = mapped_column(String(40))
+    target_id: Mapped[str] = mapped_column(String(255))
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    parse_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    evidence_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="SET NULL"), nullable=True
+    )
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    extraction_version: Mapped[str] = mapped_column(String(80), default="comparison-v1")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class ReviewItem(Base, TimestampMixin):
     """复核项表（``review_items``）：人工质量复核队列中的待处理项。
 

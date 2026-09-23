@@ -236,6 +236,18 @@ class ToolRegistry:
                                 "type": "string",
                                 "description": "Optional document ID to scope retrieval to a single document.",
                             },
+                            "compare_document_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 5,
+                                "description": "Optional strict comparison scope of 1-5 document IDs.",
+                            },
+                            "compare_dimensions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 12,
+                                "description": "Optional comparison dimensions.",
+                            },
                         },
                         "required": ["project_slug", "question"],
                     },
@@ -277,6 +289,18 @@ class ToolRegistry:
                         "document_id": {
                             "type": "string",
                             "description": "Optional document ID to scope the answer to a single document.",
+                        },
+                        "compare_document_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 5,
+                            "description": "Optional strict comparison scope of 1-5 document IDs.",
+                        },
+                        "compare_dimensions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 12,
+                            "description": "Optional comparison dimensions.",
                         },
                     },
                     "required": ["project_slug", "question"],
@@ -488,11 +512,21 @@ def _rag_answer_handler(
     db = ctx.get("db")
     if db is None:
         raise ToolExecutionError("Tool context is missing 'db' Session")
+    answer_kwargs: dict[str, Any] = {"document_id": args.get("document_id")}
+    compare_document_ids = args.get("compare_document_ids") or None
+    compare_dimensions = args.get("compare_dimensions") or None
+    # Keep the tool adapter compatible with older test doubles and integrations
+    # that only implement the original RAG signature.  The new comparison
+    # fields are sent only when the caller actually selected a comparison.
+    if compare_document_ids:
+        answer_kwargs["compare_document_ids"] = compare_document_ids
+    if compare_dimensions:
+        answer_kwargs["compare_dimensions"] = compare_dimensions
     response = rag_adapter.answer(
         db,
         args["project_slug"],
         args["question"],
-        document_id=args.get("document_id"),
+        **answer_kwargs,
     )
     # 把响应对象转换为普通字典；引用列表逐项 model_dump 以便 JSON 序列化。
     return {
@@ -516,12 +550,21 @@ def _rag_retrieve_evidence_handler(
     limit = args.get("limit", 15)
     if not isinstance(limit, int):
         limit = 15
+    retrieval_kwargs: dict[str, Any] = {
+        "limit": limit,
+        "document_id": args.get("document_id"),
+    }
+    compare_document_ids = args.get("compare_document_ids") or None
+    compare_dimensions = args.get("compare_dimensions") or None
+    if compare_document_ids:
+        retrieval_kwargs["compare_document_ids"] = compare_document_ids
+    if compare_dimensions:
+        retrieval_kwargs["compare_dimensions"] = compare_dimensions
     pack = rag_adapter.retrieve_evidence(
         db,
         args["project_slug"],
         args["question"],
-        limit=limit,
-        document_id=args.get("document_id"),
+        **retrieval_kwargs,
     )
     # 证据包对象转普通字典：status + items（逐项 model_dump）。
     return {
@@ -536,6 +579,7 @@ def _rag_retrieve_evidence_handler(
         "inventory": [inv.model_dump() for inv in pack.inventory],
         "coverage_status": pack.coverage_status,
         "coverage_missing_tables": list(pack.coverage_missing_tables),
+        "comparison": pack.comparison.model_dump() if pack.comparison else None,
     }
 
 

@@ -1,0 +1,953 @@
+{
+  "benchmark_id": "rag_benchmark_v1",
+  "version": "v1.1-draft",
+  "status": "draft_pending_review",
+  "project_slug": "internal-research",
+  "generated_at": "2026-09-22",
+  "case_count": 15,
+  "category_counts": {
+    "single_paper_fact": 8,
+    "cross_paper_compare": 4,
+    "table_metric": 3
+  },
+  "corpus": {
+    "project_slug": "internal-research",
+    "document_count": 7,
+    "documents": [
+      {
+        "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+        "corpus_title": "rag_2005.11401",
+        "paper_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+        "page_slug": "sources/rag-2005-11401",
+        "sha256": "23e3249e9a1e75418d82efecab0ea8c4d033b89c93742f63208d47ce01f21233",
+        "pdf_pages": 19,
+        "parse_version": "canonical-v4-23e3249e9a1e-4bed62f86f6e",
+        "parse_status": "accepted_with_warnings",
+        "parse_score": 0.85
+      },
+      {
+        "document_id": "739b84a7-d1ff-446d-8eaa-c964d062a71c",
+        "corpus_title": "selfrag_2310.11511",
+        "paper_title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+        "page_slug": "sources/selfrag-2310-11511",
+        "sha256": "d9eaa1398abac0df67a9d0933a5bf8b6d9d83d2e72da2a486073cd842dd52978",
+        "pdf_pages": 30,
+        "parse_version": "canonical-v4-d9eaa1398aba-4bed62f86f6e",
+        "parse_status": "accepted_with_warnings",
+        "parse_score": 0.6
+      },
+      {
+        "document_id": "c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560",
+        "corpus_title": "crag_2401.15884",
+        "paper_title": "Corrective Retrieval Augmented Generation",
+        "page_slug": "sources/crag-2401-15884",
+        "sha256": "975aa1fd3c1b603126e93ff99d6504858b61301bf1d34c9df88ebe53a0b026cb",
+        "pdf_pages": 16,
+        "parse_version": "canonical-v4-975aa1fd3c1b-4bed62f86f6e",
+        "parse_status": "accepted_with_warnings",
+        "parse_score": 0.95
+      },
+      {
+        "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+        "corpus_title": "colbert_2004.12832",
+        "paper_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+        "page_slug": "sources/colbert-2004-12832",
+        "sha256": "2e487d9b96e3c2e5e286d843e98a066adc0442faa3a6e8ddbd1771221bf9ae14",
+        "pdf_pages": 10,
+        "parse_version": "canonical-v4-2e487d9b96e3-4bed62f86f6e",
+        "parse_status": "accepted_with_warnings",
+        "parse_score": 0.85
+      },
+      {
+        "document_id": "8731660a-375e-4815-aaac-b99684af729f",
+        "corpus_title": "murag_2210.02928",
+        "paper_title": "MuRAG: Multimodal Retrieval-Augmented Generator for Open Question Answering over Images and Text",
+        "page_slug": "sources/murag-2210-02928",
+        "sha256": "dfdfb9bcf1e615b092f4c2ca66ab31fddb75393d2c03e1b265e710cead69fa7e",
+        "pdf_pages": 13,
+        "parse_version": "canonical-v4-dfdfb9bcf1e6-4bed62f86f6e",
+        "parse_status": "accepted_with_warnings",
+        "parse_score": 0.7
+      },
+      {
+        "document_id": "0ae69731-f290-4230-97af-d2c82516fef7",
+        "corpus_title": "react_2210.03629",
+        "paper_title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+        "page_slug": "sources/react-2210-03629",
+        "sha256": "f285b0971ae4a790e402fb93966bed3adde2cf0a04977d08b2b40d6ab0cace69",
+        "pdf_pages": 33,
+        "parse_version": "canonical-v4-textfallback-f285b0971ae4-4bed62f86f6e",
+        "parse_status": "validation_failed",
+        "parse_score": 0.85,
+        "fallback_pages": [
+          33
+        ]
+      },
+      {
+        "document_id": "a3bad38b-a172-48a2-9550-b7ad3865e17f",
+        "corpus_title": "visrag_2410.10594",
+        "paper_title": "VisRAG: Vision-based Retrieval-augmented Generation on Multi-modality Documents",
+        "page_slug": "sources/visrag-2410-10594",
+        "sha256": "1b952e416611b4e0d076ace1d94d74730585409cc53c405db0e6fe9da9d16269",
+        "pdf_pages": 25,
+        "parse_version": "canonical-v4-textfallback-1b952e416611-4bed62f86f6e",
+        "parse_status": "validation_failed",
+        "parse_score": 0.55,
+        "fallback_pages": [
+          22
+        ]
+      }
+    ]
+  },
+  "methodology": {
+    "evidence_source": "Keyword and phrase probes run read-only against the live PostgreSQL corpus of the internal-research project (document_chunks.text per page_label), cross-checked against the seven source PDFs whose SHA-256 hashes match the loaded documents.",
+    "page_label_semantics": "expected_citations[].page_label is the corpus page_label (a 1-based page number produced by the canonical parse), not necessarily the printed page number in the PDF. For react_2210.03629 the corpus attributes Table 1 to page_label 4 while the printed page is 5; for visrag_2410.10594 the phrase VisRAG-Ret is attributed to page_label 1 rather than the printed page 2.",
+    "no_external_knowledge": "Every expected_answer_point was verified to appear on the cited page of the live corpus. No answer point relies on outside knowledge or on a page that the corpus does not contain.",
+    "draft_status": "This is a draft awaiting human review (v1.1). Scoring hints now exist as structured per-case metadata (see scoring_model), but no evaluator has validated them, the set has not been run against the agent, and there are still no abstention/unanswerable cases.",
+    "scoring_model": {
+      "purpose": "Structured, case-level scoring hints so two evaluators can reach the same verdict without reading the Chinese notes.",
+      "required_point_count": "Minimum number of expected_answer_points that must be matched for the case to pass.",
+      "required_citation_count": "Minimum number of distinct expected_citations (document + page_label pairs) that must appear in the answer's citations.",
+      "numeric_tolerance": "'exact' when the answer points contain a required numeric or order-of-magnitude value that must be matched after normalisation (all three table_metric cases, plus the fact cases whose points carry numbers); null when the case is purely qualitative and no numeric comparison is needed.",
+      "partial_credit": "'per_answer_point' for every case: each matched answer point scores independently and the case passes at required_point_count.",
+      "required_terms": "Terms that must appear in a correct answer. Every term was verified to occur on at least one of the case's own cited corpus pages.",
+      "term_aliases": "Accepted surface variants for a required term, mapping canonical term -> list of alternatives. Includes corpus-specific renderings such as '10- 20%' and 'nonparametric'.",
+      "normalisation": "Term matching must normalise unicode (NFKC), collapse whitespace, treat hyphen-at-linebreak as removed, and ignore the thousands separator in numbers."
+    }
+  },
+  "cases": [
+    {
+      "id": "spf_rag_two_components",
+      "category": "single_paper_fact",
+      "question": "在 RAG 论文中，RAG 模型的参数化记忆（parametric memory）和非参数化记忆（non-parametric memory）分别由什么实现？两者由什么组件连接？",
+      "language": "zh",
+      "expected_answer_points": [
+        "参数化记忆是一个预训练的 seq2seq 模型（BART）",
+        "非参数化记忆是 Wikipedia 的稠密向量索引（dense vector index）",
+        "该索引由一个预训练的神经检索器访问，即 DPR（Dense Passage Retriever）",
+        "检索器给出隐变量文档，seq2seq 生成器在这些文档条件下生成输出，二者端到端联合微调"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+          "corpus_title": "rag_2005.11401",
+          "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+          "page_slug": "sources/rag-2005-11401",
+          "page_label": "1",
+          "evidence_anchor": "dense vector index of Wikipedia"
+        },
+        {
+          "document_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+          "corpus_title": "rag_2005.11401",
+          "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+          "page_slug": "sources/rag-2005-11401",
+          "page_label": "2",
+          "evidence_anchor": "Dense Passage Retriever [26], henceforth DPR ... seq2seq model (BART [32])"
+        }
+      ],
+      "difficulty": "easy",
+      "notes": "摘要（page_label 1）只给出总体描述（pre-trained seq2seq + dense vector index of Wikipedia）；BART 与 DPR 的具体命名出现在 page_label 2，完整答案需要引用两页。若答案把非参数化记忆说成“知识图谱”或“搜索引擎”，判为错误。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "BART",
+          "DPR",
+          "Wikipedia"
+        ],
+        "term_aliases": {
+          "BART": [
+            "BART [32]"
+          ],
+          "DPR": [
+            "Dense Passage Retriever"
+          ],
+          "Wikipedia": [
+            "dense vector index of Wikipedia"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_rag_sequence_vs_token",
+      "category": "single_paper_fact",
+      "question": "What is the difference between the RAG-Sequence and RAG-Token formulations in how they marginalize the retrieved document?",
+      "language": "en",
+      "expected_answer_points": [
+        "RAG-Sequence uses the same retrieved document to generate the complete output sequence",
+        "RAG-Token can draw a different latent document for each target token",
+        "Both marginalize over the top-K retrieved documents returned by the retriever",
+        "For sequence classification the two formulations are equivalent"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+          "corpus_title": "rag_2005.11401",
+          "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+          "page_slug": "sources/rag-2005-11401",
+          "page_label": "3",
+          "evidence_anchor": "RAG-Sequence Model / RAG-Token Model"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "Both definitions and the classification-equivalence remark sit on page_label 3. An answer that only says 'they marginalize differently' without the per-sequence vs per-token distinction should be scored as incomplete.",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 1,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "RAG-Sequence",
+          "RAG-Token",
+          "top-K"
+        ],
+        "term_aliases": {
+          "RAG-Sequence": [
+            "RAG-Seq.",
+            "RAG-Sequence model"
+          ],
+          "RAG-Token": [
+            "RAG-Tok.",
+            "RAG-Token model"
+          ],
+          "top-K": [
+            "top-k",
+            "top K"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_selfrag_reflection_tokens",
+      "category": "single_paper_fact",
+      "question": "What are reflection tokens in SELF-RAG, and what two broad categories do they fall into? What do they allow the model to do at inference time?",
+      "language": "en",
+      "expected_answer_points": [
+        "Special tokens that the language model itself generates to reflect on the retrieved passages and on its own generation",
+        "They are categorized into retrieval tokens and critique tokens",
+        "The retrieval token decides whether retrieval is needed, enabling adaptive on-demand retrieval",
+        "They are learned by expanding the model vocabulary and predicting them as ordinary next tokens"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+          "corpus_title": "selfrag_2310.11511",
+          "document_id": "739b84a7-d1ff-446d-8eaa-c964d062a71c",
+          "page_slug": "sources/selfrag-2310-11511",
+          "page_label": "1",
+          "evidence_anchor": "categorized into retrieval and critique tokens"
+        },
+        {
+          "document_title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+          "corpus_title": "selfrag_2310.11511",
+          "document_id": "739b84a7-d1ff-446d-8eaa-c964d062a71c",
+          "page_slug": "sources/selfrag-2310-11511",
+          "page_label": "2",
+          "evidence_anchor": "next token prediction from the expanded model vocabulary"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "Page 1 states the two-way categorization (retrieval vs critique tokens) and what they let the model do at inference time. The vocabulary-expansion training mechanism is NOT on page 1: it is stated on page_label 2 (“unifying them as the next token prediction from the expanded model vocabulary”) and recurs on page_label 4. Both pages must be cited for the fourth answer point to be verifiable. The four concrete token types are listed separately in Table 1 on page_label 4 (see case tm_selfrag_reflection_token_table).",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "reflection tokens",
+          "retrieval and critique tokens",
+          "expanded model vocabulary"
+        ],
+        "term_aliases": {
+          "reflection tokens": [
+            "reflection token"
+          ],
+          "retrieval and critique tokens": [
+            "retrieval token",
+            "critique token",
+            "retrieval and critique token"
+          ],
+          "expanded model vocabulary": [
+            "next token prediction from the expanded model vocabulary"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_crag_three_actions",
+      "category": "single_paper_fact",
+      "question": "CRAG 的检索评估器（retrieval evaluator）由什么模型初始化？它把检索结果判成哪三个动作，每个动作各自触发什么处理？",
+      "language": "zh",
+      "expected_answer_points": [
+        "用 T5-large 初始化并微调，参数量远小于当时的 LLM",
+        "把相关性置信度量化成三个动作 {Correct, Incorrect, Ambiguous}",
+        "Correct：把检索文档精炼成 knowledge strips，过程包含 knowledge decomposition、filter、recomposition",
+        "Incorrect：丢弃检索到的文档，改用大规模网络搜索作为补充知识来源",
+        "Ambiguous：无法确信地判定对错时触发，同时结合上述两种处理"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Corrective Retrieval Augmented Generation",
+          "corpus_title": "crag_2401.15884",
+          "document_id": "c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560",
+          "page_slug": "sources/crag-2401-15884",
+          "page_label": "4",
+          "evidence_anchor": "T5-large ... {Correct, Incorrect, Ambiguous}"
+        },
+        {
+          "document_title": "Corrective Retrieval Augmented Generation",
+          "corpus_title": "crag_2401.15884",
+          "document_id": "c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560",
+          "page_slug": "sources/crag-2401-15884",
+          "page_label": "3",
+          "evidence_anchor": "refined into more precise knowledge strips"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "T5-large 与三动作在 page_label 4，各分支处理细节在 page_label 3。注意语料把摘要里的 'decompose-then-recompose' 渲染成 'decompose-thenrecompose'（换行连字符被吞掉），按原文词组做字符串匹配会漏，需要按语义判定。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "T5-large",
+          "Correct",
+          "Incorrect",
+          "Ambiguous",
+          "knowledge strips"
+        ],
+        "term_aliases": {
+          "T5-large": [
+            "T5-large (Raffel et al., 2020)"
+          ],
+          "knowledge strips": [
+            "knowledge strip"
+          ],
+          "Ambiguous": [
+            "ambiguous action"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_colbert_late_interaction",
+      "category": "single_paper_fact",
+      "question": "How does ColBERT's late interaction architecture work, and what efficiency claim does the paper make against BERT-based rankers?",
+      "language": "en",
+      "expected_answer_points": [
+        "Query and document are encoded independently by BERT rather than jointly",
+        "A cheap interaction step then models fine-grained token-level similarity between the two encodings",
+        "Because interaction is delayed, document representations can be pre-computed offline",
+        "ColBERT executes two orders-of-magnitude faster and requires four orders-of-magnitude fewer FLOPs per query than BERT-based rankers"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+          "corpus_title": "colbert_2004.12832",
+          "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+          "page_slug": "sources/colbert-2004-12832",
+          "page_label": "1",
+          "evidence_anchor": "two orders-of-magnitude faster and requiring four orders-of-magnitude fewer FLOPs"
+        },
+        {
+          "document_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+          "corpus_title": "colbert_2004.12832",
+          "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+          "page_slug": "sources/colbert-2004-12832",
+          "page_label": "2",
+          "evidence_anchor": "MaxSim"
+        }
+      ],
+      "difficulty": "easy",
+      "notes": "Page 1 carries the architecture description and the efficiency claim; the MaxSim operator itself is defined in the model section attributed to page_label 2. The two-orders/four-orders phrasing is also present in the ACM reference block on page 1.",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "late interaction",
+          "BERT",
+          "two orders-of-magnitude",
+          "four orders-of-magnitude"
+        ],
+        "term_aliases": {
+          "late interaction": [
+            "late interaction architecture",
+            "late-interaction"
+          ],
+          "two orders-of-magnitude": [
+            "two orders of magnitude",
+            "2 orders of magnitude"
+          ],
+          "four orders-of-magnitude": [
+            "four orders of magnitude",
+            "4 orders of magnitude"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_murag_design",
+      "category": "single_paper_fact",
+      "question": "MuRAG 相对之前的检索增强模型有什么本质区别？它的骨干编码器由什么构成，在哪些数据集上评测，效果如何？",
+      "language": "zh",
+      "expected_answer_points": [
+        "是第一个能够使用多模态知识（视觉与文本）的检索增强模型，可访问外部非参数化多模态记忆",
+        "该记忆包含图像、纯文本或图文对条目",
+        "骨干编码器由预训练的 T5 与 ViT 组合而成，把记忆条目与查询编码到同一表示空间",
+        "在 WebQA 与 MultimodalQA 两个开放多模态 QA 数据集上评测",
+        "相比已有基线绝对提升 10–20%，在 distractor（40+ 候选）与 full-wiki（100 万候选）两种设定下都成立"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "MuRAG: Multimodal Retrieval-Augmented Generator for Open Question Answering over Images and Text",
+          "corpus_title": "murag_2210.02928",
+          "document_id": "8731660a-375e-4815-aaac-b99684af729f",
+          "page_slug": "sources/murag-2210-02928",
+          "page_label": "1",
+          "evidence_anchor": "first Multimodal Retrieval-Augmented"
+        },
+        {
+          "document_title": "MuRAG: Multimodal Retrieval-Augmented Generator for Open Question Answering over Images and Text",
+          "corpus_title": "murag_2210.02928",
+          "document_id": "8731660a-375e-4815-aaac-b99684af729f",
+          "page_slug": "sources/murag-2210-02928",
+          "page_label": "2",
+          "evidence_anchor": "combine pre-trained T5 (Raffel et al., 2020) and ViT"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "page_label 1 的摘要里 '10- 20%' 因换行在语料中带一个空格，按 '10-20%' 精确匹配会漏；page_label 2 的正文写作 '10-20%' 且给出 40+/1M 候选规模。T5+ViT 骨干只在 page_label 2。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "T5",
+          "ViT",
+          "WebQA",
+          "MultimodalQA",
+          "10-20%"
+        ],
+        "term_aliases": {
+          "T5": [
+            "T5 (Raffel et al., 2020)"
+          ],
+          "ViT": [
+            "ViT (Dosovitskiy et al., 2020)"
+          ],
+          "10-20%": [
+            "10- 20%",
+            "10–20%",
+            "10 to 20%"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_react_alfworld_webshop",
+      "category": "single_paper_fact",
+      "question": "On the two interactive decision-making benchmarks, how much does ReAct improve over imitation and reinforcement learning baselines, and how many in-context examples does it use?",
+      "language": "en",
+      "expected_answer_points": [
+        "ALFWorld: 34% absolute improvement in success rate",
+        "WebShop: 10% absolute improvement in success rate",
+        "It is prompted with only one or two in-context examples",
+        "Both gains are over imitation and reinforcement learning methods"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+          "corpus_title": "react_2210.03629",
+          "document_id": "0ae69731-f290-4230-97af-d2c82516fef7",
+          "page_slug": "sources/react-2210-03629",
+          "page_label": "1",
+          "evidence_anchor": "absolute success rate of 34% and 10% respectively"
+        }
+      ],
+      "difficulty": "easy",
+      "notes": "Both numbers and the one-or-two-examples claim are in the abstract on page_label 1. The base model is the frozen PaLM-540B (corpus page_label 3); an answer that additionally names PaLM-540B is more complete but not required.",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 1,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "ALFWorld",
+          "WebShop",
+          "34%",
+          "10%"
+        ],
+        "term_aliases": {
+          "34%": [
+            "34 %"
+          ],
+          "10%": [
+            "10 %"
+          ]
+        }
+      }
+    },
+    {
+      "id": "spf_visrag_design",
+      "category": "single_paper_fact",
+      "question": "VisRAG 的检索与生成分别由什么组件完成？它为什么声称能避免传统文本 RAG 的信息损失，端到端收益是多少？",
+      "language": "zh",
+      "expected_answer_points": [
+        "流水线由 VLM 驱动的检索器 VisRAG-Ret 与生成器 VisRAG-Gen 组成",
+        "文档不再先解析成文本，而是直接作为图像由 VLM 编码",
+        "因此保留原始文档的版式与图像信息，消除解析阶段引入的信息损失",
+        "相比传统文本 RAG 流水线取得 20–40% 的端到端性能提升",
+        "VisRAG-Ret 沿用稠密检索的双塔结构，对最终隐状态做加权平均池化得到嵌入"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "VisRAG: Vision-based Retrieval-augmented Generation on Multi-modality Documents",
+          "corpus_title": "visrag_2410.10594",
+          "document_id": "a3bad38b-a172-48a2-9550-b7ad3865e17f",
+          "page_slug": "sources/visrag-2410-10594",
+          "page_label": "1",
+          "evidence_anchor": "VisRAG-Ret"
+        },
+        {
+          "document_title": "VisRAG: Vision-based Retrieval-augmented Generation on Multi-modality Documents",
+          "corpus_title": "visrag_2410.10594",
+          "document_id": "a3bad38b-a172-48a2-9550-b7ad3865e17f",
+          "page_slug": "sources/visrag-2410-10594",
+          "page_label": "2",
+          "evidence_anchor": "VisRAG-Gen"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "证据限制：该文档 parse 状态为 validation_failed（score 0.55）。语料把 'VisRAG-Ret' 一词归到 page_label 1（页边界归属偏移），page_label 2 只含 'VisRAG-Gen'，因此引用 page_label 2 时不要断言该页出现 'VisRAG-Ret'。加权平均池化在 page_label 1。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "VisRAG-Ret",
+          "VisRAG-Gen",
+          "VLM",
+          "20–40%"
+        ],
+        "term_aliases": {
+          "VisRAG-Ret": [
+            "VisRAG Ret"
+          ],
+          "VisRAG-Gen": [
+            "VisRAG Gen"
+          ],
+          "20–40%": [
+            "20-40%"
+          ],
+          "VLM": [
+            "vision-language model"
+          ]
+        }
+      }
+    },
+    {
+      "id": "cpc_selfrag_vs_crag",
+      "category": "cross_paper_compare",
+      "question": "Self-RAG 和 CRAG 都想让 RAG 在检索不可靠时更稳健，两者在机制上有什么本质区别？",
+      "language": "zh",
+      "expected_answer_points": [
+        "Self-RAG 的评判内生于生成模型：同一个 LM 生成 reflection tokens（retrieval 与 critique 两类）来按需决定检索并自我评判",
+        "CRAG 外挂一个独立的轻量检索评估器（T5-large 初始化），对整批检索文档打分",
+        "CRAG 由置信度触发 {Correct, Incorrect, Ambiguous} 三个动作；Self-RAG 没有独立的三分支动作",
+        "CRAG 在 Incorrect 分支引入大规模网络搜索，作为静态语料之外的外部知识；Self-RAG 不引入外部搜索",
+        "CRAG 的 Correct 分支用 knowledge strips 做分解-过滤-重组的知识精炼；Self-RAG 用 critique token 控制生成质量"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+          "corpus_title": "selfrag_2310.11511",
+          "document_id": "739b84a7-d1ff-446d-8eaa-c964d062a71c",
+          "page_slug": "sources/selfrag-2310-11511",
+          "page_label": "1",
+          "evidence_anchor": "categorized into retrieval and critique tokens"
+        },
+        {
+          "document_title": "Corrective Retrieval Augmented Generation",
+          "corpus_title": "crag_2401.15884",
+          "document_id": "c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560",
+          "page_slug": "sources/crag-2401-15884",
+          "page_label": "4",
+          "evidence_anchor": "T5-large ... {Correct, Incorrect, Ambiguous}"
+        },
+        {
+          "document_title": "Corrective Retrieval Augmented Generation",
+          "corpus_title": "crag_2401.15884",
+          "document_id": "c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560",
+          "page_slug": "sources/crag-2401-15884",
+          "page_label": "3",
+          "evidence_anchor": "web searches are resorted to and regarded as complementary knowledge sources"
+        }
+      ],
+      "difficulty": "hard",
+      "notes": "两篇都在处理检索质量问题，落差在于“评判在哪一层”：Self-RAG 是 token 级、内生于生成模型；CRAG 是独立评估器 + 三分支动作 + 外部网络搜索。答案若只说“都做检索纠错”而不区分 evaluator 与 reflection token，判为不足。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "reflection tokens",
+          "T5-large",
+          "Correct",
+          "Incorrect",
+          "Ambiguous"
+        ],
+        "term_aliases": {
+          "reflection tokens": [
+            "reflection token"
+          ],
+          "T5-large": [
+            "T5-large (Raffel et al., 2020)"
+          ]
+        }
+      }
+    },
+    {
+      "id": "cpc_rag_vs_colbert_retrieval",
+      "category": "cross_paper_compare",
+      "question": "Compare the retrieval component in the original RAG paper with ColBERT's retrieval design. How does each represent queries and documents, and how is each trained?",
+      "language": "en",
+      "expected_answer_points": [
+        "RAG uses DPR, a bi-encoder that produces a single dense vector per query and per document",
+        "RAG retrieves the top-K documents by maximum inner product search (MIPS) over the Wikipedia index",
+        "ColBERT encodes query and document independently with BERT but keeps per-token embeddings and scores them with late interaction (MaxSim)",
+        "Because the interaction step is delayed, ColBERT's token-level document representations can be pre-computed offline and served through vector-similarity indexes for end-to-end retrieval",
+        "RAG's retriever is fine-tuned jointly with the generator, whereas ColBERT is a standalone ranking/retrieval model"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+          "corpus_title": "rag_2005.11401",
+          "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+          "page_slug": "sources/rag-2005-11401",
+          "page_label": "3",
+          "evidence_anchor": "DPR follows a bi-encoder architecture"
+        },
+        {
+          "document_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+          "corpus_title": "colbert_2004.12832",
+          "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+          "page_slug": "sources/colbert-2004-12832",
+          "page_label": "1",
+          "evidence_anchor": "late interaction architecture"
+        },
+        {
+          "document_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+          "corpus_title": "colbert_2004.12832",
+          "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+          "page_slug": "sources/colbert-2004-12832",
+          "page_label": "2",
+          "evidence_anchor": "MaxSim"
+        }
+      ],
+      "difficulty": "hard",
+      "notes": "The load-bearing distinction is the single-vector bi-encoder (DPR) against ColBERT's per-token embeddings scored by late interaction (MaxSim). An answer that compares only parameter counts or datasets, without naming the single-vector vs per-token difference, should be scored as incomplete. Terminology note: the ColBERT paper never uses the vector-per-token compound wording anywhere in its 10 pages, so score against the paper's own vocabulary (per-token embeddings, late interaction, MaxSim). Page_label 1 also writes “oﬄine” with an ff ligature, so a literal ASCII match on “offline” fails.",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "DPR",
+          "bi-encoder",
+          "late interaction",
+          "MaxSim"
+        ],
+        "term_aliases": {
+          "DPR": [
+            "Dense Passage Retriever"
+          ],
+          "bi-encoder": [
+            "bi-encoder architecture"
+          ],
+          "MaxSim": [
+            "MaxSim operator"
+          ],
+          "late interaction": [
+            "late interaction architecture"
+          ]
+        }
+      }
+    },
+    {
+      "id": "cpc_murag_vs_visrag",
+      "category": "cross_paper_compare",
+      "question": "MuRAG 和 VisRAG 都属于多模态 RAG，它们“检索什么”和“怎么检索”有什么不同？",
+      "language": "zh",
+      "expected_answer_points": [
+        "MuRAG 检索的是外部非参数化多模态记忆中的条目，条目可以是图像、纯文本或图文对",
+        "MuRAG 用 T5+ViT 组成的骨干把记忆条目与查询编码进同一空间，以对比损失与生成损失联合预训练",
+        "VisRAG 检索的是整页文档图像，把页面图像直接交给 VLM 编码，不做文本解析",
+        "VisRAG 的嵌入来自 VLM 末层隐状态的加权平均池化，属于双塔稠密检索",
+        "评测取向不同：MuRAG 面向开放多模态 QA（WebQA、MultimodalQA），VisRAG 面向多模态文档的页级 RAG"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "MuRAG: Multimodal Retrieval-Augmented Generator for Open Question Answering over Images and Text",
+          "corpus_title": "murag_2210.02928",
+          "document_id": "8731660a-375e-4815-aaac-b99684af729f",
+          "page_slug": "sources/murag-2210-02928",
+          "page_label": "2",
+          "evidence_anchor": "nonparametric multimodal memory containing images, text, or image-text pairs"
+        },
+        {
+          "document_title": "MuRAG: Multimodal Retrieval-Augmented Generator for Open Question Answering over Images and Text",
+          "corpus_title": "murag_2210.02928",
+          "document_id": "8731660a-375e-4815-aaac-b99684af729f",
+          "page_slug": "sources/murag-2210-02928",
+          "page_label": "1",
+          "evidence_anchor": "WebQA, and MultimodalQA"
+        },
+        {
+          "document_title": "VisRAG: Vision-based Retrieval-augmented Generation on Multi-modality Documents",
+          "corpus_title": "visrag_2410.10594",
+          "document_id": "a3bad38b-a172-48a2-9550-b7ad3865e17f",
+          "page_slug": "sources/visrag-2410-10594",
+          "page_label": "1",
+          "evidence_anchor": "utilizing the document’s image directly instead of relying on extracted textual content"
+        }
+      ],
+      "difficulty": "hard",
+      "notes": "关键差别是检索单元的粒度：MuRAG 检索的是记忆条目（图文对/文本/图像），VisRAG 检索的是整页图像。答案若只笼统说“两者都用图像”而不点出粒度与是否解析，判为不足。证据限制：描述 VisRAG-Ret 直接用文档图像、不走解析的那句话在语料中归属 page_label 1（印刷页为第 2 页），因此本条引用 page_label 1 而非 2。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "MuRAG",
+          "VisRAG",
+          "T5",
+          "ViT",
+          "VLM"
+        ],
+        "term_aliases": {
+          "T5": [
+            "T5 (Raffel et al., 2020)"
+          ],
+          "ViT": [
+            "ViT (Dosovitskiy et al., 2020)"
+          ],
+          "VLM": [
+            "vision-language model"
+          ]
+        }
+      }
+    },
+    {
+      "id": "cpc_react_vs_rag_pipeline",
+      "category": "cross_paper_compare",
+      "question": "How does ReAct's use of external knowledge differ from the retrieve-then-generate pipeline of the RAG paper?",
+      "language": "en",
+      "expected_answer_points": [
+        "ReAct interleaves free-form reasoning traces (thoughts) with task-specific actions, so retrieval is one action among several rather than a fixed first stage",
+        "ReAct acts on a simple Wikipedia API and reads observations back into the trajectory, letting the model update plans and handle exceptions",
+        "RAG performs one dense retrieval of top-K Wikipedia passages per query and marginalizes over them during generation",
+        "ReAct prompts a frozen LLM (PaLM-540B) with one or two in-context examples, while RAG fine-tunes retriever and generator end-to-end",
+        "ReAct is evaluated on multi-hop QA and fact verification as well as interactive environments (ALFWorld, WebShop); RAG targets knowledge-intensive generation and classification tasks"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+          "corpus_title": "react_2210.03629",
+          "document_id": "0ae69731-f290-4230-97af-d2c82516fef7",
+          "page_slug": "sources/react-2210-03629",
+          "page_label": "1",
+          "evidence_anchor": "interacting with a simple Wikipedia API"
+        },
+        {
+          "document_title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+          "corpus_title": "react_2210.03629",
+          "document_id": "0ae69731-f290-4230-97af-d2c82516fef7",
+          "page_slug": "sources/react-2210-03629",
+          "page_label": "3",
+          "evidence_anchor": "frozen large language model, PaLM-540B"
+        },
+        {
+          "document_title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+          "corpus_title": "rag_2005.11401",
+          "document_id": "e671cfa6-7077-4f4e-8884-bbbaccf123d2",
+          "page_slug": "sources/rag-2005-11401",
+          "page_label": "2",
+          "evidence_anchor": "marginalize the latent documents with a top-K approximation"
+        }
+      ],
+      "difficulty": "hard",
+      "notes": "核心是“交织式 推理-行动-观察 轨迹”对比“一次性检索后生成”。答案若只比较数据集或模型规模，而没有提到可以从观察中修正计划，应判为不足。react 文档 parse 状态为 validation_failed，page_label 3 在语料中是一个较短的块。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 2,
+        "numeric_tolerance": null,
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "ReAct",
+          "Wikipedia API",
+          "top-K",
+          "PaLM-540B"
+        ],
+        "term_aliases": {
+          "Wikipedia API": [
+            "simple Wikipedia API"
+          ],
+          "top-K": [
+            "top-k",
+            "top K"
+          ]
+        }
+      }
+    },
+    {
+      "id": "tm_selfrag_reflection_token_table",
+      "category": "table_metric",
+      "question": "Self-RAG 论文 Table 1 列出了哪四类 reflection token？其中 Retrieve、ISREL、ISSUP、ISUSE 各自的取值集合是什么？",
+      "language": "zh",
+      "expected_answer_points": [
+        "四类：Retrieve、ISREL、ISSUP、ISUSE",
+        "Retrieve 取值 {yes, no, continue}，用于决定何时用检索器 R 检索",
+        "ISREL 取值 {relevant, irrelevant}，判断文档 d 对解决 x 是否有用",
+        "ISSUP 取值 {fully supported, partially supported, no support}",
+        "ISUSE 取值 {5, 4, 3, 2, 1}",
+        "后三行是三类 critique token，表注指出加粗的是最理想的取值"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+          "corpus_title": "selfrag_2310.11511",
+          "document_id": "739b84a7-d1ff-446d-8eaa-c964d062a71c",
+          "page_slug": "sources/selfrag-2310-11511",
+          "page_label": "4",
+          "evidence_anchor": "Table 1: Four types of reflection tokens used in SELF-RAG"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "语料把该表渲染成规整的 markdown 表格，四行齐全，属于本批文档中表格保真度最高的一处。ISSUP 的取值在语料中为一行三值，注意不要只答 'fully supported'。",
+      "scoring": {
+        "required_point_count": 4,
+        "required_citation_count": 1,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "Retrieve",
+          "ISREL",
+          "ISSUP",
+          "ISUSE",
+          "{yes, no, continue}",
+          "{relevant, irrelevant}",
+          "{fully supported, partially supported, no support}",
+          "{5, 4, 3, 2, 1}"
+        ],
+        "term_aliases": {
+          "{5, 4, 3, 2, 1}": [
+            "{5,4,3,2,1}",
+            "5, 4, 3, 2, 1"
+          ],
+          "{fully supported, partially supported, no support}": [
+            "fully supported, partially supported, no support"
+          ]
+        }
+      }
+    },
+    {
+      "id": "tm_react_hotpotqa_fever_table",
+      "category": "table_metric",
+      "question": "In ReAct Table 1 (PaLM-540B prompting results), what are the HotpotQA EM and Fever accuracy for ReAct, CoT-SC→ReAct, and ReAct→CoT-SC? The CoT-SC baseline is required as well.",
+      "language": "en",
+      "expected_answer_points": [
+        "ReAct: HotpotQA EM 27.4, Fever accuracy 60.9",
+        "CoT-SC→ReAct: HotpotQA EM 34.2, Fever accuracy 64.6",
+        "ReAct→CoT-SC: HotpotQA EM 35.1, Fever accuracy 62.0",
+        "CoT-SC baseline: HotpotQA EM 33.4, Fever accuracy 60.4",
+        "Supervised SoTA (upper reference): HotpotQA EM 67.5, Fever accuracy 89.5"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "ReAct: Synergizing Reasoning and Acting in Language Models",
+          "corpus_title": "react_2210.03629",
+          "document_id": "0ae69731-f290-4230-97af-d2c82516fef7",
+          "page_slug": "sources/react-2210-03629",
+          "page_label": "4",
+          "evidence_anchor": "Table 1: PaLM-540B prompting results on HotpotQA and Fever"
+        }
+      ],
+      "difficulty": "medium",
+      "notes": "重要证据限制：该表的表体在语料中归属 page_label 4，而不是 PDF 印刷页码 5。react 文档使用 textfallback 解析版本，表格以纯文本行渲染（每行形如 'CoT-SC→ ReAct 34.2 64.6'），没有 markdown 竖线；引用 page_label 5 只会命中 Figure 2 与脚注，会错过表体。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 1,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "27.4",
+          "60.9",
+          "34.2",
+          "64.6",
+          "35.1",
+          "62.0",
+          "33.4",
+          "60.4"
+        ],
+        "term_aliases": {}
+      }
+    },
+    {
+      "id": "tm_colbert_rerank_table",
+      "category": "table_metric",
+      "question": "ColBERT 论文 Table 1 的 MS MARCO 重排序结果中，ColBERT（over BERT_base）、BERT_base 与 BERT_large 的 MRR@10（Dev）、重排序延迟和 FLOPs/query 分别是多少？",
+      "language": "zh",
+      "expected_answer_points": [
+        "ColBERT（over BERT_base）：MRR@10 (Dev) 34.9，延迟 61 ms，FLOPs/query 7B（1×）",
+        "BERT_base：MRR@10 (Dev) 34.7，延迟 10,700 ms，FLOPs/query 97T（13,900×）",
+        "BERT_large：MRR@10 (Dev) 36.5，延迟 32,900 ms，FLOPs/query 340T（48,600×）",
+        "表注说明每个神经模型都对 BM25 官方 top-1000 结果重排序，表中延迟只计重排序部分"
+      ],
+      "expected_citations": [
+        {
+          "document_title": "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT",
+          "corpus_title": "colbert_2004.12832",
+          "document_id": "523c63cd-2ed7-4ee4-9529-42b3dca8a171",
+          "page_slug": "sources/colbert-2004-12832",
+          "page_label": "7",
+          "evidence_anchor": "Table 1: “Re-ranking” results on MS MARCO"
+        }
+      ],
+      "difficulty": "hard",
+      "notes": "语料把该表完整渲染成 markdown 表格。BERT 行的方法名在语料里是 LaTeX 形式（$\\mathrm{BERT_{base}}$），字面匹配 'BERT_base' 会漏。数字带千分位逗号（10,700 / 32,900），判分时应接受 '10700' / '32900' 写法。",
+      "scoring": {
+        "required_point_count": 3,
+        "required_citation_count": 1,
+        "numeric_tolerance": "exact",
+        "partial_credit": "per_answer_point",
+        "required_terms": [
+          "34.9",
+          "34.7",
+          "10,700",
+          "97T",
+          "36.5",
+          "32,900",
+          "340T",
+          "7B"
+        ],
+        "term_aliases": {
+          "10,700": [
+            "10700"
+          ],
+          "32,900": [
+            "32900"
+          ]
+        }
+      }
+    }
+  ]
+}

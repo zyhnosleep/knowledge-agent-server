@@ -5,7 +5,9 @@ Knowledge Agent 是一个面向团队内部使用的文献知识与证据问答�
 ## 模型
 
 - 回答生成：`qwen3.5:9b`
-- 向量检索：`qwen3-embedding:4b`（2560 维）
+- 向量检索：本地回退为 `qwen3-embedding:4b`（2560 维）；开发环境的
+  OpenAI-compatible endpoint 使用 `qwen3.7-text-embedding`（1024 维），
+  由 `EMBEDDING_API_MODEL` 与 `EMBEDDING_DIMENSIONS` 控制。
 - 上下文：32K
 - 本地推理：Ollama、Flash Attention、q8_0 KV Cache
 - 闲置策略：最后一次调用 5 分钟后释放 GPU

@@ -771,7 +771,7 @@ flowchart LR
 | 上下文化 | `CONTEXTUALIZATION_ENABLED` / `_BATCH_SIZE` / `_MAX_RETRIES` / `_TIMEOUT` / `_MAX_SENTENCES` / `_PROMPT_VERSION` | true / 12 / 2 / 180 / 2 / context-v1 | 策略层白名单当前为空 → 通过性 |
 | PDF 解析 | `MINERU_ENABLED`/`MINERU_BIN`/`MINERU_BACKEND`/`MINERU_TIMEOUT` / `DOCUMENT_INTELLIGENCE_ENABLED` / `PDF_RENDER_DPI` / `OCR_FALLBACK_ENABLED` / `FIGURE_ANALYSIS_MODEL`/`FORMULA_ANALYSIS_MODEL` | true / .venv/bin/mineru / pipeline / 3600 / true / 160 / false / qwen3.5:9b | 解析回退链 |
 | 向量存储 | `VECTOR_STORE_ENABLED` / `VECTOR_STORE_BACKEND` | true / sqlite-vec | pgvector 后端（PostgreSQL 时） |
-| 检索 | `QUERY_MODE` / `SAC_KG_ENABLED` / `DEFAULT_PROJECT_SLUG` | rag / true / internal-research | 查询模式/默认项目 |
+| 检索 | `QUERY_MODE` / `SAC_KG_ENABLED` / `DEFAULT_PROJECT_SLUG` | rag / false / internal-research | 查询模式/默认项目；SAC-KG 语义抽取需显式开启并配置生成 provider |
 | Agent | `AGENT_ENABLED` / `_MAX_STEPS` / `_MAX_TOOL_CALLS` / `_BUDGET_TOKENS` / `_TIMEOUT_SECONDS` / `_ALLOW_EXTERNAL_NETWORK` / `_MAX_CONVERSATION_TURNS` / `_SYNTHESIS_PROVIDER` / `_CONVERSATION_TTL_DAYS` / `_TRACE_RETENTION_DAYS` / `_STREAM_HEARTBEAT_SECONDS` | true / 8 / 5 / 20000 / 90 / false / 200 / auto / 30 / 30 / 15 | 执行预算与生命周期 |
 | 外部 API | `EXTERNAL_API_ENABLED`/`_BASE_URL`/`_KEY`/`_MODEL`/`_TIMEOUT` | 全关 / gpt-4o-mini / 90 | 备选 provider |
 | MinIO | `MINIO_ENABLED` + `MINIO_*` | false | 对象存储镜像 |

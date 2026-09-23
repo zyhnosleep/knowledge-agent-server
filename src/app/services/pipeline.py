@@ -64,6 +64,7 @@ from app.models.records import (
 from app.services.ai import (
     DocumentAnalysisPayload,
     DocumentExtraction,
+    DeepSeekClient,
     ExternalVerifier,
     ExtractedClaim,
     ExtractedEntity,
@@ -599,11 +600,61 @@ class IngestionPipeline:
     """
 
     def __init__(self, db: Session) -> None:
-        """保存会话并初始化 Ollama 客户端、外部验证器与对象存储。"""
+        """保存会话并初始化检索/生成客户端、验证器与对象存储。
+
+        ``self.ollama`` remains the embedding and local-generation client.  The
+        SAC-KG extraction calls go through ``_generate_sac_kg_structured`` so a
+        deployment can switch only that generation path to DeepSeek without
+        changing Qwen embeddings, MinerU parsing, or the RAG index.
+        """
         self.db = db
         self.ollama = OllamaClient()
+        self.deepseek: DeepSeekClient | None = None
         self.verifier = ExternalVerifier()
         self.storage = ObjectStorage()
+
+    def _generate_sac_kg_structured(
+        self,
+        schema,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model: str | None = None,
+    ):
+        """Generate one SAC-KG payload using the configured generation provider.
+
+        This is deliberately a narrow provider boundary.  Embeddings still go
+        through ``self.ollama.embed`` (which already selects the hosted Qwen
+        embedding API), while only entity/claim extraction and growth decisions
+        honor ``GENERATION_PROVIDER``.  In tests and local deployments the
+        default remains Ollama; with ``deepseek`` selected, no Ollama generation
+        request is made.
+        """
+        provider = self._sac_kg_generation_provider()
+        if provider == "deepseek":
+            if self.deepseek is None:
+                self.deepseek = DeepSeekClient()
+            return self.deepseek.generate_structured(
+                schema,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=getattr(settings, "deepseek_model", None),
+            )
+        if provider not in {"", "ollama"}:
+            logger.warning("Unsupported SAC-KG generation provider %r; using Ollama compatibility path.", provider)
+        return self.ollama.generate_structured(
+            schema,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+        )
+
+    @staticmethod
+    def _sac_kg_generation_provider() -> str:
+        """Return the normalized provider used by SAC-KG structured calls."""
+        return str(
+            getattr(settings, "generation_provider", "ollama") or "ollama"
+        ).strip().lower()
 
     def ingestion_stage_handlers(self) -> dict[str, object]:
         """Expose stages backed by durable canonical artifact operations.
@@ -1261,10 +1312,10 @@ class IngestionPipeline:
             if len(embedding) != dimensions:
                 raise RuntimeError("Embedding response dimensions are inconsistent.")
             child_embeddings.append([float(value) for value in embedding])
-        if dimensions != settings.ollama_embedding_dimensions:
+        if dimensions != settings.active_embedding_dimensions:
             raise RuntimeError(
                 "Embedding response dimensions do not match the configured "
-                f"embedding dimensions ({settings.ollama_embedding_dimensions})."
+                f"embedding dimensions ({settings.active_embedding_dimensions})."
             )
         embedded = iter(child_embeddings)
         records = [
@@ -1317,7 +1368,7 @@ class IngestionPipeline:
             or expected_dimensions <= 0
         ):
             raise RuntimeError("Embed checkpoint has invalid dimensions.")
-        if expected_dimensions != settings.ollama_embedding_dimensions:
+        if expected_dimensions != settings.active_embedding_dimensions:
             raise RuntimeError(
                 "Embedding dimensions do not match the configured embedding dimensions."
             )
@@ -1456,7 +1507,7 @@ class IngestionPipeline:
             valid_contextualized_embedding(chunk) for chunk in eligible
         )
         plain_embedding_count = sum(valid_plain_embedding(chunk) for chunk in plain)
-        dimensions = settings.ollama_embedding_dimensions
+        dimensions = settings.active_embedding_dimensions
         embedded_count = sum(
             isinstance(chunk.embedding, list)
             and len(chunk.embedding) == dimensions
@@ -2364,7 +2415,13 @@ class IngestionPipeline:
                 self.db.commit()
                 return run
 
-            self._set_progress(run, 45, "extracting", "Generating SAC-KG routing facts with Ollama.")
+            generation_provider = self._sac_kg_generation_provider()
+            self._set_progress(
+                run,
+                45,
+                "extracting",
+                f"Generating SAC-KG routing facts with {generation_provider}.",
+            )
             extraction = self._extract_document(document, parsed.text)
             ensure_source_identity(document, extraction.title or document.title)
             ensure_paper_profile(document)
@@ -2386,6 +2443,8 @@ class IngestionPipeline:
                 "claims": len(claims),
                 "review_items": review_count,
                 "ingest_quality": quality_report,
+                "sac_kg_enabled": True,
+                "generation_provider": generation_provider,
             }
             self._set_progress(run, 100, "completed", "Ingest completed successfully.")
             self.db.commit()
@@ -2565,7 +2624,7 @@ class IngestionPipeline:
     ) -> DocumentAnalysisPayload:
         """生成文档级"种子分析"（摘要/关键事实/实体/概念/草稿三元组）。
 
-        调用 Ollama 结构化生成（DocumentAnalysisPayload）；失败退回
+        调用配置的结构化生成 provider（Ollama 或 DeepSeek）；失败退回
         ``_fallback_analysis``。
         """
         fallback = self._fallback_analysis(document, full_text, contexts)
@@ -2582,7 +2641,7 @@ class IngestionPipeline:
             ]
         )
         return safe_model_call(
-            lambda: self.ollama.generate_structured(
+            lambda: self._generate_sac_kg_structured(
                 DocumentAnalysisPayload,
                 system_prompt=(
                     "You are preparing a structured overview for an internal document knowledge base. "
@@ -2789,7 +2848,7 @@ class IngestionPipeline:
             ]
         )
         analysis = safe_model_call(
-            lambda: self.ollama.generate_structured(
+            lambda: self._generate_sac_kg_structured(
                 HeadAnalysisPayload,
                 system_prompt=(
                     "You are the Generator in a SAC-KG-inspired document pipeline. "
@@ -2887,7 +2946,7 @@ class IngestionPipeline:
             return filtered
 
         correction = safe_model_call(
-            lambda: self.ollama.generate_structured(
+            lambda: self._generate_sac_kg_structured(
                 HeadAnalysisPayload,
                 system_prompt=(
                     "You are the Verifier correction pass in a SAC-KG-inspired document pipeline. "
@@ -3571,7 +3630,7 @@ class IngestionPipeline:
             )
             fallback = GrowthDecisionPayload(decisions=[])
             ai_decisions = safe_model_call(
-                lambda: self.ollama.generate_structured(
+                lambda: self._generate_sac_kg_structured(
                     GrowthDecisionPayload,
                     system_prompt="You are the Pruner in a SAC-KG-inspired RAG pipeline. Return strict JSON decisions only.",
                     user_prompt=prompt,
@@ -3587,7 +3646,7 @@ class IngestionPipeline:
                     name=item.name,
                     item_type=item.item_type or "entity",
                     decision=normalized,
-                    reason=item.reason or "Ollama pruner decision.",
+                    reason=item.reason or "Configured SAC-KG generation provider decision.",
                 )
         return decisions
 

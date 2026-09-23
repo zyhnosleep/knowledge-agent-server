@@ -3,12 +3,14 @@ ai.py —— AI 模型接入层：Ollama 客户端 / 外部验证器 / 数据结
 ==================================================================
 
 职责：
-- 封装 Ollama（本地 LLM）的多种调用形态：
+- 封装 Ollama（本地 LLM）的多种调用形态，并提供独立的 DeepSeek
+  OpenAI-compatible 文本生成客户端：
   - 普通对话补全（非流式 ``generate_chat`` 与流式 ``stream_chat``）。
   - 结构化输出 ``generate_structured`` / ``generate_structured_with_images``：
     通过 ``format=schema.model_json_schema()`` 强制模型按 JSON Schema
     输出，解析失败时自动退化为 ``format=json`` 的宽松 JSON 模式重试。
-  - 文本嵌入 ``embed`` 与模型卸载 ``unload_loaded_models``。
+- 文本嵌入 ``embed``（本地 Ollama 或 Qwen3-Embedding-4B API）与模型卸载
+  ``unload_loaded_models``。
 - 提供一套用于文档分析 / 知识抽取的数据模型（Pydantic BaseModel），
   描述实体、三元组、页面解析、三重验证、增长决策、抽取结果等。
 - 提供 ``ContextualizationOllamaClient``：把 Ollama 传输层"冻结"到
@@ -450,6 +452,15 @@ class OllamaClient:
         """
         if not texts:
             return []
+        provider = settings.active_embedding_provider
+        if provider == "openai-compatible":
+            return self._embed_openai_compatible(texts)
+        if provider != "ollama":
+            raise ValueError(
+                "Unsupported EMBEDDING_PROVIDER: "
+                f"{settings.embedding_provider!r}; expected 'ollama' or "
+                "'openai-compatible'."
+            )
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(
                 f"{self.embedding_base_url}/api/embed",
@@ -462,6 +473,107 @@ class OllamaClient:
             )
             response.raise_for_status()
             return response.json()["embeddings"]
+
+    def _embed_openai_compatible(self, texts: list[str]) -> list[list[float]]:
+        """Call a hosted OpenAI-compatible embeddings endpoint.
+
+        The endpoint is intentionally vendor-neutral.  ``EMBEDDING_API_BASE_URL``
+        points at the API root (normally ending in ``/v1``); this method appends
+        ``/embeddings``.  Response rows are sorted by their explicit ``index`` so
+        batching cannot silently reorder document chunks.
+        """
+        base_url = (settings.embedding_api_base_url or "").strip().rstrip("/")
+        api_key = settings.embedding_api_key
+        if not base_url:
+            raise ValueError(
+                "EMBEDDING_API_BASE_URL is required when "
+                "EMBEDDING_PROVIDER=openai-compatible."
+            )
+        if not api_key or api_key.strip().upper() in {"CHANGE_ME", "YOUR_API_KEY"}:
+            raise ValueError(
+                "EMBEDDING_API_KEY is required when "
+                "EMBEDDING_PROVIDER=openai-compatible."
+            )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        embeddings: list[list[float]] = []
+        batch_size = settings.embedding_api_batch_size
+        with httpx.Client(timeout=settings.embedding_api_timeout) as client:
+            for offset in range(0, len(texts), batch_size):
+                batch = texts[offset : offset + batch_size]
+                response = client.post(
+                    f"{base_url}/embeddings",
+                    headers=headers,
+                    json={"model": settings.embedding_api_model, "input": batch},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                rows = payload.get("data")
+                if not isinstance(rows, list):
+                    raise ValueError("Embedding API response is missing a data array.")
+                if len(rows) != len(batch) or any(
+                    not isinstance(row, dict) for row in rows
+                ):
+                    raise ValueError(
+                        "Embedding API returned an invalid number or shape of embeddings."
+                    )
+                # OpenAI-compatible servers normally include an integer ``index``.
+                # A few providers omit it while preserving response order, so
+                # accept the all-omitted form but reject partial, duplicate, or
+                # out-of-range indices within each batch.  The batch-local index
+                # is intentional: concatenating validated batches preserves the
+                # original document order without assuming a global index.
+                indices = [row.get("index") for row in rows]
+                if all(index is None for index in indices):
+                    ordered = rows
+                elif all(
+                    isinstance(index, int) and not isinstance(index, bool)
+                    for index in indices
+                ):
+                    expected_indices = set(range(len(batch)))
+                    actual_indices = {
+                        index for index in indices if isinstance(index, int)
+                    }
+                    if actual_indices != expected_indices:
+                        raise ValueError(
+                            "Embedding API returned invalid or duplicate data indices."
+                        )
+                    ordered = sorted(rows, key=lambda row: row["index"])
+                else:
+                    raise ValueError(
+                        "Embedding API returned invalid or partial data indices."
+                    )
+
+                raw_embeddings = [row.get("embedding") for row in ordered]
+                if any(not isinstance(item, list) for item in raw_embeddings):
+                    raise ValueError(
+                        "Embedding API returned an invalid number or shape of embeddings."
+                    )
+                dimensions = {len(item) for item in raw_embeddings}
+                expected_dimensions = settings.active_embedding_dimensions
+                if dimensions != {expected_dimensions}:
+                    raise ValueError(
+                        "Embedding API dimensions do not match the configured index: "
+                        f"received {sorted(dimensions)}, expected "
+                        f"{expected_dimensions}."
+                    )
+                for item in raw_embeddings:
+                    vector: list[float] = []
+                    for value in item:
+                        if isinstance(value, bool) or not isinstance(value, (int, float)):
+                            raise ValueError(
+                                "Embedding API returned a non-numeric vector value."
+                            )
+                        numeric = float(value)
+                        if not math.isfinite(numeric):
+                            raise ValueError(
+                                "Embedding API returned a non-finite vector value."
+                            )
+                        vector.append(numeric)
+                    embeddings.append(vector)
+        return embeddings
 
     def unload_loaded_models(self) -> list[str]:
         """卸载当前加载的全部模型（内存回收）。
@@ -708,6 +820,272 @@ class OllamaClient:
             except json.JSONDecodeError:
                 continue
         raise ValueError("No valid JSON object found in Ollama response.")
+
+
+class DeepSeekAPIError(RuntimeError):
+    """A classified DeepSeek transport or response error.
+
+    ``status_code`` and ``retryable`` are retained for trace/audit callers so
+    they can distinguish credential failures (401/403), throttling (429),
+    transient server failures (5xx), and exhausted network retries without
+    parsing provider-specific exception strings.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.error_code = error_code
+
+
+class DeepSeekClient:
+    """Small OpenAI-compatible DeepSeek chat client with bounded retries.
+
+    The client is deliberately independent from ``OllamaClient``: generation
+    credentials, timeout, retry budget, model identity, and usage accounting
+    come from the DeepSeek-specific settings.  It never logs the API key and
+    does not retry credential errors (401/403).
+    """
+
+    _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        retry_backoff_seconds: float | None = None,
+    ) -> None:
+        self.base_url = (base_url or settings.deepseek_base_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.deepseek_api_key
+        self.model = model or settings.deepseek_model
+        self.timeout = (
+            timeout if timeout is not None else settings.generation_timeout_seconds
+        )
+        self.max_retries = (
+            max_retries if max_retries is not None else settings.generation_max_retries
+        )
+        self.retry_backoff_seconds = (
+            retry_backoff_seconds
+            if retry_backoff_seconds is not None
+            else settings.generation_retry_backoff_seconds
+        )
+
+    def generate_chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+        max_output_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate one non-streaming response and preserve provider usage.
+
+        Retries are bounded by ``GENERATION_MAX_RETRIES``.  Only 429/5xx and
+        transport timeouts/connectivity errors are retried; malformed response
+        payloads and authentication failures fail immediately.
+        """
+        if not self.base_url:
+            raise DeepSeekAPIError("DEEPSEEK_BASE_URL is required.")
+        if not self.api_key or self.api_key.strip().upper() in {"CHANGE_ME", "YOUR_API_KEY"}:
+            raise DeepSeekAPIError(
+                "DEEPSEEK_API_KEY is required.", error_code="missing_credentials"
+            )
+        payload: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_output_tokens or settings.generation_max_output_tokens,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error: DeepSeekAPIError | None = None
+        for attempt in range(max(0, self.max_retries) + 1):
+            try:
+                with httpx.Client(timeout=self.timeout) as client:
+                    response = client.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                retryable = isinstance(
+                    exc,
+                    (
+                        httpx.TimeoutException,
+                        httpx.NetworkError,
+                        ConnectionError,
+                        TimeoutError,
+                    ),
+                )
+                last_error = DeepSeekAPIError(
+                    f"DeepSeek request failed: {type(exc).__name__}: {exc}",
+                    retryable=retryable,
+                    error_code="transport_error",
+                )
+                if retryable and attempt < self.max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise last_error from exc
+
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status_code < 300:
+                retryable = status_code in self._RETRYABLE_STATUS_CODES
+                if retryable and attempt < self.max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                message = f"DeepSeek API returned HTTP {status_code}."
+                try:
+                    response.raise_for_status()
+                except Exception as exc:  # noqa: BLE001
+                    last_error = DeepSeekAPIError(
+                        message,
+                        status_code=status_code,
+                        retryable=retryable,
+                        error_code="http_error",
+                    )
+                    raise last_error from exc
+                raise DeepSeekAPIError(
+                    message,
+                    status_code=status_code,
+                    retryable=retryable,
+                    error_code="http_error",
+                )
+
+            try:
+                data = response.json()
+                content = self._content_from_response(data)
+            except Exception as exc:  # noqa: BLE001
+                raise DeepSeekAPIError(
+                    f"DeepSeek response format is invalid: {exc}",
+                    status_code=status_code,
+                    error_code="invalid_response",
+                ) from exc
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+            return {
+                "content": content,
+                "model": str(data.get("model") or self.model),
+                "provider": "deepseek",
+                "usage": usage,
+                "usage_source": "provider" if usage else "unknown",
+                "prompt_tokens": usage.get("prompt_tokens") if usage else None,
+                "completion_tokens": usage.get("completion_tokens") if usage else None,
+                "total_tokens": usage.get("total_tokens") if usage else None,
+            }
+
+        # The loop either returns or raises; retain a defensive guard for
+        # static analyzers and future changes to retry conditions.
+        raise last_error or DeepSeekAPIError("DeepSeek request failed.")
+
+    def generate_structured(
+        self,
+        schema: type[SchemaT],
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model: str | None = None,
+        max_output_tokens: int | None = None,
+    ) -> SchemaT:
+        """Generate and validate a JSON object for a Pydantic schema.
+
+        DeepSeek's JSON mode guarantees a JSON object, but it does not accept
+        Ollama's full ``format=<json-schema>`` contract.  Keep the schema
+        enforcement provider-neutral by putting a compact shape in the prompt,
+        requesting ``json_object`` mode, and validating the returned object
+        locally.  A single bounded parse retry adds explicit formatting
+        instructions without hiding transport/authentication failures.
+        """
+        shape = json.dumps(
+            OllamaClient._compact_schema_shape(schema),
+            ensure_ascii=False,
+        )
+        structured_prompt = "\n\n".join(
+            [
+                user_prompt,
+                "Return exactly one valid JSON object and no markdown, code fences, or explanation.",
+                "Use this JSON shape; keep every required key and use empty arrays when evidence is unavailable:",
+                shape,
+            ]
+        )
+        response = self.generate_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": structured_prompt},
+            ],
+            max_output_tokens=max_output_tokens,
+            response_format={"type": "json_object"},
+        )
+        content = response.get("content", "")
+        try:
+            return OllamaClient._parse_structured_content(schema, content)
+        except Exception as first_error:  # noqa: BLE001
+            logger.warning(
+                "DeepSeek structured response was invalid; retrying with an explicit JSON shape: %s",
+                first_error,
+            )
+
+        retry_prompt = "\n\n".join(
+            [
+                structured_prompt,
+                "The previous response was not valid for the requested schema. "
+                "Return only one JSON object that matches the shape above.",
+            ]
+        )
+        retry_response = self.generate_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": retry_prompt},
+            ],
+            max_output_tokens=max_output_tokens,
+            response_format={"type": "json_object"},
+        )
+        return OllamaClient._parse_structured_content(
+            schema,
+            retry_response.get("content", ""),
+        )
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        delay = max(0.0, float(self.retry_backoff_seconds)) * (2**attempt)
+        if delay:
+            time.sleep(delay)
+
+    @staticmethod
+    def _content_from_response(data: Any) -> str:
+        if not isinstance(data, dict):
+            raise ValueError("response must be an object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("choices is missing or empty")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise ValueError("first choice is invalid")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("message is missing")
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or "")
 
 
 class ContextualizationOllamaClient(OllamaClient):

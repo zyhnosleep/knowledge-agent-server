@@ -1,0 +1,896 @@
+{
+  "benchmark_id": "rag_benchmark_v1",
+  "benchmark_version": "v1.1-draft",
+  "created_at": "2026-09-23T05:48:28.611780+00:00",
+  "source_replay": "runtime\\evals\\rag_benchmark_v1_replay_remote_retry_20260923_postrestart.json",
+  "judge_model": "deepseek-chat",
+  "summary": {
+    "judged_cases": 15,
+    "average_score_0_100": 70.0,
+    "median_score_0_100": 78,
+    "pass_rate_at_70": 0.6,
+    "failure_class_counts": {
+      "none": 8,
+      "retrieval-limited": 3,
+      "generation-limited": 3,
+      "mixed": 1
+    },
+    "category_average_score_0_100": {
+      "single_paper_fact": 72.25,
+      "cross_paper_compare": 46.5,
+      "table_metric": 95.33
+    }
+  },
+  "judgments": [
+    {
+      "case_id": "spf_rag_two_components",
+      "score_0_100": 95,
+      "correctness_0_4": 4,
+      "completeness_0_4": 4,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 4,
+      "style_0_4": 3,
+      "point_judgments": [
+        {
+          "point": "参数化记忆是一个预训练的 seq2seq 模型（BART）",
+          "status": "full",
+          "reason": "答案明确指出参数化记忆由预训练 seq2seq 模型实现，并具体点名为 BART，引用证据 [0][1] 支持。"
+        },
+        {
+          "point": "非参数化记忆是 Wikipedia 的稠密向量索引（dense vector index）",
+          "status": "full",
+          "reason": "答案明确写明非参数化记忆是 Wikipedia 的稠密向量索引，并引用了包含该表述的证据。"
+        },
+        {
+          "point": "该索引由一个预训练的神经检索器访问，即 DPR（Dense Passage Retriever）",
+          "status": "full",
+          "reason": "答案指出通过预训练神经检索器访问，并具体说明为 Dense Passage Retriever（DPR），证据 [1] 支持。"
+        },
+        {
+          "point": "检索器给出隐变量文档，seq2seq 生成器在这些文档条件下生成输出，二者端到端联合微调",
+          "status": "full",
+          "reason": "答案描述了检索器提供潜在文档、BART 在文档与输入条件下生成输出，并提及端到端联合学习，与证据 [1] 一致。"
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "答案完整且准确地覆盖了所有必需要点，正确识别 BART、DPR 和 Wikipedia 稠密向量索引，并引用了第1页和第2页的两条证据，满足多页引用要求。内容与检索证据高度一致，无事实性错误。风格上额外包含证据与不确定性小节，稍显冗余但表述清晰，不影响事实正确性。",
+      "category": "single_paper_fact",
+      "difficulty": "easy",
+      "latency_ms": 2232,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 6396,
+          "completion_tokens": 438,
+          "total_tokens": 6834,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 5244
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_rag_sequence_vs_token",
+      "score_0_100": 70,
+      "correctness_0_4": 4,
+      "completeness_0_4": 3,
+      "groundedness_0_4": 3,
+      "citation_quality_0_4": 1,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "RAG-Sequence uses the same retrieved document to generate the complete output sequence",
+          "status": "full",
+          "reason": "The answer explicitly states this and the retrieved evidence supports it."
+        },
+        {
+          "point": "RAG-Token can draw a different latent document for each target token",
+          "status": "full",
+          "reason": "The answer correctly states this and it is directly supported by the evidence."
+        },
+        {
+          "point": "Both marginalize over the top-K retrieved documents returned by the retriever",
+          "status": "full",
+          "reason": "The answer identifies marginalization over top documents, and the evidence specifies top-K. The answer includes the term 'top' but does not explicitly repeat 'top-K' in the main text; however, the concept is conveyed."
+        },
+        {
+          "point": "For sequence classification the two formulations are equivalent",
+          "status": "full",
+          "reason": "The answer includes this exact point in the uncertainty section, supported by evidence."
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "The answer correctly explains the difference between RAG-Sequence and RAG-Token formulations, covering all required points with accurate definitions and marginalization details grounded in the retrieved evidence. It includes all required terms and the equivalence remark for classification. However, it does not properly cite the evidence: the only citation provided is to a corrupted table on page 6, which is irrelevant to the explanation. Despite this citation error, the factual content is correct and complete, so the overall score is 70.",
+      "category": "single_paper_fact",
+      "difficulty": "medium",
+      "latency_ms": 2341,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 4481,
+          "completion_tokens": 430,
+          "total_tokens": 4911,
+          "prompt_tokens_details": {
+            "cached_tokens": 896
+          },
+          "prompt_cache_hit_tokens": 896,
+          "prompt_cache_miss_tokens": 3585
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_selfrag_reflection_tokens",
+      "score_0_100": 62,
+      "correctness_0_4": 3,
+      "completeness_0_4": 2,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 1,
+      "style_0_4": 3,
+      "point_judgments": [
+        {
+          "point": "Special tokens that the language model itself generates to reflect on the retrieved passages and on its own generation",
+          "status": "full",
+          "reason": "The answer correctly identifies reflection tokens as special tokens the LM learns to generate during training, citing text that says the LM generates text informed by retrieved passages and criticizes output by learning to generate special tokens."
+        },
+        {
+          "point": "They are categorized into retrieval tokens and critique tokens",
+          "status": "full",
+          "reason": "The answer states they fall into two broad categories: a Retrieval token and three types of Critique tokens, and the supplied table evidence confirms the bottom three are Critique tokens."
+        },
+        {
+          "point": "The retrieval token decides whether retrieval is needed, enabling adaptive on-demand retrieval",
+          "status": "full",
+          "reason": "The answer explains that at inference time they allow the model to decide on-demand whether retrieval is needed; the Table 1 Retrieve row supports this."
+        },
+        {
+          "point": "They are learned by expanding the model vocabulary and predicting them as ordinary next tokens",
+          "status": "missing",
+          "reason": "The answer never states that reflection tokens are learned by expanding the model vocabulary or as next-token prediction from the expanded vocabulary; the page 2 evidence containing this mechanism is absent."
+        }
+      ],
+      "failure_class": "retrieval-limited",
+      "major_errors": [
+        "The answer omits the required mechanism that reflection tokens are learned by expanding the model vocabulary and predicting them as ordinary next tokens; the page-2 evidence is not present in the supplied context."
+      ],
+      "summary": "The answer correctly and fully covers three of the four rubric points using the page-1 and Table 1 evidence: reflection tokens are special generated tokens, categorized into retrieval and critique tokens, and enable on-demand retrieval/self-critique. However, the fourth required point about vocabulary expansion is entirely absent because the page-2 evidence containing that mechanism was not retrieved. The response is well structured and appropriately cites the evidence it does use, but incompleteness and the retrieval gap prevent a higher score.",
+      "category": "single_paper_fact",
+      "difficulty": "medium",
+      "latency_ms": 2977,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 7085,
+          "completion_tokens": 534,
+          "total_tokens": 7619,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 5933
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_crag_three_actions",
+      "score_0_100": 78,
+      "correctness_0_4": 3,
+      "completeness_0_4": 3,
+      "groundedness_0_4": 3,
+      "citation_quality_0_4": 3,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "用 T5-large 初始化并微调，参数量远小于当时的 LLM",
+          "status": "partial",
+          "reason": "答案正确指出 T5-large 初始化和微调，也引用了参数量小的原文，但正文未明确给出“参数量远小于当时的 LLM”这一完整论点，仅在证据引用中隐含。"
+        },
+        {
+          "point": "把相关性置信度量化成三个动作 {Correct, Incorrect, Ambiguous}",
+          "status": "full",
+          "reason": "答案完整列出三个动作，并说明由置信度触发，与证据一致。"
+        },
+        {
+          "point": "Correct：把检索文档精炼成 knowledge strips，过程包含 knowledge decomposition、filter、recomposition",
+          "status": "partial",
+          "reason": "答案提到 Knowledge_Refine 和内部知识，但没有明确给出“knowledge strips”和“knowledge decomposition、filter、recomposition”过程。"
+        },
+        {
+          "point": "Incorrect：丢弃检索到的文档，改用大规模网络搜索作为补充知识来源",
+          "status": "partial",
+          "reason": "答案正确描述 Web_Search 和外部知识，但未点明“丢弃检索文档”这一前置动作，尽管隐含在外部知识替换中。"
+        },
+        {
+          "point": "Ambiguous：无法确信地判定对错时触发，同时结合上述两种处理",
+          "status": "full",
+          "reason": "答案完整描述同时执行 Knowledge_Refine 和 Web_Search，并在不确定性部分说明无法确信判定。"
+        }
+      ],
+      "failure_class": "generation-limited",
+      "major_errors": [],
+      "summary": "答案正确识别 T5-large 和三种动作，并基于证据描述各分支处理，引用质量较好。但未明确覆盖部分 rubric 细节，如参数量比较、knowledge strips 及分解-过滤-重组流程、Incorrect 中丢弃文档的步骤，因此扣减完整性和正确性分数。",
+      "category": "single_paper_fact",
+      "difficulty": "medium",
+      "latency_ms": 2855,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 6331,
+          "completion_tokens": 522,
+          "total_tokens": 6853,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 5179
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_colbert_late_interaction",
+      "score_0_100": 3,
+      "correctness_0_4": 0,
+      "completeness_0_4": 0,
+      "groundedness_0_4": 0,
+      "citation_quality_0_4": 0,
+      "style_0_4": 1,
+      "point_judgments": [
+        {
+          "point": "Query and document are encoded independently by BERT rather than jointly",
+          "status": "missing",
+          "reason": "The answer does not state this point; it instead claims insufficient evidence, despite the evidence saying ColBERT independently encodes query and document using BERT."
+        },
+        {
+          "point": "A cheap interaction step then models fine-grained token-level similarity between the two encodings",
+          "status": "missing",
+          "reason": "The answer does not mention the cheap interaction step or fine-grained token-level similarity."
+        },
+        {
+          "point": "Because interaction is delayed, document representations can be pre-computed offline",
+          "status": "missing",
+          "reason": "The answer does not mention delayed interaction or offline pre-computation of document representations."
+        },
+        {
+          "point": "ColBERT executes two orders-of-magnitude faster and requires four orders-of-magnitude fewer FLOPs per query than BERT-based rankers",
+          "status": "missing",
+          "reason": "The answer does not state the two-orders-of-magnitude speedup or four-orders-of-magnitude FLOP reduction, although this is explicitly in the retrieved evidence."
+        }
+      ],
+      "failure_class": "generation-limited",
+      "major_errors": [
+        "The answer claims insufficient evidence despite the retrieved evidence containing the architecture description and efficiency claim needed to answer the question.",
+        "It omits all required answer points and does not cite the supplied evidence."
+      ],
+      "summary": "The answer is a refusal due to supposed insufficient evidence, but the retrieved documents clearly contain the required facts. This is a generation-limited failure: the evidence supports the answer, yet the response does not synthesize it, omits all required points, and provides no citations.",
+      "category": "single_paper_fact",
+      "difficulty": "easy",
+      "latency_ms": 2454,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 5398,
+          "completion_tokens": 460,
+          "total_tokens": 5858,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 4246
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_murag_design",
+      "score_0_100": 86,
+      "correctness_0_4": 4,
+      "completeness_0_4": 4,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 3,
+      "style_0_4": 3,
+      "point_judgments": [
+        {
+          "point": "是第一个能够使用多模态知识（视觉与文本）的检索增强模型，可访问外部非参数化多模态记忆",
+          "status": "full",
+          "reason": "答案明确指出 MuRAG 是首个能够使用多模态（视觉+文本）知识进行检索增强的模型，并提及可访问外部非参数化多模态记忆，与证据一致。"
+        },
+        {
+          "point": "该记忆包含图像、纯文本或图文对条目",
+          "status": "full",
+          "reason": "答案提到记忆包含图像、文本或图文对的非参数化多模态记忆，正确覆盖该点。"
+        },
+        {
+          "point": "骨干编码器由预训练的 T5 与 ViT 组合而成，把记忆条目与查询编码到同一表示空间",
+          "status": "full",
+          "reason": "答案说明骨干编码器由预训练 T5 与 ViT 组合构建，编码图文对、纯图像、纯文本输入，并用于嵌入记忆条目和查询，符合证据。"
+        },
+        {
+          "point": "在 WebQA 与 MultimodalQA 两个开放多模态 QA 数据集上评测",
+          "status": "full",
+          "reason": "答案准确列出在 WebQA 和 MultimodalQA 两个开放式多模态问答数据集上评测。"
+        },
+        {
+          "point": "相比已有基线绝对提升 10–20%，在 distractor（40+ 候选）与 full-wiki（100 万候选）两种设定下都成立",
+          "status": "full",
+          "reason": "答案明确给出相比强基线提升约 10–20% 准确率，并说明在 distractor（40+ 候选）与 full-wiki（1M 候选）两种设定下均成立，与证据一致。"
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "回答完整准确地覆盖了所有要求的回答点，引用证据支持有力。存在少量冗余表述和格式问题，但核心事实和数值均与证据一致，未出现重大错误。",
+      "category": "single_paper_fact",
+      "difficulty": "medium",
+      "latency_ms": 2718,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 6668,
+          "completion_tokens": 547,
+          "total_tokens": 7215,
+          "prompt_tokens_details": {
+            "cached_tokens": 1280
+          },
+          "prompt_cache_hit_tokens": 1280,
+          "prompt_cache_miss_tokens": 5388
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_react_alfworld_webshop",
+      "score_0_100": 96,
+      "correctness_0_4": 4,
+      "completeness_0_4": 4,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 3,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "ALFWorld: 34% absolute improvement in success rate",
+          "status": "full",
+          "reason": "Answer states ALFWorld improvement of 34% absolute success rate over baselines."
+        },
+        {
+          "point": "WebShop: 10% absolute improvement in success rate",
+          "status": "full",
+          "reason": "Answer states WebShop improvement of 10% absolute success rate over baselines."
+        },
+        {
+          "point": "It is prompted with only one or two in-context examples",
+          "status": "full",
+          "reason": "Answer states ReAct is prompted with only one or two in-context examples for these benchmarks."
+        },
+        {
+          "point": "Both gains are over imitation and reinforcement learning methods",
+          "status": "full",
+          "reason": "Answer explicitly says it outperforms imitation and reinforcement learning methods."
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "The answer correctly identifies ALFWorld and WebShop, reports the 34% and 10% absolute success-rate improvements, attributes them to comparison against imitation and reinforcement learning methods, and notes the one-to-two in-context examples. It is well grounded in the cited abstract excerpt and required citation. Minor deductions: citation formatting is bracket-only with no page label, and it adds an unnecessary 'Uncertainty' section that could slightly reduce confidence/clarity, but no factual errors.",
+      "category": "single_paper_fact",
+      "difficulty": "easy",
+      "latency_ms": 2219,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 5972,
+          "completion_tokens": 362,
+          "total_tokens": 6334,
+          "prompt_tokens_details": {
+            "cached_tokens": 896
+          },
+          "prompt_cache_hit_tokens": 896,
+          "prompt_cache_miss_tokens": 5076
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "spf_visrag_design",
+      "score_0_100": 88,
+      "correctness_0_4": 4,
+      "completeness_0_4": 3,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 3,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "流水线由 VLM 驱动的检索器 VisRAG-Ret 与生成器 VisRAG-Gen 组成",
+          "status": "full",
+          "reason": "明确指出检索由 VLM 基座检索器 VisRAG-Ret 完成，生成由 VLM 基座生成器 VisRAG-Gen 完成，与证据[0]一致。"
+        },
+        {
+          "point": "文档不再先解析成文本，而是直接作为图像由 VLM 编码",
+          "status": "full",
+          "reason": "明确说明不再先把文档解析成文本，而是直接以文档图像形式嵌入、检索并用于生成，与证据一致。"
+        },
+        {
+          "point": "因此保留原始文档的版式与图像信息，消除解析阶段引入的信息损失",
+          "status": "full",
+          "reason": "准确表述为保留原始视觉格式中的全部信息，避免解析阶段的信息丢失或失真，与证据[0][1]一致。"
+        },
+        {
+          "point": "相比传统文本 RAG 流水线取得 20–40% 的端到端性能提升",
+          "status": "partial",
+          "reason": "回答给出40%和20%的具体相对提升，并限定为相对提升而非绝对准确率差值，方向正确；但未直接使用题目要求的'20–40%'整体端到端收益范围，也未涉及摘要中'20–40% end-to-end performance gain'的总体表述。"
+        },
+        {
+          "point": "VisRAG-Ret 沿用稠密检索的双塔结构，对最终隐状态做加权平均池化得到嵌入",
+          "status": "partial",
+          "reason": "回答正确指出VisRAG-Ret沿用文本稠密检索器的双编码器结构，并说明嵌入通过对最终隐状态做加权平均池化得到；证据中为'bi-encoder'而非'双塔'，术语略有偏差，但核心机制正确。"
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [
+        "未能按题目要求明确给出'20–40%'这一整体端到端收益区间，仅分别列出40%和20%两个具体数值，导致第4个必答点不完整。"
+      ],
+      "summary": "答案整体正确且证据支撑充分，清晰说明了VisRAG由VLM驱动的VisRAG-Ret与VisRAG-Gen组成，直接以图像编码并保留原始视觉信息，也给出了40%/20%的相对提升；但未按题目要求使用'20–40%'整体端到端收益表述，第4个必答点仅为部分覆盖，故最终得分为88。",
+      "category": "single_paper_fact",
+      "difficulty": "medium",
+      "latency_ms": 3456,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 8356,
+          "completion_tokens": 619,
+          "total_tokens": 8975,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 7204
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "cpc_selfrag_vs_crag",
+      "score_0_100": 48,
+      "correctness_0_4": 2,
+      "completeness_0_4": 1,
+      "groundedness_0_4": 3,
+      "citation_quality_0_4": 2,
+      "style_0_4": 3,
+      "point_judgments": [
+        {
+          "point": "Self-RAG 的评判内生于生成模型：同一个 LM 生成 reflection tokens（retrieval 与 critique 两类）来按需决定检索并自我评判",
+          "status": "partial",
+          "reason": "回答正确指出 Self-RAG 是“模型内化的检索与自评”，并提到模型自身执行 retrieve/critique/generate，方向正确；但未提及 reflection tokens、retrieval 与 critique 两类 token 或“同一个 LM”这一内生化关键细节，而所需证据（Self-RAG 页面）并未在 Top-10 中检索到。"
+        },
+        {
+          "point": "CRAG 外挂一个独立的轻量检索评估器（T5-large 初始化），对整批检索文档打分",
+          "status": "partial",
+          "reason": "回答正确描述 CRAG 有独立检索评估器 E 对每对 (x, d_i) 打分并汇总置信度，机制正确；但完全没有提到评估器由 T5-large 初始化，required term “T5-large” 缺失。"
+        },
+        {
+          "point": "CRAG 由置信度触发 {Correct, Incorrect, Ambiguous} 三个动作；Self-RAG 没有独立的三分支动作",
+          "status": "full",
+          "reason": "回答明确给出 [CORRECT]、[INCORRECT]、[AMBIGUOUS] 三档置信度及对应三条分支，并指出 Self-RAG 没有这种外挂三分支机制。"
+        },
+        {
+          "point": "CRAG 在 Incorrect 分支引入大规模网络搜索，作为静态语料之外的外部知识；Self-RAG 不引入外部搜索",
+          "status": "full",
+          "reason": "回答准确复述 INCORRECT 分支用查询改写后做 Web_Search 获取外部知识，并说明这是 CRAG 的外部知识来源；对比中暗示 Self-RAG 不引入外部搜索。"
+        },
+        {
+          "point": "CRAG 的 Correct 分支用 knowledge strips 做分解-过滤-重组的知识精炼；Self-RAG 用 critique token 控制生成质量",
+          "status": "partial",
+          "reason": "回答提到 CORRECT 分支使用 Knowledge_Refine 得到内部知识，方向正确；但未提 knowledge strips、分解-过滤-重组流程，也未说明 Self-RAG 用 critique token 控制生成质量。"
+        }
+      ],
+      "failure_class": "retrieval-limited",
+      "major_errors": [
+        "未提及 CRAG 评估器由 T5-large 初始化（required term 缺失）",
+        "未提及 Self-RAG 的 reflection tokens 及其 retrieval/critique 两类划分",
+        "未提及 knowledge strips 与分解-过滤-重组的知识精炼流程"
+      ],
+      "summary": "回答对 CRAG 的独立评估器-三分支-网络搜索机制描述较准确且有 Algorithm 1 引用支撑，对 Self-RAG 只给出“内化检索与自评”的高层概括，核心术语（reflection tokens、T5-large、knowledge strips、分解-过滤-重组）均缺失。检索指标显示 Self-RAG 原论文页（739b84a7…page 1）与 CRAG 第 3、4 页的预期引文均未进入 Top-10，构成明显的 retrieval-limited；回答虽自行声明证据不足，但未达 benchmark 要求的机制对比深度，故 completeness 仅得 1。",
+      "category": "cross_paper_compare",
+      "difficulty": "hard",
+      "latency_ms": 3732,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 6927,
+          "completion_tokens": 790,
+          "total_tokens": 7717,
+          "prompt_tokens_details": {
+            "cached_tokens": 1408
+          },
+          "prompt_cache_hit_tokens": 1408,
+          "prompt_cache_miss_tokens": 5519
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "cpc_rag_vs_colbert_retrieval",
+      "score_0_100": 15,
+      "correctness_0_4": 1,
+      "completeness_0_4": 0,
+      "groundedness_0_4": 2,
+      "citation_quality_0_4": 1,
+      "style_0_4": 1,
+      "point_judgments": [
+        {
+          "point": "RAG uses DPR, a bi-encoder that produces a single dense vector per query and per document",
+          "status": "missing",
+          "reason": "No RAG-paper evidence is present in the retrieved set, and the answer (a raw-evidence fallback) never describes DPR or single-vector bi-encoding."
+        },
+        {
+          "point": "RAG retrieves the top-K documents by maximum inner product search (MIPS) over the Wikipedia index",
+          "status": "missing",
+          "reason": "Entirely absent; no RAG retrieval mechanics or Wikipedia index are mentioned."
+        },
+        {
+          "point": "ColBERT encodes query and document independently with BERT but keeps per-token embeddings and scores them with late interaction (MaxSim)",
+          "status": "partial",
+          "reason": "The answer contains only the title ('Contextualized Late Interaction over BERT') and a figure caption; it never explains independent BERT encoding, per-token embeddings, or the MaxSim scoring formulation."
+        },
+        {
+          "point": "Because the interaction step is delayed, ColBERT's token-level document representations can be pre-computed offline and served through vector-similarity indexes for end-to-end retrieval",
+          "status": "partial",
+          "reason": "The raw excerpt mentions the IVFPQ index and end-to-end retrieval, but the answer does not synthesize the delayed-interaction/offline-precompute rationale."
+        },
+        {
+          "point": "RAG's retriever is fine-tuned jointly with the generator, whereas ColBERT is a standalone ranking/retrieval model",
+          "status": "missing",
+          "reason": "Not addressed at all; no comparison of training regimes is provided."
+        }
+      ],
+      "failure_class": "retrieval-limited",
+      "major_errors": [
+        "The response is a system-failure fallback that returns raw retrieval evidence rather than an answer; it does not actually compare RAG and ColBERT.",
+        "The RAG side of the comparison is entirely unanswerable from the provided evidence, and the ColBERT side is presented as raw excerpts without synthesis."
+      ],
+      "summary": "The submitted response is a pipeline-fallback notice ('LLM generation temporarily failed... raw retrieval evidence') that dumps retrieved ColBERT excerpts without answering the comparison question. The required DPR/bi-encoder/single-vector points and the RAG-vs-ColBERT training distinction are absent, and the ColBERT per-token/late-interaction/MaxSim points are only indirectly present in unprocessed text. This is primarily retrieval-limited (no original RAG paper evidence was supplied), compounded by a generation/pipeline failure that produced no synthesized answer. Score reflects near-zero completeness and weak correctness despite faint grounding in the raw excerpts.",
+      "category": "cross_paper_compare",
+      "difficulty": "hard",
+      "latency_ms": 3177,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 6047,
+          "completion_tokens": 629,
+          "total_tokens": 6676,
+          "prompt_tokens_details": {
+            "cached_tokens": 1408
+          },
+          "prompt_cache_hit_tokens": 1408,
+          "prompt_cache_miss_tokens": 4639
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "cpc_murag_vs_visrag",
+      "score_0_100": 65,
+      "correctness_0_4": 3,
+      "completeness_0_4": 2,
+      "groundedness_0_4": 3,
+      "citation_quality_0_4": 2,
+      "style_0_4": 2,
+      "point_judgments": [
+        {
+          "point": "MuRAG 检索的是外部非参数化多模态记忆中的条目，条目可以是图像、纯文本或图文对",
+          "status": "partial",
+          "reason": "答案正确说 MuRAG 检索外部非参数化多模态记忆，也提及视觉与文本知识数据，但未明确说明条目可以是图像、纯文本或图文对；检索证据中出现在 benchmark 期望句子中，但答案未完整覆盖条目粒度。"
+        },
+        {
+          "point": "MuRAG 用 T5+ViT 组成的骨干把记忆条目与查询编码进同一空间，以对比损失与生成损失联合预训练",
+          "status": "partial",
+          "reason": "答案提到了 joint contrastive and generative loss，但完全没有提到 T5+ViT 骨干，也未说明把记忆条目与查询编码进同一空间；证据中也没有 T5 相关信息。"
+        },
+        {
+          "point": "VisRAG 检索的是整页文档图像，把页面图像直接交给 VLM 编码，不做文本解析",
+          "status": "full",
+          "reason": "答案完整说明 VisRAG 检索文档页面图像本身，直接使用文档图像而非抽取文本，走纯视觉管线并绕过文本解析阶段，与证据一致。"
+        },
+        {
+          "point": "VisRAG 的嵌入来自 VLM 末层隐状态的加权平均池化，属于双塔稠密检索",
+          "status": "full",
+          "reason": "答案明确说嵌入由最终隐状态做 weighted mean pooling 得到，并提到沿用 bi-encoder 结构，覆盖了双塔稠密检索。"
+        },
+        {
+          "point": "评测取向不同：MuRAG 面向开放多模态 QA（WebQA、MultimodalQA），VisRAG 面向多模态文档的页级 RAG",
+          "status": "full",
+          "reason": "答案指出 MuRAG 使用 WebQA 与 MultimodalQA，VisRAG 面向多模态文档页级 RAG，虽然引用略乱，但内容正确。"
+        }
+      ],
+      "failure_class": "mixed",
+      "major_errors": [
+        "MuRAG 的 T5+ViT 骨干、编码进同一空间等关键实现细节缺失，答案也未提及 T5。",
+        "MuRAG 检索条目粒度（图像、纯文本或图文对）表述不够明确。",
+        "答案中 MuRAG WebQA/MultimodalQA 的引用 [3] 未出现在 answer_citations 中，引用支持不完整。",
+        "答案风格包含推测性表述，弱化了直接对照。"
+      ],
+      "summary": "答案在 VisRAG 的检索对象、纯视觉管线、加权平均池化与双塔检索、以及评测取向上基本正确，但 MuRAG 侧缺少 T5+ViT 骨干、查询与记忆条目同空间编码、条目粒度等关键点；部分信息受检索证据限制。引用方面存在证据支持不足和引用与正文锚点不完全对应的问题。综合为 correctness 3、completeness 2、groundedness 3、citation 2、style 2，总分 65。",
+      "category": "cross_paper_compare",
+      "difficulty": "hard",
+      "latency_ms": 3634,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 7401,
+          "completion_tokens": 782,
+          "total_tokens": 8183,
+          "prompt_tokens_details": {
+            "cached_tokens": 1408
+          },
+          "prompt_cache_hit_tokens": 1408,
+          "prompt_cache_miss_tokens": 5993
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "cpc_react_vs_rag_pipeline",
+      "score_0_100": 58,
+      "correctness_0_4": 2,
+      "completeness_0_4": 2,
+      "groundedness_0_4": 3,
+      "citation_quality_0_4": 1,
+      "style_0_4": 3,
+      "point_judgments": [
+        {
+          "point": "ReAct interleaves free-form reasoning traces (thoughts) with task-specific actions, so retrieval is one action among several rather than a fixed first stage",
+          "status": "full",
+          "reason": "The answer correctly states that ReAct interleaves reasoning traces and task-specific actions and that retrieval is dynamic and part of the trajectory, supported by the evidence (e.g., [1] and [2])."
+        },
+        {
+          "point": "ReAct acts on a simple Wikipedia API and reads observations back into the trajectory, letting the model update plans and handle exceptions",
+          "status": "partial",
+          "reason": "The answer mentions the Wikipedia API and dynamic retrieval, but does not explicitly cover reading observations back into the trajectory to update plans and handle exceptions, which is a key part of the point."
+        },
+        {
+          "point": "RAG performs one dense retrieval of top-K Wikipedia passages per query and marginalizes over them during generation",
+          "status": "partial",
+          "reason": "The answer describes RAG's retrieval and conditioning but does not clearly state that it is a single dense retrieval of top-K passages per query, nor the marginalization over latent documents as specified in the evidence [7]."
+        },
+        {
+          "point": "ReAct prompts a frozen LLM (PaLM-540B) with one or two in-context examples, while RAG fine-tunes retriever and generator end-to-end",
+          "status": "missing",
+          "reason": "The answer does not mention PaLM-540B, frozen LLM prompting, or the contrast with RAG's end-to-end fine-tuning of retriever and generator, despite this being a required point and term."
+        },
+        {
+          "point": "ReAct is evaluated on multi-hop QA and fact verification as well as interactive environments (ALFWorld, WebShop); RAG targets knowledge-intensive generation and classification tasks",
+          "status": "partial",
+          "reason": "The answer only mentions HotpotQA and Fever for ReAct and does not mention ALFWorld or WebShop, nor does it describe RAG's target tasks, so the comparison is incomplete."
+        }
+      ],
+      "failure_class": "generation-limited",
+      "major_errors": [
+        "Missing required term 'PaLM-540B' and the associated point about ReAct using a frozen LLM with in-context examples.",
+        "Incomplete description of RAG's retrieval mechanism (top-K, marginalization).",
+        "Incomplete coverage of evaluation tasks for both systems.",
+        "Citation quality is poor: citations are sparse, some evidence in the answer is not cited, and the format [0] and [1] is not clearly tied to the expected citation anchors."
+      ],
+      "summary": "The answer captures the core contrast that ReAct interleaves reasoning and acting to gather external knowledge dynamically, while RAG retrieves and then generates. However, it omits key required points: the frozen PaLM-540B model, the precise top-K retrieval and marginalization in RAG, and the full evaluation benchmarks. Citations are insufficient, and some claims are only partially grounded. Overall, it is a generation-limited response that is partially correct but incomplete.",
+      "category": "cross_paper_compare",
+      "difficulty": "hard",
+      "latency_ms": 3498,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 7781,
+          "completion_tokens": 765,
+          "total_tokens": 8546,
+          "prompt_tokens_details": {
+            "cached_tokens": 1280
+          },
+          "prompt_cache_hit_tokens": 1280,
+          "prompt_cache_miss_tokens": 6501
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "tm_selfrag_reflection_token_table",
+      "score_0_100": 98,
+      "correctness_0_4": 4,
+      "completeness_0_4": 4,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 4,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "四类：Retrieve、ISREL、ISSUP、ISUSE",
+          "status": "full",
+          "reason": "答案明确列出四类 reflection token 为 Retrieve、ISREL、ISSUP、ISUSE，与证据中的 Table 1 一致。"
+        },
+        {
+          "point": "Retrieve 取值 {yes, no, continue}，用于决定何时用检索器 R 检索",
+          "status": "full",
+          "reason": "答案给出 Retrieve 取值 {yes, no, continue}，并引用定义 'Decides when to retrieve with R'，与证据一致。"
+        },
+        {
+          "point": "ISREL 取值 {relevant, irrelevant}，判断文档 d 对解决 x 是否有用",
+          "status": "full",
+          "reason": "答案给出 ISREL 取值 {relevant, irrelevant}，定义为 'd provides useful information to solve x'，与证据一致。"
+        },
+        {
+          "point": "ISSUP 取值 {fully supported, partially supported, no support}",
+          "status": "full",
+          "reason": "答案给出 ISSUP 三值集合 {fully supported, partially supported, no support}，完整覆盖基准提醒的三值，与证据一致。"
+        },
+        {
+          "point": "ISUSE 取值 {5, 4, 3, 2, 1}",
+          "status": "full",
+          "reason": "答案给出 ISUSE 取值 {5, 4, 3, 2, 1}，与证据一致。"
+        },
+        {
+          "point": "后三行是三类 critique token，表注指出加粗的是最理想的取值",
+          "status": "full",
+          "reason": "答案引用表注 'The bottom three rows are three types of Critique tokens, and the bold text indicates the most desirable critique tokens'，完整覆盖该点。"
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "答案准确、完整地回答了 Self-RAG Table 1 中四类 reflection token 及其取值集合，覆盖全部 rubric 要点，引用与证据一致，并诚实标注了 ISREL/ISUSE 定义列的抽取噪声；除轻微排版噪声外无实质性错误。",
+      "category": "table_metric",
+      "difficulty": "medium",
+      "latency_ms": 2343,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 7079,
+          "completion_tokens": 528,
+          "total_tokens": 7607,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 5927
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "tm_react_hotpotqa_fever_table",
+      "score_0_100": 100,
+      "correctness_0_4": 4,
+      "completeness_0_4": 4,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 4,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "ReAct: HotpotQA EM 27.4, Fever accuracy 60.9",
+          "status": "full",
+          "reason": "The answer table lists ReAct as 27.4 EM and 60.9 Fever accuracy, matching the required values and the Table 1 evidence."
+        },
+        {
+          "point": "CoT-SC→ReAct: HotpotQA EM 34.2, Fever accuracy 64.6",
+          "status": "full",
+          "reason": "The answer table lists CoT-SC→ReAct as 34.2 EM and 64.6 Fever accuracy, matching the expected values."
+        },
+        {
+          "point": "ReAct→CoT-SC: HotpotQA EM 35.1, Fever accuracy 62.0",
+          "status": "full",
+          "reason": "The answer table lists ReAct→CoT-SC as 35.1 EM and 62.0 Fever accuracy, matching the expected values."
+        },
+        {
+          "point": "CoT-SC baseline: HotpotQA EM 33.4, Fever accuracy 60.4",
+          "status": "full",
+          "reason": "The answer table lists CoT-SC baseline as 33.4 EM and 60.4 Fever accuracy, matching the expected values."
+        },
+        {
+          "point": "Supervised SoTA (upper reference): HotpotQA EM 67.5, Fever accuracy 89.5",
+          "status": "full",
+          "reason": "The answer evidence paragraph lists Supervised SoTA as 67.5 / 89.5, matching the required reference point."
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "The answer correctly and completely reports all requested Table 1 values, including the CoT-SC baseline and the Supervised SoTA reference, and grounds them in the retrieved Table 1 evidence. Citations identify the source and excerpt, though page labels primarily reflect page 5/6 discussion excerpts rather than the expected page_label 4 table excerpt; the table values themselves are explicitly cited to the source. The response is well structured, clear, and contains no factual errors.",
+      "category": "table_metric",
+      "difficulty": "medium",
+      "latency_ms": 2517,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 9385,
+          "completion_tokens": 520,
+          "total_tokens": 9905,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 8233
+        },
+        "usage_source": "provider"
+      }
+    },
+    {
+      "case_id": "tm_colbert_rerank_table",
+      "score_0_100": 88,
+      "correctness_0_4": 4,
+      "completeness_0_4": 3,
+      "groundedness_0_4": 4,
+      "citation_quality_0_4": 3,
+      "style_0_4": 4,
+      "point_judgments": [
+        {
+          "point": "ColBERT（over BERT_base）：MRR@10 (Dev) 34.9，延迟 61 ms，FLOPs/query 7B（1×）",
+          "status": "full",
+          "reason": "答案表格和证据部分均完整给出这三个数值，与证据中的 Table 1 行一致。"
+        },
+        {
+          "point": "BERT_base：MRR@10 (Dev) 34.7，延迟 10,700 ms，FLOPs/query 97T（13,900×）",
+          "status": "full",
+          "reason": "答案明确列出 BERT_base [25] 行的 34.7、10,700、97T (13,900×)，完全覆盖要求。"
+        },
+        {
+          "point": "BERT_large：MRR@10 (Dev) 36.5，延迟 32,900 ms，FLOPs/query 340T（48,600×）",
+          "status": "full",
+          "reason": "答案表格和证据部分均给出 BERT_large 的 36.5、32,900、340T (48,600×)，与证据一致。"
+        },
+        {
+          "point": "表注说明每个神经模型都对 BM25 官方 top-1000 结果重排序，表中延迟只计重排序部分",
+          "status": "partial",
+          "reason": "答案在证据部分简要提及“延迟仅计重排序部分”，但未完整明确说明每个神经模型都对 BM25 官方 top-1000 结果重排序；表注信息覆盖不完整。"
+        }
+      ],
+      "failure_class": "none",
+      "major_errors": [],
+      "summary": "答案准确并完整地给出了所问三个模型行的 MRR@10 (Dev)、重排序延迟和 FLOPs/query，数字全部与检索到的 Table 1 证据一致，且处理了 BERT_base 两行造成的歧义。主要不足是表注中“每个神经模型都对 BM25 官方 top-1000 结果重排序”这一说明只被部分转述，完整性略有欠缺。引用格式为一般编号，未直接给出页面定位，但引用质量尚可。",
+      "category": "table_metric",
+      "difficulty": "hard",
+      "latency_ms": 2802,
+      "error": null,
+      "response": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "usage": {
+          "prompt_tokens": 8793,
+          "completion_tokens": 572,
+          "total_tokens": 9365,
+          "prompt_tokens_details": {
+            "cached_tokens": 1152
+          },
+          "prompt_cache_hit_tokens": 1152,
+          "prompt_cache_miss_tokens": 7641
+        },
+        "usage_source": "provider"
+      }
+    }
+  ],
+  "completed_at": "2026-09-23T05:48:28.619786+00:00"
+}

@@ -106,7 +106,10 @@ class Settings(BaseSettings):
     default_project_slug: str = Field(default="internal-research", alias="DEFAULT_PROJECT_SLUG")
     default_project_name: str = Field(default="Internal Research", alias="DEFAULT_PROJECT_NAME")
     query_mode: str = Field(default="rag", alias="QUERY_MODE")
-    sac_kg_enabled: bool = Field(default=True, alias="SAC_KG_ENABLED")
+    # Keep semantic extraction opt-in.  RAG ingestion must remain usable when
+    # the Claim/Entity pipeline has not been migrated to the configured remote
+    # generation provider yet.
+    sac_kg_enabled: bool = Field(default=False, alias="SAC_KG_ENABLED")
     vector_store_enabled: bool = Field(default=True, alias="VECTOR_STORE_ENABLED")
     vector_store_backend: str = Field(default="sqlite-vec", alias="VECTOR_STORE_BACKEND")
 
@@ -131,6 +134,46 @@ class Settings(BaseSettings):
     ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
     ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")
     ollama_synthesis_model: str | None = Field(default=None, alias="OLLAMA_SYNTHESIS_MODEL")
+
+    # ---- Embedding provider ----
+    # ``ollama`` keeps the existing local path. ``openai-compatible`` calls a
+    # remote /v1/embeddings-style API, for example a hosted
+    # Qwen/Qwen3-Embedding-4B endpoint.  The API key is server-side only.
+    embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
+    embedding_api_base_url: str | None = Field(default=None, alias="EMBEDDING_API_BASE_URL")
+    embedding_api_key: str | None = Field(default=None, alias="EMBEDDING_API_KEY")
+    embedding_api_model: str = Field(
+        default="Qwen/Qwen3-Embedding-4B", alias="EMBEDDING_API_MODEL"
+    )
+    embedding_api_timeout: int = Field(default=180, gt=0, alias="EMBEDDING_API_TIMEOUT")
+    # MaaS-compatible embedding endpoints commonly cap one request at 20
+    # inputs.  Keep the limit configurable while using that safe default.
+    embedding_api_batch_size: int = Field(
+        default=20, gt=0, alias="EMBEDDING_API_BATCH_SIZE"
+    )
+    # Optional provider-neutral dimension override.  When omitted, the legacy
+    # ``OLLAMA_EMBEDDING_DIMENSIONS`` value remains the compatibility default,
+    # so existing local deployments and tests keep the same index contract.
+    embedding_dimensions: int | None = Field(
+        default=None, gt=0, alias="EMBEDDING_DIMENSIONS"
+    )
+
+    @property
+    def active_embedding_provider(self) -> str:
+        """Return the normalized embedding provider identifier."""
+        return self.embedding_provider.strip().lower()
+
+    @property
+    def active_embedding_model(self) -> str:
+        """Return the model identity used to create vectors for this run."""
+        if self.active_embedding_provider == "openai-compatible":
+            return self.embedding_api_model
+        return self.ollama_embedding_model
+
+    @property
+    def active_embedding_dimensions(self) -> int:
+        """Return the vector dimension enforced by the active index contract."""
+        return self.embedding_dimensions or self.ollama_embedding_dimensions
 
     ollama_generation_base_url: str = Field(
         default="http://localhost:11435", alias="OLLAMA_GENERATION_BASE_URL"
@@ -196,6 +239,30 @@ class Settings(BaseSettings):
     external_api_model: str = Field(default="gpt-4o-mini", alias="EXTERNAL_API_MODEL")
     external_api_timeout: int = Field(default=90, alias="EXTERNAL_API_TIMEOUT")
 
+    # ---- Generation provider (DeepSeek API is opt-in) ----
+    # Keep Ollama as the compatibility default.  Deployments that choose
+    # DeepSeek set GENERATION_PROVIDER=deepseek and provide the key only in
+    # the server environment; no generation credential is exposed to clients.
+    generation_provider: str = Field(default="ollama", alias="GENERATION_PROVIDER")
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL"
+    )
+    deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
+    deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    generation_timeout_seconds: int = Field(
+        default=90, gt=0, alias="GENERATION_TIMEOUT_SECONDS"
+    )
+    generation_max_retries: int = Field(
+        default=1, ge=0, alias="GENERATION_MAX_RETRIES"
+    )
+    generation_max_output_tokens: int = Field(
+        default=2048, gt=0, alias="GENERATION_MAX_OUTPUT_TOKENS"
+    )
+    generation_retry_backoff_seconds: float = Field(
+        default=0.5, ge=0, alias="GENERATION_RETRY_BACKOFF_SECONDS"
+    )
+    generation_concurrency: int = Field(default=1, gt=0, alias="GENERATION_CONCURRENCY")
+
     # ---- MinIO 对象存储（可选） ----
     minio_enabled: bool = Field(default=False, alias="MINIO_ENABLED")
     minio_endpoint: str = Field(default="localhost:9000", alias="MINIO_ENDPOINT")
@@ -218,6 +285,11 @@ class Settings(BaseSettings):
     agent_conversation_ttl_days: int = Field(default=30, alias="AGENT_CONVERSATION_TTL_DAYS")
     agent_trace_retention_days: int = Field(default=30, alias="AGENT_TRACE_RETENTION_DAYS")
     agent_stream_heartbeat_seconds: int = Field(default=15, alias="AGENT_STREAM_HEARTBEAT_SECONDS")
+    # Graph-lite comparison workbench rollout flag.  The legacy
+    # natural-language multi-source route remains available when disabled.
+    compare_workbench_enabled: bool = Field(
+        default=True, alias="COMPARE_WORKBENCH_ENABLED"
+    )
 
     quality_reports_dir: Path = Field(default=Path("./tmp"), alias="QUALITY_REPORTS_DIR")
 

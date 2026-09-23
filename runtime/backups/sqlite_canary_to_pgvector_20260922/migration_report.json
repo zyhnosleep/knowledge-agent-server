@@ -1,0 +1,95 @@
+{
+  "snapshot": "D:\\LLM_wiki\\.worktrees\\internal-pilot\\runtime\\backups\\sqlite_canary_to_pgvector_20260922\\multimodal.sqlite",
+  "tables": {
+    "agent_trace_runs": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conversation_turns": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "projects": {
+      "count": 1,
+      "source_sha256": "51d28dce621a8cf803f285a623d8140851f7b212a1cac0d7df5414f8f3350aa6",
+      "target_sha256": "51d28dce621a8cf803f285a623d8140851f7b212a1cac0d7df5414f8f3350aa6"
+    },
+    "users": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "agent_trace_steps": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "auth_sessions": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "documents": {
+      "count": 7,
+      "source_sha256": "bfc188186ed95499960db711788cdabfc110b575c277fc6cc3beec2c30576870",
+      "target_sha256": "bfc188186ed95499960db711788cdabfc110b575c277fc6cc3beec2c30576870"
+    },
+    "entities": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "question_answers": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "claims": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conversation_sessions": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "document_chunks": {
+      "count": 1076,
+      "source_sha256": "2801b6700685c25efe58dba4370e8ff3a4ac8c80543f3611dcd206a87b7abf86",
+      "target_sha256": "2801b6700685c25efe58dba4370e8ff3a4ac8c80543f3611dcd206a87b7abf86"
+    },
+    "document_parse_versions": {
+      "count": 14,
+      "source_sha256": "1ad5dd2720f74888ee31949bd197274d057b6f41af57036eb4b20ff0eb990ede",
+      "target_sha256": "1ad5dd2720f74888ee31949bd197274d057b6f41af57036eb4b20ff0eb990ede"
+    },
+    "pipeline_runs": {
+      "count": 9,
+      "source_sha256": "ad39c17e9c8defdfdc7951600d52caf28c82553f8d07c3bc7e69cf7267c00616",
+      "target_sha256": "ad39c17e9c8defdfdc7951600d52caf28c82553f8d07c3bc7e69cf7267c00616"
+    },
+    "review_items": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "session_attachments": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "session_attachment_chunks": {
+      "count": 0,
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "target_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "backend": "pgvector",
+  "distance": "cosine (<=>)",
+  "reembedded": false,
+  "indexed_children": 728,
+  "pgvector_version": "0.8.0"
+}

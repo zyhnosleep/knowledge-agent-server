@@ -1,0 +1,72 @@
+None of PyTorch, TensorFlow >= 2.0, or Flax have been found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+INFO:     Started server process [55412]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
+2026-09-23 13:43:24,160 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:27,439 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:29,787 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:43:30,040 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:43:32,749 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:43:41,053 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:45,350 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:48,236 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:43:54,167 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:55,792 WARNING [app.services.search] coverage: typed inventory unavailable for 739b84a7-d1ff-446d-8eaa-c964d062a71c@canonical-v4-d9eaa1398aba-4bed62f86f6e: store root does not exist: runtime\data\parsed
+2026-09-23 13:43:56,193 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:43:57,750 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:43:57,943 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:03,131 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:04,917 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:06,347 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:44:06,563 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:11,835 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:13,748 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:15,558 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:21,603 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:22,974 WARNING [app.services.search] coverage: typed inventory unavailable for 8731660a-375e-4815-aaac-b99684af729f@canonical-v4-dfdfb9bcf1e6-4bed62f86f6e: store root does not exist: runtime\data\parsed
+2026-09-23 13:44:23,647 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:25,033 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:44:25,359 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:29,869 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:35,670 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:37,659 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:39,643 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:44:39,999 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:44,965 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:47,667 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:44:49,979 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:44:50,184 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:44:54,957 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:02,043 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:04,702 WARNING [app.services.search] coverage: typed inventory unavailable for c9ec7fd8-1512-4bb1-8bf4-3aaf2a7ac560@canonical-v4-975aa1fd3c1b-4bed62f86f6e: store root does not exist: runtime\data\parsed
+2026-09-23 13:45:05,528 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:08,229 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:45:08,454 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:20,424 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:25,610 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:29,370 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:45:29,586 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:35,537 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:42,669 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:45,334 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:45:47,214 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:45:47,503 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:52,332 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:45:58,458 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:00,449 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:02,192 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:46:02,884 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:46:07,960 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:08,634 WARNING [app.services.search] coverage: typed inventory unavailable for 739b84a7-d1ff-446d-8eaa-c964d062a71c@canonical-v4-d9eaa1398aba-4bed62f86f6e: store root does not exist: runtime\data\parsed
+2026-09-23 13:46:09,079 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:11,238 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:46:15,596 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:16,286 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:17,003 INFO [app.services.search] Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured.
+2026-09-23 13:46:17,334 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:46:20,699 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-09-23 13:46:24,182 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:24,538 WARNING [app.services.search] coverage: typed inventory unavailable for 523c63cd-2ed7-4ee4-9529-42b3dca8a171@canonical-v4-2e487d9b96e3-4bed62f86f6e: store root does not exist: runtime\data\parsed
+2026-09-23 13:46:24,959 INFO [httpx] HTTP Request: POST https://ws-8xzx1nph3m9kst3s.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/embeddings "HTTP/1.1 200 OK"
+2026-09-23 13:46:26,456 INFO [httpx] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"

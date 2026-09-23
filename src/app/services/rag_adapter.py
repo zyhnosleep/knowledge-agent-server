@@ -53,6 +53,8 @@ class RAGAdapter:
         question: str,
         document_id: str | None = None,
         *,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
         parse_version_map: dict[str, str] | None = None,
     ) -> QueryResponse:
         """执行一次 RAG 查询并返回完整响应。
@@ -64,12 +66,18 @@ class RAGAdapter:
         t0 = time.monotonic()
         try:
             # 委托给 QueryService 完成实际的检索与回答生成。
+            answer_kwargs = {
+                "save_answer": False,
+                "document_id": document_id,
+            }
+            if compare_document_ids:
+                answer_kwargs["compare_document_ids"] = compare_document_ids
+            if compare_dimensions:
+                answer_kwargs["compare_dimensions"] = compare_dimensions
             result = QueryService(
                 db,
                 parse_version_map=parse_version_map,
-            ).answer(
-                project_slug, question, save_answer=False, document_id=document_id
-            )
+            ).answer(project_slug, question, **answer_kwargs)
         except ValueError:
             # 项目不存在时 QueryService 会抛 ValueError,这里返回一个
             # 空但合法的响应,让 Agent 可以记录该步骤并向调用方暴露错误。
@@ -94,6 +102,8 @@ class RAGAdapter:
         limit: int = 15,
         document_id: str | None = None,
         *,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
         parse_version_map: dict[str, str] | None = None,
     ) -> EvidencePack:
         """仅检索的 RAG:返回证据包(EvidencePack),不生成回答。
@@ -106,12 +116,15 @@ class RAGAdapter:
         t0 = time.monotonic()
         try:
             # 委托给 QueryService 完成向量检索与证据组装。
+            retrieval_kwargs = {"limit": limit, "document_id": document_id}
+            if compare_document_ids:
+                retrieval_kwargs["compare_document_ids"] = compare_document_ids
+            if compare_dimensions:
+                retrieval_kwargs["compare_dimensions"] = compare_dimensions
             result = QueryService(
                 db,
                 parse_version_map=parse_version_map,
-            ).retrieve_evidence(
-                project_slug, question, limit=limit, document_id=document_id
-            )
+            ).retrieve_evidence(project_slug, question, **retrieval_kwargs)
         except ValueError:
             # 项目不存在时返回带状态标记的空证据包,供上层判断。
             logger.warning(

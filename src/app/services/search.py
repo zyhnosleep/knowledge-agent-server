@@ -412,8 +412,54 @@ class QueryService:
         question: str,
         save_answer: bool = True,
         document_id: str | None = None,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
     ) -> QueryResponse:
         """执行一次完整 RAG 问答（检索 + 生成 + 验证 + 引用修复）。"""
+        if self._comparison_workbench_requested(
+            project_slug,
+            question,
+            document_id=document_id,
+            compare_document_ids=compare_document_ids,
+        ):
+            from app.services.comparison import ComparisonService
+
+            pack = ComparisonService(
+                self.db,
+                parse_version_map=self.parse_version_map,
+            ).build(
+                project_slug,
+                question,
+                document_ids=compare_document_ids or None,
+                dimensions=compare_dimensions,
+                limit=15,
+            )
+            if pack.comparison is not None:
+                citations = [
+                    Citation(
+                        **{
+                            key: value
+                            for key, value in item.model_dump().items()
+                            if key in Citation.model_fields
+                        }
+                    )
+                    for item in pack.items
+                ]
+                draft = ComparisonService.render_draft(pack.comparison, pack.items)
+                if pack.comparison.status == "needs_selection":
+                    draft = (
+                        "## 需要确认比较范围\n"
+                        "自动路由只找到一篇或没有足够候选论文，请先选择至少两篇论文。"
+                    )
+                return QueryResponse(
+                    answer_markdown=draft,
+                    citations=citations,
+                    verification_status=(
+                        "comparison-partial"
+                        if pack.comparison.status != "ready"
+                        else "local-only"
+                    ),
+                )
         return self._answer_rag_first(
             project_slug, question, save_answer=save_answer, document_id=document_id
         )
@@ -424,6 +470,8 @@ class QueryService:
         question: str,
         limit: int = 15,
         document_id: str | None = None,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
     ) -> "EvidencePack":
         """只检索、不生成答案的 RAG 接口，返回 EvidencePack。
 
@@ -431,6 +479,24 @@ class QueryService:
         LLM、不验证、不持久化 QuestionAnswer。当提供 *document_id* 时，
         检索被限定在单篇文档内，不 fallback 到整个项目。
         """
+        if self._comparison_workbench_requested(
+            project_slug,
+            question,
+            document_id=document_id,
+            compare_document_ids=compare_document_ids,
+        ):
+            from app.services.comparison import ComparisonService
+
+            return ComparisonService(
+                self.db,
+                parse_version_map=self.parse_version_map,
+            ).build(
+                project_slug,
+                question,
+                document_ids=compare_document_ids or None,
+                dimensions=compare_dimensions,
+                limit=limit,
+            )
         from app.schemas.agent import (
             EvidenceItem,
             EvidencePack,
@@ -1046,6 +1112,108 @@ class QueryService:
             return [self._locked_paper_match(ranked[0])]
         return ranked[:limit]
 
+    def _route_comparison_papers(
+        self,
+        question: str,
+        project_id: str,
+        *,
+        limit: int = 5,
+    ) -> list[PaperMatch]:
+        """Route a comparison by explicitly named paper identities first.
+
+        The ordinary router intentionally scores broad lexical relevance.  For
+        a comparison this can select a third paper that merely shares a term
+        such as ``RAG`` and crowd out one of the two papers named by the user.
+        Paper titles and profile key terms are stronger scope signals here.  If
+        at least two distinct identities are present in the question, use only
+        those papers; otherwise retain the normal router and its
+        ``candidate_selection`` behavior.
+        """
+        statement = select(Document).where(
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+        )
+        documents = self.db.scalars(statement).all()
+        generic_terms = {
+            "paper",
+            "method",
+            "model",
+            "retrieval",
+            "design",
+            "component",
+            "pipeline",
+            "architecture",
+            "approach",
+        }
+        named: list[tuple[int, float, bool, PaperMatch]] = []
+        question_text = str(question or "")
+        for document in documents:
+            profile = paper_profile_data(document)
+            title = str(document.title or profile.get("title") or "")
+            candidates: list[tuple[str, float]] = []
+            # Title tokens include short identities such as ``RAG``.  They are
+            # safe here because they are bound to this document's title rather
+            # than treated as generic corpus terms.
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)*", title):
+                if len(token) >= 3:
+                    candidates.append((token, 3.0))
+                # Source titles commonly use ``react_2210``/``rag_2005``;
+                # retain the human method stem as an explicit identity too.
+                for stem in re.split(r"[-_/]", token):
+                    if len(stem) >= 3:
+                        candidates.append((stem, 3.0))
+            for value in profile.get("aliases") or []:
+                value = str(value).strip()
+                if len(value) >= 4:
+                    candidates.append((value, 2.0))
+            for value in profile.get("key_terms") or []:
+                value = str(value).strip()
+                lowered = value.casefold()
+                if len(value) >= 4 and lowered not in generic_terms | {"rag"}:
+                    candidates.append((value, 2.5))
+
+            best: tuple[int, float, str] | None = None
+            seen: set[str] = set()
+            for value, weight in candidates:
+                key = value.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not alias_in_text(value, question_text):
+                    continue
+                position = question_text.casefold().find(key)
+                if position < 0:
+                    continue
+                candidate = (position, weight, value)
+                if best is None or (candidate[0], -candidate[1]) < (best[0], -best[1]):
+                    best = candidate
+            if best is not None:
+                generic_identity = best[2].casefold() == "rag"
+                named.append(
+                    (
+                        best[0],
+                        best[1],
+                        generic_identity,
+                        PaperMatch(
+                            document=document,
+                            score=100.0 + best[1],
+                            exact_alias=True,
+                            locked=True,
+                        ),
+                    )
+                )
+
+        if len(named) >= 2:
+            # A query such as ``Self-RAG vs CRAG`` contains the generic token
+            # ``RAG`` as well.  Prefer the two named systems and keep a generic
+            # RAG paper only when it is one of the two explicit identities.
+            non_generic = [item for item in named if not item[2]]
+            if len(non_generic) >= 2:
+                named = non_generic
+            named.sort(key=lambda item: (item[0], -item[1], item[3].document.id))
+            return [match for _, _, _, match in named[: max(2, limit)]]
+        return self._route_papers(question, project_id, limit=limit)
+
     @staticmethod
     def _locked_paper_match(match: PaperMatch) -> PaperMatch:
         return PaperMatch(
@@ -1295,7 +1463,26 @@ class QueryService:
                 if QueryService._is_formula_query(question)
                 else MAX_CONTEXTS
             )
-            contexts.extend(self._search_source_chunks(question, project_id, derived_document_ids, limit=source_context_limit, route_terms=profile_terms, question_vector=question_vector))
+            contexts.extend(
+                self._search_source_chunks(
+                    question,
+                    project_id,
+                    derived_document_ids,
+                    limit=source_context_limit,
+                    route_terms=profile_terms,
+                    question_vector=question_vector,
+                    # For an ordinary single-paper question, lexical rescue is
+                    # scoped to one confidently routed document.  If routing
+                    # leaves several low-confidence papers, broad lexical
+                    # rescue would admit generic pages from all of them and
+                    # regress the existing semantic ranking.  Cross-paper
+                    # comparisons intentionally keep the rescue enabled.
+                    page_backstop=(
+                        len(derived_document_ids) <= 1
+                        or self._is_cross_paper_query(question)
+                    ),
+                )
+            )
             contexts.extend(
                 self._supplement_profile_term_contexts(
                     project_id,
@@ -1353,6 +1540,12 @@ class QueryService:
                     # 让无关文档的表格与词法路表格平手竞争，正确文档会被
                     # 挤出 top-10（opls5_table_metrics 内部回归，2026-08-18）。
                     table_promotion=False,
+                    # A locked single-paper query still gets the semantic
+                    # cross-document safety net, but lexical page rescue is
+                    # scoped to the routed document.  Otherwise common terms
+                    # such as "retrieval" admit pages from every paper and
+                    # crowd out the requested paper before finalization.
+                    page_backstop=self._is_cross_paper_query(question),
                 )
             )
         return self._finalize_contexts(contexts, question=question)
@@ -1411,6 +1604,84 @@ class QueryService:
     @staticmethod
     def _question_has_exact_alias(question: str, aliases: list[str]) -> bool:
         return any(alias_in_text(alias, question) for alias in aliases if str(alias or "").strip())
+
+    def _comparison_workbench_requested(
+        self,
+        project_slug: str,
+        question: str,
+        *,
+        document_id: str | None,
+        compare_document_ids: list[str] | None,
+    ) -> bool:
+        """Decide when the new matrix path should replace legacy RAG.
+
+        Explicit workbench selections are always strict.  Automatic routing is
+        intentionally conservative: a normal comparison enters the matrix
+        when at least two ready paper matches exist.  When the query explicitly
+        names a cross-paper scope (for example ``Self-RAG vs CRAG`` or
+        ``跨论文``), the matrix also handles zero/one matches so the caller
+        receives candidate selection instead of an unscoped legacy answer.
+        Generic within-paper/table comparisons retain the established path.
+        """
+        if not settings.compare_workbench_enabled:
+            return False
+        if compare_document_ids:
+            return True
+        if document_id is not None or not self._is_cross_paper_query(question):
+            return False
+        project = self.db.scalar(select(Project).where(Project.slug == project_slug))
+        if project is None:
+            return False
+        try:
+            matches = self._route_papers(question, project.id, limit=5)
+        except Exception:
+            logger.debug("Automatic comparison routing probe failed", exc_info=True)
+            return False
+        if len(matches) >= 2:
+            return True
+        return self._has_explicit_cross_paper_scope(question)
+
+    @staticmethod
+    def _has_explicit_cross_paper_scope(question: str) -> bool:
+        """Detect explicit multi-paper wording for the low-confidence branch.
+
+        ``_is_cross_paper_query`` is intentionally broad because legacy RAG
+        uses it for routing.  This narrower predicate is only used when the
+        router found zero or one candidates, preventing a single-paper table
+        comparison from becoming a candidate-selection prompt while honoring
+        explicit cross-paper wording.
+        """
+        text = str(question or "").strip().lower()
+        if not text:
+            return False
+        explicit_markers = (
+            "cross-paper",
+            "cross paper",
+            "across papers",
+            "multiple papers",
+            "two papers",
+            "论文之间",
+            "跨论文",
+            "多篇论文",
+            "两篇论文",
+            "不同论文",
+            "论文对比",
+        )
+        if any(marker in text for marker in explicit_markers):
+            return True
+        if re.search(r"\b(?:vs\.?|versus|v\.s\.)\b", text):
+            return True
+        if re.search(
+            r"\b(?:compare|comparison|contrast)\b[^?\n]{0,180}\b(?:and|with|between)\b",
+            text,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?:比较|对比).{0,80}(?:和|与|及|跟).{0,80}(?:论文|方法|模型|系统|retrieval|rag)",
+                text,
+            )
+        )
 
     @staticmethod
     def _is_cross_paper_query(question: str) -> bool:
@@ -2537,6 +2808,7 @@ class QueryService:
         route_terms: list[str] | None = None,
         question_vector: list[float] | None = None,
         table_promotion: bool = True,
+        page_backstop: bool = True,
     ) -> list[RetrievedContext]:
         # R1：调用方（如 _build_rag_contexts 的全库补充路由）可复用已算好的
         # 查询向量，避免同一问题在文档内检索与全库补充两处各 embed 一次
@@ -2572,12 +2844,35 @@ class QueryService:
         base_query_terms = self._tokenize(question)
         route_query_terms = self._tokenize(" ".join(route_terms or []))
         query_terms = base_query_terms | route_query_terms
+        # The embedding model is allowed to decide the semantic order, but it
+        # must not be allowed to make a page disappear when the query contains
+        # an exact paper term (for example ``RAG-Token``, ``MaxSim`` or
+        # ``Table 1``).  This is deliberately a small, page-level lexical
+        # backstop: it supplements the vector top-k and never replaces it.
+        #
+        # We prepare it before scoring so that a low-similarity canonical
+        # chunk can be admitted after the vector candidates have been ranked.
+        page_anchor_terms, page_phrase_terms = (
+            self._page_backstop_terms(question) if page_backstop else (set(), [])
+        )
+        page_term_counts: Counter[str] = Counter()
+        if page_anchor_terms:
+            for chunk in chunks:
+                page_term_counts.update(
+                    page_anchor_terms & self._tokenize(chunk.text)
+                )
+        rare_page_terms = {
+            term
+            for term, count in page_term_counts.items()
+            if count <= max(8, len(chunks) // 20)
+        }
         route_token_counts: Counter[str] = Counter()
         if route_query_terms:
             for chunk in chunks:
                 route_token_counts.update(route_query_terms & self._tokenize(chunk.text))
         rare_route_terms = {term for term, count in route_token_counts.items() if count <= 3}
         scored: list[tuple[DocumentChunk, float, str | None]] = []
+        page_backstop: dict[tuple[str, str], tuple[DocumentChunk, float, str | None]] = {}
         for chunk in chunks:
             score = 0.0
             chunk_terms = self._tokenize(chunk.text)
@@ -2610,12 +2905,30 @@ class QueryService:
             if score <= 0:
                 continue
             has_table_data = self._context_has_table_data(chunk.text)
+            has_explicit_table_label = bool(
+                re.search(
+                    r"\btable\s*(?:s\s*)?(?:\d+|[ivxlcdm]+)\b",
+                    chunk.text,
+                    re.IGNORECASE,
+                )
+            )
+            table_like = has_table_data or has_explicit_table_label
+            table_block_match = self._table_block_matches_query(question, chunk.text)
             if is_table_query and not has_table_data:
-                continue
+                # MinerU's text fallback often keeps a numeric table in the
+                # narrative Child (rather than markdown pipe rows).  When the
+                # Child carries the requested Table label and query anchors,
+                # retain it as page evidence instead of dropping the page.
+                if not (
+                    has_explicit_table_label
+                    and table_block_match
+                ):
+                    continue
             if needs_table_first and not has_table_data and not self._context_has_metric_numbers(chunk.text):
-                continue
-            if needs_table_first and has_table_data:
-                if not self._table_block_matches_query(question, chunk.text):
+                if not (is_table_query and has_explicit_table_label and table_block_match):
+                    continue
+            if needs_table_first and table_like:
+                if not table_block_match:
                     # 与 _search_document_table_contexts 相同：指代查询放宽，
                     # 避免中文序数指代全灭过滤掉候选表格。
                     if not QueryService._is_table_reference_query(question):
@@ -2635,12 +2948,171 @@ class QueryService:
             else:
                 evidence_kind = chunk.block_type if chunk.block_type in {"figure", "formula"} else None
             scored.append((chunk, score, evidence_kind))
+
+            # Page backstop admission happens after the normal query filters
+            # above.  A table/figure query therefore cannot accidentally pull
+            # a prose chunk merely because it shares one word with the query.
+            if page_anchor_terms:
+                exact_anchor_hits = sum(
+                    1
+                    for term in page_phrase_terms
+                    if self._normalize_selector(term)
+                    and self._normalize_selector(term)
+                    in self._normalize_selector(chunk.text)
+                )
+                lexical_hits = len(rare_page_terms & chunk_terms)
+                specific_hits = len(
+                    {
+                        term
+                        for term in page_anchor_terms
+                        if term in rare_page_terms
+                    }
+                    & chunk_terms
+                )
+                # One exact scientific phrase is enough.  For ordinary words
+                # require two rare/content hits so generic words such as
+                # ``model`` or ``retrieval`` do not flood the candidate list.
+                strong_page_match = (
+                    exact_anchor_hits > 0
+                    or lexical_hits >= 2
+                    or (specific_hits > 0 and overlap >= 2)
+                )
+                if strong_page_match:
+                    lexical_score = (
+                        5.5
+                        + min(lexical_hits, 6) * 0.25
+                        + min(exact_anchor_hits, 3) * 0.8
+                        + (0.5 if specific_hits else 0.0)
+                    )
+                    # Keep the semantic score when it is already stronger;
+                    # otherwise give the lexical page a meaningful but bounded
+                    # score so it survives final top-8 trimming.
+                    backstop_score = max(score, lexical_score)
+                    page_key = (
+                        chunk.document_id,
+                        str(chunk.page_label or f"__chunk__:{chunk.id}"),
+                    )
+                    current = page_backstop.get(page_key)
+                    if current is None or backstop_score > current[1]:
+                        page_backstop[page_key] = (
+                            chunk,
+                            backstop_score,
+                            evidence_kind or "page-lexical",
+                        )
+
         top_candidates = sorted(scored, key=lambda item: item[1], reverse=True)[:limit]
+        selected_ids = {chunk.id for chunk, _score, _kind in top_candidates}
+        # Admit a bounded number of best pages per document.  The bound keeps
+        # cross-paper queries cheap while ensuring two-page answers (abstract +
+        # method, or definition + comparison) are not lost to one dense page.
+        # A caller explicitly asking for a single source item expects the
+        # historical top-1 contract (and several low-level callers use that
+        # mode for a strict semantic probe).  Page rescue is enabled for the
+        # normal multi-context path only.
+        backstop_limit = min(3, max(1, limit // 3)) if limit > 1 else 0
+        backstop_by_document: dict[str, list[tuple[DocumentChunk, float, str | None]]] = {}
+        for candidate in page_backstop.values():
+            backstop_by_document.setdefault(candidate[0].document_id, []).append(candidate)
+        for document_candidates in backstop_by_document.values():
+            document_candidates.sort(key=lambda item: item[1], reverse=True)
+        for document_candidates in backstop_by_document.values():
+            for candidate in document_candidates[:backstop_limit]:
+                if candidate[0].id not in selected_ids:
+                    top_candidates.append(candidate)
+                    selected_ids.add(candidate[0].id)
         return self._expand_source_candidates(
             top_candidates,
             question=question,
             project_id=project_id,
         )
+
+    @classmethod
+    def _page_backstop_terms(cls, question: str) -> tuple[set[str], list[str]]:
+        """Return content tokens and exact phrases for page-level rescue.
+
+        The normal vector path is intentionally unchanged.  These terms are
+        only used to rescue a page when a remote embedding model ranks another
+        page above it.  Scientific selectors and content-word bigrams are kept
+        separately: an exact phrase such as ``reflection tokens`` is strong
+        evidence, while ordinary tokens need a rare two-token match.
+        """
+        if not question:
+            return set(), []
+        stopwords = cls._QUESTION_STOP_TERMS | cls._CLAIM_ANCHOR_STOP_KEYS | {
+            "they",
+            "two",
+            "broad",
+            "into",
+            "fall",
+            "allow",
+            "allows",
+            "inference",
+        }
+        raw_terms: list[str] = []
+        raw_terms.extend(cls._scientific_evidence_terms(question))
+        raw_terms.extend(cls._scientific_identifier_selectors(question))
+        raw_terms.extend(cls._extract_query_facets(question))
+        raw_terms.extend(cls._extract_generic_table_terms(question))
+        raw_terms.extend(
+            word
+            for word in re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_/][A-Za-z0-9]+)*", question)
+        )
+
+        phrases: list[str] = []
+        # Only identifier-like terms are exact anchors.  Treating every query
+        # noun ("document", "retrieved", "formulation") as an exact phrase
+        # made almost every page in a paper look like a rescue candidate.
+        # Ordinary prose is handled by the rare two-token rule below.
+        for term in raw_terms:
+            value = str(term or "").strip()
+            key = cls._normalize_selector(value)
+            if (
+                len(key) >= 4
+                and key not in stopwords
+                and cls._is_profile_retrieval_term(value)
+            ):
+                phrases.append(value)
+
+        # Add adjacent content-word bigrams.  This catches prose concepts such
+        # as "reflection tokens" and "late interaction" even when they are not
+        # registered scientific identifiers.
+        words = re.findall(r"[A-Za-z][A-Za-z0-9-]*", question)
+        for first, second in zip(words, words[1:]):
+            first_key = cls._normalize_selector(first)
+            second_key = cls._normalize_selector(second)
+            if (
+                len(first_key) >= 3
+                and len(second_key) >= 3
+                and first_key not in stopwords
+                and second_key not in stopwords
+                and not (
+                    first_key
+                    in {"difference", "formulation", "formulations", "retrieved", "document", "documents"}
+                    or second_key
+                    in {"difference", "formulation", "formulations", "retrieved", "document", "documents"}
+                )
+            ):
+                phrases.append(f"{first} {second}")
+
+        tokens: set[str] = set()
+        for term in raw_terms:
+            key = cls._normalize_selector(term)
+            if len(key) < 3 or key in stopwords:
+                continue
+            tokens.update(
+                token
+                for token in cls._tokenize(term)
+                if token not in stopwords and len(token) >= 3
+            )
+        # Keep insertion order for stable diagnostics while de-duplicating.
+        unique_phrases: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases:
+            key = cls._normalize_selector(phrase)
+            if key and key not in seen:
+                unique_phrases.append(phrase)
+                seen.add(key)
+        return tokens, unique_phrases[:32]
 
     def _expand_source_candidates(
         self,
@@ -3824,6 +4296,25 @@ class QueryService:
                         return accepted
                     raise
             raise RuntimeError("unreachable RAG draft retry state")
+
+        # DeepSeek 部署下，RAG 层只负责检索证据，最终组织由 AgentSynthesizer
+        # 统一调用 DeepSeek API。不要再尝试本地 Ollama（通常端口不存在，
+        # 会额外等待三轮重试并把一个可用的远程部署误报成生成失败）。
+        # ``fallback`` 保留证据片段与 citation indexes，供后续 synthesis
+        # 使用；未配置 DeepSeek key 时继续走历史 Ollama 兼容路径。
+        generation_provider = str(
+            getattr(settings, "generation_provider", "ollama")
+        ).strip().lower()
+        deepseek_key = getattr(settings, "deepseek_api_key", None)
+        has_deepseek_key = bool(
+            deepseek_key
+            and str(deepseek_key).strip().upper() not in {"CHANGE_ME", "YOUR_API_KEY"}
+        )
+        if generation_provider == "deepseek" and has_deepseek_key:
+            logger.info(
+                "Skipping local Ollama RAG draft; remote DeepSeek synthesis is configured."
+            )
+            return fallback
 
         return safe_model_call(generate_with_query_retries, fallback)
 
@@ -7159,7 +7650,13 @@ class QueryService:
             if key in seen_keys:
                 continue
             if citation.page_slug:
-                current_count = page_counts.get(citation.page_slug, 0)
+                # ``page_slug`` identifies the source document, not an
+                # individual PDF page.  Counting only by slug therefore let
+                # the first five chunks of one document evict every later
+                # page (the exact failure mode exposed by the 15-case replay).
+                # Keep the diversity cap at the page level.
+                page_key = f"{citation.page_slug}:{citation.page_label or ''}"
+                current_count = page_counts.get(page_key, 0)
                 per_page_limit = (
                     len(sorted_contexts)
                     if self._context_evidence_kind(context) == "profile-term"
@@ -7169,7 +7666,7 @@ class QueryService:
                 )
                 if current_count >= per_page_limit:
                     continue
-                page_counts[citation.page_slug] = current_count + 1
+                page_counts[page_key] = current_count + 1
             deduped.append(context)
             seen_keys.add(key)
 

@@ -162,6 +162,22 @@ class AgentExecutor:
             # ==============================================================
             route_t0 = time.monotonic()
             route = PolicyRouter().route(request.query)
+            if (
+                request.compare_document_ids
+                and settings.compare_workbench_enabled
+                and route.route != "needs_clarification"
+            ):
+                route = AgentRouteDecision(
+                    route="multi_source_compare",
+                    requires_citations=True,
+                    max_retries=1,
+                    confidence=1.0,
+                    reason="Explicit comparison document scope provided.",
+                )
+            elif request.compare_document_ids and not settings.compare_workbench_enabled:
+                warnings.append(
+                    "Comparison workbench is disabled; using the legacy RAG route."
+                )
             inference_target = AgentModelRouter().select(route.route)
             route_latency = int((time.monotonic() - route_t0) * 1000)
 
@@ -360,6 +376,8 @@ class AgentExecutor:
                     steps,
                     usage,
                     session_id,
+                    compare_document_ids=request.compare_document_ids,
+                    compare_dimensions=request.compare_dimensions,
                 )
 
                 # T1/T2：项目级会话（无文档锁定）检索 0 items 时，回退到会话
@@ -371,6 +389,7 @@ class AgentExecutor:
                 if (
                     (not evidence_pack or not evidence_pack.get("items"))
                     and request.document_id is None
+                    and not request.compare_document_ids
                 ):
                     history_document_id = self._majority_hit_document_id(session_id)
                     if history_document_id is not None:
@@ -382,6 +401,8 @@ class AgentExecutor:
                             steps,
                             usage,
                             session_id,
+                            compare_document_ids=request.compare_document_ids,
+                            compare_dimensions=request.compare_dimensions,
                         )
                         if fallback_pack and fallback_pack.get("items"):
                             evidence_pack = fallback_pack
@@ -431,6 +452,9 @@ class AgentExecutor:
                     steps,
                     usage,
                     session_id,
+                    compare_document_ids=request.compare_document_ids,
+                    compare_dimensions=request.compare_dimensions,
+                    evidence_pack=evidence_pack,
                 )
                 tool_calls = tool_calls_used
                 attachment_citations = self._session_attachment_citations(evidence_pack)
@@ -476,6 +500,28 @@ class AgentExecutor:
             # draft verify（确定性校验，非第二次 LLM 综合）；通过才直通
             # rag.answer，关闭"LLM 无差别重写压缩精确事实"的破坏路径。
             # 复杂多跳与跨轮引用保留 synthesize（受约束组织器）+ final verify。
+            # Remote-only deployments must reserve their tool budget for the
+            # actual DeepSeek synthesis and its final verification. The local
+            # direct path can afford draft-verify + one RAG retry before
+            # deciding whether to synthesize; on a remote path that sequence
+            # consumes all five default tool calls (retrieve, rag.answer,
+            # verify, retry, verify) and silently skips the only generation
+            # call. Keep the remote provider out of the direct preflight path.
+            generation_provider = str(
+                getattr(settings, "generation_provider", "ollama")
+            ).strip().lower()
+            synthesis_provider = str(
+                getattr(settings, "agent_synthesis_provider", "auto")
+            ).strip().lower()
+            remote_synthesis_configured = (
+                generation_provider == "deepseek"
+                and bool(
+                    getattr(settings, "deepseek_api_key", None)
+                    and str(settings.deepseek_api_key).strip().upper()
+                    not in {"CHANGE_ME", "YOUR_API_KEY"}
+                )
+            ) or synthesis_provider in {"deepseek", "external_api"}
+
             _direct_routes = {
                 "simple_rag",
                 "evidence_required",
@@ -487,6 +533,7 @@ class AgentExecutor:
                 and not max_steps_hit
                 and route.route in _direct_routes
                 and not self._is_cross_turn_query(request.query, session_id)
+                and not remote_synthesis_configured
             )
             direct_block_reason: str | None = None
             draft_verification = False
@@ -533,6 +580,9 @@ class AgentExecutor:
                         steps,
                         usage,
                         session_id,
+                        compare_document_ids=request.compare_document_ids,
+                        compare_dimensions=request.compare_dimensions,
+                        evidence_pack=evidence_pack,
                     )
                     if retry_calls > 0:
                         tool_calls += retry_calls
@@ -580,8 +630,14 @@ class AgentExecutor:
                 and evidence_pack is not None
                 and evidence_pack.get("coverage_status") == "partial"
             )
+            # 远程生成模式下不能把 RAG 的证据草稿直接当作最终答案：
+            # DeepSeek 必须有机会将检索结果组织成可读回答。上面的
+            # ``direct_candidate`` 已在远程模式关闭，因此不会先消耗
+            # draft-verify/retry 的工具额度；Ollama/本地 provider 保持原有
+            # 的 draft-verify 直通优化。
             skip_synthesis = bool(
                 direct_candidate
+                and not remote_synthesis_configured
                 and not _evidence_insufficient
                 and bool(answer_text.strip())
                 and bool(citations)
@@ -633,16 +689,18 @@ class AgentExecutor:
                     # 根据综合结果过滤引用：只保留被明确引用的 citation
                     cited_indexes = synth_data.get("cited_indexes", [])
                     if isinstance(cited_indexes, list) and cited_indexes:
-                        selected_indexes = sorted(
-                            {
-                                index
-                                for index in cited_indexes
-                                if isinstance(index, int) and 0 <= index < len(citations)
-                            }
+                        selected_indexes = self._normalized_synthesis_indexes(
+                            cited_indexes,
+                            citations,
+                            evidence_pack,
                         )
                         if selected_indexes:
                             answer_text = self._retarget_citation_markers(
                                 answer_text,
+                                selected_indexes,
+                            )
+                            self._remap_comparison_citation_indexes(
+                                evidence_pack,
                                 selected_indexes,
                             )
                             selected_set = set(selected_indexes)
@@ -677,10 +735,24 @@ class AgentExecutor:
                         warnings.extend(verify_warnings)
 
             # ---- 重试：仅 synthesize 路径的 final verify 建议重试时 ----
+            comparison_structured_fallback = bool(
+                isinstance(evidence_pack, dict)
+                and evidence_pack.get("comparison") is not None
+                and any(
+                    "structured comparison matrix fallback" in str(warning)
+                    for warning in warnings
+                )
+            )
             retry_recommended = (
                 not skip_synthesis
                 and verify_result["ok"]
                 and verify_result.get("result", {}).get("retry_recommended", False)
+                # A failed comparison synthesis has already been reduced to
+                # the authoritative matrix.  Retrying the whole DeepSeek
+                # answer only repeats the malformed/low-fidelity response and
+                # burns ~10s; missing cells are explicitly surfaced for a
+                # targeted follow-up instead.
+                and not comparison_structured_fallback
             )
             # 空答案兜底（T3）：模型生成空/纯空白答案是不可交付的硬失败，
             # 无视路由 max_retries 配额强制重试一次（二次仍空才交付）。
@@ -697,58 +769,124 @@ class AgentExecutor:
                 and tool_calls < constraints.max_tool_calls
                 and len(steps) < constraints.max_steps
             ):
-                (
-                    retry_answer,
-                    retry_citations,
-                    retry_calls,
-                    _retry_verification_status,
-                ) = self._run_rag_answer(
-                    request.project_slug,
-                    retrieval_query,
-                    effective_document_id,
-                    constraints,
-                    steps,
-                    usage,
-                    session_id,
-                )
-                if retry_calls > 0:
-                    retry_ran = True
-                    tool_calls += retry_calls
-                    if retry_answer.strip():
-                        answer_text = retry_answer
-                        citations = retry_citations
-                        # Task 9：最终答案来自 retry，verification status 必须
-                        # 同步为 retry 返回的状态，finalize trace 才能与最终答案一致。
-                        rag_verification_status = _retry_verification_status
-                    warnings.append("Retry performed after verification warning")
-                    # Task 9：retry 后必须对最终答案与 citations 重新执行 final
-                    # verify；retry 前的第一次 verify 结果不能作为最终校验依据。
-                    verify_result = self._run_verify(
+                if remote_synthesis_configured:
+                    # A remote synthesis retry must retry DeepSeek itself. The
+                    # historical branch below retries ``rag.answer``; in a
+                    # remote-only deployment that replaces a valid synthesis
+                    # with the degraded raw-evidence marker and was the main
+                    # source of false ``LLM generation failed`` answers.
+                    remote_retry = self._run_synthesize(
                         request.query,
+                        route.route,
                         answer_text,
                         citations,
-                        route.route,
                         constraints,
                         steps,
                         usage,
-                        tool_calls,
+                        session_id,
+                        evidence_pack=evidence_pack,
+                        target=inference_target,
+                    )
+                    retry_ran = True
+                    if remote_retry.get("ok"):
+                        retry_data = remote_retry.get("result", {})
+                        retry_answer = str(
+                            retry_data.get("answer_markdown") or ""
+                        ).strip()
+                        if retry_answer:
+                            answer_text = retry_answer
+                        retry_warnings = retry_data.get("warnings", [])
+                        if isinstance(retry_warnings, list):
+                            warnings.extend(retry_warnings)
+                        synth_provider = retry_data.get("provider", synth_provider)
+                        synth_model = retry_data.get("model", synth_model)
+                        expected_facts_status = retry_data.get(
+                            "expected_facts_status", expected_facts_status
+                        )
+                        retry_indexes = retry_data.get("cited_indexes", [])
+                        if isinstance(retry_indexes, list) and retry_indexes:
+                            selected_indexes = self._normalized_synthesis_indexes(
+                                retry_indexes,
+                                citations,
+                                evidence_pack,
+                            )
+                            if selected_indexes:
+                                answer_text = self._retarget_citation_markers(
+                                    answer_text,
+                                    selected_indexes,
+                                )
+                                self._remap_comparison_citation_indexes(
+                                    evidence_pack,
+                                    selected_indexes,
+                                )
+                                selected_set = set(selected_indexes)
+                                citations = [
+                                    citation
+                                    for index, citation in enumerate(citations)
+                                    if index in selected_set
+                                ]
+                    warnings.append(
+                        "DeepSeek synthesis retry performed after verification warning"
                     )
                     tool_calls = usage.tool_calls
-                    if verify_result["ok"]:
-                        verify_warnings = verify_result.get("result", {}).get(
-                            "warnings", []
-                        )
-                        if isinstance(verify_warnings, list):
-                            warnings.extend(verify_warnings)
-                    # 重验后若仍建议 retry，不再发起第二次重试（retry 只执行
-                    # 一次），但 retry_recommended 保留重验结果，finalize trace
-                    # 不得宣称最终答案已验证通过。
-                    retry_recommended = (
-                        verify_result["ok"]
-                        and verify_result.get("result", {}).get(
-                            "retry_recommended", False
-                        )
+                else:
+                    (
+                        retry_answer,
+                        retry_citations,
+                        retry_calls,
+                        _retry_verification_status,
+                    ) = self._run_rag_answer(
+                        request.project_slug,
+                        retrieval_query,
+                        effective_document_id,
+                        constraints,
+                        steps,
+                        usage,
+                        session_id,
+                        compare_document_ids=request.compare_document_ids,
+                        compare_dimensions=request.compare_dimensions,
+                        evidence_pack=evidence_pack,
                     )
+                    if retry_calls > 0:
+                        retry_ran = True
+                        tool_calls += retry_calls
+                        if retry_answer.strip():
+                            answer_text = retry_answer
+                            citations = retry_citations
+                            # Task 9：最终答案来自 retry，verification status 必须
+                            # 同步为 retry 返回的状态，finalize trace 才能与最终答案一致。
+                            rag_verification_status = _retry_verification_status
+                        warnings.append("Retry performed after verification warning")
+                    # Task 9：retry 后必须对最终答案与 citations 重新执行 final
+                    # verify；retry 前的第一次 verify 结果不能作为最终校验依据。
+                # Task 9：retry 后必须对最终答案与 citations 重新执行 final
+                # verify；retry 前的第一次 verify 结果不能作为最终校验依据。
+                verify_result = self._run_verify(
+                    request.query,
+                    answer_text,
+                    citations,
+                    route.route,
+                    constraints,
+                    steps,
+                    usage,
+                    tool_calls,
+                )
+                tool_calls = usage.tool_calls
+                if verify_result["ok"]:
+                    verify_warnings = verify_result.get("result", {}).get(
+                        "warnings", []
+                    )
+                    if isinstance(verify_warnings, list):
+                        warnings.extend(verify_warnings)
+                # 重验后若仍建议 retry，不再发起第二次重试（retry 只执行
+                # 一次），但 retry_recommended 保留重验结果，finalize trace
+                # 不得宣称最终答案已验证通过。
+                retry_recommended = (
+                    verify_result["ok"]
+                    and verify_result.get("result", {}).get(
+                        "retry_recommended", False
+                    )
+                )
 
             # ---- 空答案降级标记（T2）：重试后仍为空 = 不可交付，显式标记 ----
             # 旧行为：空答案重试一次后仍空，直接交付空字符串，消费方无法
@@ -880,6 +1018,11 @@ class AgentExecutor:
                 trace_id=trace_id,
                 answer_provider=synth_provider,
                 answer_model=synth_model,
+                comparison=(
+                    evidence_pack.get("comparison")
+                    if isinstance(evidence_pack, dict)
+                    else None
+                ),
             )
 
         except Exception as exc:
@@ -1092,6 +1235,9 @@ class AgentExecutor:
         steps: list[AgentStep],
         usage: AgentUsage,
         session_id: str,
+        *,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """调用 rag.retrieve_evidence 工具，记录 step，返回 evidence pack。
 
@@ -1118,6 +1264,10 @@ class AgentExecutor:
         }
         if document_id is not None:
             tool_args["document_id"] = document_id
+        if compare_document_ids:
+            tool_args["compare_document_ids"] = list(compare_document_ids)
+        if compare_dimensions:
+            tool_args["compare_dimensions"] = list(compare_dimensions)
         tool_result = self._tools.call_tool(
             "rag.retrieve_evidence",
             tool_args,
@@ -1162,6 +1312,7 @@ class AgentExecutor:
                     "support_hints": support_hints,
                     "status": pack_status,
                     "document_id": document_id,
+                    "comparison": bool(rdata.get("comparison")),
                 },
             )
             steps.append(step)
@@ -1212,6 +1363,10 @@ class AgentExecutor:
         steps: list[AgentStep],
         usage: AgentUsage,
         session_id: str,
+        *,
+        compare_document_ids: list[str] | None = None,
+        compare_dimensions: list[str] | None = None,
+        evidence_pack: dict[str, Any] | None = None,
     ) -> tuple[str, list[Citation], int, str]:
         """调用 rag.answer 工具，记录 step，返回
         (答案文本, 引用列表, 实际工具调用数, verification_status)。
@@ -1224,6 +1379,51 @@ class AgentExecutor:
         if len(steps) >= constraints.max_steps:
             return "", [], 0, "local-only"
 
+        # The comparison workbench already performed one bounded retrieval for
+        # every paper × dimension in ``evidence_pack``.  Calling ``rag.answer``
+        # here would rebuild that matrix a second time (and issue another dozen
+        # remote embedding requests), while also reopening the Graph-lite
+        # transaction.  Reuse the authoritative matrix as the grounded RAG
+        # draft and retain the normal trace/tool-call shape.
+        if evidence_pack and evidence_pack.get("comparison") is not None:
+            from app.services.comparison import ComparisonService
+
+            raw_items = list(evidence_pack.get("items") or [])
+            citations = [
+                Citation(
+                    **{
+                        key: value
+                        for key, value in (
+                            item.model_dump()
+                            if hasattr(item, "model_dump")
+                            else dict(item)
+                        ).items()
+                        if key in Citation.model_fields
+                    }
+                )
+                for item in raw_items
+            ]
+            comparison = evidence_pack.get("comparison")
+            answer_text = ComparisonService.render_draft(comparison, raw_items)
+            step = AgentStep(
+                step_id=len(steps),
+                step_type="tool_call",
+                summary=(
+                    f"rag.answer reused comparison matrix ({len(citations)} citation(s))"
+                ),
+                latency_ms=0,
+                tool_name="rag.answer",
+                tool_ok=True,
+                metadata={
+                    "comparison": True,
+                    "comparison_reused": True,
+                    "evidence_count": len(raw_items),
+                },
+            )
+            steps.append(step)
+            usage.tool_calls += 1
+            return answer_text, citations, 1, "local-only"
+
         step_id = len(steps)
         t0 = time.monotonic()
         tool_args: dict[str, Any] = {
@@ -1232,6 +1432,10 @@ class AgentExecutor:
         }
         if document_id is not None:
             tool_args["document_id"] = document_id
+        if compare_document_ids:
+            tool_args["compare_document_ids"] = list(compare_document_ids)
+        if compare_dimensions:
+            tool_args["compare_dimensions"] = list(compare_dimensions)
         tool_result = self._tools.call_tool(
             "rag.answer",
             tool_args,
@@ -1794,6 +1998,11 @@ class AgentExecutor:
         if status == "project_not_found" and items:
             status = "ok"
         result = {"status": status, "items": items, "table_facts": table_facts}
+        # Comparison retrieval is a structured result, not ordinary evidence
+        # to be merged or re-ranked.  Preserve it while attachment evidence is
+        # appended so the API/UI can still render the matrix.
+        if base.get("comparison") is not None:
+            result["comparison"] = base["comparison"]
         # 9.7.3：coverage 元数据透传——附件 facts 并入后无法按单一 inventory
         # 验证，降级为 unknown（门禁中性）；否则原样保留 base 的 coverage 字段。
         if session_pack and session_pack.get("table_facts"):
@@ -1805,6 +2014,70 @@ class AgentExecutor:
                 if key in base:
                     result[key] = base[key]
         return result
+
+    @staticmethod
+    def _normalized_synthesis_indexes(
+        cited_indexes: list[Any],
+        citations: list[Citation],
+        evidence_pack: dict[str, Any] | None,
+    ) -> list[int]:
+        """Normalize synthesis indexes while preserving every paper side.
+
+        A comparison answer is not allowed to cite only the paper that happened
+        to receive the highest retrieval scores.  When DeepSeek omits a side,
+        add that paper's first available citation before compacting the list.
+        Legacy (non-comparison) calls retain the original filtering behavior.
+        """
+        selected = sorted(
+            {
+                index
+                for index in cited_indexes
+                if isinstance(index, int) and 0 <= index < len(citations)
+            }
+        )
+        comparison = (evidence_pack or {}).get("comparison")
+        if not isinstance(comparison, dict):
+            return selected
+        paper_ids = [
+            str(paper.get("document_id") or "")
+            for paper in (comparison.get("papers") or [])
+            if isinstance(paper, dict) and paper.get("document_id")
+        ]
+        selected_set = set(selected)
+        for paper_id in paper_ids:
+            if any(str(citations[index].document_id or "") == paper_id for index in selected):
+                continue
+            fallback = next(
+                (
+                    index
+                    for index, citation in enumerate(citations)
+                    if str(citation.document_id or "") == paper_id
+                ),
+                None,
+            )
+            if fallback is not None:
+                selected_set.add(fallback)
+        return sorted(selected_set)
+
+    @staticmethod
+    def _remap_comparison_citation_indexes(
+        evidence_pack: dict[str, Any] | None,
+        selected_indexes: list[int],
+    ) -> None:
+        """Keep matrix cell citation indexes aligned after response compaction."""
+        comparison = (evidence_pack or {}).get("comparison")
+        if not isinstance(comparison, dict):
+            return
+        index_map = {old: new for new, old in enumerate(selected_indexes)}
+        for cell in comparison.get("cells") or []:
+            if not isinstance(cell, dict):
+                continue
+            raw_indexes = cell.get("citation_indexes") or []
+            cell["citation_indexes"] = [
+                index_map[int(value)]
+                for value in raw_indexes
+                if isinstance(value, int) and value in index_map
+            ]
 
     @staticmethod
     def _retarget_citation_markers(

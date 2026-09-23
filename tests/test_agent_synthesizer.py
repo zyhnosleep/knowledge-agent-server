@@ -1525,6 +1525,247 @@ def test_synthesize_external_api_empty_answer_returns_fallback(monkeypatch) -> N
     assert any("empty answer" in w.lower() for w in result["warnings"])
 
 
+def _fake_settings_deepseek():
+    from app.core.config import Settings
+
+    s = Settings(_env_file=None)
+    s.agent_synthesis_provider = "deepseek"
+    s.generation_provider = "deepseek"
+    s.deepseek_api_key = "test-key"
+    s.deepseek_base_url = "https://api.deepseek.com/v1"
+    s.deepseek_model = "deepseek-chat"
+    s.generation_max_retries = 0
+    s.generation_retry_backoff_seconds = 0
+    return s
+
+
+def test_synthesize_deepseek_returns_usage_and_structured_result(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+
+    def fake_generate(self, **kwargs):
+        assert kwargs["response_format"] == {"type": "json_object"}
+        return {
+            "content": '{"answer_markdown":"DeepSeek answer [0]", "cited_indexes":[0], "warnings":[], "confidence":0.8}',
+            "model": "deepseek-chat",
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+            "usage_source": "provider",
+        }
+
+    monkeypatch.setattr("app.services.agent_synthesizer.DeepSeekClient.generate_chat", fake_generate)
+    syn = AgentSynthesizer()
+
+    result = syn.synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert result["provider"] == "deepseek"
+    assert result["model"] == "deepseek-chat"
+    assert result["usage"]["total_tokens"] == 28
+    assert result["usage_source"] == "provider"
+
+
+def test_comparison_synthesis_allows_grounded_paraphrase_without_matrix_anchor_rollback(
+    monkeypatch,
+) -> None:
+    """Comparison prose need not repeat every raw excerpt verbatim.
+
+    The side-aware matrix guard still requires both paper citations, while the
+    generic draft-anchor guard is intentionally skipped for matrix drafts.
+    """
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.DeepSeekClient.generate_chat",
+        lambda self, **kwargs: {
+            "content": '{"answer_markdown":"Paper A uses self-reflection [0], while Paper B uses an external evaluator and corrective actions [1].","cited_indexes":[0,1],"warnings":[],"confidence":0.9}',
+            "model": "deepseek-chat",
+            "usage": {"total_tokens": 12},
+            "usage_source": "provider",
+        },
+    )
+    evidence_pack = {
+        "status": "ok",
+        "items": [
+            {"index": 0, "document_id": "d1", "excerpt": "raw anchor A that should be paraphrased"},
+            {"index": 1, "document_id": "d2", "excerpt": "raw anchor B that should be paraphrased"},
+        ],
+        "comparison": {
+            "papers": [{"document_id": "d1"}, {"document_id": "d2"}],
+            "cells": [
+                {"paper_id": "d1", "dimension": "method", "status": "supported", "evidence_indexes": [0], "citation_indexes": [0]},
+                {"paper_id": "d2", "dimension": "method", "status": "supported", "evidence_indexes": [1], "citation_indexes": [1]},
+            ],
+        },
+    }
+    result = AgentSynthesizer().synthesize(
+        query="compare the methods",
+        route="multi_source_compare",
+        rag_answer="## Comparison evidence matrix\n- d1: raw anchor A that should be paraphrased [0]\n- d2: raw anchor B that should be paraphrased [1]",
+        citations=[
+            {"document_id": "d1", "chunk_id": "c1", "excerpt": "raw anchor A that should be paraphrased"},
+            {"document_id": "d2", "chunk_id": "c2", "excerpt": "raw anchor B that should be paraphrased"},
+        ],
+        evidence_pack=evidence_pack,
+    )
+
+    assert result["answer_markdown"].startswith("Paper A uses self-reflection")
+    assert result["provider"] == "deepseek"
+    assert not any("lost evidence-anchor" in warning for warning in result["warnings"])
+
+
+def test_answer_numbers_ignores_arxiv_identifiers() -> None:
+    assert AgentSynthesizer._answer_numbers("arXiv:2401.15884 reports 84.3") == {"84.3"}
+
+
+def test_deepseek_fidelity_fallback_keeps_remote_provider_identity(monkeypatch) -> None:
+    """A rejected DeepSeek answer must not be mislabeled as local Ollama."""
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.DeepSeekClient.generate_chat",
+        lambda self, **kwargs: {
+            "content": '{"answer_markdown":"Only the method is reported.","cited_indexes":[0],"warnings":[],"confidence":0.6}',
+            "model": "deepseek-chat",
+            "usage": {"total_tokens": 10},
+            "usage_source": "provider",
+        },
+    )
+    syn = AgentSynthesizer()
+    draft = "NMR spectroscopy at 7.5 kcal/mol for the GLH mutant was used."
+    result = syn.synthesize(
+        query="What technique and energy?",
+        route="table_or_metric",
+        rag_answer=draft,
+        citations=[
+            {
+                "document_id": "d1",
+                "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+            }
+        ],
+        evidence_pack={
+            "status": "ok",
+            "items": [
+                {
+                    "index": 0,
+                    "document_id": "d1",
+                    "excerpt": "Table 5: NMR at 7.5 kcal/mol for GLH mutant.",
+                    "evidence_kind": "table",
+                }
+            ],
+        },
+    )
+
+    assert result["answer_markdown"] == draft
+    assert result["provider"] == "deepseek"
+    assert result["model"] == "deepseek-chat"
+    assert any("fidelity guard" in warning.lower() for warning in result["warnings"])
+
+
+def test_parse_deepseek_json_accepts_fence_and_reasoning_wrapper() -> None:
+    payload = AgentSynthesizer._parse_deepseek_json(
+        "<think>brief reasoning</think>\n```json\n"
+        '{"answer_markdown":"Grounded answer","cited_indexes":[0]}\n```'
+    )
+    assert payload["answer_markdown"] == "Grounded answer"
+    assert payload["cited_indexes"] == [0]
+
+
+def test_deepseek_singleton_object_array_is_accepted(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.DeepSeekClient.generate_chat",
+        lambda self, **kwargs: {
+            "content": '[{"answer_markdown":"Wrapped answer [0]","cited_indexes":[0],"warnings":[],"confidence":0.8}]',
+            "model": "deepseek-chat",
+            "usage": {"total_tokens": 4},
+            "usage_source": "provider",
+        },
+    )
+
+    result = AgentSynthesizer().synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert result["answer_markdown"] == "Wrapped answer [0]"
+    assert result["provider"] == "deepseek"
+
+
+def test_deepseek_retries_once_after_invalid_json(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+    calls = {"count": 0}
+
+    def fake_generate(self, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"content": "[invalid]", "model": "deepseek-chat"}
+        return {
+            "content": '{"answer_markdown":"Recovered answer [0]","cited_indexes":[0],"warnings":[],"confidence":0.8}',
+            "model": "deepseek-chat",
+            "usage": {"total_tokens": 4},
+            "usage_source": "provider",
+        }
+
+    monkeypatch.setattr("app.services.agent_synthesizer.DeepSeekClient.generate_chat", fake_generate)
+    result = AgentSynthesizer().synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert calls["count"] == 2
+    assert result["answer_markdown"] == "Recovered answer [0]"
+    assert any("parse retry" in warning for warning in result["warnings"])
+
+
+def test_synthesize_auto_selects_deepseek_when_generation_provider_is_configured(
+    monkeypatch,
+) -> None:
+    settings = _fake_settings_deepseek()
+    settings.agent_synthesis_provider = "auto"
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.DeepSeekClient.generate_chat",
+        lambda self, **kwargs: {
+            "content": '{"answer_markdown":"DeepSeek answer", "cited_indexes":[], "warnings":[], "confidence":0.7}',
+            "model": "deepseek-chat",
+            "usage": None,
+            "usage_source": "unknown",
+        },
+    )
+
+    result = AgentSynthesizer().synthesize(
+        query="Say hello",
+        route="simple_rag",
+        rag_answer="Hello",
+        citations=[],
+    )
+
+    assert result["provider"] == "deepseek"
+
+
+def test_synthesize_deepseek_without_key_uses_grounded_fallback(monkeypatch) -> None:
+    settings = _fake_settings_deepseek()
+    settings.deepseek_api_key = None
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", lambda: settings)
+
+    result = AgentSynthesizer().synthesize(
+        query="Say hello",
+        route="simple_rag",
+        rag_answer="Hello",
+        citations=[],
+    )
+
+    assert result["provider"] == "deepseek"
+    assert result["answer_markdown"] == "Hello"
+    assert any("not configured" in warning for warning in result["warnings"])
+
+
 def test_synthesize_result_has_required_fields(monkeypatch) -> None:
     """Result dict contains all required keys: answer_markdown, cited_indexes, warnings, confidence, provider, model."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)

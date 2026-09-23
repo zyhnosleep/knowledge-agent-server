@@ -77,8 +77,25 @@ class AgentModelRouter:
                 reason="needs_clarification does not require generation",
             )
 
-        # 其余所有路由统一指向配置的 Ollama 生成模型。
-        # 先去除 base_url 末尾斜杠，避免后续拼接模型路径时产生双斜杠。
+        # 其余所有路由统一指向配置的生成目标。DeepSeek 是 OpenAI-compatible
+        # 远程 provider，不使用本地 Ollama 地址；这里的 target 主要用于
+        # 队列、trace 与 UI 可观测性，真正的请求由对应 synthesizer 发出。
+        generation_provider = str(
+            getattr(self._settings, "generation_provider", "ollama")
+        ).strip().lower()
+        if generation_provider == "deepseek":
+            return InferenceTarget(
+                profile="generation",
+                base_url=self._settings.deepseek_base_url.rstrip("/"),
+                model=self._settings.deepseek_model,
+                # DeepSeek 不需要 Ollama 的 num_ctx；保留配置的上下文预算
+                # 作为 trace/队列中的兼容字段，避免改变 InferenceTarget 契约。
+                context_length=self._settings.ollama_generation_context_length,
+                reason=f"DeepSeek API generation target for route: {route}",
+            )
+
+        # 本地兼容路径：先去除 base_url 末尾斜杠，避免后续拼接模型路径
+        # 时产生双斜杠。
         return InferenceTarget(
             profile="generation",
             base_url=self._settings.ollama_generation_base_url.rstrip("/"),
