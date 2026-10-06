@@ -227,7 +227,7 @@ def test_visual_pixels_require_manifest_identity_and_registered_hash(evidence, m
 
 def test_mixed_table_figure_limit_keeps_three_visual_ranks(evidence):
     _, service, _ = evidence
-    figures = [RetrievedContext(Citation(excerpt='Figure '+str(i),score=6-i), 'Figure '+str(i),6-i,
+    figures = [RetrievedContext(Citation(document_id='d1',parse_version='v5',excerpt='Figure '+str(i),score=6-i), 'Figure '+str(i),6-i,
         evidence_kind='figure', visual_rank=i) for i in range(3)]
     tables = [RetrievedContext(Citation(document_id='d1',parse_version='v5',table_id='table-'+str(i),
         block_type='table',excerpt='Table '+str(i)+'\n|a|b|\n|1|2|',score=60+i),

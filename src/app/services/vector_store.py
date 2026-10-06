@@ -389,7 +389,8 @@ class SQLiteVecStore:
         chunks_by_row_id = {
             int(row.id): (str(row.chunk_id), str(row.parse_version))
             for row in mapping_rows
-            if str(row.parse_version)
+            if (parse_version_map is None or str(row.document_id) in shadow_versions)
+            and str(row.parse_version)
             == (
                 shadow_versions.get(str(row.document_id))
                 or str(row.active_parse_version or "legacy")
@@ -747,7 +748,7 @@ class PGVectorStore:
                     scoped_document_ids,
                     parse_version_map=parse_version_map,
                 )
-                if parse_version_map
+                if parse_version_map is not None
                 else self._search_rows(normalized, limit, scoped_document_ids)
             )
             # 直接把行转换为 VectorHit(查询已含版本过滤)。
@@ -819,7 +820,7 @@ class PGVectorStore:
             str(document_id): str(version_key)
             for document_id, version_key in (parse_version_map or {}).items()
         }
-        if shadow_versions:
+        if parse_version_map is not None:
             shadow_conditions: list[str] = []
             shadow_document_keys: list[str] = []
             # 为每个影子版本文档生成 (document_id = X AND parse_version = Y)。
@@ -834,11 +835,7 @@ class PGVectorStore:
                     f"AND idx.parse_version = :{version_key})"
                 )
             # 版本条件 = 任一影子文档命中,或"非影子文档按常规规则"。
-            version_sql = (
-                "(" + " OR ".join(shadow_conditions) + " OR "
-                f"(idx.document_id NOT IN ({','.join(shadow_document_keys)}) AND "
-                f"{version_sql}))"
-            )
+            version_sql = "(" + " OR ".join(shadow_conditions) + ")" if shadow_conditions else "FALSE"
         return self.db.execute(
             text(
                 f"SELECT idx.chunk_id, idx.parse_version, "

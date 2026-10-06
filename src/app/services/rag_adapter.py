@@ -154,6 +154,9 @@ class RAGAdapter:
         logger.debug("RAGAdapter.retrieve_evidence took %d ms", elapsed_ms)
         return result
 
+    def merge_prepared_snapshots(self, db: Session, base: PreparedEvidence, extra: PreparedEvidence) -> PreparedEvidence:
+        return QueryService(db).merge_prepared_snapshots(base, extra)
+
     @staticmethod
     def answer_is_insufficient_evidence(answer_text: str) -> bool:
         """当回答文本表明检索证据不足以支撑有依据的答案时返回 True。

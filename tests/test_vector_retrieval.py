@@ -153,8 +153,9 @@ def test_pgvector_query_uses_shadow_version_only_for_mapped_documents() -> None:
     ) == []
     assert db.parameters["shadow_document_id_0"] == "d1"
     assert db.parameters["shadow_parse_version_0"] == "staged-v"
-    assert "idx.document_id NOT IN" in db.sql
-    assert "idx.parse_version = document.active_parse_version" in db.sql
+    # An explicit map is the complete frozen set, not a partial override.
+    assert "idx.document_id NOT IN" not in db.sql
+    assert "idx.parse_version = document.active_parse_version" not in db.sql
 
 
 def test_sqlite_vec_hits_include_only_the_document_active_parse_version() -> None:

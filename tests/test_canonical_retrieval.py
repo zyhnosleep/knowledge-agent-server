@@ -192,7 +192,8 @@ def test_shadow_map_is_mixed_with_active_versions_without_leaking_old_chunks() -
         ]
     )
     db.commit()
-    service = QueryService(db, parse_version_map={staged_document.id: "staged-v"})
+    service = QueryService(db, parse_version_map={
+        staged_document.id: "staged-v", active_document.id: "active-v"})
     service.ollama = NoVectorOllama()
 
     contexts = service._search_source_chunks(
@@ -503,12 +504,12 @@ def test_answer_enforces_context_token_budget_before_drafting(monkeypatch) -> No
     service._retrieval_token_counter = lambda text: len(text.split())
     contexts = [
         RetrievedContext(
-            citation=Citation(score=10.0, excerpt="one two three four"),
+            citation=Citation(document_id="d1", parse_version="canonical-v1", score=10.0, excerpt="one two three four"),
             prompt_text="one two three four",
             score=10.0,
         ),
         RetrievedContext(
-            citation=Citation(score=9.0, excerpt="five six seven four"),
+            citation=Citation(document_id="d1", parse_version="canonical-v1", score=9.0, excerpt="five six seven four"),
             prompt_text="five six seven four",
             score=9.0,
         ),

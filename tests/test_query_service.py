@@ -5456,9 +5456,12 @@ def test_rag_table_query_answers_grouped_peptide_values_without_model_generation
         "|  | % ppII | 28.0 (1.4) | 30.1 (1.2) | 0.5 (0.2) | 29.5 (1.2) |\n"
         "|  | % alpha-helix | 5.4 (0.8) | 8.2 (1.1) | 95.3 (0.1) | 21.0 (1.7) |"
     )
+    db.add(make_table_document(table_markdown=table))
+    db.commit()
     contexts = [
         RetrievedContext(
             citation=Citation(
+                document_id="d1",
                 page_slug="sources/charmm36-force-field-refinement-for-proteins",
                 page_title="CHARMM36",
                 page_kind="source_summary",
@@ -8946,12 +8949,15 @@ def test_opls5_metric_answer_retains_tail_table7_binding_rmse_values() -> None:
     contexts = _opls5_row_level_canonical_contexts(question, tables)
     db = service.db
     db.add(Project(id="p1", slug="demo", name="Demo"))
+    document = make_table_document(id="opls5", title="OPLS5", table_markdown=tables[0][3])
+    document.active_parse_version = "canonical-v4"
+    db.add(document)
     db.commit()
     fake_ollama = CountingFakeOllama()
     service.ollama = fake_ollama
     service.verifier = FakeVerifier()
     service._route_papers = lambda question, project_id, document_id=None, limit=3: [
-        PaperMatch(document=Document(id="opls5", project_id="p1", title="OPLS5"), score=20, locked=True)
+        PaperMatch(document=document, score=20, locked=True)
     ]
     service._build_rag_contexts = lambda question, project_id, paper_matches, document_ids=None: contexts
     service._search_source_chunks = lambda question, project_id, document_ids, limit=5: []
@@ -9584,6 +9590,9 @@ def test_retrieve_evidence_wires_table_scopes_to_coverage_when_facts_empty(monke
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
     db.add(project)
+    document = make_table_document(table_markdown="Table 7: RMSE comparison")
+    document.active_parse_version = "v1"
+    db.add(document)
     db.commit()
 
     service = QueryService(db)
@@ -9740,6 +9749,9 @@ def test_retrieve_evidence_coverage_narrowed_to_requested_tables(monkeypatch) ->
     db = make_session()
     project = Project(id="p2", slug="demo2", name="Demo2")
     db.add(project)
+    document = make_table_document(project_id="p2", table_markdown="Table 7: RMSE comparison")
+    document.active_parse_version = "v1"
+    db.add(document)
     db.commit()
 
     from app.schemas.agent import TableFactEvidence
@@ -9979,6 +9991,9 @@ def test_retrieve_evidence_keeps_partial_when_fill_table_missing_from_db(monkeyp
     db = make_session()
     project = Project(id="p1", slug="demo", name="Demo")
     db.add(project)
+    document = make_table_document(table_markdown="Table 7: RMSE comparison")
+    document.active_parse_version = "v1"
+    db.add(document)
     db.commit()
 
     service = QueryService(db)

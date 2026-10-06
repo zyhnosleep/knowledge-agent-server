@@ -32,7 +32,7 @@ def resolve_context_images(db, contexts, root: Path, version_map=None):
             if chunk is None or chunk.block_type != "figure" or chunk.chunk_role != "child":
                 raise ValueError("not a canonical figure child")
             document = chunk.document
-            selected = (version_map or {}).get(document.id, document.active_parse_version)
+            selected = version_map.get(document.id) if version_map is not None else document.active_parse_version
             if (chunk.parse_version != selected or citation.document_id != chunk.document_id
                     or citation.parse_version != chunk.parse_version):
                 raise ValueError("selected version/identity mismatch")

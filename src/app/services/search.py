@@ -33,7 +33,7 @@ from uuid import uuid4
 from typing import Any, Literal
 
 from pydantic import ValidationError
-from sqlalchemy import and_, or_, select, literal
+from sqlalchemy import and_, or_, select, literal, false
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -444,7 +444,7 @@ class QueryService:
         question: str,
         limit: int = 15,
         document_id: str | None = None,
-        *, paper_limit: int | None = None,
+        *, paper_limit: int | None = None, parse_version_map: dict[str, str] | None = None,
     ) -> PreparedEvidence:
         """只检索、不生成答案的 RAG 接口，返回 EvidencePack。
 
@@ -457,15 +457,25 @@ class QueryService:
             raise ValueError(f"Project '{project_slug}' not found")
 
         self._validate_document_scope(project.id, document_id)
-        versions = dict(self.parse_version_map or {})
-        for document in self.db.scalars(select(Document).where(Document.project_id == project.id)).all():
-            versions.setdefault(document.id, document.active_parse_version or 'legacy')
         original_versions = self.parse_version_map
+        selected_versions = parse_version_map if parse_version_map is not None else original_versions
+        documents = self.db.scalars(select(Document).where(Document.project_id == project.id)).all()
+        allowed = {document.id for document in documents}
+        if selected_versions is None:
+            versions = {document.id: document.active_parse_version or 'legacy' for document in documents
+                        if document_id is None or document.id == document_id}
+        else:
+            versions = dict(selected_versions)
+            if not set(versions) <= allowed or (document_id is not None and document_id not in versions):
+                raise ValueError("Requested document is outside frozen scope")
         self.parse_version_map = versions
         try:
             if settings.vector_store_strict:
-                from app.services.runtime_contract import check_pgvector_contract
-                check_pgvector_contract(self.db, settings)
+                from app.services.runtime_contract import EmbeddingIdentity, check_embedding_contract, check_pgvector_configuration
+                check_pgvector_configuration(self.db, settings)
+                check_embedding_contract(self.db, EmbeddingIdentity.from_settings(settings), versions)
+            if not versions:
+                return PreparedEvidence(project.id, project.slug, question, document_id, {}, [], EvidencePack(status='empty', items=[]))
             return self._prepare_project_evidence(project, question, limit, document_id,
                                                   paper_limit=paper_limit)
         finally:
@@ -489,8 +499,8 @@ class QueryService:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
             if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
-        contexts = [c for c in contexts if c.citation.document_id not in versions
-                    or (c.citation.parse_version or 'legacy') == versions[c.citation.document_id]]
+        contexts = [c for c in contexts if c.citation.document_id in versions
+                    and (c.citation.parse_version or 'legacy') == versions[c.citation.document_id]]
         items, table_facts = self._evidence_items_and_facts(
             contexts, limit, question=question
         )
@@ -554,17 +564,19 @@ class QueryService:
                         requested_table_scopes=requested_table_scopes,
                     )
                 )
-                filled_table_ids = {
-                    ctx.citation.table_id for ctx in fill_contexts
+                visible_chunks = {item.chunk_id for item in items}
+                filled_scopes = {
+                    (ctx.citation.document_id, ctx.citation.parse_version, ctx.citation.table_id)
+                    for ctx in fill_contexts if ctx.citation.chunk_id in visible_chunks
                 }
-                remaining_missing = [
-                    table_id
-                    for table_id in coverage_missing
-                    if table_id not in filled_table_ids
-                ]
-                if not remaining_missing:
+                remaining_scopes = [scope for scope in requested_table_scopes if scope not in filled_scopes]
+                if not remaining_scopes:
                     coverage_status = "complete"
                     coverage_missing = []
+                else:
+                    _, coverage_status, coverage_missing = self._build_table_coverage(
+                        table_facts, requested_table_scopes=remaining_scopes,
+                    )
         pack = EvidencePack(
             status=status,
             items=items,
@@ -599,7 +611,9 @@ class QueryService:
                     continue
                 if prepared.document_id and document.id != prepared.document_id:
                     continue
-                selected = prepared.parse_version_map.get(document.id, document.active_parse_version or 'legacy')
+                if document.id not in prepared.parse_version_map:
+                    continue
+                selected = prepared.parse_version_map[document.id]
                 if (item.parse_version or 'legacy') != selected:
                     continue
                 if item.chunk_id:
@@ -644,6 +658,68 @@ class QueryService:
             'status': 'ok' if accepted else 'empty',
         })
         return replace(prepared, contexts=contexts, pack=merged_pack)
+
+    def merge_prepared_snapshots(self, base: PreparedEvidence, extra: PreparedEvidence) -> PreparedEvidence:
+        """Merge source-authoritative contexts, then rebuild facts, coverage and indexes."""
+        if (base.project_id != extra.project_id or base.project_slug != extra.project_slug
+                or base.parse_version_map != extra.parse_version_map):
+            raise ValueError("Evidence snapshot scope/version mismatch")
+        if base.document_id is not None and extra.document_id != base.document_id:
+            raise ValueError("Supplement cannot expand document scope")
+        if extra.document_id is not None and extra.document_id not in base.parse_version_map:
+            raise ValueError("Supplement document is outside frozen scope")
+        original_versions = self.parse_version_map
+        self.parse_version_map = dict(base.parse_version_map)
+        contexts, candidates, seen = [], [], set()
+        try:
+            for source, trusted_base in ((base, True), (extra, False)):
+                for context in source.contexts:
+                    citation = context.citation
+                    if citation.attachment_id:
+                        if not trusted_base:
+                            continue  # Only the executor's already-authorized initial attachments survive.
+                    else:
+                        document = self.db.get(Document, citation.document_id) if citation.document_id else None
+                        if (document is None or document.project_id != base.project_id
+                                or document.id not in base.parse_version_map
+                                or (base.document_id and document.id != base.document_id)
+                                or (extra.document_id and not trusted_base and document.id != extra.document_id)
+                                or (citation.parse_version or 'legacy') != base.parse_version_map[document.id]):
+                            continue
+                        chunk = self.db.get(DocumentChunk, citation.chunk_id) if citation.chunk_id else None
+                        if chunk is None:
+                            if not trusted_base or base.parse_version_map[document.id] != 'legacy':
+                                continue
+                        else:
+                            identifiers = self._canonical_chunk_identifiers(chunk)
+                            if (chunk.document_id != document.id or chunk.parse_version != base.parse_version_map[document.id]
+                                    or chunk.chunk_role != 'child' or chunk.block_type == 'reference'
+                                    or (citation.block_type and citation.block_type != chunk.block_type)
+                                    or any(getattr(citation, name) and getattr(citation, name) != value
+                                           for name, value in identifiers.items())):
+                                continue
+                            authoritative = self._expand_child_hit(chunk, question=base.retrieval_question,
+                                score=context.score, evidence_kind=chunk.block_type,
+                                page_fields=self._source_page_fields_by_document_id(
+                                    base.project_id, [chunk.document_id]).get(chunk.document_id, {}))
+                            context = replace(authoritative, visual_rank=context.visual_rank)
+                            candidates.append((chunk, context.score, chunk.block_type))
+                    key = (context.citation.document_id, context.citation.parse_version,
+                           context.citation.chunk_id, context.citation.attachment_id,
+                           '' if context.citation.chunk_id else context.citation.excerpt)
+                    if key not in seen:
+                        seen.add(key)
+                        contexts.append(context)
+            contexts = self._attach_complete_table_evidence(contexts, candidates, question=base.retrieval_question)
+            items, facts = self._evidence_items_and_facts(contexts, len(contexts), question=base.retrieval_question)
+            scopes = self._requested_table_scopes(contexts, question=base.retrieval_question)
+            inventory, coverage, missing = self._build_table_coverage(facts, requested_table_scopes=scopes)
+            pack = EvidencePack(status='ok' if items else 'empty', items=items, table_facts=facts,
+                                inventory=inventory, coverage_status=coverage, coverage_missing_tables=missing)
+            return replace(base, parse_version_map=dict(base.parse_version_map), contexts=contexts,
+                           pack=pack, visual_evidence_trace={})
+        finally:
+            self.parse_version_map = original_versions
 
     def _evidence_items_and_facts(
         self,
@@ -1094,6 +1170,7 @@ class QueryService:
         statement = select(Document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
+            *self._frozen_document_conditions(),
         )
         if document_id is not None:
             statement = statement.where(Document.id == document_id)
@@ -1514,6 +1591,7 @@ class QueryService:
             select(Document).where(
                 Document.project_id == project_id,
                 Document.status == DocumentStatus.ready.value,
+                *self._frozen_document_conditions(),
             )
         ).all()
         if len(rows) == 1:
@@ -1582,6 +1660,7 @@ class QueryService:
         statement = select(Document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
+            *self._frozen_document_conditions(),
             or_(
                 Document.active_parse_version.is_(None),
                 Document.active_parse_version == "legacy",
@@ -1669,13 +1748,20 @@ class QueryService:
         chunks = self.db.scalars(canonical_statement).all()
         if chunks:
             vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
-            compatible = self._compatible_vector_chunk_ids(chunks, vector)
+            pg_scores = {}
+            if settings.vector_store_strict:
+                hits = get_vector_store(self.db).search(vector, limit=max(50, len(chunks)),
+                    document_ids=list({chunk.document_id for chunk in chunks}), parse_version_map=self.parse_version_map)
+                pg_scores = {hit.chunk_id: 1.0 - hit.distance for hit in hits}
+                self.retrieval_backend = 'pgvector'
+            compatible = self._compatible_vector_chunk_ids(chunks, vector, indexed_ids=set(pg_scores))
             requested_numbers = re.findall(r"(?:figure|fig\.?|图)\s*(\d+)", question, re.I)
             def rank(chunk):
                 exact = bool(requested_numbers and any(re.search(
                     rf"(?:figure|fig\.?|图)\s*{re.escape(number)}(?!\d)", chunk.text, re.I)
                     for number in requested_numbers))
-                semantic = cosine_similarity(vector, chunk.embedding) if chunk.id in compatible else 0.0
+                semantic = (pg_scores.get(chunk.id, 0.0) if settings.vector_store_strict else
+                            cosine_similarity(vector, chunk.embedding) if chunk.id in compatible else 0.0)
                 lexical = len(self._tokenize(question) & self._tokenize(chunk.text))
                 return exact, semantic, lexical, chunk.id
             ranked = sorted(chunks, key=rank, reverse=True)[:limit]
@@ -1687,6 +1773,7 @@ class QueryService:
         statement = select(Document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
+            *self._frozen_document_conditions(),
             or_(
                 Document.active_parse_version.is_(None),
                 Document.active_parse_version == "legacy",
@@ -2715,7 +2802,7 @@ class QueryService:
             "limit": max(limit * 20, 50),
             "document_ids": document_ids or None,
         }
-        if self.parse_version_map:
+        if self.parse_version_map is not None:
             vector_search_kwargs["parse_version_map"] = self.parse_version_map
         vector_hits = (
             vector_store.search(question_vector, **vector_search_kwargs)
@@ -3132,6 +3219,9 @@ class QueryService:
     def _active_child_chunk_conditions(cls):
         return (cls._active_child_chunk_condition(),)
 
+    def _frozen_document_conditions(self):
+        return (Document.id.in_(tuple(self.parse_version_map)),) if self.parse_version_map is not None else ()
+
     def _selected_child_chunk_conditions(self):
         """Return child filters for active documents plus any shadow versions.
 
@@ -3140,14 +3230,9 @@ class QueryService:
         the same map to semantic hits; SQL/lexical retrieval and finalization
         must use the identical selection rule.
         """
-        if not self.parse_version_map:
+        if self.parse_version_map is None:
             return self._active_child_chunk_conditions()
 
-        mapped_document_ids = tuple(
-            str(document_id)
-            for document_id in self.parse_version_map
-            if str(document_id).strip()
-        )
         mapped_conditions = [
             and_(
                 Document.id == str(document_id),
@@ -3162,11 +3247,7 @@ class QueryService:
             for document_id, version_key in self.parse_version_map.items()
             if str(document_id).strip() and str(version_key).strip()
         ]
-        unmapped_condition = and_(
-            ~Document.id.in_(mapped_document_ids),
-            self._active_child_chunk_condition(),
-        )
-        return (or_(*mapped_conditions, unmapped_condition),)
+        return (or_(*mapped_conditions) if mapped_conditions else false(),)
 
     def _expand_child_hit(
         self,
@@ -6006,20 +6087,21 @@ class QueryService:
         """
         from app.services.table_evidence import assemble_table_context, extract_table_facts
 
-        scope_by_table_id: dict[str, tuple[str, str]] = {}
+        selected_scopes: list[tuple[str, str, str]] = []
         for document_id, parse_version, table_id in requested_table_scopes:
             if not (table_id and document_id and parse_version):
                 continue
-            scope_by_table_id.setdefault(table_id, (document_id, parse_version))
+            scope = (document_id, parse_version, table_id)
+            if table_id in missing_table_ids and scope not in selected_scopes:
+                selected_scopes.append(scope)
         fills: list[RetrievedContext] = []
-        for table_id in dict.fromkeys(missing_table_ids):
-            scope = scope_by_table_id.get(table_id)
-            if scope is None:
-                continue
-            document_id, parse_version = scope
+        for document_id, parse_version, table_id in selected_scopes:
             statement = (
                 select(DocumentChunk)
+                .join(DocumentChunk.document)
                 .where(
+                    Document.project_id == project_id,
+                    Document.status == DocumentStatus.ready.value,
                     DocumentChunk.document_id == document_id,
                     DocumentChunk.parse_version == parse_version,
                     DocumentChunk.chunk_role == "child",
@@ -7309,6 +7391,8 @@ class QueryService:
         )
         expanded_contexts: list[RetrievedContext] = []
         for context in contexts:
+            if self.parse_version_map is not None and context.citation.document_id not in self.parse_version_map:
+                continue
             chunk_id = context.citation.chunk_id
             chunk = self.db.get(DocumentChunk, chunk_id) if chunk_id else None
             if chunk is None or chunk.parse_version in {None, "legacy"}:
@@ -7316,11 +7400,8 @@ class QueryService:
                 continue
             document = chunk.document
             expected_parse_version = (
-                self.parse_version_map.get(
-                    chunk.document_id,
-                    document.active_parse_version,
-                )
-                if self.parse_version_map
+                self.parse_version_map.get(chunk.document_id)
+                if self.parse_version_map is not None
                 else document.active_parse_version
             )
             if (
