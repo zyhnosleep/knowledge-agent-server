@@ -152,6 +152,27 @@ def test_valid_empty_pgvector_search_does_not_read_json_embeddings(monkeypatch, 
     assert service.retrieval_backend == "pgvector"
 
 
+def test_empty_query_embedding_is_not_falsely_reported_as_pgvector(monkeypatch, db):
+    import app.services.search as search
+    monkeypatch.setattr(search, "settings", strict_settings(OLLAMA_EMBEDDING_DIMENSIONS=2))
+    monkeypatch.setattr(search, "get_vector_store", lambda db: SimpleNamespace(search=lambda *a, **k: []))
+    with pytest.raises(RuntimeError, match="pgvector_invalid_embedding"):
+        QueryService(db)._search_source_chunks("probe", "p", ["d"], question_vector=[])
+
+
+def test_readiness_checks_its_configured_database_not_global(monkeypatch):
+    import app.services.runtime_contract as contract
+    from sqlalchemy.engine import make_url
+    configured = strict_settings(DATABASE_URL="sqlite:///:memory:")
+    observed = []
+    def check(db, settings):
+        observed.append(db.get_bind().url)
+        return {"status": "ready"}
+    monkeypatch.setattr(contract, "check_pgvector_contract", check)
+    assert ModelReadiness(configured)._probe_database_contract()["status"] == "ready"
+    assert observed == [make_url("sqlite:///:memory:")]
+
+
 def test_pgvector_contract_rejects_sqlite_without_printing_connection_url(db):
     from app.services.runtime_contract import RuntimeContractError, check_pgvector_contract
     with pytest.raises(RuntimeContractError, match="pgvector_config_invalid") as exc:

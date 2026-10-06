@@ -153,14 +153,21 @@ class ModelReadiness:
         return {"status": overall, "models": profiles}
 
     def _probe_database_contract(self) -> dict[str, Any]:
-        from app.db.session import SessionLocal
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
         from app.services.runtime_contract import check_pgvector_contract
+        engine = None
         try:
-            with SessionLocal() as db:
+            connect_args = {"connect_timeout": 5} if self._settings.database_url.startswith("postgresql") else {}
+            engine = create_engine(self._settings.database_url, connect_args=connect_args)
+            with Session(engine) as db:
                 return check_pgvector_contract(db, self._settings)
         except Exception as exc:
             return {"status": "unverified", "backend": "pgvector", "error":
                 exc.reason if isinstance(exc, RuntimeContractError) else "pgvector_inspection_failed"}
+        finally:
+            if engine is not None:
+                engine.dispose()
 
     def _remote_generation_status(self) -> dict[str, Any]:
         """Report DeepSeek generation configuration without making a call."""

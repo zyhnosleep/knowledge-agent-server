@@ -1,0 +1,107 @@
+#!/usr/bin/env python
+"""Smoke the official APIs. HTTP/structure success never becomes accuracy."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.evaluate_adaptive_agent import (
+    CONSTRAINTS, Case, assert_loopback_url, capture_context, private_json)
+import httpx
+
+
+def check_agent_result(body, *, require_pgvector=False, require_pixels=False):
+    if body.get("status") != "completed" or not body.get("final_answer"):
+        raise ValueError("execution_not_completed")
+    metadata = body.get("metadata", {})
+    backends = [metadata.get("retrieval_backend")]
+    backends.extend(step.get("metadata", {}).get("retrieval_backend") for step in body.get("steps", []))
+    if require_pgvector and ("pgvector" not in backends or any(b in ("json_cosine", "sqlite-vec") for b in backends)):
+        raise ValueError("pgvector_not_executed")
+    visual = metadata.get("visual_evidence", {})
+    if require_pixels and not visual.get("sent"):
+        raise ValueError("pixels_not_executed")
+    return {"backend": metadata.get("retrieval_backend"), "pixels_sent": len(visual.get("sent", [])),
+        "execution_mode": metadata.get("execution_mode"), "fact_correct": None}
+
+
+def parse_sse_final(lines):
+    event, data, finals = "", [], []
+    for line in [*lines, ""]:
+        if line == "":
+            if event == "final":
+                finals.append(json.loads("\n".join(data)))
+            event, data = "", []
+        elif line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data.append(line[5:].strip())
+    if len(finals) != 1:
+        raise ValueError("sse_final_missing" if not finals else "sse_multiple_finals")
+    return finals[0]
+
+
+def run_smoke(*, base_url, project, cases=None):
+    assert_loopback_url(base_url)
+    context = capture_context(project)
+    checks = []
+    if not cases:
+        raise ValueError("reviewed_smoke_cases_required")
+    with httpx.Client(timeout=135) as client:
+        health = client.get(base_url.rstrip("/") + "/api/health")
+        health.raise_for_status()
+        body = health.json()
+        if body.get("status") != "ok" or body.get("models", {}).get("vector_store", {}).get("status") != "ready":
+            raise ValueError("readiness_failed")
+        for case in cases:
+            row = {"id": case.id, "fact_correct": None}
+            try:
+                plain = client.post(base_url.rstrip("/") + "/api/query", json={"project_slug": project,
+                    "question": case.question, "document_id": case.document_scope, "save_answer": False})
+                plain.raise_for_status()
+                plain_body = plain.json()
+                if not plain_body.get("answer_markdown"):
+                    raise ValueError("plain_answer_missing")
+                payload = {"project_slug": project, "query": case.question, "document_id": case.document_scope,
+                    "constraints": dict(CONSTRAINTS)}
+                response = client.post(base_url.rstrip("/") + "/api/agent/query", json=payload)
+                response.raise_for_status()
+                agent = response.json()
+                pixel = case.group == "pixels"
+                row["json"] = check_agent_result(agent, require_pgvector=not case.unanswerable, require_pixels=pixel)
+                with client.stream("POST", base_url.rstrip("/") + "/api/agent/query/stream", json=payload) as stream:
+                    stream.raise_for_status()
+                    sse = parse_sse_final(list(stream.iter_lines()))
+                row["sse"] = check_agent_result(sse, require_pgvector=not case.unanswerable, require_pixels=pixel)
+                row["plain_response"], row["json_response"], row["sse_response"] = plain_body, agent, sse
+                row["passed"] = True
+            except Exception:
+                row.update({"passed": False, "error": "smoke_check_failed"})
+            checks.append(row)
+    stable = context == capture_context(project)
+    return {"passed": stable and all(c["passed"] for c in checks), "context_stable": stable,
+        "context": context, "checks": checks, "accuracy": None}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--cases", type=Path)
+    args = parser.parse_args(argv)
+    args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    try:
+        cases = [Case.model_validate(json.loads(line)) for line in args.cases.read_text(encoding="utf-8").splitlines() if line.strip()] if args.cases else None
+        report = run_smoke(base_url=args.base_url, project=args.project, cases=cases)
+    except Exception:
+        report = {"passed": False, "checks": [], "error": "smoke_failed"}
+    private_json(args.output / "report.json", report)
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

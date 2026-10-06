@@ -458,6 +458,7 @@ class QueryService:
             raise ValueError(f"Project '{project_slug}' not found")
 
         self._validate_document_scope(project.id, document_id)
+        self.retrieval_backend = "not_queried"
         original_versions = self.parse_version_map
         selected_versions = parse_version_map if parse_version_map is not None else original_versions
         documents = self.db.scalars(select(Document).where(Document.project_id == project.id)).all()
@@ -2811,6 +2812,9 @@ class QueryService:
         }
         if self.parse_version_map is not None:
             vector_search_kwargs["parse_version_map"] = self.parse_version_map
+        if settings.vector_store_strict and not question_vector:
+            from app.services.runtime_contract import RuntimeContractError
+            raise RuntimeContractError("pgvector_invalid_embedding")
         vector_hits = (
             vector_store.search(question_vector, **vector_search_kwargs)
             if question_vector

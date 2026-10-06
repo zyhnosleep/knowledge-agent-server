@@ -62,6 +62,16 @@ def test_prepared_snapshot_rejects_other_project(evidence, monkeypatch):
     assert post.call_count == 0
 
 
+def test_prepared_backend_is_current_retrieval_not_previous_call(evidence, monkeypatch):
+    _, service, _ = evidence
+    contexts = service._search_source_chunks("legend", "p1", ["d1"], question_vector=[1, 0])
+    service.retrieval_backend = "pgvector"
+    monkeypatch.setattr(service, "_route_papers", lambda *a, **kw: [])
+    monkeypatch.setattr(service, "_build_rag_contexts", lambda *a, **kw: contexts)
+    prepared = service.prepare_evidence("pilot", "legend")
+    assert prepared.retrieval_backend == "canonical_sql"
+
+
 def test_prepare_freezes_versions_before_routing_and_table_expansion(evidence, monkeypatch):
     from app.models.records import DocumentChunk
     db, service, _ = evidence
