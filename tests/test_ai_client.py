@@ -1,3 +1,6 @@
+import pytest
+import httpx
+
 from app.services import ai
 from app.services.ai import (
     ContextualizationOllamaClient,
@@ -170,6 +173,355 @@ def test_embed_uses_dedicated_embedding_url(monkeypatch) -> None:
     assert client.embed(["alpha"]) == [[0.1, 0.2]]
     assert captured["url"] == "http://embed:11435/api/embed"
     assert captured["json"]["model"] == "embed-model"
+
+
+def test_embed_uses_openai_compatible_qwen_api_and_restores_input_order(monkeypatch) -> None:
+    from app.services import ai
+
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"index": 1, "embedding": [0.3, 0.4]},
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                ]
+            }
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def post(self, url, *, headers, json):
+            captured.update({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    monkeypatch.setattr(ai.settings, "embedding_provider", "openai-compatible")
+    monkeypatch.setattr(ai.settings, "embedding_api_base_url", "https://embed.example/v1/")
+    monkeypatch.setattr(ai.settings, "embedding_api_key", "test-secret")
+    monkeypatch.setattr(ai.settings, "embedding_api_model", "Qwen/Qwen3-Embedding-4B")
+    monkeypatch.setattr(ai.settings, "embedding_api_timeout", 12)
+    monkeypatch.setattr(ai.settings, "ollama_embedding_dimensions", 2)
+
+    result = OllamaClient().embed(["alpha", "beta"])
+
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    assert captured["url"] == "https://embed.example/v1/embeddings"
+    assert captured["headers"]["Authorization"] == "Bearer test-secret"
+    assert captured["json"] == {
+        "model": "Qwen/Qwen3-Embedding-4B",
+        "input": ["alpha", "beta"],
+    }
+    assert captured["timeout"] == 12
+
+
+def test_embed_batches_openai_compatible_requests_at_configured_limit(monkeypatch) -> None:
+    from app.services import ai
+
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, payload: dict):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def post(self, url, *, headers, json):
+            calls.append({"url": url, "headers": headers, "json": json})
+            # Return each batch in reverse order to verify batch-local index
+            # sorting while the caller concatenates batches in input order.
+            offset = (len(calls) - 1) * 100
+            rows = [
+                {"index": index, "embedding": [float(offset + index), 1.0]}
+                for index in range(len(json["input"]))
+            ]
+            return FakeResponse({"data": list(reversed(rows))})
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    monkeypatch.setattr(ai.settings, "embedding_provider", "openai-compatible")
+    monkeypatch.setattr(ai.settings, "embedding_api_base_url", "https://embed.example/v1")
+    monkeypatch.setattr(ai.settings, "embedding_api_key", "test-secret")
+    monkeypatch.setattr(ai.settings, "embedding_api_model", "qwen3.7-text-embedding")
+    monkeypatch.setattr(ai.settings, "embedding_api_batch_size", 20)
+    monkeypatch.setattr(ai.settings, "embedding_dimensions", 2)
+
+    texts = [f"text-{index}" for index in range(21)]
+    result = OllamaClient().embed(texts)
+
+    assert len(calls) == 2
+    assert [len(call["json"]["input"]) for call in calls] == [20, 1]
+    assert result == [
+        [float(index), 1.0] for index in range(20)
+    ] + [[100.0, 1.0]]
+
+
+def test_embed_openai_compatible_requires_server_credentials(monkeypatch) -> None:
+    from app.services import ai
+
+    monkeypatch.setattr(ai.settings, "embedding_provider", "openai-compatible")
+    monkeypatch.setattr(ai.settings, "embedding_api_base_url", None)
+    monkeypatch.setattr(ai.settings, "embedding_api_key", None)
+
+    with pytest.raises(ValueError, match="EMBEDDING_API_BASE_URL"):
+        OllamaClient().embed(["alpha"])
+
+
+def test_embed_openai_compatible_rejects_wrong_dimensions(monkeypatch) -> None:
+    from app.services import ai
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"index": 0, "embedding": [0.1]}]}
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def post(self, url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    monkeypatch.setattr(ai.settings, "embedding_provider", "openai-compatible")
+    monkeypatch.setattr(ai.settings, "embedding_api_base_url", "https://embed.example/v1")
+    monkeypatch.setattr(ai.settings, "embedding_api_key", "test-secret")
+    monkeypatch.setattr(ai.settings, "ollama_embedding_dimensions", 2)
+
+    with pytest.raises(ValueError, match="dimensions"):
+        OllamaClient().embed(["alpha"])
+
+
+def test_deepseek_client_posts_openai_compatible_payload_and_preserves_usage(monkeypatch) -> None:
+    from app.services.ai import DeepSeekClient
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "model": "deepseek-chat",
+                "choices": [{"message": {"content": '{"answer":"ok"}'}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16},
+            }
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url, *, json, headers):
+            captured.update({"url": url, "json": json, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    client = DeepSeekClient(
+        base_url="https://api.deepseek.com/v1/",
+        api_key="test-key",
+        model="deepseek-chat",
+        timeout=7,
+        max_retries=0,
+    )
+
+    result = client.generate_chat(
+        messages=[{"role": "user", "content": "hello"}],
+        max_output_tokens=128,
+        response_format={"type": "json_object"},
+    )
+
+    assert result["content"] == '{"answer":"ok"}'
+    assert result["usage"] == {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}
+    assert result["usage_source"] == "provider"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert captured["json"]["max_tokens"] == 128
+    assert captured["json"]["response_format"] == {"type": "json_object"}
+    assert captured["timeout"] == 7
+
+
+def test_deepseek_client_does_not_retry_authentication_errors(monkeypatch) -> None:
+    from app.services.ai import DeepSeekAPIError, DeepSeekClient
+
+    calls = 0
+
+    class FakeResponse:
+        status_code = 401
+
+        def raise_for_status(self):
+            raise RuntimeError("unauthorized")
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+
+    with pytest.raises(DeepSeekAPIError) as exc_info:
+        DeepSeekClient(api_key="test-key", max_retries=3, retry_backoff_seconds=0).generate_chat(
+            messages=[]
+        )
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.retryable is False
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+def test_deepseek_client_retries_transient_http_errors(monkeypatch, status_code: int) -> None:
+    from app.services.ai import DeepSeekAPIError, DeepSeekClient
+
+    calls = 0
+
+    class FakeResponse:
+        def __init__(self, status):
+            self.status_code = status
+
+        def raise_for_status(self):
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return FakeResponse(status_code) if calls == 1 else FakeResponse(200)
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    result = DeepSeekClient(api_key="test-key", max_retries=1, retry_backoff_seconds=0).generate_chat(
+        messages=[]
+    )
+
+    assert result["content"] == "ok"
+    assert calls == 2
+
+
+def test_deepseek_client_exhausts_transient_errors_and_retries_timeout(monkeypatch) -> None:
+    from app.services.ai import DeepSeekAPIError, DeepSeekClient
+
+    calls = 0
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+
+    with pytest.raises(DeepSeekAPIError) as exc_info:
+        DeepSeekClient(api_key="test-key", max_retries=1, retry_backoff_seconds=0).generate_chat(
+            messages=[]
+        )
+
+    assert exc_info.value.error_code == "transport_error"
+    assert exc_info.value.retryable is True
+    assert calls == 2
+
+
+def test_deepseek_client_marks_missing_usage_unknown(monkeypatch) -> None:
+    from app.services.ai import DeepSeekClient
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(ai.httpx, "Client", FakeHttpClient)
+    result = DeepSeekClient(api_key="test-key", max_retries=0).generate_chat(messages=[])
+
+    assert result["usage"] is None
+    assert result["usage_source"] == "unknown"
+    assert result["prompt_tokens"] is None
 
 
 def test_generate_structured_retries_empty_schema_response(monkeypatch) -> None:

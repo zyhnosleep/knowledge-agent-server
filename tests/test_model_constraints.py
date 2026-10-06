@@ -61,6 +61,24 @@ def test_default_generation_stack_is_single_qwen_profile() -> None:
     assert settings.ollama_generation_parallelism == 1
     assert settings.ollama_embedding_model == "qwen3-embedding:4b"
     assert settings.ollama_embedding_dimensions == 2560
+    assert settings.embedding_provider == "ollama"
+    assert settings.embedding_api_model == "Qwen/Qwen3-Embedding-4B"
+    assert settings.active_embedding_provider == "ollama"
+    assert settings.active_embedding_model == "qwen3-embedding:4b"
+    assert settings.active_embedding_dimensions == 2560
+
+
+def test_remote_embedding_configuration_selects_qwen_api_identity() -> None:
+    settings = Settings(
+        _env_file=None,
+        EMBEDDING_PROVIDER="openai-compatible",
+        EMBEDDING_API_MODEL="Qwen/Qwen3-Embedding-4B",
+        EMBEDDING_DIMENSIONS=2560,
+    )
+
+    assert settings.active_embedding_provider == "openai-compatible"
+    assert settings.active_embedding_model == "Qwen/Qwen3-Embedding-4B"
+    assert settings.active_embedding_dimensions == 2560
 
 
 @pytest.mark.parametrize(

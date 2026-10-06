@@ -307,7 +307,8 @@ def build_ingestion_config_snapshot(
     - ``algorithm_revisions``：各算法/流程的修订版本。
     - ``tokenizer``：模型名、修订、内容哈希（默认实时解析，也可由调用
       方预先传入避免重复解析）。
-    - ``embedding``：嵌入模型名与维度。
+    - ``embedding``：provider、嵌入模型名与维度；provider 变化会强制
+      生成新的解析/索引身份，避免不同服务商的向量混用。
     - ``semantic_splitting``：语义切分模型与父/子块 token 上下限、
       切分百分位、重叠 token 数。
 
@@ -324,8 +325,9 @@ def build_ingestion_config_snapshot(
             "content_sha256": identity["content_sha256"],
         },
         "embedding": {
-            "model": configured.ollama_embedding_model,
-            "dimensions": configured.ollama_embedding_dimensions,
+            "provider": configured.active_embedding_provider,
+            "model": configured.active_embedding_model,
+            "dimensions": configured.active_embedding_dimensions,
         },
         "semantic_splitting": {
             "model": configured.semantic_splitting_model,

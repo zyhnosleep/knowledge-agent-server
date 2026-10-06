@@ -164,7 +164,7 @@ def test_stream_emits_live_route_tokens_and_citations_in_order(monkeypatch) -> N
 
     monkeypatch.setattr(
         "app.services.rag_adapter.RAGAdapter.answer",
-        lambda self, db, project_slug, question, document_id=None: QueryResponse(
+        lambda self, db, project_slug, question, document_id=None, **kwargs: QueryResponse(
             answer_markdown="draft",
             citations=[
                 Citation(

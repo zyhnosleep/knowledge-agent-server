@@ -53,6 +53,10 @@ from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
 from app.services.model_runtime import ModelRuntime, get_model_runtime
 from app.services.rag_adapter import RAGAdapter, _INSUFFICIENT_EVIDENCE_RE
+from app.services.search import PreparedEvidence
+from app.services.execution_budget import (
+    BudgetExceeded, ExecutionBudget, current_execution_budget, execution_budget_scope,
+)
 from app.services.session_attachments import retrieve_session_attachment_evidence
 from app.services.tool_registry import ToolRegistry
 
@@ -125,6 +129,14 @@ class AgentExecutor:
     # ------------------------------------------------------------------
 
     def execute(self, request: AgentQueryRequest) -> AgentQueryResponse:
+        budget = ExecutionBudget(request.constraints, cancel_event=self._cancel_event)
+        with execution_budget_scope(budget):
+            response = self._execute(request, budget)
+            if not response.metadata:
+                response.metadata = self._stamp_execution(response.steps, response.usage)
+            return response
+
+    def _execute(self, request: AgentQueryRequest, budget: ExecutionBudget) -> AgentQueryResponse:
         """执行单轮 Agent 查询并返回结构化响应。
 
         流程中的所有步骤都受到 constraints.max_steps 限制；
@@ -138,6 +150,9 @@ class AgentExecutor:
         warnings: list[str] = []
         t_start = time.monotonic()
         max_steps_hit = False
+        answer_text = ''
+        citations: list[Citation] = []
+        route = None
 
         # ---- 会话维护：更新 TTL、清理过期会话 ----
         self._memory.touch_session(
@@ -161,7 +176,9 @@ class AgentExecutor:
             # Step 0: 路由 — 决定查询类型和后续策略
             # ==============================================================
             route_t0 = time.monotonic()
+            budget.check_deadline()
             route = PolicyRouter().route(request.query)
+            budget.set_answer_retry_limit(route.max_retries)
             inference_target = AgentModelRouter().select(route.route)
             route_latency = int((time.monotonic() - route_t0) * 1000)
 
@@ -254,6 +271,7 @@ class AgentExecutor:
                         "before finalize — trace truncated"
                     )
                 usage.steps = len(steps)
+                self._stamp_execution(steps, usage)
 
                 self._memory.add_turn(
                     session_id,
@@ -324,6 +342,8 @@ class AgentExecutor:
             retrieval_query = self._contextualize_retrieval_query(
                 session_id, request.query
             )
+            evidence_state: dict[str, PreparedEvidence] = {}
+            conversation_summary = self._build_conversation_summary(session_id)
 
             if attachment_only_requested:
                 session_attachment_pack = self._run_retrieve_session_attachments(
@@ -360,6 +380,7 @@ class AgentExecutor:
                     steps,
                     usage,
                     session_id,
+                    evidence_state=evidence_state,
                 )
 
                 # T1/T2：项目级会话（无文档锁定）检索 0 items 时，回退到会话
@@ -382,6 +403,7 @@ class AgentExecutor:
                             steps,
                             usage,
                             session_id,
+                            evidence_state=evidence_state,
                         )
                         if fallback_pack and fallback_pack.get("items"):
                             evidence_pack = fallback_pack
@@ -431,8 +453,12 @@ class AgentExecutor:
                     steps,
                     usage,
                     session_id,
+                    prepared_evidence=evidence_state.get('prepared'),
+                    evidence_pack=evidence_pack,
+                    answer_query=request.query,
+                    conversation_summary=conversation_summary,
                 )
-                tool_calls = tool_calls_used
+                tool_calls = usage.tool_calls
                 attachment_citations = self._session_attachment_citations(evidence_pack)
                 if attachment_citations:
                     citations = self._merge_citations(citations, attachment_citations)
@@ -482,11 +508,15 @@ class AgentExecutor:
                 "table_or_metric",
                 "multi_source_compare",
             }
+            visual_request = any(
+                step.metadata.get('visual_evidence', {}).get('intent', False)
+                for step in steps if step.tool_name == 'rag.answer'
+            )
             direct_candidate = (
                 not attachment_only
                 and not max_steps_hit
-                and route.route in _direct_routes
-                and not self._is_cross_turn_query(request.query, session_id)
+                and (visual_request or (route.route in _direct_routes
+                     and not self._is_cross_turn_query(request.query, session_id)))
             )
             direct_block_reason: str | None = None
             draft_verification = False
@@ -507,6 +537,7 @@ class AgentExecutor:
                     tool_calls,
                 )
                 tool_calls = usage.tool_calls
+                draft_verification = bool(draft_verify_result.get('verification_executed'))
                 draft_retry = bool(
                     draft_verify_result["ok"]
                     and draft_verify_result.get("result", {}).get(
@@ -519,6 +550,7 @@ class AgentExecutor:
                     and route.max_retries > 0
                     and tool_calls < constraints.max_tool_calls
                     and len(steps) < constraints.max_steps
+                    and budget.consume_answer_retry()
                 ):
                     (
                         retry_answer,
@@ -533,9 +565,13 @@ class AgentExecutor:
                         steps,
                         usage,
                         session_id,
+                        prepared_evidence=evidence_state.get('prepared'),
+                        evidence_pack=evidence_pack,
+                        answer_query=request.query,
+                        conversation_summary=conversation_summary,
                     )
                     if retry_calls > 0:
-                        tool_calls += retry_calls
+                        tool_calls = usage.tool_calls
                         if retry_answer.strip():
                             answer_text = retry_answer
                             citations = retry_citations
@@ -562,6 +598,7 @@ class AgentExecutor:
                             tool_calls,
                         )
                         tool_calls = usage.tool_calls
+                        draft_verification = bool(draft_verify_result.get('verification_executed'))
                         draft_retry = bool(
                             draft_verify_result["ok"]
                             and draft_verify_result.get("result", {}).get(
@@ -588,7 +625,12 @@ class AgentExecutor:
                 and rag_verification_status != "contradicted"
                 and not draft_retry
                 and not coverage_partial
+                and draft_verify_result is not None
+                and draft_verify_result.get('verification_state') == 'passed'
             )
+            # A text-only organizer cannot rewrite facts read from pixels.
+            # Even an abstention/missing-image response must not become a guess.
+            skip_synthesis = skip_synthesis or visual_request
             if direct_candidate and not skip_synthesis:
                 if _evidence_insufficient:
                     direct_block_reason = "evidence_insufficient"
@@ -602,9 +644,13 @@ class AgentExecutor:
                     direct_block_reason = "draft_verify_retry"
                 elif coverage_partial:
                     direct_block_reason = "coverage_partial"
+                else:
+                    direct_block_reason = 'verification_not_passed'
 
             synth_provider = "local"
-            synth_model = "rag-direct" if skip_synthesis else "local-fallback"
+            synth_model = ('rag-direct' if skip_synthesis and draft_verify_result
+                           and draft_verify_result.get('verification_state') == 'passed'
+                           else 'visual-evidence' if visual_request else 'local-fallback')
             # 9.8：需求侧期望 facts 状态（synthesize 未调用时为 None）
             expected_facts_status: str | None = None
             if not max_steps_hit and not attachment_only and not skip_synthesis:
@@ -654,7 +700,7 @@ class AgentExecutor:
 
             # ---- final verify：直通路径 draft verify 即最终校验（不重复消耗）；
             #      synthesize 路径在综合后执行 final verify ----
-            if skip_synthesis:
+            if skip_synthesis and draft_verify_result is not None:
                 verify_result = draft_verify_result
             else:
                 final_verification = True
@@ -669,6 +715,7 @@ class AgentExecutor:
                     tool_calls,
                 )
                 tool_calls = usage.tool_calls
+                final_verification = bool(verify_result.get('verification_executed'))
                 if verify_result["ok"]:
                     verify_warnings = verify_result.get("result", {}).get(
                         "warnings", []
@@ -696,6 +743,7 @@ class AgentExecutor:
                 )
                 and tool_calls < constraints.max_tool_calls
                 and len(steps) < constraints.max_steps
+                and budget.consume_answer_retry(empty_answer=answer_is_empty)
             ):
                 (
                     retry_answer,
@@ -710,10 +758,14 @@ class AgentExecutor:
                     steps,
                     usage,
                     session_id,
+                    prepared_evidence=evidence_state.get('prepared'),
+                    evidence_pack=evidence_pack,
+                    answer_query=request.query,
+                    conversation_summary=conversation_summary,
                 )
                 if retry_calls > 0:
                     retry_ran = True
-                    tool_calls += retry_calls
+                    tool_calls = usage.tool_calls
                     if retry_answer.strip():
                         answer_text = retry_answer
                         citations = retry_citations
@@ -734,6 +786,7 @@ class AgentExecutor:
                         tool_calls,
                     )
                     tool_calls = usage.tool_calls
+                    final_verification = bool(verify_result.get('verification_executed'))
                     if verify_result["ok"]:
                         verify_warnings = verify_result.get("result", {}).get(
                             "warnings", []
@@ -774,6 +827,10 @@ class AgentExecutor:
                         "delivering degraded response"
                     )
 
+
+            for checked in (draft_verify_result, verify_result):
+                if checked:
+                    warnings.extend(w for w in checked.get('result', {}).get('warnings', []) if w not in warnings)
 
             # ---- 检查 max_steps 是否耗尽 ----
             hit_limit = len(steps) >= constraints.max_steps
@@ -820,12 +877,8 @@ class AgentExecutor:
                 )
                 steps.append(finalize_step)
 
-            # Approximate token usage
-            prompt_tokens = _estimate_tokens(request.query)
-            completion_tokens = _estimate_tokens(answer_text)
-            usage.prompt_tokens = prompt_tokens
-            usage.completion_tokens = completion_tokens
             usage.steps = len(steps)
+            run_metadata = self._stamp_execution(steps, usage, verify_result)
 
             self._memory.add_turn(
                 session_id,
@@ -839,6 +892,8 @@ class AgentExecutor:
             status = "completed"
             if hit_limit:
                 status = "max_steps"
+            elif run_metadata['verification_state'] == 'skipped':
+                status = 'error'
             if total_elapsed > constraints.timeout_seconds * 1000:
                 status = "timeout"
 
@@ -880,6 +935,7 @@ class AgentExecutor:
                 trace_id=trace_id,
                 answer_provider=synth_provider,
                 answer_model=synth_model,
+                metadata=run_metadata,
             )
 
         except Exception as exc:
@@ -894,6 +950,13 @@ class AgentExecutor:
                     )
                 )
             usage.steps = len(steps)
+            stopped = isinstance(exc, BudgetExceeded)
+            error_status = 'timeout' if stopped and exc.reason in ('deadline', 'cancelled') else 'error'
+            if stopped:
+                warnings.append(f'Execution stopped: {exc.reason}; answer verification skipped after budget stop.')
+            run_metadata = self._stamp_execution(steps, usage, stop=exc.reason if stopped else 'execution_error')
+            available_answer = answer_text if stopped else ''
+            available_citations = citations if stopped else []
             total_elapsed = int((time.monotonic() - t_start) * 1000)
 
             # ---- persist trace for error ----
@@ -909,10 +972,10 @@ class AgentExecutor:
                         route=None,
                         steps=steps,
                         usage=usage,
-                        final_answer="",
-                        citations=[],
+                        final_answer=available_answer,
+                        citations=[c.model_dump() for c in available_citations],
                         warnings=warnings,
-                        status="error",
+                        status=error_status,
                         latency_ms=total_elapsed,
                         provider="local",
                         model="local-fallback",
@@ -923,15 +986,16 @@ class AgentExecutor:
             return AgentQueryResponse(
                 request_id=request_id,
                 session_id=session_id,
-                status="error",
-                final_answer="",
-                citations=[],
+                status=error_status,
+                final_answer=available_answer,
+                citations=available_citations,
                 steps=steps,
                 usage=usage,
                 warnings=warnings,
                 trace_id=trace_id,
                 answer_provider="local",
                 answer_model="local-fallback",
+                metadata=run_metadata,
             )
 
     # ------------------------------------------------------------------
@@ -945,6 +1009,44 @@ class AgentExecutor:
         except Exception:
             self._db.rollback()
             raise
+
+    @staticmethod
+    def _stamp_execution(steps: list[AgentStep], usage: AgentUsage,
+                         verification: dict[str, Any] | None = None, *, stop: str | None = None) -> dict[str, Any]:
+        budget = current_execution_budget()
+        metadata = {
+            'verification_state': (verification or {}).get('verification_state', 'skipped'),
+            'verification_scope': 'structural',
+            'verification_executed': bool((verification or {}).get('verification_executed', False)),
+        }
+        if budget:
+            ledger = budget.usage_metadata()
+            for key in ('prompt_tokens', 'completion_tokens', 'model_requests', 'answer_retries', 'format_retries', 'usage_source'):
+                setattr(usage, key, ledger[key])
+            metadata['budget'] = ledger
+        if stop:
+            metadata['budget_stop'] = stop
+            metadata['verification_reason'] = stop
+        elif verification:
+            metadata['verification_reason'] = verification.get('result', {}).get('reason', '')
+        rag_steps = [step for step in steps if step.tool_name == 'rag.answer']
+        if rag_steps:
+            metadata['evidence_snapshot_reused'] = rag_steps[-1].metadata.get('evidence_snapshot_reused', False)
+            metadata['visual_evidence'] = rag_steps[-1].metadata.get('visual_evidence', {})
+        if steps:
+            steps[-1].metadata['execution'] = metadata
+        return metadata
+
+    @staticmethod
+    def _tool_block_reason(constraints: AgentConstraints, steps: list[AgentStep], usage: AgentUsage) -> str | None:
+        budget = current_execution_budget()
+        if budget:
+            return budget.tool_block_reason(step_count=len(steps), tool_calls=usage.tool_calls)
+        if len(steps) >= constraints.max_steps:
+            return 'step_limit'
+        if usage.tool_calls >= constraints.max_tool_calls:
+            return 'tool_limit'
+        return None
 
     @staticmethod
     def _is_attachment_only_query(query: str) -> bool:
@@ -991,11 +1093,9 @@ class AgentExecutor:
             f"Reached max_steps limit ({constraints.max_steps}). "
             "Trace truncated — no tool calls were made."
         )
-        prompt_tokens = _estimate_tokens(request.query)
-        completion_tokens = _estimate_tokens(answer_text)
-        usage.prompt_tokens = prompt_tokens
-        usage.completion_tokens = completion_tokens
         usage.steps = len(steps)
+        warnings.append('Answer verification skipped: step limit reached before generation.')
+        metadata = self._stamp_execution(steps, usage, stop='step_limit')
 
         self._memory.add_turn(
             session_id,
@@ -1092,6 +1192,7 @@ class AgentExecutor:
         steps: list[AgentStep],
         usage: AgentUsage,
         session_id: str,
+        *, evidence_state: dict[str, PreparedEvidence] | None = None,
     ) -> dict[str, Any] | None:
         """调用 rag.retrieve_evidence 工具，记录 step，返回 evidence pack。
 
@@ -1104,9 +1205,7 @@ class AgentExecutor:
             return None
 
         # Enforce limits
-        if usage.tool_calls >= constraints.max_tool_calls:
-            return None
-        if len(steps) >= constraints.max_steps:
+        if self._tool_block_reason(constraints, steps, usage):
             return None
 
         step_id = len(steps)
@@ -1121,7 +1220,7 @@ class AgentExecutor:
         tool_result = self._tools.call_tool(
             "rag.retrieve_evidence",
             tool_args,
-            ctx={"db": self._db},
+            ctx={"db": self._db, 'prepared_evidence_out': evidence_state},
         )
         latency = int((time.monotonic() - t0) * 1000)
         usage.tool_calls += 1
@@ -1212,6 +1311,10 @@ class AgentExecutor:
         steps: list[AgentStep],
         usage: AgentUsage,
         session_id: str,
+        *, prepared_evidence: PreparedEvidence | None = None,
+        evidence_pack: dict[str, Any] | None = None,
+        answer_query: str | None = None,
+        conversation_summary: str = '',
     ) -> tuple[str, list[Citation], int, str]:
         """调用 rag.answer 工具，记录 step，返回
         (答案文本, 引用列表, 实际工具调用数, verification_status)。
@@ -1219,9 +1322,7 @@ class AgentExecutor:
         如果受 max_tool_calls / max_steps 限制，返回 ("", [], 0, "local-only")。
         """
         # Enforce limits
-        if usage.tool_calls >= constraints.max_tool_calls:
-            return "", [], 0, "local-only"
-        if len(steps) >= constraints.max_steps:
+        if self._tool_block_reason(constraints, steps, usage):
             return "", [], 0, "local-only"
 
         step_id = len(steps)
@@ -1235,7 +1336,13 @@ class AgentExecutor:
         tool_result = self._tools.call_tool(
             "rag.answer",
             tool_args,
-            ctx={"db": self._db},
+            ctx={"db": self._db, 'prepared_evidence': prepared_evidence,
+                 'evidence_pack': evidence_pack, 'answer_query': answer_query or question,
+                 'conversation_summary': conversation_summary,
+                 'trusted_attachment_ids': frozenset(
+                     item['attachment_id'] for item in (evidence_pack or {}).get('items', [])
+                     if item.get('attachment_id')
+                 )},
         )
         latency = int((time.monotonic() - t0) * 1000)
         usage.tool_calls += 1
@@ -1245,17 +1352,7 @@ class AgentExecutor:
             answer_text = rag_data.get("answer_markdown", "")
             raw_citations = rag_data.get("citations", [])
             citations = [
-                Citation(
-                    document_id=c.get("document_id"),
-                    chunk_id=c.get("chunk_id"),
-                    attachment_id=c.get("attachment_id"),
-                    page_slug=c.get("page_slug"),
-                    page_title=c.get("page_title"),
-                    page_kind=c.get("page_kind"),
-                    score=float(c.get("score", 0)),
-                    page_label=c.get("page_label"),
-                    excerpt=str(c.get("excerpt", "")),
-                )
+                Citation.model_validate(c)
                 for c in raw_citations
             ]
             step = AgentStep(
@@ -1268,7 +1365,9 @@ class AgentExecutor:
                 latency_ms=latency,
                 tool_name="rag.answer",
                 tool_ok=True,
-                metadata={"answer_chars": len(answer_text), "document_id": document_id},
+                metadata={"answer_chars": len(answer_text), "document_id": document_id,
+                          'evidence_snapshot_reused': rag_data.get('evidence_snapshot_reused', False),
+                          'visual_evidence': rag_data.get('visual_evidence', {})},
             )
         else:
             answer_text = ""
@@ -1317,28 +1416,19 @@ class AgentExecutor:
         如果受限制，返回 no-op 结果（不触发重试）。
         验证工具会返回 retry_recommended，决定是否进入后续重试逻辑。
         """
-        # Enforce limits
-        if usage.tool_calls >= constraints.max_tool_calls:
+        reason = self._tool_block_reason(constraints, steps, usage)
+        if reason:
             return {
                 "ok": True,
                 "name": "answer.verify",
+                'verification_state': 'skipped',
+                'verification_scope': 'structural',
+                'verification_executed': False,
                 "result": {
-                    "ok": True,
-                    "warnings": ["Skipped verification — tool call limit reached"],
+                    "ok": False,
+                    "warnings": [f'Skipped verification — {reason} reached'],
                     "retry_recommended": False,
-                    "reason": "Tool call limit",
-                },
-                "latency_ms": 0,
-            }
-        if len(steps) >= constraints.max_steps:
-            return {
-                "ok": True,
-                "name": "answer.verify",
-                "result": {
-                    "ok": True,
-                    "warnings": ["Skipped verification — step limit reached"],
-                    "retry_recommended": False,
-                    "reason": "Step limit",
+                    "reason": reason,
                 },
                 "latency_ms": 0,
             }
@@ -1358,6 +1448,14 @@ class AgentExecutor:
         latency = int((time.monotonic() - t0) * 1000)
         usage.tool_calls += 1
 
+        vdata = verify_result.get('result', {})
+        verify_result.update({
+            'verification_state': 'passed' if verify_result.get('ok') and vdata.get('ok')
+                                  and not vdata.get('retry_recommended') else 'failed',
+            'verification_executed': True,
+            'verification_scope': 'structural',
+        })
+
         if verify_result["ok"]:
             vdata = verify_result.get("result", {})
             step = AgentStep(
@@ -1375,6 +1473,9 @@ class AgentExecutor:
                     "verify_ok": vdata.get("ok"),
                     "retry_recommended": vdata.get("retry_recommended"),
                     "verify_warnings": vdata.get("warnings", []),
+                    'verification_state': verify_result['verification_state'],
+                    'verification_executed': True,
+                    'verification_scope': 'structural',
                 },
             )
         else:
@@ -1409,29 +1510,17 @@ class AgentExecutor:
         如果受 max_tool_calls / max_steps 限制，返回 no-op 结果（保持原答案）。
         会把 evidence_pack 和 conversation_summary 传给综合工具。
         """
-        # Enforce limits
-        if usage.tool_calls >= constraints.max_tool_calls:
+        reason = self._tool_block_reason(constraints, steps, usage)
+        if reason:
             return {
                 "ok": True,
                 "name": "answer.synthesize",
                 "result": {
                     "answer_markdown": answer_text,
                     "cited_indexes": list(range(len(citations))),
-                    "warnings": ["Skipped synthesis — tool call limit reached"],
-                    "confidence": 1.0,
-                    "provider": "local",
-                    "model": "local-fallback",
-                },
-            }
-        if len(steps) >= constraints.max_steps:
-            return {
-                "ok": True,
-                "name": "answer.synthesize",
-                "result": {
-                    "answer_markdown": answer_text,
-                    "cited_indexes": list(range(len(citations))),
-                    "warnings": ["Skipped synthesis — step limit reached"],
-                    "confidence": 1.0,
+                    "warnings": [f'Skipped synthesis — {reason} reached'],
+                    "confidence": 0.0,
+                    'synthesis_executed': False,
                     "provider": "local",
                     "model": "local-fallback",
                 },
@@ -1636,6 +1725,9 @@ class AgentExecutor:
                 {
                     "index": next_index,
                     "document_id": anchor.get("document_id"),
+                    "chunk_id": anchor.get("chunk_id"),
+                    "parse_version": anchor.get("parse_version"),
+                    "source_spans": anchor.get("source_spans", []),
                     "page_label": anchor.get("page_label"),
                     "table_id": anchor.get("table_id"),
                     "excerpt": excerpt,
@@ -1700,6 +1792,11 @@ class AgentExecutor:
         previous_query = self._resolvable_previous_turn(session_id, normalized)
         if previous_query is None:
             return query
+        from app.services.search import QueryService
+        if QueryService._is_figure_query(previous_query) and QueryService._is_explicit_text_task(normalized):
+            # Keep history in synthesis, but do not force a new text task's
+            # retrieval/ranking into the previous figure's modality.
+            return query
         return f"上一轮问题：{previous_query}\n当前追问：{normalized}"
 
     def _run_retrieve_session_attachments(
@@ -1716,9 +1813,7 @@ class AgentExecutor:
         Returns a dict evidence pack or None when limits are hit. Adds a
         visible ``retrieve`` step so the trace shows the attachment lookup.
         """
-        if usage.tool_calls >= constraints.max_tool_calls:
-            return None
-        if len(steps) >= constraints.max_steps:
+        if self._tool_block_reason(constraints, steps, usage):
             return None
 
         t0 = time.monotonic()
@@ -2093,10 +2188,3 @@ class AgentExecutor:
             "\n以上只使用当前对话的临时附件，不会引用其他专题或会话里的文档。"
         )
         return "\n".join(lines)
-
-
-def _estimate_tokens(text: str) -> int:
-    """粗略估算 token 数：按每 4 个字符 1 个 token 计算。"""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)

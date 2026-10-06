@@ -1261,10 +1261,10 @@ class IngestionPipeline:
             if len(embedding) != dimensions:
                 raise RuntimeError("Embedding response dimensions are inconsistent.")
             child_embeddings.append([float(value) for value in embedding])
-        if dimensions != settings.ollama_embedding_dimensions:
+        if dimensions != settings.active_embedding_dimensions:
             raise RuntimeError(
                 "Embedding response dimensions do not match the configured "
-                f"embedding dimensions ({settings.ollama_embedding_dimensions})."
+                f"embedding dimensions ({settings.active_embedding_dimensions})."
             )
         embedded = iter(child_embeddings)
         records = [
@@ -1317,7 +1317,7 @@ class IngestionPipeline:
             or expected_dimensions <= 0
         ):
             raise RuntimeError("Embed checkpoint has invalid dimensions.")
-        if expected_dimensions != settings.ollama_embedding_dimensions:
+        if expected_dimensions != settings.active_embedding_dimensions:
             raise RuntimeError(
                 "Embedding dimensions do not match the configured embedding dimensions."
             )
@@ -1456,7 +1456,7 @@ class IngestionPipeline:
             valid_contextualized_embedding(chunk) for chunk in eligible
         )
         plain_embedding_count = sum(valid_plain_embedding(chunk) for chunk in plain)
-        dimensions = settings.ollama_embedding_dimensions
+        dimensions = settings.active_embedding_dimensions
         embedded_count = sum(
             isinstance(chunk.embedding, list)
             and len(chunk.embedding) == dimensions

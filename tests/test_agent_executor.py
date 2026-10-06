@@ -387,8 +387,11 @@ def test_execute_records_usage() -> None:
     # v2a: route + rag.answer + verify + finalize
     assert response.usage.steps >= 3
     assert response.usage.tool_calls >= 2  # rag.answer + answer.verify
-    assert response.usage.prompt_tokens > 0
-    assert response.usage.completion_tokens > 0
+    # This deterministic fixture sends no model requests: don't invent usage.
+    assert response.usage.prompt_tokens == 0
+    assert response.usage.completion_tokens == 0
+    assert response.usage.model_requests == 0
+    assert response.usage.usage_source == 'none'
 
 
 def test_execute_persists_turns_in_memory() -> None:
@@ -491,7 +494,8 @@ def test_execute_empty_answer() -> None:
     request = AgentQueryRequest(project_slug="demo", query="empty?")
     response = executor.execute(request)
 
-    assert response.status == "completed"
+    assert response.status == "error"
+    assert response.metadata['verification_state'] == 'skipped'
     assert response.final_answer == ""
     assert response.citations == []
     # v2a: steps[1] is the rag.answer tool call (steps[0] is route)
@@ -723,7 +727,8 @@ def test_empty_answer_after_retry_marks_degraded_delivery() -> None:
     request = AgentQueryRequest(project_slug="demo", query="general question")
     response = executor.execute(request)
 
-    assert response.status == "completed"
+    assert response.status == "error"
+    assert response.metadata['verification_state'] == 'skipped'
     assert any(
         "empty after retry" in w.lower() and "degraded" in w.lower()
         for w in response.warnings
@@ -773,7 +778,8 @@ def test_max_tool_calls_limit_respected() -> None:
 
     assert response.usage.tool_calls <= 1
     # Should still produce a valid response
-    assert response.status in ("completed", "max_steps")
+    assert response.status == 'error'
+    assert response.metadata['verification_executed'] is False
     assert response.final_answer is not None
 
 
@@ -1281,7 +1287,8 @@ def test_complex_plan_with_tight_max_tool_calls() -> None:
     # Plan step should still be present (it's not a tool call)
     plan_steps = [s for s in response.steps if s.step_type == "plan"]
     assert len(plan_steps) == 1
-    assert response.status in ("completed", "max_steps")
+    assert response.status == 'error'
+    assert response.metadata['verification_state'] == 'skipped'
 
 
 # ------------------------------------------------------------------
@@ -1693,7 +1700,8 @@ def test_retrieve_step_respects_max_tool_calls() -> None:
 
     # With max_tool_calls=1, only the retrieve step should execute
     assert response.usage.tool_calls <= 1
-    assert response.status in ("completed", "max_steps")
+    assert response.status == 'error'
+    assert response.metadata['verification_state'] == 'skipped'
 
 
 def test_retrieve_step_before_rag_answer() -> None:

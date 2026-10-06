@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ from functools import lru_cache
 from itertools import count
 
 from app.core.config import get_settings
+from app.services.execution_budget import BudgetExceeded, current_execution_budget
 
 
 class ModelRequestCancelled(RuntimeError):
@@ -76,6 +78,7 @@ class ModelRuntime:
         *,
         on_queue: Callable[[int], None] | None = None,
         cancel_event: threading.Event | None = None,
+        deadline: float | None = None,
     ) -> Iterator[None]:
         """按 FIFO 顺序获取一个 profile 槽位，并在退出时始终释放。
 
@@ -97,6 +100,10 @@ class ModelRuntime:
         """
         if profile not in self._capacities:
             raise ValueError(f"Unknown model profile: {profile}")
+        budget = current_execution_budget()
+        if budget:
+            budget.check_deadline()
+            deadline = budget.deadline if deadline is None else min(deadline, budget.deadline)
         # 进入前先做一次取消检查，避免已经取消的请求还去排队。
         if cancel_event is not None and cancel_event.is_set():
             raise ModelRequestCancelled(f"{profile} model request was cancelled")
@@ -111,6 +118,11 @@ class ModelRuntime:
             queue.append(ticket)
             try:
                 while True:
+                    if budget:
+                        budget.check_deadline()
+                    clock = budget.clock if budget else time.monotonic
+                    if deadline is not None and clock() >= deadline:
+                        raise BudgetExceeded('deadline')
                     # 每次被唤醒都重新检查取消事件（支持协作式取消）。
                     if cancel_event is not None and cancel_event.is_set():
                         raise ModelRequestCancelled(
@@ -135,7 +147,7 @@ class ModelRuntime:
                         on_queue(position)
                         last_position = position
                     # 条件等待：带 0.1s 超时，以便周期醒来检查取消事件。
-                    self._condition.wait(timeout=0.1)
+                    self._condition.wait(timeout=min(0.1, max(0.0, deadline - clock())) if deadline is not None else 0.1)
             except BaseException:
                 # 任一异常（如取消）路径：若尚未获得槽位且自己仍在队列中，
                 # 把自己从队列移除并广播唤醒，避免残留请求堵住队列。

@@ -64,6 +64,42 @@ def test_ingestion_snapshot_versions_all_fidelity_affecting_algorithms(
     }
 
 
+def test_ingestion_snapshot_uses_provider_neutral_embedding_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.ingestion_identity import build_ingestion_config_snapshot
+
+    _clear_settings_environment(monkeypatch)
+    tokenizer_identity = {
+        "name": "Qwen/Qwen3-Embedding-4B",
+        "revision": "r1",
+        "content_sha256": "a" * 64,
+    }
+    local = build_ingestion_config_snapshot(
+        Settings(_env_file=None), tokenizer_identity=tokenizer_identity
+    )
+    remote = build_ingestion_config_snapshot(
+        Settings(
+            _env_file=None,
+            EMBEDDING_PROVIDER="openai-compatible",
+            EMBEDDING_API_MODEL="Qwen/Qwen3-Embedding-4B",
+            EMBEDDING_DIMENSIONS=2560,
+        ),
+        tokenizer_identity=tokenizer_identity,
+    )
+
+    assert local["embedding"] == {
+        "provider": "ollama",
+        "model": "qwen3-embedding:4b",
+        "dimensions": 2560,
+    }
+    assert remote["embedding"] == {
+        "provider": "openai-compatible",
+        "model": "Qwen/Qwen3-Embedding-4B",
+        "dimensions": 2560,
+    }
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected_message"),
     [

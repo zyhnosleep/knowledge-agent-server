@@ -3,12 +3,14 @@ ai.py —— AI 模型接入层：Ollama 客户端 / 外部验证器 / 数据结
 ==================================================================
 
 职责：
-- 封装 Ollama（本地 LLM）的多种调用形态：
+- 封装 Ollama（本地 LLM）的多种调用形态，并提供独立的 DeepSeek
+  OpenAI-compatible 文本生成客户端：
   - 普通对话补全（非流式 ``generate_chat`` 与流式 ``stream_chat``）。
   - 结构化输出 ``generate_structured`` / ``generate_structured_with_images``：
     通过 ``format=schema.model_json_schema()`` 强制模型按 JSON Schema
     输出，解析失败时自动退化为 ``format=json`` 的宽松 JSON 模式重试。
-  - 文本嵌入 ``embed`` 与模型卸载 ``unload_loaded_models``。
+- 文本嵌入 ``embed``（本地 Ollama 或 Qwen3-Embedding-4B API）与模型卸载
+  ``unload_loaded_models``。
 - 提供一套用于文档分析 / 知识抽取的数据模型（Pydantic BaseModel），
   描述实体、三元组、页面解析、三重验证、增长决策、抽取结果等。
 - 提供 ``ContextualizationOllamaClient``：把 Ollama 传输层"冻结"到
@@ -30,6 +32,8 @@ import logging
 import time
 import math
 import threading
+import socket
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, get_args, get_origin
@@ -38,6 +42,7 @@ import httpx
 from pydantic import BaseModel, Field, PrivateAttr
 
 from app.core.config import get_settings
+from app.services.execution_budget import BudgetExceeded, current_execution_budget
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -45,6 +50,111 @@ settings = get_settings()
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 # 哨兵对象：区分"未显式传入 keep_alive"与"显式传 None"
 _DEFAULT_KEEP_ALIVE = object()
+
+
+def request_timeout(configured: float) -> float:
+    budget = current_execution_budget()
+    return budget.http_timeout(configured) if budget else configured
+
+
+@contextmanager
+def _model_request(payload: dict[str, Any], timeout: float, *, ollama: bool):
+    """Admit one actual attempt; failed/unknown attempts keep their reserve."""
+    budget = current_execution_budget()
+    reservation = None
+    if budget is not None:
+        options = dict(payload.get('options') or {})
+        context_length = options.get('num_ctx', settings.ollama_generation_context_length)
+        output_limit = options.get('num_predict', settings.generation_max_output_tokens) if ollama else payload.get('max_tokens', settings.generation_max_output_tokens)
+        messages = list(payload.get('messages') or [])
+        if isinstance(payload.get('format'), dict):
+            messages.append({'role':'format', 'content':json.dumps(payload['format'], ensure_ascii=False)})
+        if payload.get('response_format'):
+            messages.append({'role':'format', 'content':json.dumps(payload['response_format'], ensure_ascii=False)})
+        reservation = budget.reserve_model_call(messages=messages, model=str(payload.get('model', '')),
+            max_output_tokens=output_limit, context_length=context_length)
+        payload = dict(payload)
+        if ollama:
+            options['num_ctx'] = context_length
+            options['num_predict'] = reservation.max_output_tokens
+            payload['options'] = options
+        else:
+            payload['max_tokens'] = reservation.max_output_tokens
+    try:
+        yield payload, request_timeout(timeout), reservation
+    finally:
+        if reservation is not None and not reservation.settled:
+            budget.finish_model_call(reservation, prompt_tokens=None, completion_tokens=None)
+
+
+def _settle_model_response(reservation, data: dict[str, Any], *, ollama: bool):
+    budget = current_execution_budget()
+    if budget is not None and reservation is not None and not reservation.settled:
+        usage = data if ollama else data.get('usage', {})
+        usage = usage if isinstance(usage, dict) else {}
+        budget.finish_model_call(reservation,
+            prompt_tokens=usage.get('prompt_eval_count' if ollama else 'prompt_tokens'),
+            completion_tokens=usage.get('eval_count' if ollama else 'completion_tokens'))
+        budget.check_deadline()
+
+
+def budgeted_completion_post(url: str, *, payload: dict[str, Any], timeout: float,
+                             headers: dict[str, str]) -> dict[str, Any]:
+    """Shared OpenAI-compatible HTTP boundary (including legacy verifier)."""
+    with _model_request(payload, timeout, ollama=False) as (bounded, remaining, reservation):
+        with httpx.Client(timeout=remaining) as client:
+            response = client.post(url, json=bounded, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        _settle_model_response(reservation, data, ollama=False)
+        return data
+
+
+@contextmanager
+def _stream_budget_guard(response: httpx.Response, cancel_event: threading.Event | None):
+    """Interrupt a blocked body read, not merely reject its next yielded line.
+
+    HTTPX read timeouts are inactivity limits. Its native transport exposes
+    the network stream: shutting down that request's socket wakes recv before
+    closing the response. Custom transports must make close interrupt reads.
+    """
+    budget = current_execution_budget()
+    if budget is None and cancel_event is None:
+        yield
+        return
+    finished = threading.Event()
+
+    def watch():
+        while not finished.is_set():
+            expired = cancel_event is not None and cancel_event.is_set()
+            if budget is not None:
+                try:
+                    budget.check_deadline()
+                except BudgetExceeded:
+                    expired = True
+            if expired:
+                network_stream = response.extensions.get('network_stream')
+                try:
+                    native_socket = network_stream.get_extra_info('socket') if network_stream else None
+                    if native_socket is not None:
+                        native_socket.shutdown(socket.SHUT_RDWR)
+                except (OSError, AttributeError):
+                    pass  # Already closed; response.close is still required.
+                try:
+                    response.close()
+                except Exception:
+                    logger.debug('Interrupted stream close failed', exc_info=True)
+                return
+            delay = min(0.05, max(0.001, budget.deadline - budget.clock())) if budget else 0.05
+            finished.wait(delay)
+
+    watcher = threading.Thread(target=watch, name='model-stream-budget', daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        watcher.join(timeout=0.2)
 
 
 class ExtractedEntity(BaseModel):
@@ -283,21 +393,51 @@ class OllamaClient:
                 },
             }
         )
-        with httpx.Client(timeout=self.timeout) as client:
-            with client.stream(
-                "POST", f"{self.base_url}/api/chat", json=payload
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    # 支持外部取消：取消事件触发即停止 yield
-                    if cancel_event is not None and cancel_event.is_set():
-                        break
-                    if not line:
-                        continue
-                    data = json.loads(line)
-                    result = self._chat_result(data)
-                    result["done"] = bool(data.get("done"))
-                    yield result
+        with _model_request(payload, self.timeout, ollama=True) as (bounded, remaining, reservation):
+            with httpx.Client(timeout=remaining) as client:
+                with client.stream('POST', f'{self.base_url}/api/chat', json=bounded) as response, _stream_budget_guard(response, cancel_event):
+                    response.raise_for_status()
+                    lines = iter(response.iter_lines())
+                    while True:
+                        budget = current_execution_budget()
+                        if budget:
+                            budget.check_deadline()
+                        if cancel_event is not None and cancel_event.is_set():
+                            if budget:
+                                raise BudgetExceeded('cancelled')
+                            break
+                        try:
+                            line = next(lines)
+                        except StopIteration:
+                            if budget:
+                                budget.check_deadline()
+                            if cancel_event is not None and cancel_event.is_set() and budget:
+                                raise BudgetExceeded('cancelled')
+                            break
+                        except (httpx.TransportError, OSError):
+                            if budget:
+                                budget.check_deadline()
+                            if cancel_event is not None and cancel_event.is_set():
+                                if budget:
+                                    raise BudgetExceeded('cancelled')
+                                break
+                            raise
+                        if budget:
+                            budget.check_deadline()
+                        if cancel_event is not None and cancel_event.is_set():
+                            if budget:
+                                raise BudgetExceeded('cancelled')
+                            break
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        result = self._chat_result(data)
+                        result['done'] = bool(data.get('done'))
+                        if result['done']:
+                            _settle_model_response(reservation, data, ollama=True)
+                        yield result
+                        if result['done']:
+                            break
 
     def generate_structured(
         self,
@@ -345,6 +485,9 @@ class OllamaClient:
         try:
             return self._parse_structured_content(schema, content)
         except Exception as exc:  # noqa: BLE001
+            budget = current_execution_budget()
+            if isinstance(exc, BudgetExceeded) or (budget and not budget.consume_format_retry()):
+                raise
             # 模型原始输出随异常透传（调用方"自由文本接受"决策依据）：
             # ollama 对 qwen3.5 的 format=schema 是提示式软约束，模型高频
             # 输出自然语言回答而非 JSON，原始文本必须到达调用方才能被接受。
@@ -421,6 +564,9 @@ class OllamaClient:
         try:
             return self._parse_structured_content(schema, content)
         except Exception as exc:  # noqa: BLE001
+            budget = current_execution_budget()
+            if isinstance(exc, BudgetExceeded) or (budget and not budget.consume_format_retry()):
+                raise
             logger.warning("Structured vision response was invalid; retrying with JSON mode: %s", exc)
             retry_payload = self._json_mode_payload(
                 schema=schema,
@@ -450,7 +596,16 @@ class OllamaClient:
         """
         if not texts:
             return []
-        with httpx.Client(timeout=self.timeout) as client:
+        provider = settings.active_embedding_provider
+        if provider == "openai-compatible":
+            return self._embed_openai_compatible(texts)
+        if provider != "ollama":
+            raise ValueError(
+                "Unsupported EMBEDDING_PROVIDER: "
+                f"{settings.embedding_provider!r}; expected 'ollama' or "
+                "'openai-compatible'."
+            )
+        with httpx.Client(timeout=request_timeout(self.timeout)) as client:
             response = client.post(
                 f"{self.embedding_base_url}/api/embed",
                 json={
@@ -462,6 +617,111 @@ class OllamaClient:
             )
             response.raise_for_status()
             return response.json()["embeddings"]
+
+    def _embed_openai_compatible(self, texts: list[str]) -> list[list[float]]:
+        """Call a hosted OpenAI-compatible embeddings endpoint.
+
+        The endpoint is intentionally vendor-neutral.  ``EMBEDDING_API_BASE_URL``
+        points at the API root (normally ending in ``/v1``); this method appends
+        ``/embeddings``.  Response rows are sorted by their explicit ``index`` so
+        batching cannot silently reorder document chunks.
+        """
+        base_url = (settings.embedding_api_base_url or "").strip().rstrip("/")
+        api_key = settings.embedding_api_key
+        if not base_url:
+            raise ValueError(
+                "EMBEDDING_API_BASE_URL is required when "
+                "EMBEDDING_PROVIDER=openai-compatible."
+            )
+        if not api_key or api_key.strip().upper() in {"CHANGE_ME", "YOUR_API_KEY"}:
+            raise ValueError(
+                "EMBEDDING_API_KEY is required when "
+                "EMBEDDING_PROVIDER=openai-compatible."
+            )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        embeddings: list[list[float]] = []
+        batch_size = settings.embedding_api_batch_size
+        with httpx.Client(timeout=request_timeout(settings.embedding_api_timeout)) as client:
+            for offset in range(0, len(texts), batch_size):
+                budget = current_execution_budget()
+                if budget:
+                    budget.check_deadline()
+                batch = texts[offset : offset + batch_size]
+                response = client.post(
+                    f"{base_url}/embeddings",
+                    headers=headers,
+                    json={"model": settings.embedding_api_model, "input": batch},
+                    **({'timeout': budget.http_timeout(settings.embedding_api_timeout)} if budget else {}),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                rows = payload.get("data")
+                if not isinstance(rows, list):
+                    raise ValueError("Embedding API response is missing a data array.")
+                if len(rows) != len(batch) or any(
+                    not isinstance(row, dict) for row in rows
+                ):
+                    raise ValueError(
+                        "Embedding API returned an invalid number or shape of embeddings."
+                    )
+                # OpenAI-compatible servers normally include an integer ``index``.
+                # A few providers omit it while preserving response order, so
+                # accept the all-omitted form but reject partial, duplicate, or
+                # out-of-range indices within each batch.  The batch-local index
+                # is intentional: concatenating validated batches preserves the
+                # original document order without assuming a global index.
+                indices = [row.get("index") for row in rows]
+                if all(index is None for index in indices):
+                    ordered = rows
+                elif all(
+                    isinstance(index, int) and not isinstance(index, bool)
+                    for index in indices
+                ):
+                    expected_indices = set(range(len(batch)))
+                    actual_indices = {
+                        index for index in indices if isinstance(index, int)
+                    }
+                    if actual_indices != expected_indices:
+                        raise ValueError(
+                            "Embedding API returned invalid or duplicate data indices."
+                        )
+                    ordered = sorted(rows, key=lambda row: row["index"])
+                else:
+                    raise ValueError(
+                        "Embedding API returned invalid or partial data indices."
+                    )
+
+                raw_embeddings = [row.get("embedding") for row in ordered]
+                if any(not isinstance(item, list) for item in raw_embeddings):
+                    raise ValueError(
+                        "Embedding API returned an invalid number or shape of embeddings."
+                    )
+                dimensions = {len(item) for item in raw_embeddings}
+                expected_dimensions = settings.active_embedding_dimensions
+                if dimensions != {expected_dimensions}:
+                    raise ValueError(
+                        "Embedding API dimensions do not match the configured index: "
+                        f"received {sorted(dimensions)}, expected "
+                        f"{expected_dimensions}."
+                    )
+                for item in raw_embeddings:
+                    vector: list[float] = []
+                    for value in item:
+                        if isinstance(value, bool) or not isinstance(value, (int, float)):
+                            raise ValueError(
+                                "Embedding API returned a non-numeric vector value."
+                            )
+                        numeric = float(value)
+                        if not math.isfinite(numeric):
+                            raise ValueError(
+                                "Embedding API returned a non-finite vector value."
+                            )
+                        vector.append(numeric)
+                    embeddings.append(vector)
+        return embeddings
 
     def unload_loaded_models(self) -> list[str]:
         """卸载当前加载的全部模型（内存回收）。
@@ -535,10 +795,13 @@ class OllamaClient:
 
     def _post_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /api/chat（自动注入 keep_alive）并返回 JSON。"""
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}/api/chat", json=self._with_keep_alive(payload))
-            response.raise_for_status()
-            return response.json()
+        with _model_request(payload, self.timeout, ollama=True) as (bounded, remaining, reservation):
+            with httpx.Client(timeout=remaining) as client:
+                response = client.post(f'{self.base_url}/api/chat', json=self._with_keep_alive(bounded))
+                response.raise_for_status()
+                data = response.json()
+            _settle_model_response(reservation, data, ollama=True)
+            return data
 
     @staticmethod
     def _with_keep_alive(payload: dict[str, Any]) -> dict[str, Any]:
@@ -710,6 +973,211 @@ class OllamaClient:
         raise ValueError("No valid JSON object found in Ollama response.")
 
 
+class DeepSeekAPIError(RuntimeError):
+    """A classified DeepSeek transport or response error.
+
+    ``status_code`` and ``retryable`` are retained for trace/audit callers so
+    they can distinguish credential failures (401/403), throttling (429),
+    transient server failures (5xx), and exhausted network retries without
+    parsing provider-specific exception strings.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.error_code = error_code
+
+
+class DeepSeekClient:
+    """Small OpenAI-compatible DeepSeek chat client with bounded retries.
+
+    The client is deliberately independent from ``OllamaClient``: generation
+    credentials, timeout, retry budget, model identity, and usage accounting
+    come from the DeepSeek-specific settings.  It never logs the API key and
+    does not retry credential errors (401/403).
+    """
+
+    _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        retry_backoff_seconds: float | None = None,
+    ) -> None:
+        self.base_url = (base_url or settings.deepseek_base_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else settings.deepseek_api_key
+        self.model = model or settings.deepseek_model
+        self.timeout = (
+            timeout if timeout is not None else settings.generation_timeout_seconds
+        )
+        self.max_retries = (
+            max_retries if max_retries is not None else settings.generation_max_retries
+        )
+        self.retry_backoff_seconds = (
+            retry_backoff_seconds
+            if retry_backoff_seconds is not None
+            else settings.generation_retry_backoff_seconds
+        )
+
+    def generate_chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        max_output_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate one non-streaming response and preserve provider usage.
+
+        Retries are bounded by ``GENERATION_MAX_RETRIES``.  Only 429/5xx and
+        transport timeouts/connectivity errors are retried; malformed response
+        payloads and authentication failures fail immediately.
+        """
+        if not self.base_url:
+            raise DeepSeekAPIError("DEEPSEEK_BASE_URL is required.")
+        if not self.api_key or self.api_key.strip().upper() in {"CHANGE_ME", "YOUR_API_KEY"}:
+            raise DeepSeekAPIError(
+                "DEEPSEEK_API_KEY is required.", error_code="missing_credentials"
+            )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_output_tokens or settings.generation_max_output_tokens,
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error: DeepSeekAPIError | None = None
+        for attempt in range(max(0, self.max_retries) + 1):
+            try:
+                with _model_request(payload, self.timeout, ollama=False) as (bounded, remaining, reservation):
+                    with httpx.Client(timeout=remaining) as client:
+                        response = client.post(
+                        f"{self.base_url}/chat/completions",
+                        json=bounded,
+                        headers=headers,
+                        )
+                    if 200 <= response.status_code < 300:
+                        _settle_model_response(reservation, response.json(), ollama=False)
+            except BudgetExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                retryable = isinstance(
+                    exc,
+                    (
+                        httpx.TimeoutException,
+                        httpx.NetworkError,
+                        ConnectionError,
+                        TimeoutError,
+                    ),
+                )
+                last_error = DeepSeekAPIError(
+                    f"DeepSeek request failed: {type(exc).__name__}: {exc}",
+                    retryable=retryable,
+                    error_code="transport_error",
+                )
+                if retryable and attempt < self.max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise last_error from exc
+
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status_code < 300:
+                retryable = status_code in self._RETRYABLE_STATUS_CODES
+                if retryable and attempt < self.max_retries:
+                    self._sleep_before_retry(attempt)
+                    continue
+                message = f"DeepSeek API returned HTTP {status_code}."
+                try:
+                    response.raise_for_status()
+                except Exception as exc:  # noqa: BLE001
+                    last_error = DeepSeekAPIError(
+                        message,
+                        status_code=status_code,
+                        retryable=retryable,
+                        error_code="http_error",
+                    )
+                    raise last_error from exc
+                raise DeepSeekAPIError(
+                    message,
+                    status_code=status_code,
+                    retryable=retryable,
+                    error_code="http_error",
+                )
+
+            try:
+                data = response.json()
+                content = self._content_from_response(data)
+            except Exception as exc:  # noqa: BLE001
+                raise DeepSeekAPIError(
+                    f"DeepSeek response format is invalid: {exc}",
+                    status_code=status_code,
+                    error_code="invalid_response",
+                ) from exc
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+            return {
+                "content": content,
+                "model": str(data.get("model") or self.model),
+                "provider": "deepseek",
+                "usage": usage,
+                "usage_source": "provider" if usage else "unknown",
+                "prompt_tokens": usage.get("prompt_tokens") if usage else None,
+                "completion_tokens": usage.get("completion_tokens") if usage else None,
+                "total_tokens": usage.get("total_tokens") if usage else None,
+            }
+
+        # The loop either returns or raises; retain a defensive guard for
+        # static analyzers and future changes to retry conditions.
+        raise last_error or DeepSeekAPIError("DeepSeek request failed.")
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        delay = max(0.0, float(self.retry_backoff_seconds)) * (2**attempt)
+        if delay:
+            budget = current_execution_budget()
+            time.sleep(budget.http_timeout(delay) if budget else delay)
+        budget = current_execution_budget()
+        if budget:
+            budget.check_deadline()
+
+    @staticmethod
+    def _content_from_response(data: Any) -> str:
+        if not isinstance(data, dict):
+            raise ValueError("response must be an object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("choices is missing or empty")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise ValueError("first choice is invalid")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("message is missing")
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or "")
+
+
 class ContextualizationOllamaClient(OllamaClient):
     """Ollama transport frozen to the contextualization model configuration.
 
@@ -841,10 +1309,8 @@ class ExternalVerifier:
                 "json_schema": {"name": "verification_payload", "schema": schema},
             },
         }
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(f"{self.base_url}/chat/completions", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        data = budgeted_completion_post(f'{self.base_url}/chat/completions',
+            payload=payload, timeout=self.timeout, headers=headers)
         # 内容可能是字符串或多段列表，统一为字符串再解析
         content = data["choices"][0]["message"]["content"]
         if isinstance(content, list):
@@ -854,6 +1320,10 @@ class ExternalVerifier:
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:  # 向量相似度计算
     """计算两个向量的余弦相似度（0 范数时返回 0.0）。"""
+    if len(vec_a) != len(vec_b):
+        raise ValueError(f"Embedding dimension mismatch: {len(vec_a)} != {len(vec_b)}")
+    if not all(math.isfinite(value) for value in (*vec_a, *vec_b)):
+        raise ValueError("Embedding contains non-finite values")
     numerator = sum(a * b for a, b in zip(vec_a, vec_b))
     norm_a = math.sqrt(sum(a * a for a in vec_a))
     norm_b = math.sqrt(sum(b * b for b in vec_b))
@@ -899,6 +1369,8 @@ def safe_model_call(func, fallback):
     """
     try:
         return func()
+    except BudgetExceeded:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model call failed, falling back: %s", exc)
         return fallback

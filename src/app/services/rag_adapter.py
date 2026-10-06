@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.schemas.common import QueryResponse
 from app.schemas.agent import EvidencePack
-from app.services.search import QueryService
+from app.services.search import PreparedEvidence, QueryService
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,11 @@ class RAGAdapter:
         document_id: str | None = None,
         *,
         parse_version_map: dict[str, str] | None = None,
+        prepared_evidence: PreparedEvidence | None = None,
+        evidence_pack: EvidencePack | None = None,
+        conversation_summary: str = '',
+        visual_intent: bool | None = None,
+        trusted_attachment_ids: frozenset[str] = frozenset(),
     ) -> QueryResponse:
         """执行一次 RAG 查询并返回完整响应。
 
@@ -64,12 +69,22 @@ class RAGAdapter:
         t0 = time.monotonic()
         try:
             # 委托给 QueryService 完成实际的检索与回答生成。
-            result = QueryService(
+            service = QueryService(
                 db,
                 parse_version_map=parse_version_map,
-            ).answer(
-                project_slug, question, save_answer=False, document_id=document_id
             )
+            if prepared_evidence is not None:
+                if evidence_pack is not None:
+                    prepared_evidence = service.merge_prepared_evidence(
+                        prepared_evidence, evidence_pack,
+                        trusted_attachment_ids=trusted_attachment_ids,
+                    )
+                result = service.answer_from_evidence(
+                    project_slug, question, prepared_evidence,
+                    conversation_summary=conversation_summary, visual_intent=visual_intent,
+                )
+            else:
+                result = service.answer(project_slug, question, save_answer=False, document_id=document_id)
         except ValueError:
             # 项目不存在时 QueryService 会抛 ValueError,这里返回一个
             # 空但合法的响应,让 Agent 可以记录该步骤并向调用方暴露错误。
@@ -85,6 +100,21 @@ class RAGAdapter:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         logger.debug("RAGAdapter.answer took %d ms", elapsed_ms)
         return result
+
+    def prepare_evidence(
+        self, db: Session, project_slug: str, question: str, limit: int = 15,
+        document_id: str | None = None, *, parse_version_map: dict[str, str] | None = None,
+    ) -> PreparedEvidence:
+        try:
+            return QueryService(db, parse_version_map=parse_version_map).prepare_evidence(
+                project_slug, question, limit=limit, document_id=document_id,
+            )
+        except ValueError:
+            return PreparedEvidence(
+                project_id=None, project_slug=project_slug, retrieval_question=question,
+                document_id=document_id, parse_version_map={}, contexts=[],
+                pack=EvidencePack(status='project_not_found', items=[]),
+            )
 
     def retrieve_evidence(
         self,

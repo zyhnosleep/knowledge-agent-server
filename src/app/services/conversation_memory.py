@@ -216,6 +216,9 @@ class ConversationMemory:
                     {
                         "excerpt": excerpt,
                         "document_id": citation.get("document_id"),
+                        "chunk_id": citation.get("chunk_id"),
+                        "parse_version": citation.get("parse_version"),
+                        "source_spans": citation.get("source_spans", []),
                         "page_label": citation.get("page_label"),
                         "table_id": citation.get("table_id"),
                         "turn_index": row.turn_index,

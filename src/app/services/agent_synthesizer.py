@@ -31,23 +31,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
-from app.services.ai import OllamaClient
-from app.services.agent_model_router import InferenceTarget
-
-logger = logging.getLogger(__name__)
-import logging
-import re
-import threading
-import time
-from collections.abc import Callable
-from typing import Any
-
-import httpx
-
-from pydantic import BaseModel, Field
-
-from app.core.config import get_settings
-from app.services.ai import OllamaClient
+from app.services.ai import DeepSeekClient, OllamaClient, budgeted_completion_post
+from app.services.execution_budget import BudgetExceeded, current_execution_budget
 from app.services.agent_model_router import InferenceTarget
 
 logger = logging.getLogger(__name__)
@@ -87,18 +72,17 @@ class SynthesisPayload(BaseModel):
 
 
 class AgentSynthesizer:
-    """Evidence synthesis using Ollama, an external API, or safe fallback.
+    """Evidence synthesis using Ollama, DeepSeek, or safe fallback.
 
-    Allowed synthesis providers are ``auto``, ``external_api``, and ``local``.
-    When the provider is ``auto``, the external API is only used when
-    ``EXTERNAL_API_ENABLED=true`` and an API key is configured.
+    Allowed synthesis providers are ``auto``, ``deepseek``, ``external_api``,
+    and ``local``. ``external_api`` remains for backwards compatibility.
 
     External synthesis prompts the model to synthesize from evidence
     (not concatenate paragraphs) and to cite only from provided citations.
     """
 
     # 合法的 synthesis provider：auto 会根据配置自动选择。
-    VALID_PROVIDERS = {"auto", "external_api", "local", "ollama"}
+    VALID_PROVIDERS = {"auto", "deepseek", "external_api", "local", "ollama"}
 
     # evidence_pack 在 prompt 中的上限：最多 10 条，每条摘录最多 300 字符。
     MAX_EVIDENCE_PACK_ITEMS = 10
@@ -155,6 +139,16 @@ class AgentSynthesizer:
             )
         elif provider == "ollama":
             result = self._ollama_synthesize(
+                query=query,
+                route=route,
+                conversation_summary=conversation_summary,
+                rag_answer=rag_answer,
+                citations=citations,
+                evidence_pack=evidence_pack,
+                narrow_context=narrow_context,
+            )
+        elif provider == "deepseek":
+            result = self._deepseek_synthesize(
                 query=query,
                 route=route,
                 conversation_summary=conversation_summary,
@@ -274,6 +268,8 @@ class AgentSynthesizer:
                     chunks.append(delta)
                     event_sink("token", {"delta": delta, "model": model})
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Streaming local Ollama synthesis failed: %s", exc)
             result = self._local_fallback(rag_answer, citations)
             result["warnings"].append(
@@ -390,13 +386,30 @@ class AgentSynthesizer:
         if configured == "external_api":
             return "external_api"
 
-        # "auto": prefer external API when available, otherwise use the
-        # existing local Ollama generation path.  The explicit ``ollama``
-        # provider is reserved for structured synthesis via
-        # ``_ollama_synthesize``.
-        if self._settings.external_api_enabled and bool(self._settings.external_api_key):
+        if configured == "deepseek":
+            return "deepseek"
+
+        # "auto": prefer explicitly configured DeepSeek, then the legacy
+        # external API path, otherwise use the existing local Ollama path.
+        generation_provider = str(
+            getattr(self._settings, "generation_provider", "ollama")
+        ).strip().lower()
+        deepseek_key = getattr(self._settings, "deepseek_api_key", None)
+        if generation_provider == "deepseek" and self._has_secret(deepseek_key):
+            return "deepseek"
+        if self._settings.external_api_enabled and self._has_secret(
+            self._settings.external_api_key
+        ):
             return "external_api"
         return "local"
+
+    @staticmethod
+    def _has_secret(value: str | None) -> bool:
+        """Treat example placeholders as missing credentials."""
+        return bool(value and value.strip() and value.strip().upper() not in {
+            "CHANGE_ME",
+            "YOUR_API_KEY",
+        })
 
     def _local_fallback(
         self, rag_answer: str, citations: list[dict[str, Any]]
@@ -452,6 +465,8 @@ class AgentSynthesizer:
                 max_output_tokens=768,
             )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Local Ollama synthesis failed: %s", exc)
             result = self._local_fallback(rag_answer, citations)
             result["warnings"].append(
@@ -866,6 +881,8 @@ class AgentSynthesizer:
                 model=model,
             )
         except Exception as exc:
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Ollama synthesis failed: %s", exc)
             fallback = self._local_fallback(rag_answer, citations)
             fallback["warnings"].append(
@@ -966,6 +983,10 @@ class AgentSynthesizer:
         if not missing:
             return None
 
+        budget = current_execution_budget()
+        if budget and not budget.consume_answer_retry():
+            return None
+
         evidence_parts = []
         for index, citation in enumerate(citations):
             excerpt = citation.get("excerpt", "")
@@ -1006,6 +1027,8 @@ class AgentSynthesizer:
                 model=model,
             )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Ollama evidence coverage retry failed: %s", exc)
             return None
 
@@ -1061,6 +1084,10 @@ class AgentSynthesizer:
         if not missing:
             return None
 
+        budget = current_execution_budget()
+        if budget and not budget.consume_answer_retry():
+            return None
+
         evidence_parts = []
         for index, citation in enumerate(citations):
             excerpt = citation.get("excerpt", "")
@@ -1102,6 +1129,8 @@ class AgentSynthesizer:
                 max_output_tokens=768,
             )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Local evidence coverage retry failed: %s", exc)
             return None
 
@@ -1740,6 +1769,143 @@ class AgentSynthesizer:
         )
 
 
+    def _deepseek_synthesize(
+        self,
+        *,
+        query: str,
+        route: str,
+        conversation_summary: str,
+        rag_answer: str,
+        citations: list[dict[str, Any]],
+        evidence_pack: dict[str, Any] | None = None,
+        narrow_context: bool = False,
+    ) -> dict[str, Any]:
+        """Synthesize through the configured DeepSeek API.
+
+        DeepSeek is kept separate from the legacy ``external_api`` path so its
+        retry budget, model identity, and usage accounting are explicit.  A
+        failed/empty/malformed response always returns the grounded RAG draft
+        with ``provider=deepseek`` and an actionable warning.
+        """
+        api_key = getattr(self._settings, "deepseek_api_key", None)
+        if not self._has_secret(api_key):
+            result = self._local_fallback(rag_answer, citations)
+            result["provider"] = "deepseek"
+            result["model"] = getattr(self._settings, "deepseek_model", "deepseek-chat")
+            result["warnings"].append(
+                "DeepSeek synthesis requested but DEEPSEEK_API_KEY is not configured; "
+                "using the RAG fallback."
+            )
+            return result
+
+        evidence_parts: list[str] = []
+        for index, citation in enumerate(citations):
+            excerpt = citation.get("excerpt", "")
+            title = citation.get("page_title") or citation.get("document_id", "")
+            if excerpt:
+                evidence_parts.append(f"[{index}] {title}: {excerpt}")
+        evidence_text = "\n\n".join(evidence_parts) if evidence_parts else "(no evidence)"
+        evidence_pack_text = (
+            "" if narrow_context else self._format_evidence_pack_section(evidence_pack)
+        )
+        table_facts_text = self._format_table_facts_section(evidence_pack)
+        system_prompt = (
+            "You are an evidence synthesis assistant. Synthesize a final answer "
+            "from the provided RAG answer and evidence excerpts. Do not invent "
+            "facts or citations. Return a JSON object with keys: "
+            "answer_markdown (string), cited_indexes (array of valid integers), "
+            "warnings (array of strings), confidence (number 0.0-1.0).\n"
+            + self._answer_rules(query)
+        )
+        user_prompt = (
+            f"Original query: {query}\n"
+            f"Route type: {route}\n"
+            f"Conversation context: {conversation_summary or '(none)'}\n\n"
+            f"RAG answer: {rag_answer}\n\n"
+            f"Evidence excerpts with citation indexes:\n{evidence_text}\n\n"
+            + (f"{evidence_pack_text}\n\n" if evidence_pack_text else "")
+            + (f"{table_facts_text}\n\n" if table_facts_text else "")
+            + "Return only the JSON object."
+        )
+        client = DeepSeekClient(
+            base_url=getattr(self._settings, "deepseek_base_url", None),
+            api_key=api_key,
+            model=getattr(self._settings, "deepseek_model", "deepseek-chat"),
+            timeout=getattr(self._settings, "generation_timeout_seconds", 90),
+            max_retries=getattr(self._settings, "generation_max_retries", 1),
+            retry_backoff_seconds=getattr(
+                self._settings, "generation_retry_backoff_seconds", 0.5
+            ),
+        )
+        try:
+            generated = client.generate_chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_output_tokens=getattr(
+                    self._settings, "generation_max_output_tokens", 2048
+                ),
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, BudgetExceeded):
+                raise
+            logger.warning("DeepSeek synthesis API call failed: %s", exc)
+            result = self._local_fallback(rag_answer, citations)
+            result["provider"] = "deepseek"
+            result["model"] = client.model
+            result["warnings"].append(
+                f"DeepSeek synthesis failed ({type(exc).__name__}), using the RAG fallback: {exc}"
+            )
+            return result
+
+        content = str(generated.get("content") or "").strip()
+        try:
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = OllamaClient._extract_first_json_value(content)
+            if not isinstance(parsed, dict):
+                raise ValueError("DeepSeek synthesis JSON must be an object")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse DeepSeek synthesis response: %s", exc)
+            result = self._local_fallback(rag_answer, citations)
+            result["provider"] = "deepseek"
+            result["model"] = str(generated.get("model") or client.model)
+            result["warnings"].append(
+                f"DeepSeek returned an invalid synthesis response, using the RAG fallback: {exc}"
+            )
+            return result
+
+        max_index = len(citations)
+        raw_indexes = parsed.get("cited_indexes", [])
+        cited_indexes = (
+            [index for index in raw_indexes if isinstance(index, int) and 0 <= index < max_index]
+            if isinstance(raw_indexes, list)
+            else []
+        )
+        answer_markdown = str(parsed.get("answer_markdown") or "").strip()
+        warnings = [str(item) for item in (parsed.get("warnings") or [])]
+        if not answer_markdown:
+            answer_markdown = rag_answer
+            warnings.append("DeepSeek returned an empty answer; using the RAG fallback.")
+        try:
+            confidence = float(parsed.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        return {
+            "answer_markdown": answer_markdown,
+            "cited_indexes": cited_indexes,
+            "warnings": warnings,
+            "confidence": confidence,
+            "provider": "deepseek",
+            "model": str(generated.get("model") or client.model),
+            "usage": generated.get("usage"),
+            "usage_source": generated.get("usage_source", "unknown"),
+        }
+
+
     def _external_synthesize(
         self,
         *,
@@ -1815,15 +1981,12 @@ class AgentSynthesizer:
         }
 
         try:
-            with httpx.Client(timeout=self._settings.external_api_timeout) as client:
-                response = client.post(
-                    f"{self._settings.external_api_base_url.rstrip('/')}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                data = response.json()
+            data = budgeted_completion_post(
+                f"{self._settings.external_api_base_url.rstrip('/')}/chat/completions",
+                payload=payload, timeout=self._settings.external_api_timeout, headers=headers)
         except Exception as exc:
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("External synthesis API call failed: %s", exc)
             result = self._local_fallback(rag_answer, citations)
             result["provider"] = "external_api"
@@ -2046,6 +2209,10 @@ class AgentSynthesizer:
         if not missing:
             return None  # all covered — no need to retry
 
+        budget = current_execution_budget()
+        if budget and not budget.consume_answer_retry():
+            return None
+
         # Rebuild evidence context (same as first call)
         evidence_parts: list[str] = []
         for i, c in enumerate(citations):
@@ -2099,15 +2266,12 @@ class AgentSynthesizer:
         }
 
         try:
-            with httpx.Client(timeout=self._settings.external_api_timeout) as client:
-                response = client.post(
-                    f"{self._settings.external_api_base_url.rstrip('/')}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                data = response.json()
+            data = budgeted_completion_post(
+                f"{self._settings.external_api_base_url.rstrip('/')}/chat/completions",
+                payload=payload, timeout=self._settings.external_api_timeout, headers=headers)
         except Exception as exc:
+            if isinstance(exc, BudgetExceeded):
+                raise
             logger.warning("Coverage retry API call failed: %s", exc)
             return None
 

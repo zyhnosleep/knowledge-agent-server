@@ -1525,6 +1525,91 @@ def test_synthesize_external_api_empty_answer_returns_fallback(monkeypatch) -> N
     assert any("empty answer" in w.lower() for w in result["warnings"])
 
 
+def _fake_settings_deepseek():
+    from app.core.config import Settings
+
+    s = Settings(_env_file=None)
+    s.agent_synthesis_provider = "deepseek"
+    s.generation_provider = "deepseek"
+    s.deepseek_api_key = "test-key"
+    s.deepseek_base_url = "https://api.deepseek.com/v1"
+    s.deepseek_model = "deepseek-chat"
+    s.generation_max_retries = 0
+    s.generation_retry_backoff_seconds = 0
+    return s
+
+
+def test_synthesize_deepseek_returns_usage_and_structured_result(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_deepseek)
+
+    def fake_generate(self, **kwargs):
+        assert kwargs["response_format"] == {"type": "json_object"}
+        return {
+            "content": '{"answer_markdown":"DeepSeek answer [0]", "cited_indexes":[0], "warnings":[], "confidence":0.8}',
+            "model": "deepseek-chat",
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+            "usage_source": "provider",
+        }
+
+    monkeypatch.setattr("app.services.agent_synthesizer.DeepSeekClient.generate_chat", fake_generate)
+    syn = AgentSynthesizer()
+
+    result = syn.synthesize(
+        query="What is entropy?",
+        route="simple_rag",
+        rag_answer="Entropy is a measure of disorder.",
+        citations=[{"document_id": "d1", "excerpt": "entropy defined"}],
+    )
+
+    assert result["provider"] == "deepseek"
+    assert result["model"] == "deepseek-chat"
+    assert result["usage"]["total_tokens"] == 28
+    assert result["usage_source"] == "provider"
+
+
+def test_synthesize_auto_selects_deepseek_when_generation_provider_is_configured(
+    monkeypatch,
+) -> None:
+    settings = _fake_settings_deepseek()
+    settings.agent_synthesis_provider = "auto"
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", lambda: settings)
+    monkeypatch.setattr(
+        "app.services.agent_synthesizer.DeepSeekClient.generate_chat",
+        lambda self, **kwargs: {
+            "content": '{"answer_markdown":"DeepSeek answer", "cited_indexes":[], "warnings":[], "confidence":0.7}',
+            "model": "deepseek-chat",
+            "usage": None,
+            "usage_source": "unknown",
+        },
+    )
+
+    result = AgentSynthesizer().synthesize(
+        query="Say hello",
+        route="simple_rag",
+        rag_answer="Hello",
+        citations=[],
+    )
+
+    assert result["provider"] == "deepseek"
+
+
+def test_synthesize_deepseek_without_key_uses_grounded_fallback(monkeypatch) -> None:
+    settings = _fake_settings_deepseek()
+    settings.deepseek_api_key = None
+    monkeypatch.setattr("app.services.agent_synthesizer.get_settings", lambda: settings)
+
+    result = AgentSynthesizer().synthesize(
+        query="Say hello",
+        route="simple_rag",
+        rag_answer="Hello",
+        citations=[],
+    )
+
+    assert result["provider"] == "deepseek"
+    assert result["answer_markdown"] == "Hello"
+    assert any("not configured" in warning for warning in result["warnings"])
+
+
 def test_synthesize_result_has_required_fields(monkeypatch) -> None:
     """Result dict contains all required keys: answer_markdown, cited_indexes, warnings, confidence, provider, model."""
     monkeypatch.setattr("app.services.agent_synthesizer.get_settings", _fake_settings_local)

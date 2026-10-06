@@ -151,6 +151,10 @@ class AgentUsage(BaseModel):
     completion_tokens: int = 0  # 生成（completion）token 数
     tool_calls: int = 0  # 工具调用次数
     steps: int = 0  # 步骤数
+    model_requests: int = 0
+    answer_retries: int = 0
+    format_retries: int = 0
+    usage_source: str = 'none'
 
 
 class AgentQueryResponse(BaseModel):
@@ -177,6 +181,7 @@ class AgentQueryResponse(BaseModel):
     trace_id: str | None = None  # 轨迹 ID（可空）
     answer_provider: str = "local"  # 生成回答的模型提供商（默认 "local"）
     answer_model: str = "local-fallback"  # 生成回答的模型名（默认 "local-fallback"）
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvidenceItem(BaseModel):

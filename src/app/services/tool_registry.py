@@ -19,11 +19,13 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import time
 from collections.abc import Callable
 from typing import Any
 
 from app.schemas.agent import ToolSpec
+from app.services.execution_budget import BudgetExceeded, current_execution_budget
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +160,13 @@ class ToolRegistry:
         handler = item["handler"]
         # 使用单调时钟计时，不受系统时间跳变影响。
         t0 = time.monotonic()
+        budget = current_execution_budget()
+        if budget:
+            budget.check_deadline()
         try:
             result = handler(args, ctx)
+        except BudgetExceeded:
+            raise
         except ToolError as exc:
             # 已知的工具类异常：保留其类型名，便于 Agent 识别错误类别。
             return {
@@ -478,6 +485,22 @@ class ToolRegistry:
 # ----------------------------------------------------------------------
 
 
+def _supports_prepared_answer(rag_adapter: Any) -> bool:
+    """Only use snapshot handoff when the answer endpoint accepts it.
+
+    Inspect before calling; retrying a TypeError after invocation could
+    duplicate a model request if the error originated inside the adapter.
+    """
+    try:
+        inspect.signature(rag_adapter.answer).bind(
+            None, 'project', 'question', document_id=None,
+            prepared_evidence=None, conversation_summary='', visual_intent=None,
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _rag_answer_handler(
     rag_adapter: Any, ctx: dict[str, Any], args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -488,17 +511,41 @@ def _rag_answer_handler(
     db = ctx.get("db")
     if db is None:
         raise ToolExecutionError("Tool context is missing 'db' Session")
+    internal = {}
+    prepared = ctx.get('prepared_evidence') if _supports_prepared_answer(rag_adapter) else None
+    if prepared is not None:
+        from app.schemas.agent import EvidencePack
+        from app.services.search import QueryService
+        raw_pack = ctx.get('evidence_pack')
+        if raw_pack is not None:
+            prepared = QueryService(db).merge_prepared_evidence(
+                prepared, EvidencePack.model_validate(raw_pack),
+                trusted_attachment_ids=ctx.get('trusted_attachment_ids', frozenset()),
+            )
+            # All downstream projections (table citations/text synthesis) must
+            # use the same scope-validated request-local pack as generation.
+            raw_pack.clear()
+            raw_pack.update(prepared.pack.model_dump())
+        internal = {
+            'prepared_evidence': prepared,
+            'conversation_summary': ctx.get('conversation_summary', ''),
+            'visual_intent': QueryService._resolve_visual_intent(
+                ctx.get('answer_query', args['question']), prepared.retrieval_question),
+        }
     response = rag_adapter.answer(
         db,
         args["project_slug"],
-        args["question"],
+        ctx.get('answer_query', args["question"]) if prepared is not None else args['question'],
         document_id=args.get("document_id"),
+        **internal,
     )
     # 把响应对象转换为普通字典；引用列表逐项 model_dump 以便 JSON 序列化。
     return {
         "answer_markdown": response.answer_markdown,
         "citations": [c.model_dump() for c in response.citations],
         "verification_status": response.verification_status,
+        "evidence_snapshot_reused": prepared is not None,
+        "visual_evidence": prepared.visual_evidence_trace if prepared is not None else {},
     }
 
 
@@ -516,13 +563,21 @@ def _rag_retrieve_evidence_handler(
     limit = args.get("limit", 15)
     if not isinstance(limit, int):
         limit = 15
-    pack = rag_adapter.retrieve_evidence(
+    prepare = getattr(rag_adapter, 'prepare_evidence', None)
+    holder = ctx.get('prepared_evidence_out')
+    if holder is not None and callable(prepare) and _supports_prepared_answer(rag_adapter):
+        prepared = prepare(db, args['project_slug'], args['question'], limit=limit,
+                           document_id=args.get('document_id'))
+        holder['prepared'] = prepared
+        pack = prepared.pack
+    else:
+        pack = rag_adapter.retrieve_evidence(
         db,
         args["project_slug"],
         args["question"],
         limit=limit,
         document_id=args.get("document_id"),
-    )
+        )
     # 证据包对象转普通字典：status + items（逐项 model_dump）。
     return {
         "status": pack.status,

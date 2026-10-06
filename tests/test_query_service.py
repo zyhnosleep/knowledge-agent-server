@@ -3677,13 +3677,12 @@ def test_extract_table_blocks_from_document_markdown() -> None:
 
 
 def test_build_answer_constraints_figure_query_with_context() -> None:
-    """When context has figure info, constraints should forbid saying 'not included'."""
+    """A caption alone must not prevent disclosing missing image pixels."""
     db = make_session()
     service = QueryService(db)
     ctx = type("ctx", (), {"prompt_text": "Figure 1 shows the architecture with three components."})()
     constraints = service._build_answer_constraints("Figure 1 灞曠ず浜嗕粈涔堬紵", [ctx])
-    assert "Do NOT say" in constraints
-    assert "Figure" in constraints
+    assert "Do NOT say the figure is 'not included'" not in constraints
 
 
 def test_build_answer_constraints_language_follows_question() -> None:

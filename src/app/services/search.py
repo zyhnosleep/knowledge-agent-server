@@ -24,21 +24,22 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import ValidationError
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, literal
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.records import Claim, Document, DocumentChunk, DocumentStatus, Project, QuestionAnswer
+from app.models.records import Claim, Document, DocumentChunk, DocumentParseVersion, DocumentStatus, Project, QuestionAnswer
 from app.schemas.common import Citation, QueryResponse
+from app.schemas.agent import EvidencePack
 from app.services.ai import (
     QueryAnswerPayload,
     VerificationPayload,
@@ -47,6 +48,7 @@ from app.services.ai import (
     safe_model_call,
 )
 from app.services.ai import ExternalVerifier, OllamaClient
+from app.services.execution_budget import BudgetExceeded, current_execution_budget
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
 from app.services.paper_profile import (
     alias_in_text,
@@ -129,7 +131,6 @@ def _selector_boundary_pattern(selector_text: str) -> re.Pattern:
 # as a deterministic, bounded inventory so the model can only report verbatim
 # values.  The cap keeps a wide table from ballooning the repair prompt.
 REPAIR_TABLE_FACT_INVENTORY_LIMIT = 60
-QUERY_GENERATION_TIMEOUT_SECONDS = 45
 DRAFT_CONTEXT_TOKEN_BUDGET = 6000
 NEIGHBOR_EXPANSION_TOKEN_BUDGET = 900
 # Keep ordinary narrative prompts from expanding every retrieved Child to its
@@ -171,9 +172,20 @@ class RetrievedContext:
     neighbor_text: str = ""
     table_context: TableContext | None = None
     table_facts: tuple[TableFact, ...] = ()
+    visual_rank: int | None = None
 
 
 @dataclass
+class PreparedEvidence:
+    """One request's ordered evidence; never serialized or cached across sessions."""
+    project_id: str | None
+    project_slug: str
+    retrieval_question: str
+    document_id: str | None
+    parse_version_map: dict[str, str]
+    contexts: list[RetrievedContext]
+    pack: EvidencePack
+    visual_evidence_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -419,42 +431,62 @@ class QueryService:
         )
 
     def retrieve_evidence(
+        self, project_slug: str, question: str, limit: int = 15,
+        document_id: str | None = None,
+    ) -> EvidencePack:
+        """Safe projection of the same evidence preparation used by answers."""
+        return self.prepare_evidence(project_slug, question, limit, document_id).pack
+
+    def prepare_evidence(
         self,
         project_slug: str,
         question: str,
         limit: int = 15,
         document_id: str | None = None,
-    ) -> "EvidencePack":
+        *, paper_limit: int | None = None,
+    ) -> PreparedEvidence:
         """只检索、不生成答案的 RAG 接口，返回 EvidencePack。
 
         复用与 ``answer()`` 相同的路由与上下文选择逻辑，但**不**调用
         LLM、不验证、不持久化 QuestionAnswer。当提供 *document_id* 时，
         检索被限定在单篇文档内，不 fallback 到整个项目。
         """
-        from app.schemas.agent import (
-            EvidenceItem,
-            EvidencePack,
-            TableCoverage,
-            TableFactEvidence,
-        )
-        from app.services.canonical_artifacts import CanonicalArtifactStore
-
         project = self.db.scalar(select(Project).where(Project.slug == project_slug))
         if project is None:
             raise ValueError(f"Project '{project_slug}' not found")
 
-        scoped_document = self._validate_document_scope(project.id, document_id)
+        self._validate_document_scope(project.id, document_id)
+        versions = dict(self.parse_version_map or {})
+        for document in self.db.scalars(select(Document).where(Document.project_id == project.id)).all():
+            versions.setdefault(document.id, document.active_parse_version or 'legacy')
+        original_versions = self.parse_version_map
+        self.parse_version_map = versions
+        try:
+            return self._prepare_project_evidence(project, question, limit, document_id,
+                                                  paper_limit=paper_limit)
+        finally:
+            self.parse_version_map = original_versions
+
+    def _prepare_project_evidence(
+        self, project: Project, question: str, limit: int, document_id: str | None,
+        *, paper_limit: int | None,
+    ) -> PreparedEvidence:
+        """All routing, expansion and coverage share the already frozen map."""
+        versions = dict(self.parse_version_map or {})
         document_ids = [document_id] if document_id else None
         paper_matches = self._route_papers(
-            question, project.id, limit=limit, document_id=document_id
+            question, project.id, limit=limit if paper_limit is None else paper_limit,
+            document_id=document_id,
         )
         contexts = self._build_rag_contexts(
             question, project.id, paper_matches, document_ids=document_ids
         )
-        if not contexts and paper_matches and document_ids is None:
+        if not contexts and document_ids is None:
             locked_document_ids = self._locked_document_ids(question, paper_matches)
             if not locked_document_ids and not QueryService._is_document_overview_query(question):
                 contexts = self._search_source_chunks(question, project.id, [], limit=5)
+        contexts = [c for c in contexts if c.citation.document_id not in versions
+                    or (c.citation.parse_version or 'legacy') == versions[c.citation.document_id]]
         items, table_facts = self._evidence_items_and_facts(
             contexts, limit, question=question
         )
@@ -529,7 +561,7 @@ class QueryService:
                 if not remaining_missing:
                     coverage_status = "complete"
                     coverage_missing = []
-        return EvidencePack(
+        pack = EvidencePack(
             status=status,
             items=items,
             table_facts=table_facts,
@@ -537,6 +569,77 @@ class QueryService:
             coverage_status=coverage_status,
             coverage_missing_tables=coverage_missing,
         )
+        return PreparedEvidence(project.id, project.slug, question, document_id,
+                                versions, contexts, pack)
+
+    def merge_prepared_evidence(
+        self, prepared: PreparedEvidence, pack: EvidencePack, *,
+        trusted_attachment_ids: frozenset[str] = frozenset(),
+    ) -> PreparedEvidence:
+        """Merge source-linked extras without another routing/vector search."""
+        contexts = list(prepared.contexts)
+        seen = {(c.citation.chunk_id, c.citation.attachment_id, c.citation.excerpt) for c in contexts}
+        known = {(i.chunk_id, i.attachment_id, i.page_slug, i.parse_version, i.excerpt) for i in prepared.pack.items}
+        additions = []
+        candidates = []
+        for item in pack.items:
+            chunk = None
+            if (item.chunk_id, item.attachment_id, item.page_slug, item.parse_version, item.excerpt) in known:
+                continue  # The prepared context is already the authoritative projection.
+            if item.attachment_id:
+                if item.attachment_id not in trusted_attachment_ids:
+                    continue
+            elif item.document_id:
+                document = self.db.get(Document, item.document_id)
+                if document is None or document.project_id != prepared.project_id:
+                    continue
+                if prepared.document_id and document.id != prepared.document_id:
+                    continue
+                selected = prepared.parse_version_map.get(document.id, document.active_parse_version or 'legacy')
+                if (item.parse_version or 'legacy') != selected:
+                    continue
+                if item.chunk_id:
+                    chunk = self.db.get(DocumentChunk, item.chunk_id)
+                    if chunk is None or chunk.document_id != item.document_id or (chunk.parse_version or 'legacy') != (item.parse_version or 'legacy'):
+                        continue
+                    if item.block_type and item.block_type != chunk.block_type:
+                        continue
+                    identifiers = self._canonical_chunk_identifiers(chunk)
+                    if any(getattr(item, key) and getattr(item, key) != value for key, value in identifiers.items()):
+                        continue
+                elif item.parse_version not in (None, 'legacy'):
+                    continue  # Canonical history without a chunk identity cannot be trusted.
+            else:
+                continue
+            key = (item.chunk_id, item.attachment_id, item.excerpt)
+            if key in seen:
+                continue
+            text = chunk.text if chunk is not None else (item.context_text or item.excerpt)
+            citation = Citation.model_validate(item.model_dump())
+            if chunk is not None:
+                citation = citation.model_copy(update={
+                    'excerpt': text[:1600], 'block_type':chunk.block_type,
+                    'parent_chunk_id':chunk.parent_chunk_id, 'source_spans':chunk.source_spans,
+                    **self._canonical_chunk_identifiers(chunk),
+                })
+                candidates.append((chunk, item.score, chunk.block_type))
+            additions.append(RetrievedContext(
+                citation=citation, prompt_text=text,
+                context_text=text, score=item.score, evidence_kind=item.evidence_kind,
+            ))
+            seen.add(key)
+        additions = self._attach_complete_table_evidence(additions, candidates, question=prepared.retrieval_question)
+        contexts.extend(additions)
+        # Never accept arbitrary wire facts merely because doc/version matches.
+        # Preserve prepared rich tables and derive added facts from canonical text.
+        accepted, facts = self._evidence_items_and_facts(
+            contexts, max(len(contexts), len(pack.items)), question=prepared.retrieval_question)
+        merged_pack = pack.model_copy(update={
+            'items': accepted,
+            'table_facts': facts,
+            'status': 'ok' if accepted else 'empty',
+        })
+        return replace(prepared, contexts=contexts, pack=merged_pack)
 
     def _evidence_items_and_facts(
         self,
@@ -560,6 +663,7 @@ class QueryService:
                     index=idx,
                     document_id=ctx.citation.document_id,
                     chunk_id=ctx.citation.chunk_id,
+                    attachment_id=ctx.citation.attachment_id,
                     page_slug=ctx.citation.page_slug,
                     page_title=ctx.citation.page_title,
                     page_kind=ctx.citation.page_kind,
@@ -831,6 +935,33 @@ class QueryService:
         save_answer: bool = True,
         document_id: str | None = None,
     ) -> QueryResponse:
+        prepared = self.prepare_evidence(project_slug, question, document_id=document_id,
+                                         paper_limit=3)
+        return self.answer_from_evidence(project_slug, question, prepared, save_answer=save_answer)
+
+    def answer_from_evidence(
+        self, project_slug: str, question: str, prepared: PreparedEvidence, *,
+        save_answer: bool = False, conversation_summary: str = '',
+        visual_intent: bool | None = None,
+    ) -> QueryResponse:
+        project = self.db.scalar(select(Project).where(Project.slug == project_slug))
+        if project is None or project.id != prepared.project_id or project_slug != prepared.project_slug:
+            raise ValueError('Prepared evidence project scope mismatch')
+        self._validate_document_scope(project.id, prepared.document_id)
+        original_versions = self.parse_version_map
+        self.parse_version_map = prepared.parse_version_map
+        try:
+            return self._answer_prepared(project, question, prepared,
+                                         save_answer=save_answer,
+                                         conversation_summary=conversation_summary,
+                                         visual_intent=visual_intent)
+        finally:
+            self.parse_version_map = original_versions
+
+    def _answer_prepared(
+        self, project: Project, question: str, prepared: PreparedEvidence, *,
+        save_answer: bool, conversation_summary: str, visual_intent: bool | None,
+    ) -> QueryResponse:
         """RAG 优先的完整问答主流程。
 
         流程：
@@ -842,28 +973,14 @@ class QueryService:
         6. 可选追加缺失的支持性证据术语；
         7. 组装 QueryResponse（必要时持久化 QuestionAnswer）。
         """
-        project = self.db.scalar(select(Project).where(Project.slug == project_slug))
-        if project is None:
-            raise ValueError(f"Project '{project_slug}' not found")
-
-        self._validate_document_scope(project.id, document_id)
-        document_ids = [document_id] if document_id else None
-        paper_matches = self._route_papers(
-            question, project.id, document_id=document_id
-        )
-        contexts = self._build_rag_contexts(
-            question, project.id, paper_matches, document_ids=document_ids
-        )
-        if not contexts and document_ids is None:
-            locked_document_ids = self._locked_document_ids(question, paper_matches)
-            if not locked_document_ids and not QueryService._is_document_overview_query(question):
-                contexts = self._search_source_chunks(question, project.id, [], limit=5)
+        visual_query = self._is_figure_query(question) if visual_intent is None else visual_intent
         contexts = self._fit_contexts_to_token_budget(
-            contexts,
+            prepared.contexts,
             question=question,
+            visual_intent=visual_query,
         )
         if not contexts:
-            answer_payload = self._draft_answer(question, None, [])
+            answer_payload = self._draft_answer(question, None, [], conversation_summary=conversation_summary, visual_intent=visual_query)
             response = QueryResponse(answer_markdown=answer_payload.answer_markdown, citations=[], verification_status="local-only")
             if save_answer:
                 record = QuestionAnswer(
@@ -878,36 +995,52 @@ class QueryService:
                 self.db.commit()
             return response
 
-        answer_payload = self._deterministic_table_answer_if_supported(
+        answer_payload = None if visual_query else self._deterministic_table_answer_if_supported(
             question,
             contexts,
             "high" if self._is_high_risk(question) else "normal",
         )
         if answer_payload is None:
-            answer_payload = self._draft_answer(question, None, contexts)
+            if conversation_summary or visual_intent is not None:
+                answer_payload = self._draft_answer(question, None, contexts,
+                    conversation_summary=conversation_summary, visual_intent=visual_query)
+            else:
+                answer_payload = self._draft_answer(question, None, contexts)
+        trace = getattr(self, 'visual_evidence_trace', {})
+        prepared.visual_evidence_trace = {
+            'intent': visual_query,
+            'sent': [{key: value for key, value in label.items() if key != 'path'}
+                     for label in trace.get('sent', [])],
+            'skipped': [{**label, 'reason': self._safe_visual_skip_reason(label.get('reason', ''))}
+                        for label in trace.get('skipped', [])],
+        }
         verification_status = "local-only"
 
-        if self._is_high_risk(question):
+        if self._is_high_risk(question) and not visual_query:
             verification = self._verify_answer(answer_payload.answer_markdown, contexts)
             verification_status = verification.verdict
             if verification.notes:
                 answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
 
         answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
-        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts, visual_intent=visual_query)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
-        answer_payload = self._repair_unsupported_numeric_answer(question, None, contexts, answer_payload, chosen_indexes)
-        answer_payload = self._repair_missing_table_answer(question, None, contexts, answer_payload)
-        if self._should_append_supported_evidence_terms(question, contexts):
+        # Caption text is not a validator for numbers read from pixels. The
+        # text-only repair prompt would erase supported visual answers.
+        if not visual_query:
+            answer_payload = self._repair_unsupported_numeric_answer(question, None, contexts, answer_payload, chosen_indexes)
+            answer_payload = self._repair_missing_table_answer(question, None, contexts, answer_payload)
+        if not visual_query and self._should_append_supported_evidence_terms(question, contexts):
             answer_payload.answer_markdown = self._append_missing_supported_question_terms(
                 question,
                 answer_payload.answer_markdown,
                 contexts,
             )
         answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
-        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts)
+        chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts, visual_intent=visual_query)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
-        chosen_indexes = self._table_evidence_indexes_only(question, contexts, chosen_indexes)
+        if not visual_query:
+            chosen_indexes = self._table_evidence_indexes_only(question, contexts, chosen_indexes)
         evidence_insufficient = answer_payload.answer_markdown.lstrip().lower().startswith("## insufficient evidence")
         if evidence_insufficient:
             citations = []
@@ -916,7 +1049,7 @@ class QueryService:
             chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
             citations = self._select_citations(contexts, chosen_indexes)
 
-            answer_text_for_citations = self._retarget_table_answer_citations(
+            answer_text_for_citations = answer_payload.answer_markdown if visual_query else self._retarget_table_answer_citations(
                 question,
                 answer_payload.answer_markdown,
                 chosen_indexes,
@@ -927,6 +1060,8 @@ class QueryService:
                 answer_markdown = self._strip_answer_citation_markers(answer_markdown)
             else:
                 answer_markdown = self._ensure_valid_returned_citation_marker(answer_markdown, len(citations))
+        for label in prepared.visual_evidence_trace.get('sent', []):
+            label['citation_index'] = next((i for i, c in enumerate(citations) if c.chunk_id == label['chunk_id']), None)
         response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
 
         if save_answer:
@@ -1269,7 +1404,7 @@ class QueryService:
                     limit=table_limit,
                 )
             contexts.extend(table_contexts)
-            if table_contexts:
+            if table_contexts and not self._is_figure_query(question):
                 return self._finalize_contexts(contexts, question=question)
         if self._is_figure_query(question):
             figure_contexts = self._search_document_figure_contexts(question, project_id, derived_document_ids, limit=MAX_CONTEXTS)
@@ -1519,6 +1654,32 @@ class QueryService:
         document_ids: list[str],
         limit: int = 5,
     ) -> list[RetrievedContext]:
+        canonical_statement = select(DocumentChunk).join(DocumentChunk.document).where(
+            Document.project_id == project_id,
+            Document.status == DocumentStatus.ready.value,
+            DocumentChunk.block_type == "figure",
+            *self._selected_child_chunk_conditions(),
+        )
+        if document_ids:
+            canonical_statement = canonical_statement.where(DocumentChunk.document_id.in_(document_ids))
+        chunks = self.db.scalars(canonical_statement).all()
+        if chunks:
+            vector = safe_model_call(lambda: self.ollama.embed([question])[0], [])
+            compatible = self._compatible_vector_chunk_ids(chunks, vector)
+            requested_numbers = re.findall(r"(?:figure|fig\.?|图)\s*(\d+)", question, re.I)
+            def rank(chunk):
+                exact = bool(requested_numbers and any(re.search(
+                    rf"(?:figure|fig\.?|图)\s*{re.escape(number)}(?!\d)", chunk.text, re.I)
+                    for number in requested_numbers))
+                semantic = cosine_similarity(vector, chunk.embedding) if chunk.id in compatible else 0.0
+                lexical = len(self._tokenize(question) & self._tokenize(chunk.text))
+                return exact, semantic, lexical, chunk.id
+            ranked = sorted(chunks, key=rank, reverse=True)[:limit]
+            candidates = [(chunk, 10.0 * rank(chunk)[1] if chunk.id in compatible
+                else min(0.3 + rank(chunk)[2] * 0.1, 1.2), "figure") for chunk in ranked]
+            result = self._expand_source_candidates(candidates, question=question, project_id=project_id)
+            ranks = {chunk.id: i for i, chunk in enumerate(ranked)}
+            return [replace(context, visual_rank=ranks[context.citation.chunk_id]) for context in result]
         statement = select(Document).where(
             Document.project_id == project_id,
             Document.status == DocumentStatus.ready.value,
@@ -2570,6 +2731,8 @@ class QueryService:
             statement = statement.where(DocumentChunk.document_id.in_(document_ids))
         chunks = self.db.scalars(statement).all()
         base_query_terms = self._tokenize(question)
+        compatible_vector_ids = self._compatible_vector_chunk_ids(chunks, question_vector,
+            indexed_ids=set(vector_scores_by_chunk_id))
         route_query_terms = self._tokenize(" ".join(route_terms or []))
         query_terms = base_query_terms | route_query_terms
         route_token_counts: Counter[str] = Counter()
@@ -2596,10 +2759,10 @@ class QueryService:
             # 上限 1.2 合计最多 1.6（≈0.16 余弦）。向量分已改 10×cosine 拉开
             # 语义差距，词法只保留"同档并列时的微调"，不再允许字面重合
             # 反超语义差 0.16 余弦以上的证据。
-            if chunk.id in vector_scores_by_chunk_id:
+            if chunk.id in vector_scores_by_chunk_id and chunk.id in compatible_vector_ids:
                 score = vector_scores_by_chunk_id[chunk.id]
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
-            elif question_vector and chunk.embedding:
+            elif chunk.id in compatible_vector_ids:
                 # 与 _vector_distance_score 同尺度（10×cosine），两条向量路径可比。
                 score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
@@ -2641,6 +2804,47 @@ class QueryService:
             question=question,
             project_id=project_id,
         )
+
+    def _compatible_vector_chunk_ids(self, chunks: list[DocumentChunk], vector: list[float],
+            *, indexed_ids: set[str] | None = None) -> set[str]:
+        """Check provenance before either pgvector or JSON semantic scoring.
+
+        Historical unversioned chunks have no manifest; dimension validation
+        still applies. Known canonical model/provider mismatches fail closed.
+        """
+        import math
+        if not vector or not all(math.isfinite(value) for value in vector):
+            return set()
+        document_ids = {chunk.document_id for chunk in chunks}
+        if not document_ids:
+            return set()
+        versions = self.db.scalars(select(DocumentParseVersion).where(
+            DocumentParseVersion.document_id.in_(document_ids))).all()
+        identities = {(v.document_id, v.version_key):
+            (v.manifest_json or {}).get("ingestion_config", {}).get("embedding", {}) for v in versions}
+        result = set()
+        rejected = 0
+        for chunk in chunks:
+            stored = chunk.embedding or []
+            identity = identities.get((chunk.document_id, chunk.parse_version), {})
+            compatible = bool(stored and len(stored) == len(vector)
+                and all(math.isfinite(value) for value in stored))
+            if not stored and chunk.id in (indexed_ids or set()):
+                compatible = True
+            if identity:
+                compatible = compatible and (
+                    identity.get("provider") == settings.active_embedding_provider
+                    and identity.get("model") == settings.active_embedding_model
+                    and identity.get("dimensions") == len(vector))
+            elif chunk.parse_version not in {None, "legacy"}:
+                compatible = False
+            if compatible:
+                result.add(chunk.id)
+            elif stored:
+                rejected += 1
+        if rejected:
+            logger.warning("Excluded %d incompatible embedding vectors; using lexical evidence only", rejected)
+        return result
 
     def _expand_source_candidates(
         self,
@@ -2939,10 +3143,13 @@ class QueryService:
         mapped_conditions = [
             and_(
                 Document.id == str(document_id),
-                DocumentChunk.parse_version == str(version_key),
-                DocumentChunk.chunk_role == "child",
-                DocumentChunk.block_type.is_not(None),
-                DocumentChunk.block_type != "reference",
+                self._active_child_chunk_condition(document_active_version=literal('legacy'))
+                if version_key in (None, 'legacy') else and_(
+                    DocumentChunk.parse_version == str(version_key),
+                    DocumentChunk.chunk_role == "child",
+                    DocumentChunk.block_type.is_not(None),
+                    DocumentChunk.block_type != "reference",
+                ),
             )
             for document_id, version_key in self.parse_version_map.items()
             if str(document_id).strip() and str(version_key).strip()
@@ -3166,9 +3373,11 @@ class QueryService:
         contexts: list[RetrievedContext],
         *,
         question: str,
+        visual_intent: bool | None = None,
     ) -> list[RetrievedContext]:
+        visual_query = self._is_figure_query(question) if visual_intent is None else visual_intent
         contexts = self._expand_table_contexts_for_budget(contexts, question=question)
-        if self._is_table_query(question) or self._is_metric_query(question):
+        if (self._is_table_query(question) or self._is_metric_query(question)) and not visual_query:
             # A table Child is a lossless row-level evidence unit.  Put table
             # rows ahead of narrative context before applying the hard prompt
             # budget; otherwise an unrelated high-scoring paragraph can consume
@@ -3213,6 +3422,22 @@ class QueryService:
                 f"[{index}] {self._prompt_context_text(question, context)}"
                 for index, context in enumerate(values)
             )
+
+        visual_reserved = []
+        if visual_query:
+            visual_reserved = [c for c in contexts if self._context_evidence_kind(c) == 'figure'][:3]
+            for context in visual_reserved:
+                minimal = replace(context, prompt_text='Image evidence.', context_text='Image evidence.',
+                    neighbor_text='', citation=context.citation.model_copy(update={'excerpt':''}))
+                if self._count_retrieval_tokens(representation([*selected,minimal])) <= budget:
+                    selected.append(minimal)
+            contexts = [c for c in contexts if c not in visual_reserved]
+            # Expand captions only after all image identities have a slot.
+            for position, original in enumerate(visual_reserved[:len(selected)]):
+                richer = list(selected)
+                richer[position] = original
+                if self._count_retrieval_tokens(representation(richer)) <= budget:
+                    selected = richer
 
         for context in contexts:
             is_table_child = context.citation.block_type == "table"
@@ -3652,7 +3877,19 @@ class QueryService:
             "project with the relevant knowledge base."
         )
 
-    def _draft_answer(self, question: str, index_context: str | None, contexts: list[RetrievedContext]) -> QueryAnswerPayload:
+    @staticmethod
+    def _safe_visual_skip_reason(reason: str) -> str:
+        # Filesystem exceptions may contain absolute paths; expose only categories.
+        allowed = ('image_limit', 'selected version/identity mismatch', 'canonical image hash mismatch',
+                   'no image asset', 'not a canonical figure child', 'unregistered canonical figure asset',
+                   'oversized image', 'invalid image size', 'canonical manifest identity mismatch')
+        return reason if reason in allowed else 'unsafe_or_unavailable_image'
+
+    def _draft_answer(self, question: str, index_context: str | None, contexts: list[RetrievedContext], *,
+                      conversation_summary: str = '', visual_intent: bool | None = None) -> QueryAnswerPayload:
+        visual_query = self._is_figure_query(question) if visual_intent is None else visual_intent
+        self._visual_sent_context_indexes = set()
+        self.visual_evidence_trace = {'sent':[], 'skipped':[]}
         if not contexts:
             return QueryAnswerPayload(
                 answer_markdown="No supporting evidence was found yet. Please ingest relevant sources first.",
@@ -3666,18 +3903,40 @@ class QueryService:
         # insufficient-evidence answer instead of asking the LLM to
         # fabricate one from unrelated text.
         question_terms = self._extract_specific_question_scientific_terms(question)
-        if question_terms and not self._evidence_overlaps_question_scientific_terms(question, contexts):
+        if question_terms and not visual_query and not self._evidence_overlaps_question_scientific_terms(question, contexts):
             return QueryAnswerPayload(
                 answer_markdown=self._insufficient_evidence_answer(question_terms),
                 citations=[],
                 risk_level="normal",
             )
 
+        visual_images = []
+        visual_labels = []
+        skipped = []
+        if visual_query:
+            from app.services.visual_evidence import resolve_context_images
+            visual_images, visual_labels, skipped = resolve_context_images(
+                self.db, contexts, settings.canonical_artifacts_dir, self.parse_version_map)
+            if skipped:
+                logger.warning("Unavailable visual evidence: %s", skipped)
+            self.visual_evidence_trace = {'sent':visual_labels,'skipped':skipped}
+            self._visual_sent_context_indexes = {label['context_index'] for label in visual_labels}
+            if not visual_images:
+                return QueryAnswerPayload(answer_markdown="## Insufficient evidence\n\n未检索到可安全读取的图像证据，无法判断图中细节。", citations=[], risk_level="normal")
         prompt_sections: list[str] = []
         if index_context and not contexts:
             prompt_sections.append("Index overview:\n" + index_context)
         prompt_sections.extend(f"[{index}] {self._prompt_context_text(question, context)}" for index, context in enumerate(contexts))
         context_text = "\n\n".join(prompt_sections)
+        if visual_labels:
+            context_text += "\n\nAttached images in order: " + "; ".join(
+                f"Image {label['image_index']} -> context [{label['context_index']}]" for label in visual_labels)
+            context_text += "\nRead the attached pixels. If a requested fact is not visible, explicitly abstain; do not infer missing values from captions."
+        if skipped:
+            context_text += '\nUNAVAILABLE IMAGE contexts: ' + json.dumps([
+                {**label, 'reason':self._safe_visual_skip_reason(label.get('reason',''))}
+                for label in skipped], ensure_ascii=False)
+            context_text += '\nThese contexts have NOT been sent as images. State the missing evidence in comparisons; never pretend to have seen them.'
 
         # Build figure/table/dataset-aware guardrails.
         constraints = self._build_answer_constraints(question, contexts)
@@ -3707,9 +3966,12 @@ class QueryService:
             citations=list(range(len(contexts))),
             risk_level="high" if self._is_high_risk(question) else "normal",
         )
+        if visual_images:
+            fallback = QueryAnswerPayload(answer_markdown='## Insufficient evidence\n\n图像生成失败，未获得可验证的视觉答案。',citations=[],risk_level='normal')
         prompt = "\n\n".join(
             [
                 f"Question: {question}",
+                f"Conversation history (context only, not source evidence):\n{conversation_summary}" if conversation_summary else '',
                 (
                     "Answer using only the retrieved source evidence. "
                     "If the question contains multiple entities, datasets, metrics, tables, figures, or components, "
@@ -3758,19 +4020,20 @@ class QueryService:
                 risk_level="high" if self._is_high_risk(question) else "normal",
             )
 
-        def generate_with_query_timeout() -> QueryAnswerPayload:
-            original_timeout = getattr(self.ollama, "timeout", None)
-            if original_timeout is not None:
-                self.ollama.timeout = min(float(original_timeout), QUERY_GENERATION_TIMEOUT_SECONDS)
-            try:
-                return self.ollama.generate_structured(
+        def generate_draft() -> QueryAnswerPayload:
+            # HTTP deadline is request-local; never mutate a shared client.
+            if visual_images:
+                return self.ollama.generate_structured_with_images(
                     QueryAnswerPayload,
-                    system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
+                    system_prompt="Answer only from retrieved text and attached images. Cite the context index mapped to each image. Never invent unreadable or absent visual details.",
                     user_prompt=prompt,
+                    images=visual_images,
                 )
-            finally:
-                if original_timeout is not None:
-                    self.ollama.timeout = original_timeout
+            return self.ollama.generate_structured(
+                QueryAnswerPayload,
+                system_prompt="You are answering against a RAG evidence set. Use only retrieved source, table, and figure evidence; cite supporting context indexes and do not claim facts that are absent from the provided material.",
+                user_prompt=prompt,
+            )
 
         def _is_retryable_draft_error(exc: BaseException) -> bool:
             """判断 draft 生成失败是否值得重试。
@@ -3784,6 +4047,10 @@ class QueryService:
             """
             if _is_retryable_error(exc):
                 return True
+            if current_execution_budget() is not None:
+                # The transport already consumed the shared schema→JSON repair.
+                # Starting another draft would reset the format-repair cycle.
+                return False
             if isinstance(exc, ValidationError):
                 return True
             if isinstance(exc, ValueError):
@@ -3797,7 +4064,9 @@ class QueryService:
             """Retry transient Ollama failures twice; accept free-text only as a last resort."""
             for attempt in range(3):
                 try:
-                    return generate_with_query_timeout()
+                    return generate_draft()
+                except BudgetExceeded:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     if attempt < 2 and _is_retryable_draft_error(exc):
                         logger.warning(
@@ -3805,7 +4074,10 @@ class QueryService:
                             attempt + 1,
                             exc,
                         )
-                        time.sleep(5)
+                        budget = current_execution_budget()
+                        time.sleep(budget.http_timeout(5) if budget else 5)
+                        if budget:
+                            budget.check_deadline()
                         continue
                     # 3 轮重试（每轮都带 per-term coverage prompt）全部失败后，
                     # 才把模型自由文本输出当作最后手段收下 —— bff69af 曾把
@@ -3825,7 +4097,10 @@ class QueryService:
                     raise
             raise RuntimeError("unreachable RAG draft retry state")
 
-        return safe_model_call(generate_with_query_retries, fallback)
+        result = safe_model_call(generate_with_query_retries, fallback)
+        if skipped:
+            result.answer_markdown += '\n\n> 图像证据不完整：部分图像未发送（缺失、校验失败或超出图片上限）；涉及这些图的比较不能视为完整结论。'
+        return result
 
     def _degradation_notice(self, question: str, *, kind: Literal["raw", "template"]) -> str:
         """LLM 生成失败时的降级提示（双语样板统一出口）。
@@ -3896,9 +4171,9 @@ class QueryService:
             if has_figure_context:
                 parts.append(
                     "IMPORTANT: The context includes Figure descriptions. "
-                    "You MUST describe what the figure shows using the provided Figure Notes. "
+                    "Use the attached pixels and their context mapping when available. "
                     "Cite the specific figure number and page. "
-                    "Do NOT say the figure is 'not included' or 'not available' in the context."
+                    "If an image is unavailable or a detail is unreadable, explicitly state the limitation."
                 )
             else:
                 parts.append(
@@ -3989,6 +4264,9 @@ class QueryService:
                 constrained_context,
             ]
         )
+        budget = current_execution_budget()
+        if budget and not budget.consume_answer_retry():
+            return fallback
         repaired = safe_model_call(
             lambda: self.ollama.generate_structured(
                 QueryAnswerPayload,
@@ -4206,6 +4484,9 @@ class QueryService:
                 context_text,
             ]
         )
+        budget = current_execution_budget()
+        if budget and not budget.consume_answer_retry():
+            return fallback
         repaired = safe_model_call(
             lambda: self.ollama.generate_structured(
                 QueryAnswerPayload,
@@ -4267,6 +4548,10 @@ class QueryService:
         return "\n".join(facts)
 
     def _supported_citation_indexes(self, answer_markdown: str, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
+        if getattr(self,'_visual_sent_context_indexes',set()):
+            # Numeric coincidence in unrelated prose cannot validate or replace
+            # a citation supporting an answer read from the attached pixels.
+            return [index for index in chosen_indexes if 0 <= index < len(contexts)]
         if not contexts:
             return []
         indexes = [index for index in chosen_indexes if 0 <= index < len(contexts)]
@@ -4282,7 +4567,8 @@ class QueryService:
         ]
         return numeric_context_indexes or indexes
 
-    def _choose_citation_indexes(self, question: str, answer_payload: QueryAnswerPayload, contexts: list[RetrievedContext]) -> list[int]:
+    def _choose_citation_indexes(self, question: str, answer_payload: QueryAnswerPayload, contexts: list[RetrievedContext],
+                                 *, visual_intent: bool = False) -> list[int]:
         indexes: list[int] = []
         for index in answer_payload.citations:
             if 0 <= index < len(contexts) and index not in indexes:
@@ -4290,12 +4576,13 @@ class QueryService:
         for index in self._infer_citation_indexes(answer_payload.answer_markdown, len(contexts)):
             if index not in indexes:
                 indexes.append(index)
-        for index in self._table_citation_indexes(question, contexts):
-            if index not in indexes:
-                indexes.append(index)
-        for index in self._coverage_citation_indexes(question, contexts):
-            if index not in indexes:
-                indexes.append(index)
+        if not visual_intent:
+            for index in self._table_citation_indexes(question, contexts):
+                if index not in indexes:
+                    indexes.append(index)
+            for index in self._coverage_citation_indexes(question, contexts):
+                if index not in indexes:
+                    indexes.append(index)
         return indexes or list(range(min(2, len(contexts))))
 
     def _table_evidence_indexes_only(
@@ -4304,7 +4591,7 @@ class QueryService:
         contexts: list[RetrievedContext],
         indexes: list[int],
     ) -> list[int]:
-        if not (self._is_table_query(question) or self._is_metric_query(question)):
+        if self._is_figure_query(question) or not (self._is_table_query(question) or self._is_metric_query(question)):
             return indexes
         table_indexes = self._table_citation_indexes(question, contexts)
         if not table_indexes:
@@ -7059,6 +7346,7 @@ class QueryService:
                     expanded_context,
                     table_context=context.table_context,
                     table_facts=context.table_facts,
+                    visual_rank=context.visual_rank,
                 )
             )
         table_query = self._is_table_query(question) or self._is_metric_query(question)
@@ -7124,6 +7412,11 @@ class QueryService:
             return (structure_priority, relevance, evidence_priority, context.score)
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
+        if self._is_figure_query(question):
+            figures = [c for c in expanded_contexts if self._context_evidence_kind(c) == "figure"]
+            figures.sort(key=lambda c: (c.visual_rank is None,
+                c.visual_rank if c.visual_rank is not None else -c.score))
+            reserved = figures[:3]
         if table_query:
             reserved_table_contexts = self._reserve_requested_table_contexts(
                 sorted_contexts,
@@ -7141,6 +7434,8 @@ class QueryService:
                     for context in sorted_contexts
                     if context.citation.chunk_id not in reserved_ids
                 ]
+        if self._is_figure_query(question):
+            sorted_contexts = reserved + [c for c in sorted_contexts if c not in reserved]
         deduped: list[RetrievedContext] = []
         seen_keys: set[str] = set()
         page_counts: dict[str, int] = {}
@@ -7488,6 +7783,28 @@ class QueryService:
 
     # ---- Figure / Table / Metric query helpers ----
 
+    @classmethod
+    def _is_explicit_text_task(cls, question: str) -> bool:
+        """An explicit paper/method/table subject overrides inherited images.
+
+        This is only a modality boundary, not the cross-turn history gate.
+        Ambiguous follow-ups continue to use the previous task's modality.
+        """
+        return not cls._is_figure_query(question) and bool(re.search(
+            r'论文|文献|文章|方法|算法|训练|摘要|目标|局限|贡献|结论|表格|表\s*\d+'
+            r'|\b(?:paper|article|document|method|methodology|algorithm|training|dataset|'
+            r'objective|limitations?|contributions?|conclusions?|abstract|table)\b',
+            question, re.IGNORECASE,
+        ))
+
+    @classmethod
+    def _resolve_visual_intent(cls, question: str, retrieval_question: str) -> bool:
+        if cls._is_figure_query(question):
+            return True
+        if cls._is_explicit_text_task(question):
+            return False
+        return cls._is_figure_query(retrieval_question)
+
     @staticmethod
     def _is_figure_query(question: str) -> bool:
         """Detect questions asking about specific figures or illustrations."""
@@ -7495,9 +7812,11 @@ class QueryService:
         return bool(
             re.search(r"figure\s*\d+", lowered)
             or re.search(r"fig\.?\s*\d+", lowered)
-            or "图" in question
-            or "illustration" in lowered
-            or "diagram" in lowered
+            or re.search(r"\b(?:illustrations?|diagrams?|charts?|plots?|panels?|curves?|legends?|scatterplots?|heatmaps?|sankey)\b", lowered)
+            or re.search(r"\b(?:this|that|the|these)\s+(?:images?|pictures?|photos?|photographs?)\b", lowered)
+            or re.search(r"图\s*\d+|[这那该此本]张?图|图[中内里上]|图片|图像|图例|散点图|流程图|柱状图|折线图|曲线图|示意图|热力图|桑基图|直方图|面板|子图|配图", question)
+            or re.search(r"照片[中内里上]|照片.*(?:颜色|多少|几[个根张排条]|左边|右边|高度|立柱)", question)
+            or re.search(r"(?:哪条|几条|多少|最高|最低|颜色|趋势|比较|对比).*曲线|曲线.*(?:颜色|趋势|最高|最低|图例|横轴|纵轴)", question)
         )
 
     @classmethod
