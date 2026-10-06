@@ -252,6 +252,9 @@ class Settings(BaseSettings):
 
     # ---- Agent 执行约束与合成 ----
     agent_enabled: bool = Field(default=True, alias="AGENT_ENABLED")
+    agent_adaptive_enabled: bool = Field(default=False, alias="AGENT_ADAPTIVE_ENABLED")
+    agent_adaptive_max_decisions: int = Field(default=3, ge=1, le=3, alias="AGENT_ADAPTIVE_MAX_DECISIONS")
+    agent_adaptive_max_supplement_retrievals: int = Field(default=2, ge=0, le=2, alias="AGENT_ADAPTIVE_MAX_SUPPLEMENT_RETRIEVALS")
     agent_max_steps: int = Field(default=8, alias="AGENT_MAX_STEPS")
     agent_max_tool_calls: int = Field(default=5, alias="AGENT_MAX_TOOL_CALLS")
     agent_budget_tokens: int = Field(default=20000, alias="AGENT_BUDGET_TOKENS")

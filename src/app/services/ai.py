@@ -488,19 +488,23 @@ class OllamaClient:
             budget = current_execution_budget()
             if isinstance(exc, BudgetExceeded) or (budget and not budget.consume_format_retry()):
                 raise
+            strict_json = bool(getattr(schema, "strict_json_only", False))
             # 模型原始输出随异常透传（调用方"自由文本接受"决策依据）：
             # ollama 对 qwen3.5 的 format=schema 是提示式软约束，模型高频
             # 输出自然语言回答而非 JSON，原始文本必须到达调用方才能被接受。
             try:
-                exc.add_note(f"raw_content={str(content)[:6000]}")
+                if not strict_json:
+                    exc.add_note(f"raw_content={str(content)[:6000]}")
             except Exception:  # noqa: BLE001
                 pass
             # Schema 约束输出失败：退回宽松 JSON 模式重试
-            logger.warning(
-                "Structured schema response was invalid; retrying with JSON mode: %s (raw=%.500s)",
-                exc,
-                str(content)[:500],
-            )
+            if strict_json:
+                logger.warning("Invalid strict decision JSON; using shared format repair (%s)", schema.__name__)
+            else:
+                logger.warning(
+                    "Structured schema response was invalid; retrying with JSON mode: %s (raw=%.500s)",
+                    exc, str(content)[:500],
+                )
             retry_payload = self._json_mode_payload(
                 schema=schema,
                 model=model_name,
@@ -515,16 +519,18 @@ class OllamaClient:
                 return self._parse_structured_content(schema, retry_content)
             except Exception as retry_exc:  # noqa: BLE001
                 try:
-                    retry_exc.add_note(f"raw_content={str(retry_content)[:6000]}")
+                    if not strict_json:
+                        retry_exc.add_note(f"raw_content={str(retry_content)[:6000]}")
                 except Exception:  # noqa: BLE001
                     pass
                 # JSON 模式重试也失败：记录原始输出后原样抛出（调用方重试/兜底）
-                logger.warning(
-                    "JSON mode retry also failed for %s: %s (raw=%.500s)",
-                    schema.__name__,
-                    retry_exc,
-                    str(retry_content)[:500],
-                )
+                if strict_json:
+                    logger.warning("Strict decision format repair failed (%s)", schema.__name__)
+                else:
+                    logger.warning(
+                        "JSON mode retry also failed for %s: %s (raw=%.500s)",
+                        schema.__name__, retry_exc, str(retry_content)[:500],
+                    )
                 raise
 
     def generate_structured_with_images(
@@ -856,7 +862,8 @@ class OllamaClient:
                 user_prompt,
                 "Return only one valid JSON object. Do not include markdown, code fences, or explanatory text.",
                 "Use this compact JSON shape. Empty arrays are allowed when evidence is missing:",
-                json.dumps(OllamaClient._compact_schema_shape(schema), ensure_ascii=False),
+                json.dumps(getattr(schema, "json_retry_example", None) or
+                           OllamaClient._compact_schema_shape(schema), ensure_ascii=False),
             ]
         )
         user_message: dict[str, Any] = {"role": "user", "content": content}
@@ -935,6 +942,16 @@ class OllamaClient:
         text = str(content or "").strip()
         if not text:
             raise ValueError(f"Ollama returned empty content for {schema.__name__}.")
+
+        if getattr(schema, "strict_json_only", False):
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("Duplicate decision JSON key")
+                    result[key] = value
+                return result
+            return schema.model_validate(json.loads(text, object_pairs_hook=unique_object))
 
         try:
             return schema.model_validate_json(text)
