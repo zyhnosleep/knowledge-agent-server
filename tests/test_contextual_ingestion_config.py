@@ -141,22 +141,25 @@ def test_contextual_ingestion_environment_examples_are_isolated(
 ) -> None:
     _clear_settings_environment(monkeypatch)
 
-    development = Settings(_env_file=ROOT_DIR / ".env.development.example")
-    test = Settings(_env_file=ROOT_DIR / ".env.test.example")
+    development = Settings(_env_file=ROOT_DIR / "deploy/standalone.env.example")
+    test = Settings(_env_file=ROOT_DIR / "deploy/standalone.env.example",
+        CONTEXTUALIZATION_BASE_URL="http://127.0.0.1:19080", CANONICAL_ARTIFACTS_DIR="runtime/test/parsed")
 
-    assert development.contextualization_base_url == "http://127.0.0.1:11435"
-    assert test.contextualization_base_url == "http://127.0.0.1:11436"
+    assert development.contextualization_base_url == "http://127.0.0.1:18080"
+    assert test.contextualization_base_url == "http://127.0.0.1:19080"
     assert development.contextualization_base_url != test.contextualization_base_url
+    assert development.canonical_artifacts_dir != test.canonical_artifacts_dir
 
     for settings in (development, test):
-        assert settings.canonical_artifacts_dir == Path("runtime/data/parsed")
-        assert settings.canonical_pipeline_version == "canonical-v4"
+        assert settings.canonical_artifacts_dir.name == "parsed"
+        assert settings.semantic_splitting_model == "qwen3-vl-embedding:2b"
+        assert settings.canonical_pipeline_version == "canonical-v5-mineru-vl"
         assert (
             settings.semantic_tokenizer_revision
             == "5cf2132abc99cad020ac570b19d031efec650f2b"
         )
         assert settings.semantic_tokenizer_local_path == Path(
-            "runtime/models/Qwen3-Embedding-4B-tokenizer"
+            "/opt/models/Qwen3-Embedding-4B-tokenizer"
         )
         assert settings.mineru_enabled is True
         assert settings.maintenance_mode_enabled is False

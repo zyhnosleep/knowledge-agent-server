@@ -87,6 +87,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.services.model_asset_identity import fingerprint_embedding_assets
+from app.services.local_model_config import read_local_model_paths
 
 LOGGER = logging.getLogger("local_models")
 
@@ -103,16 +104,11 @@ def _embedding_assets(path: Path) -> dict[str, str]:
 # 配置
 # --------------------------------------------------------------------------
 
-DEFAULT_TEXT_EMBED = "/root/autodl-tmp/model_cache/models/Qwen--Qwen3-Embedding-4B/snapshots/master"
-DEFAULT_IMAGE_EMBED = "/root/autodl-tmp/model_cache/models/Qwen--Qwen3-VL-Embedding-2B"
-DEFAULT_CHAT = "/root/autodl-tmp/model_cache/models/Qwen--Qwen3-VL-4B-Instruct"
-DEFAULT_IMAGE_ROOTS = "/root/autodl-tmp"
-
-TEXT_EMBED_PATH = Path(os.environ.get("LOCAL_MODEL_TEXT_EMBED") or DEFAULT_TEXT_EMBED)
-IMAGE_EMBED_PATH = Path(os.environ.get("LOCAL_MODEL_IMAGE_EMBED") or DEFAULT_IMAGE_EMBED)
-CHAT_PATH = Path(os.environ.get("LOCAL_MODEL_CHAT") or DEFAULT_CHAT)
-CHAT_ADAPTER_RAW = os.environ.get("LOCAL_MODEL_CHAT_ADAPTER", "").strip()
-CHAT_ADAPTER_PATH = Path(CHAT_ADAPTER_RAW) if CHAT_ADAPTER_RAW else None
+MODEL_PATHS = read_local_model_paths(os.environ, Path(__file__).resolve().parents[1])
+TEXT_EMBED_PATH = MODEL_PATHS["text_embed"]
+IMAGE_EMBED_PATH = MODEL_PATHS["image_embed"]
+CHAT_PATH = MODEL_PATHS["chat"]
+CHAT_ADAPTER_PATH = MODEL_PATHS["adapter"]
 CHAT_ALIAS = os.environ.get("LOCAL_MODEL_CHAT_ALIAS") or "qwen3-vl:4b"
 CHAT_FT_ALIAS = os.environ.get("LOCAL_MODEL_CHAT_FT_ALIAS") or f"{CHAT_ALIAS}-ft"
 HOST = os.environ.get("LOCAL_MODEL_HOST") or "127.0.0.1"
@@ -129,24 +125,7 @@ IMAGE_EMBED_NAME = os.environ.get("LOCAL_MODEL_IMAGE_EMBED_NAME") or "qwen3-vl-e
 EMBED_BACKEND = (os.environ.get("LOCAL_MODEL_EMBED_BACKEND") or "vl").strip().lower()
 
 
-def _parse_roots(raw: str) -> list[Path]:
-    """把逗号分隔的根目录串解析成已 resolve 的 Path 列表。"""
-    roots: list[Path] = []
-    for item in raw.split(","):
-        candidate = item.strip()
-        if not candidate:
-            continue
-        try:
-            roots.append(Path(candidate).expanduser().resolve())
-        except OSError:  # pragma: no cover - resolve 基本不会抛
-            continue
-    return roots
-
-
-IMAGE_ROOTS = _parse_roots(os.environ.get("LOCAL_MODEL_IMAGE_ROOTS") or DEFAULT_IMAGE_ROOTS)
-
-if not IMAGE_ROOTS:
-    raise SystemExit("LOCAL_MODEL_IMAGE_ROOTS 解析后为空;拒绝在'任意路径可读'的状态下启动")
+IMAGE_ROOTS = MODEL_PATHS["image_roots"]
 
 
 # --------------------------------------------------------------------------

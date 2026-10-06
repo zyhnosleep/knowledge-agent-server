@@ -1,8 +1,8 @@
 # 飞书机器人平台配置清单
 
 > 目标：让群里 @ 机器人 → 传文件入库 / 提问回答 成为可能。
-> 本文档是人工操作清单（飞书开放平台侧），代码侧见 `.scratch/feishu-bot/issues/`。
-> 前置：已有飞书应用（OAuth 登录已在用，app_id/secret 已存在于 test 的 app.env）。
+> 本文档只描述可选飞书平台配置；当前单实例部署见 ../deploy/standalone.md。
+> 前置：有权使用的飞书应用，凭据仅写当前项目私有 .env。本次不启用机器人。
 
 ## 1. 应用加"机器人"能力
 
@@ -30,10 +30,10 @@
 
 ## 5. 验证
 
-- 群里 @ 机器人发一条消息 → 应收到机器人"收到，处理中"回执（需 dev 侧机器人进程运行中，见部署配置）。
+- 群里 @ 机器人发一条消息 → 应收到机器人"收到，处理中"回执（需另行运行机器人进程）。
 - 非目标租户/群的 @ 不响应（代码侧过滤，见环境配置）。
 
-## 环境配置（dev app.env 追加）
+## 环境配置（当前私有 .env 追加）
 
 ```ini
 # 复用 OAuth 的 app id/secret（同一应用）
@@ -43,8 +43,8 @@ FEISHU_ALLOWED_TENANT=<已有值>      # 租户限定：非此租户事件忽略
 FEISHU_BOT_ENABLED=true             # 机器人进程开关
 FEISHU_BOT_ALLOWED_CHAT_IDS=        # 群白名单（逗号分隔 chat_id，留空=租户内不限）
 FEISHU_BOT_INBOX_PROJECT=feishu-inbox  # 文件入库项目（项目不存在自动创建）
-FEISHU_BOT_API_BASE_URL=http://127.0.0.1:8002  # 本地 dev API（入库/问答经它）
+FEISHU_BOT_API_BASE_URL=http://127.0.0.1:18002  # 当前 loopback API
 ```
 
-启用服务：`systemctl --user enable --now knowledge-agent-dev-feishu-bot.service`
-（`deploy/systemd/knowledge-agent-dev-feishu-bot.service`，崩溃自动拉起）。
+另行加载同一私有配置，用 API 环境执行 `python -m app.services.feishu_bot.entry`。
+机器人不归 project_ctl 管理，没有默认崩溃自动拉起；不复制历史公司的凭据。

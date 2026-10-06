@@ -1,47 +1,38 @@
 # Knowledge Agent
 
-Knowledge Agent 是一个面向团队内部使用的文献知识与证据问答系统。它保存原始文档、结构化分块、向量索引、页码和来源链接，并由后端验证 Agent 回答中的引用。
+科研文献的文本/图表证据问答：保留原始文件、canonical 解析版本、页码和来源；结构引用验证不等于事实正确率。
 
-## 模型
+## 当前部署
 
-- 回答生成：`qwen3.5:9b`
-- 向量检索：`qwen3-embedding:4b`（2560 维）
-- 上下文：32K
-- 本地推理：Ollama、Flash Attention、q8_0 KV Cache
-- 闲置策略：最后一次调用 5 分钟后释放 GPU
-- 外部 API：默认关闭
+单实例 Linux/容器：PostgreSQL 16 + pgvector、2048 维 Qwen3-VL-Embedding-2B；文本和图片共用同一向量空间。生成/视觉模型为 Qwen3-VL-4B-Instruct，默认 base，LoRA 可选。API 127.0.0.1:18002，模型服务 127.0.0.1:18080；不开公网入口。
 
-## 环境
+API 与 GPU 模型使用独立 Python 环境。当前部署配置只使用 [standalone 模板](deploy/standalone.env.example)，步骤和恢复边界见 [部署说明](deploy/standalone.md)。模板路径需要按实际安装修改，实际 .env、模型、数据和凭据不能提交。
 
-同一台双 GPU 服务器运行两套完全隔离的环境：
+## 运行与验证
 
-| 环境 | API | Ollama | GPU | 访问 |
-|---|---:|---:|---:|---|
-| 开发 | `127.0.0.1:8002` | `127.0.0.1:11435` | GPU 0 | SSH 转发 |
-| 测试 | `127.0.0.1:8001` | `127.0.0.1:11436` | GPU 1 | 受保护的公网入口 |
+```bash
+.venv/bin/python scripts/project_ctl.py preflight
+.venv/bin/python scripts/project_ctl.py start
+.venv/bin/python scripts/project_ctl.py status
+.venv/bin/python scripts/project_ctl.py stop
+```
 
-开发环境使用 `.env.development.example`，测试环境使用 `.env.test.example`。正式部署时复制到各自的 `runtime/app.env` 并设置数据库密码和认证 secret，禁止提交实际 secret。
+controller 依次检查 PG、模型、API；只管理有精确进程/监听归属记录的模型和 API，stop 不停止数据库。旧索引缺 revision/processor 身份会被阻断：必须新建受控 shadow 版本、质量核验后激活，禁止补写旧向量身份。
 
-## 本地开发
+## 工作流与 Agent
+
+普通问题保留原路径、零额外 planner。仅 complex_multi_hop + AGENT_ADAPTIVE_ENABLED=true 使用 observation 驱动的只读循环：retrieve / answer / finish / abstain，最多 3 次决策、2 次补证，共享 step/tool/token/deadline/cancel 预算。
+
+版本、项目、会话和图片作用域由受信执行器冻结，模型不能扩权或执行 shell/任意 SQL/写知识源。默认开关关闭，服务器真实验收后再决定是否启用。它是受限 Agent + harness，不是把固定工作流更名为自主 Agent。
+
+## 开发
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\pip install -e ".[dev]"
-Copy-Item .env.development.example .env
-.venv\Scripts\pytest -q
-.venv\Scripts\python -m uvicorn app.main:app --app-dir src --host 127.0.0.1 --port 8002
+.venv\Scripts\python -m pip install -e ".[dev]"
+.venv\Scripts\python -m pytest -p no:cacheprovider -q
 ```
 
-## 数据迁移
+SQLite 仅为测试/历史迁移兼容，不是生产替代后端。不要把 API 的 transformers<5 安装到独立模型环境。完整运行链路见 [运行手册](docs/project-runbook.md)。
 
-更换 Embedding 模型后必须在维护模式下重建向量：
-
-```bash
-.venv/bin/alembic upgrade head
-.venv/bin/python scripts/reindex_embeddings.py \
-  --all-projects \
-  --maintenance-confirmed \
-  --report runtime/reindex-report.json
-```
-
-原始文件、解析文本、页码和项目关系不会被删除。详细部署及回滚流程见 `deploy/internal-pilot.md`。
+单测通过不代表服务器已部署；真实文本、表格、像素、跨轮、拒答、pgvector 排序和 Agent JSON/SSE 必须另行验收。私有语料、题集、评测输出和备份不发布。

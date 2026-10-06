@@ -11,9 +11,18 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def server(monkeypatch):
+def server(monkeypatch, tmp_path):
     monkeypatch.setenv('LOCAL_MODEL_PRELOAD', 'none')
-    monkeypatch.setenv('LOCAL_MODEL_CHAT_ADAPTER', '/test/new-adapter')
+    for name in ('encoder', 'chat', 'adapter', 'parsed', 'cache'):
+        (tmp_path / name).mkdir()
+    for key, name in (('LOCAL_MODEL_IMAGE_EMBED', 'encoder'), ('LOCAL_MODEL_CHAT', 'chat'),
+                      ('LOCAL_MODEL_CHAT_ADAPTER', 'adapter')):
+        monkeypatch.setenv(key, str(tmp_path / name))
+    root = Path(__file__).resolve().parents[1]
+    # Configuration path safety is independently tested without importing torch.
+    monkeypatch.setattr('app.services.local_model_config.read_local_model_paths', lambda env, root: {
+        'text_embed': None, 'image_embed': tmp_path / 'encoder', 'chat': tmp_path / 'chat',
+        'adapter': tmp_path / 'adapter', 'image_roots': (tmp_path / 'parsed', tmp_path / 'cache')})
     path = Path(__file__).resolve().parents[1] / 'scripts/serve_local_models.py'
     spec = importlib.util.spec_from_file_location('contract_server', path)
     module = importlib.util.module_from_spec(spec)

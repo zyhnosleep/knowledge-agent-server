@@ -1,5 +1,7 @@
 # 项目介绍演示稿（20 分钟版）
 
+> 历史纯文本演示稿：下述双环境/Systemd、模型和维度不适用于当前服务器，不按本稿启动服务。当前流程见 [运行手册](./project-runbook.md)，部署见 [standalone](../deploy/standalone.md)；真实自适应 Agent 和收益须以新验收为准。
+
 > 配套文档：[docs/project-runbook.md](./project-runbook.md)（完整运行手册，本稿所有细节均出自该文档）
 > 口播语速按 ~240 字/分钟 预算，全文正文约 4800 字。标注说明：
 > - **【演示】** = 现场操作步骤（照着做）
