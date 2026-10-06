@@ -44,6 +44,18 @@ def parse_sse_final(lines):
     return finals[0]
 
 
+def _error_code(exc):
+    known = {"execution_not_completed", "pgvector_not_executed", "pixels_not_executed",
+        "sse_final_missing", "sse_multiple_finals", "plain_answer_missing", "readiness_failed"}
+    if isinstance(exc, ValueError) and str(exc) in known:
+        return str(exc)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"http_status_{exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "request_timeout"
+    return "smoke_check_failed"
+
+
 def run_smoke(*, base_url, project, cases=None):
     assert_loopback_url(base_url)
     context = capture_context(project)
@@ -59,27 +71,44 @@ def run_smoke(*, base_url, project, cases=None):
         for case in cases:
             row = {"id": case.id, "fact_correct": None}
             try:
-                plain = client.post(base_url.rstrip("/") + "/api/query", json={"project_slug": project,
-                    "question": case.question, "document_id": case.document_scope, "save_answer": False})
-                plain.raise_for_status()
-                plain_body = plain.json()
-                if not plain_body.get("answer_markdown"):
-                    raise ValueError("plain_answer_missing")
-                payload = {"project_slug": project, "query": case.question, "document_id": case.document_scope,
-                    "constraints": dict(CONSTRAINTS)}
-                response = client.post(base_url.rstrip("/") + "/api/agent/query", json=payload)
-                response.raise_for_status()
-                agent = response.json()
+                if case.setup_questions:
+                    row["plain_skipped"] = "stateless_endpoint"
+                else:
+                    plain = client.post(base_url.rstrip("/") + "/api/query", json={"project_slug": project,
+                        "question": case.question, "document_id": case.document_scope, "save_answer": False})
+                    plain.raise_for_status()
+                    row["plain_response"] = plain.json()
+                    if not row["plain_response"].get("answer_markdown"):
+                        raise ValueError("plain_answer_missing")
                 pixel = case.group == "pixels"
-                row["json"] = check_agent_result(agent, require_pgvector=not case.unanswerable, require_pixels=pixel)
-                with client.stream("POST", base_url.rstrip("/") + "/api/agent/query/stream", json=payload) as stream:
-                    stream.raise_for_status()
-                    sse = parse_sse_final(list(stream.iter_lines()))
-                row["sse"] = check_agent_result(sse, require_pgvector=not case.unanswerable, require_pixels=pixel)
-                row["plain_response"], row["json_response"], row["sse_response"] = plain_body, agent, sse
+                for kind in ("json", "sse"):
+                    session_id = None
+                    row[kind + "_setup_responses"] = []
+                    for index, question in enumerate([*case.setup_questions, case.question]):
+                        payload = {"project_slug": project, "query": question, "document_id": case.document_scope,
+                            "constraints": dict(CONSTRAINTS)}
+                        if session_id:
+                            payload["session_id"] = session_id
+                        if kind == "json":
+                            response = client.post(base_url.rstrip("/") + "/api/agent/query", json=payload)
+                            response.raise_for_status()
+                            body = response.json()
+                        else:
+                            with client.stream("POST", base_url.rstrip("/") + "/api/agent/query/stream", json=payload) as stream:
+                                stream.raise_for_status()
+                                body = parse_sse_final(list(stream.iter_lines()))
+                        if index < len(case.setup_questions):
+                            row[kind + "_setup_responses"].append(body)
+                            check_agent_result(body)
+                            session_id = body.get("session_id")
+                            if not session_id:
+                                raise ValueError("execution_not_completed")
+                        else:
+                            row[kind + "_response"] = body
+                            row[kind] = check_agent_result(body, require_pgvector=not case.unanswerable, require_pixels=pixel)
                 row["passed"] = True
-            except Exception:
-                row.update({"passed": False, "error": "smoke_check_failed"})
+            except Exception as exc:
+                row.update({"passed": False, "error": _error_code(exc)})
             checks.append(row)
     stable = context == capture_context(project)
     return {"passed": stable and all(c["passed"] for c in checks), "context_stable": stable,

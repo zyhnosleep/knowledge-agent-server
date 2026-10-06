@@ -55,3 +55,61 @@ def test_smoke_consumes_real_plain_response_contract(monkeypatch):
     monkeypatch.setattr(module, "capture_context", lambda project: {"identity": "one"})
     case = Case(id="text", question="q", document_scope=None, reference_facts=["A"], required_evidence=[], unanswerable=False)
     assert module.run_smoke(base_url="http://127.0.0.1:18002", project="p", cases=[case])["passed"] is True
+
+
+def test_smoke_cross_turn_uses_separate_json_and_sse_sessions(monkeypatch):
+    import json
+    import httpx
+    import scripts.verify_standalone as module
+    from scripts.evaluate_adaptive_agent import Case
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/api/health":
+            return httpx.Response(200, json={"status": "ok", "models": {"vector_store": {"status": "ready"}}})
+        payload = json.loads(request.content)
+        seen.append((request.url.path, payload))
+        is_sse = request.url.path.endswith("/stream")
+        if payload["query"] == "首轮":
+            assert "session_id" not in payload
+        else:
+            assert payload["session_id"] == ("sse-session" if is_sse else "json-session")
+        agent = {**result("pgvector"), "session_id": "sse-session" if is_sse else "json-session"}
+        if is_sse:
+            return httpx.Response(200, text="event: final\ndata: " + json.dumps(agent) + "\n\n")
+        return httpx.Response(200, json=agent)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(module.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(module, "capture_context", lambda project: {"identity": "one"})
+    case = Case(id="cross", question="那它呢", setup_questions=["首轮"], group="cross-turn",
+        document_scope=None, reference_facts=["A"], required_evidence=[], unanswerable=False)
+    report = module.run_smoke(base_url="http://127.0.0.1:18002", project="p", cases=[case])
+    assert report["passed"] is True
+    assert [payload["query"] for _, payload in seen] == ["首轮", "那它呢", "首轮", "那它呢"]
+    assert report["checks"][0]["plain_skipped"] == "stateless_endpoint"
+
+
+def test_smoke_keeps_failed_pixel_response_with_safe_reason(monkeypatch):
+    import httpx
+    import scripts.verify_standalone as module
+    from scripts.evaluate_adaptive_agent import Case
+
+    def handler(request):
+        if request.url.path == "/api/health":
+            return httpx.Response(200, json={"status": "ok", "models": {"vector_store": {"status": "ready"}}})
+        if request.url.path == "/api/query":
+            return httpx.Response(200, json={"answer_markdown": "A", "citations": [], "verification_status": "local-only"})
+        return httpx.Response(200, json=result("pgvector"))
+
+    real_client = httpx.Client
+    monkeypatch.setattr(module.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(module, "capture_context", lambda project: {})
+    case = Case(id="pixels", question="图像?", group="pixels", document_scope=None,
+        reference_facts=[], required_evidence=[], unanswerable=False)
+    report = module.run_smoke(base_url="http://127.0.0.1:18002", project="p", cases=[case])
+    row = report["checks"][0]
+    assert report["passed"] is False
+    assert row["error"] == "pixels_not_executed"
+    assert row["json_response"]["final_answer"] == "a"
+    assert row["fact_correct"] is None

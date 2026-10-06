@@ -69,3 +69,12 @@ def test_changed_index_cannot_be_compared_as_same_experiment():
     b = [{"id": "one", "case": {}, "constraints": {}, "context": {"index_sha256": "new"}}]
     with pytest.raises(ValueError, match="paired_context_mismatch"):
         compare_arms(a, b)
+
+
+def test_failed_arm_retains_actual_response_not_a_success_score():
+    case = Case(id="one", question="q", document_scope=None, reference_facts=[], required_evidence=[], unanswerable=True)
+    rows = collect_arm([case], client=Client("static"), base_url="http://127.0.0.1:18002",
+        project="p", mode="adaptive", context={})
+    assert rows[0]["error"] == "execution_mode_mismatch"
+    assert rows[0]["response"]["metadata"]["execution_mode"] == "static"
+    assert rows[0]["fact_correct"] is None

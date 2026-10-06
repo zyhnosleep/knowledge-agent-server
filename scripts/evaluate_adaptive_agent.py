@@ -105,6 +105,7 @@ def collect_arm(cases, *, client, base_url, project, mode, context):
                 response = client.post(base_url.rstrip("/") + "/api/agent/query", json=payload)
                 response.raise_for_status()
                 body = response.json()
+                row["response"] = body
                 session_id = body.get("session_id")
                 if body.get("status") != "completed":
                     raise ValueError("execution_not_completed")
