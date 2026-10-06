@@ -1,9 +1,14 @@
 from app.db.session import Base
 from app.main import app
+from starlette.routing import Mount
 
 
 def test_legacy_content_routes_and_static_mount_are_removed() -> None:
-    paths = {route.path for route in app.routes}
+    # FastAPI now retains lazy included routers without a .path attribute.
+    # OpenAPI enumerates actual API registrations; Mount covers static paths.
+    paths = set(app.openapi()["paths"]) | {
+        route.path for route in app.routes if isinstance(route, Mount)
+    }
     legacy_segment = "/" + "wi" + "ki"
     assert not any(legacy_segment in path for path in paths)
 

@@ -317,6 +317,15 @@ def build_ingestion_config_snapshot(
     """
     configured = settings or get_settings()
     identity = dict(tokenizer_identity or get_tokenizer_identity(configured))
+    embedding_identity = {
+        "provider": configured.active_embedding_provider,
+        "model": configured.active_embedding_model,
+        "dimensions": configured.active_embedding_dimensions,
+    }
+    if configured.vector_store_strict:
+        from app.services.runtime_contract import EmbeddingIdentity
+        from dataclasses import asdict
+        embedding_identity = asdict(EmbeddingIdentity.from_settings(configured))
     return {
         "algorithm_revisions": dict(ALGORITHM_REVISIONS),
         "tokenizer": {
@@ -324,11 +333,7 @@ def build_ingestion_config_snapshot(
             "revision": identity["revision"],
             "content_sha256": identity["content_sha256"],
         },
-        "embedding": {
-            "provider": configured.active_embedding_provider,
-            "model": configured.active_embedding_model,
-            "dimensions": configured.active_embedding_dimensions,
-        },
+        "embedding": embedding_identity,
         "semantic_splitting": {
             "model": configured.semantic_splitting_model,
             "break_percentile": configured.semantic_break_percentile,

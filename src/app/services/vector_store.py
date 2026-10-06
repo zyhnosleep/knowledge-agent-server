@@ -36,6 +36,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.services.runtime_contract import RuntimeContractError, check_pgvector_configuration
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -594,6 +595,8 @@ class PGVectorStore:
         依次检查开关、后端类型、方言是否为 postgresql,然后查询
         ``pg_extension`` 中是否安装了名为 'vector' 的扩展。
         """
+        if settings.vector_store_strict:
+            check_pgvector_configuration(self.db, settings)
         # 前置开关:未启用、后端不对、方言不对则不可用。
         if not settings.vector_store_enabled:
             return False
@@ -611,8 +614,12 @@ class PGVectorStore:
             ).scalar_one_or_none()
             self._available = bool(installed)
         except Exception as exc:  # noqa: BLE001
+            if settings.vector_store_strict:
+                raise RuntimeContractError("pgvector_unavailable") from None
             logger.info("pgvector is not available on this connection: %s", exc)
             self._available = False
+        if settings.vector_store_strict and not self._available:
+            raise RuntimeContractError("pgvector_extension_missing")
         return self._available
 
     def replace_document_chunks(
@@ -625,6 +632,14 @@ class PGVectorStore:
         再批量 upsert 新行。
         """
         # 过滤非法向量、归一化,并校验维度必须等于配置的嵌入维度。
+        vectors = list(vectors)
+        if settings.vector_store_strict and any(
+            not self._valid_embedding(vector.embedding)
+            or any(type(value) not in (int, float) for value in vector.embedding)
+            or not self._normalize_embedding(vector.embedding)
+            or len(vector.embedding) != settings.active_embedding_dimensions for vector in vectors
+        ):
+            raise RuntimeContractError("pgvector_invalid_embedding")
         normalized = [
             ChunkVector(
                 chunk_id=vector.chunk_id,
@@ -668,6 +683,8 @@ class PGVectorStore:
                         ],
                     )
         except Exception as exc:  # noqa: BLE001
+            if settings.vector_store_strict:
+                raise RuntimeContractError("pgvector_index_failed") from None
             logger.warning(
                 "pgvector indexing failed for document %s; JSON embeddings remain available: %s",
                 document_id,
@@ -702,6 +719,13 @@ class PGVectorStore:
         回退到 JSON embedding)。
         """
         # 前置校验:查询向量无效、limit 非正、后端不可用则返回空。
+        if settings.vector_store_strict and (
+            not self._valid_embedding(embedding)
+            or any(type(value) not in (int, float) for value in embedding)
+            or not self._normalize_embedding(embedding)
+            or len(embedding) != settings.active_embedding_dimensions
+        ):
+            raise RuntimeContractError("pgvector_invalid_embedding")
         if not self._valid_embedding(embedding) or limit <= 0 or not self.available():
             return []
         normalized = self._normalize_embedding(embedding)
@@ -736,6 +760,8 @@ class PGVectorStore:
                 for row in rows
             ]
         except Exception as exc:  # noqa: BLE001
+            if settings.vector_store_strict:
+                raise RuntimeContractError("pgvector_search_failed") from None
             logger.warning("pgvector search failed; falling back to JSON embeddings: %s", exc)
             return []
 
@@ -848,6 +874,9 @@ def get_vector_store(db: Session) -> SQLiteVecStore | PGVectorStore:
     当配置启用了向量存储、后端为 pgvector 且当前数据库是 PostgreSQL 时
     返回 PGVectorStore;否则返回 SQLiteVecStore。
     """
+    if settings.vector_store_strict:
+        check_pgvector_configuration(db, settings)
+        return PGVectorStore(db)
     if (
         settings.vector_store_enabled
         and settings.vector_store_backend == "pgvector"

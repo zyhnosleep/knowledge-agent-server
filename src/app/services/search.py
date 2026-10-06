@@ -417,6 +417,7 @@ class QueryService:
         self.DRAFT_CONTEXT_TOKEN_BUDGET = DRAFT_CONTEXT_TOKEN_BUDGET
         self.NEIGHBOR_EXPANSION_TOKEN_BUDGET = NEIGHBOR_EXPANSION_TOKEN_BUDGET
         self._retrieval_token_counter = _RETRIEVAL_TOKEN_PROVIDER.estimate_tokens
+        self.retrieval_backend = "not_queried"
 
     def answer(
         self,
@@ -462,6 +463,9 @@ class QueryService:
         original_versions = self.parse_version_map
         self.parse_version_map = versions
         try:
+            if settings.vector_store_strict:
+                from app.services.runtime_contract import check_pgvector_contract
+                check_pgvector_contract(self.db, settings)
             return self._prepare_project_evidence(project, question, limit, document_id,
                                                   paper_limit=paper_limit)
         finally:
@@ -2718,6 +2722,10 @@ class QueryService:
             if question_vector
             else []
         )
+        self.retrieval_backend = (
+            "pgvector" if settings.vector_store_strict
+            else settings.vector_store_backend if vector_hits else "lexical_or_json"
+        )
         vector_scores_by_chunk_id = {
             hit.chunk_id: self._vector_distance_score(hit.distance)
             for hit in vector_hits
@@ -2762,7 +2770,7 @@ class QueryService:
             if chunk.id in vector_scores_by_chunk_id and chunk.id in compatible_vector_ids:
                 score = vector_scores_by_chunk_id[chunk.id]
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus
-            elif chunk.id in compatible_vector_ids:
+            elif not settings.vector_store_strict and chunk.id in compatible_vector_ids:
                 # 与 _vector_distance_score 同尺度（10×cosine），两条向量路径可比。
                 score = 10.0 * cosine_similarity(question_vector, chunk.embedding)
                 score += min(overlap * 0.05 + route_overlap * 0.08, 0.4) + rare_route_bonus

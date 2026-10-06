@@ -71,8 +71,10 @@ import io
 import json
 import logging
 import os
+import sys
 import threading
 import time
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +85,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from app.services.model_asset_identity import fingerprint_embedding_assets
+
 LOGGER = logging.getLogger("local_models")
+
+
+def _embedding_assets(path: Path) -> dict[str, str]:
+    return fingerprint_embedding_assets(path, loader_identity={
+        "loader": "sentence_transformers.SentenceTransformer",
+        "encode": {"normalize_embeddings": True, "convert_to_numpy": True, "trust_remote_code": True},
+        "packages": {name: package_version(name) for name in
+                     ("sentence-transformers", "transformers", "torch")},
+    })
 
 # --------------------------------------------------------------------------
 # 配置
@@ -272,6 +286,7 @@ class TextEmbedder:
         self._model: Any = None
         self._lock = threading.Lock()
         self.dimensions: int | None = None
+        self.asset_identity: dict[str, str] | None = None
 
     @property
     def loaded(self) -> bool:
@@ -287,8 +302,12 @@ class TextEmbedder:
 
                 LOGGER.info("加载文本嵌入模型: %s", self.path)
                 started = time.monotonic()
+                identity = _embedding_assets(self.path)
                 model = SentenceTransformer(str(self.path), device="cuda", trust_remote_code=True)
                 model.eval()
+                if _embedding_assets(self.path) != identity:
+                    raise RuntimeError("embedding_assets_changed_during_load")
+                self.asset_identity = identity
                 self._model = model
                 self.dimensions = int(model.get_sentence_embedding_dimension())
                 LOGGER.info(
@@ -322,6 +341,7 @@ class ImageEmbedder:
         self._model: Any = None
         self._lock = threading.Lock()
         self.dimensions: int | None = None
+        self.asset_identity: dict[str, str] | None = None
 
     @property
     def loaded(self) -> bool:
@@ -336,8 +356,12 @@ class ImageEmbedder:
 
                 LOGGER.info("加载图像嵌入模型: %s", self.path)
                 started = time.monotonic()
+                identity = _embedding_assets(self.path)
                 model = SentenceTransformer(str(self.path), device="cuda", trust_remote_code=True)
                 model.eval()
+                if _embedding_assets(self.path) != identity:
+                    raise RuntimeError("embedding_assets_changed_during_load")
+                self.asset_identity = identity
                 self._model = model
                 self.dimensions = int(model.get_sentence_embedding_dimension())
                 LOGGER.info(
@@ -648,6 +672,16 @@ def healthz() -> dict[str, Any]:
         "text_embed_backend": EMBED_BACKEND,
         "embedding_dimensions": active_text_embedder().dimensions,
     }
+
+
+@app.get("/api/embedding_identity")
+def api_embedding_identity() -> dict[str, Any]:
+    """Return the identity bound to the loaded encoder; never load or infer."""
+    embedder = active_text_embedder()
+    if not embedder.loaded or embedder.asset_identity is None or embedder.dimensions is None:
+        raise HTTPException(status_code=503, detail="embedding_identity_unverified")
+    return {"provider": "ollama", "model": active_text_embed_name(),
+        "dimensions": embedder.dimensions, **embedder.asset_identity}
 
 
 @app.get("/api/tags")

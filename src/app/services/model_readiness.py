@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.services.runtime_contract import EmbeddingIdentity, RuntimeContractError
 
 
 class ModelReadiness:
@@ -126,6 +127,21 @@ class ModelReadiness:
             "generation": generation,
             "embedding": embedding,
         }
+        if self._settings.vector_store_strict:
+            try:
+                expected = EmbeddingIdentity.from_settings(self._settings)
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.get(f"{self._settings.ollama_embedding_base_url.rstrip('/')}/api/embedding_identity")
+                    response.raise_for_status()
+                actual = EmbeddingIdentity.from_mapping(response.json())
+                if expected != actual:
+                    raise RuntimeContractError("embedding_identity_mismatch")
+                embedding["identity_verified"] = True
+            except Exception as exc:
+                embedding["status"] = "unverified"
+                embedding["error"] = exc.reason if isinstance(exc, RuntimeContractError) else "embedding_identity_unreachable"
+            if embedding.get("identity_verified"):
+                profiles["vector_store"] = self._probe_database_contract()
         # 总体判定：所有模型状态都属于 {ready, idle}（即均可用于推理）才算 ok，
         # 否则整体降级为 degraded（例如模型缺失或服务不可达）。
         healthy_statuses = {"ready", "idle", "configured"}
@@ -135,6 +151,16 @@ class ModelReadiness:
             else "degraded"
         )
         return {"status": overall, "models": profiles}
+
+    def _probe_database_contract(self) -> dict[str, Any]:
+        from app.db.session import SessionLocal
+        from app.services.runtime_contract import check_pgvector_contract
+        try:
+            with SessionLocal() as db:
+                return check_pgvector_contract(db, self._settings)
+        except Exception as exc:
+            return {"status": "unverified", "backend": "pgvector", "error":
+                exc.reason if isinstance(exc, RuntimeContractError) else "pgvector_inspection_failed"}
 
     def _remote_generation_status(self) -> dict[str, Any]:
         """Report DeepSeek generation configuration without making a call."""

@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     sac_kg_enabled: bool = Field(default=True, alias="SAC_KG_ENABLED")
     vector_store_enabled: bool = Field(default=True, alias="VECTOR_STORE_ENABLED")
     vector_store_backend: str = Field(default="sqlite-vec", alias="VECTOR_STORE_BACKEND")
+    vector_store_strict: bool = Field(default=False, alias="VECTOR_STORE_STRICT")
 
     # ---- Ollama 生成/嵌入模型 ----
     ollama_generation_base_url: str = Field(
@@ -154,6 +155,8 @@ class Settings(BaseSettings):
     embedding_dimensions: int | None = Field(
         default=None, gt=0, alias="EMBEDDING_DIMENSIONS"
     )
+    embedding_revision: str | None = Field(default=None, alias="EMBEDDING_REVISION")
+    embedding_processor_hash: str | None = Field(default=None, alias="EMBEDDING_PROCESSOR_HASH")
 
     @property
     def active_embedding_provider(self) -> str:
@@ -171,27 +174,6 @@ class Settings(BaseSettings):
     def active_embedding_dimensions(self) -> int:
         """Return the vector dimension enforced by the active index contract."""
         return self.embedding_dimensions or self.ollama_embedding_dimensions
-
-    ollama_generation_base_url: str = Field(
-        default="http://localhost:11435", alias="OLLAMA_GENERATION_BASE_URL"
-    )
-    ollama_generation_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_GENERATION_MODEL")
-    ollama_embedding_base_url: str = Field(
-        default="http://localhost:11435", alias="OLLAMA_EMBEDDING_BASE_URL"
-    )
-    ollama_generation_context_length: int = Field(
-        default=32768, gt=0, alias="OLLAMA_GENERATION_CONTEXT_LENGTH"
-    )
-    ollama_generation_parallelism: int = Field(
-        default=1, gt=0, alias="OLLAMA_GENERATION_PARALLELISM"
-    )
-    ollama_batch_model: str = Field(default="qwen3.5:9b", alias="OLLAMA_BATCH_MODEL")
-    ollama_embedding_model: str = Field(default="qwen3-embedding:4b", alias="OLLAMA_EMBEDDING_MODEL")
-    ollama_embedding_dimensions: int = Field(default=2560, alias="OLLAMA_EMBEDDING_DIMENSIONS")
-    ollama_vision_model: str | None = Field(default=None, alias="OLLAMA_VISION_MODEL")
-    ollama_request_timeout: int = Field(default=180, alias="OLLAMA_REQUEST_TIMEOUT")
-    ollama_keep_alive: str | None = Field(default=None, alias="OLLAMA_KEEP_ALIVE")
-    ollama_synthesis_model: str | None = Field(default=None, alias="OLLAMA_SYNTHESIS_MODEL")
 
     contextualization_enabled: bool = Field(default=True, alias="CONTEXTUALIZATION_ENABLED")
     contextualization_base_url: str = Field(
