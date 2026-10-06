@@ -131,11 +131,8 @@ def _build_executor(
 def _apply_server_constraint_defaults(payload: AgentQueryRequest) -> AgentQueryRequest:
     """当客户端省略约束时，回填服务端 .env 级别的 Agent 默认值。
 
-    背景：Pydantic 在路由收到请求前，就会用 schema 默认值填充客户端
-    省略的约束字段。因此无法通过"字段缺失"来判断客户端是否显式指定了
-    该值。这里的策略是把 schema 默认值视为"未指定"，凡与该默认值相等的
-    字段，就用服务端配置（如 AGENT_TIMEOUT_SECONDS）覆盖，从而让 .env
-    调优对 UI 请求真正生效。
+    Pydantic 的 model_fields_set 保留客户端实际提交的字段；即使值与
+    schema 默认值相同也必须尊重。只有省略的字段才使用服务端配置。
 
     参数：
         payload (AgentQueryRequest): 客户端提交的 Agent 查询请求。
@@ -147,22 +144,22 @@ def _apply_server_constraint_defaults(payload: AgentQueryRequest) -> AgentQueryR
     schema_defaults = AgentConstraints()
     updates: dict[str, int | bool] = {}
 
-    # 仅当约束值与 schema 默认值完全一致时才认为"未指定"，回填配置。
-    if constraints.allow_external_network == schema_defaults.allow_external_network:
+    explicit = constraints.model_fields_set
+    if "allow_external_network" not in explicit:
         updates["allow_external_network"] = settings.agent_allow_external_network
-    if constraints.max_steps == schema_defaults.max_steps:
+    if "max_steps" not in explicit:
         updates["max_steps"] = _positive_int(settings.agent_max_steps, schema_defaults.max_steps)
-    if constraints.max_tool_calls == schema_defaults.max_tool_calls:
+    if "max_tool_calls" not in explicit:
         updates["max_tool_calls"] = _positive_int(
             settings.agent_max_tool_calls,
             schema_defaults.max_tool_calls,
         )
-    if constraints.budget_tokens == schema_defaults.budget_tokens:
+    if "budget_tokens" not in explicit:
         updates["budget_tokens"] = _positive_int(
             settings.agent_budget_tokens,
             schema_defaults.budget_tokens,
         )
-    if constraints.timeout_seconds == schema_defaults.timeout_seconds:
+    if "timeout_seconds" not in explicit:
         updates["timeout_seconds"] = _positive_int(
             settings.agent_timeout_seconds,
             schema_defaults.timeout_seconds,
@@ -451,6 +448,7 @@ async def agent_query_stream(
     # 事件生成器：驱动工作线程并把事件序列化为 SSE 消息。
     async def event_generator():
         cancellation = threading.Event()
+        worker = None
         event_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
@@ -504,7 +502,7 @@ async def agent_query_stream(
                 # 已断连：再次确认取消，并给工作线程最多 2 秒收尾。
                 cancellation.set()
                 try:
-                    await asyncio.wait_for(worker, timeout=2.0)
+                    await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
                 return
@@ -543,6 +541,16 @@ async def agent_query_stream(
                 {"message": str(exc), "error_type": type(exc).__name__},
             )
             yield _sse_event("done", {})
+
+        finally:
+            # ASGI can close/cancel the generator without another is_disconnected
+            # poll. The request-local budget must still interrupt its model IO.
+            if worker is not None and not worker.done():
+                cancellation.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
 
     # 返回 SSE 流式响应，禁止代理缓冲以保证事件实时下发。
     return StreamingResponse(

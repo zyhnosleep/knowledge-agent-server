@@ -566,8 +566,11 @@ def _rag_retrieve_evidence_handler(
     prepare = getattr(rag_adapter, 'prepare_evidence', None)
     holder = ctx.get('prepared_evidence_out')
     if holder is not None and callable(prepare) and _supports_prepared_answer(rag_adapter):
+        internal = {}
+        if 'parse_version_map' in ctx:
+            internal['parse_version_map'] = ctx['parse_version_map']
         prepared = prepare(db, args['project_slug'], args['question'], limit=limit,
-                           document_id=args.get('document_id'))
+                           document_id=args.get('document_id'), **internal)
         holder['prepared'] = prepared
         pack = prepared.pack
     else:
@@ -591,6 +594,7 @@ def _rag_retrieve_evidence_handler(
         "inventory": [inv.model_dump() for inv in pack.inventory],
         "coverage_status": pack.coverage_status,
         "coverage_missing_tables": list(pack.coverage_missing_tables),
+        "retrieval_backend": prepared.retrieval_backend if holder is not None and 'prepared' in holder else "unreported",
     }
 
 

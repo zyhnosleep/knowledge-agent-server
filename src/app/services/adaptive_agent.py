@@ -165,7 +165,8 @@ class AdaptiveAgent:
                         return outcome("tool_error")
                     new = {_identity(item) for item in merged.pack.items} - before
                     emit("retrieve", metadata={"document_id": focus, "limit": decision.limit,
-                        "query": decision.query[:240], "new_evidence": [list(identity[:7]) for identity in sorted(new, key=str)]})
+                        "query": decision.query[:240], "retrieval_backend": extra.retrieval_backend,
+                        "new_evidence": [list(identity[:7]) for identity in sorted(new, key=str)]})
                     prepared = merged
                     if not new:
                         return outcome("no_progress")

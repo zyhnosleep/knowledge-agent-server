@@ -229,3 +229,12 @@ def test_one_filled_table_cannot_complete_same_named_missing_table(evidence, mon
         parse_version_map={"d1": "v5", "d2": "v5"})
     assert prepared.pack.coverage_status == "partial"
     assert "table-3" in prepared.pack.coverage_missing_tables
+
+
+def test_merge_reports_backend_actually_used_by_supplement(evidence):
+    db, service, root = evidence
+    contexts = service._search_source_chunks("legend", "p1", ["d1"], question_vector=[1, 0])
+    base = replace(snapshot(service, contexts, versions={"d1": "v5"}), retrieval_backend="canonical_sql")
+    extra = replace(base, retrieval_backend="pgvector")
+    merged = service.merge_prepared_snapshots(base, extra)
+    assert merged.retrieval_backend == "pgvector"

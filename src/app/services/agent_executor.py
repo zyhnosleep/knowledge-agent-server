@@ -45,7 +45,11 @@ from app.schemas.agent import (
     AgentUsage,
     ComplexPlan,
 )
-from app.schemas.common import Citation
+from app.schemas.common import Citation, QueryResponse
+from app.services.adaptive_agent import AdaptiveAgent, RequestScope
+from app.services.agent_decider import AgentDecider
+from app.services.ai import OllamaClient
+from app.services.runtime_contract import EmbeddingIdentity, RuntimeContractError
 from app.services.agent_policy import PolicyRouter
 from app.services.agent_model_router import AgentModelRouter, InferenceTarget
 from app.services.agent_synthesizer import AgentSynthesizer
@@ -53,7 +57,7 @@ from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
 from app.services.model_runtime import ModelRuntime, get_model_runtime
 from app.services.rag_adapter import RAGAdapter, _INSUFFICIENT_EVIDENCE_RE
-from app.services.search import PreparedEvidence
+from app.services.search import PreparedEvidence, QueryService
 from app.services.execution_budget import (
     BudgetExceeded, ExecutionBudget, current_execution_budget, execution_budget_scope,
 )
@@ -134,6 +138,8 @@ class AgentExecutor:
             response = self._execute(request, budget)
             if not response.metadata:
                 response.metadata = self._stamp_execution(response.steps, response.usage)
+            response.metadata.setdefault('execution_mode', 'static')
+            response.metadata.setdefault('stop_reason', response.metadata.get('budget_stop', response.status))
             return response
 
     def _execute(self, request: AgentQueryRequest, budget: ExecutionBudget) -> AgentQueryResponse:
@@ -199,6 +205,11 @@ class AgentExecutor:
             )
             steps.append(route_step)
             max_steps_hit = len(steps) >= constraints.max_steps
+
+            if route.route == 'complex_multi_hop' and settings.agent_adaptive_enabled:
+                return self._execute_adaptive(request, budget, route=route,
+                    inference_target=inference_target, session_id=session_id, steps=steps,
+                    usage=usage, request_id=request_id, t_start=t_start)
 
             # ==============================================================
             # Step 0.5: 计划 — 仅 complex_multi_hop 路由生成受控计划
@@ -880,14 +891,6 @@ class AgentExecutor:
             usage.steps = len(steps)
             run_metadata = self._stamp_execution(steps, usage, verify_result)
 
-            self._memory.add_turn(
-                session_id,
-                role="agent",
-                content=answer_text[:4000],
-                step_type="finalize",
-                citations=[c.model_dump() for c in citations],
-            )
-
             total_elapsed = int((time.monotonic() - t_start) * 1000)
             status = "completed"
             if hit_limit:
@@ -897,46 +900,10 @@ class AgentExecutor:
             if total_elapsed > constraints.timeout_seconds * 1000:
                 status = "timeout"
 
-            # ---- persist trace ----
-            trace_id = None
-            if self._trace_store is not None:
-                try:
-                    raw_citations_for_trace = [c.model_dump() for c in citations]
-                    trace_id = self._trace_store.persist_run(
-                        request_id=request_id,
-                        session_id=session_id,
-                        project_slug=request.project_slug,
-                        query=request.query,
-                        constraints=constraints.model_dump(),
-                        route=route.route,
-                        steps=steps,
-                        usage=usage,
-                        final_answer=answer_text,
-                        citations=raw_citations_for_trace,
-                        warnings=warnings,
-                        status=status,
-                        latency_ms=total_elapsed,
-                        provider=synth_provider,
-                        model=synth_model,
-                    )
-                except Exception:
-                    logger.exception("Failed to persist trace run")
-
-            return AgentQueryResponse(
-                request_id=request_id,
-                session_id=session_id,
-                status=status,
-                final_answer=answer_text,
-                citations=citations,
-                steps=steps,
-                usage=usage,
-                route=route,
-                warnings=warnings,
-                trace_id=trace_id,
-                answer_provider=synth_provider,
-                answer_model=synth_model,
-                metadata=run_metadata,
-            )
+            return self._finish_response(request, request_id=request_id, session_id=session_id,
+                route=route, steps=steps, usage=usage, answer=answer_text, citations=citations,
+                warnings=warnings, status=status, latency_ms=total_elapsed,
+                provider=synth_provider, model=synth_model, metadata=run_metadata)
 
         except Exception as exc:
             # ---- 执行异常：记录错误 trace 并返回 error 状态 ----
@@ -1002,6 +969,151 @@ class AgentExecutor:
     # 辅助方法
     # ------------------------------------------------------------------
 
+    def _finish_response(self, request: AgentQueryRequest, *, request_id: str, session_id: str,
+                         route: AgentRouteDecision, steps: list[AgentStep], usage: AgentUsage,
+                         answer: str, citations: list[Citation], warnings: list[str], status: str,
+                         latency_ms: int, provider: str, model: str, metadata: dict[str, Any]) -> AgentQueryResponse:
+        """One shared terminal write, for static and adaptive successful/controlled stops."""
+        metadata.setdefault('stop_reason', status)
+        self._memory.add_turn(session_id, role='agent', content=answer[:4000], step_type='finalize',
+                              citations=[c.model_dump() for c in citations])
+        trace_id = None
+        if self._trace_store is not None:
+            try:
+                trace_id = self._trace_store.persist_run(request_id=request_id, session_id=session_id,
+                    project_slug=request.project_slug, query=request.query, constraints=request.constraints.model_dump(),
+                    route=route.route, steps=steps, usage=usage, final_answer=answer,
+                    citations=[c.model_dump() for c in citations], warnings=warnings, status=status,
+                    latency_ms=latency_ms, provider=provider, model=model)
+            except Exception:
+                logger.exception('Failed to persist terminal trace')
+        return AgentQueryResponse(request_id=request_id, session_id=session_id, status=status, final_answer=answer,
+            citations=citations, steps=steps, usage=usage, route=route, warnings=warnings, trace_id=trace_id,
+            answer_provider=provider, answer_model=model, metadata=metadata)
+
+    def _execute_adaptive(self, request: AgentQueryRequest, budget: ExecutionBudget, *,
+                          route: AgentRouteDecision, inference_target: InferenceTarget, session_id: str,
+                          steps: list[AgentStep], usage: AgentUsage, request_id: str, t_start: float) -> AgentQueryResponse:
+        """Trusted callbacks share the initial scope, tools, model lease and terminal writer."""
+        reason, candidate, initial, outcome, verification = 'execution_error', None, None, None, None
+        warnings = []
+        constraints = request.constraints
+        try:
+            # An initial retrieval plus decision/answer/verify/finalize must remain feasible.
+            if len(steps) + 5 > constraints.max_steps:
+                raise BudgetExceeded('step_limit')
+            if usage.tool_calls + 3 > constraints.max_tool_calls:
+                raise BudgetExceeded('tool_limit')
+            retrieval_query = self._contextualize_retrieval_query(session_id, request.query)
+            conversation_summary = self._build_conversation_summary(session_id)
+            holder = {}
+            pack = self._run_retrieve_evidence(request.project_slug, retrieval_query, request.document_id,
+                constraints, steps, usage, session_id, evidence_state=holder)
+            initial = holder.get('prepared')
+            if not pack or initial is None or initial.pack.status == 'project_not_found':
+                reason = 'tool_error'
+            else:
+                identity = EmbeddingIdentity.from_settings(settings)
+                scope = RequestScope(request.project_slug, session_id, request.document_id,
+                                     initial.parse_version_map, identity)
+                # Attachments remain bound to this request's session, never planner-supplied IDs.
+                attachment_pack = self._run_retrieve_session_attachments(request.project_slug, request.query,
+                    constraints, steps, usage, session_id)
+                if attachment_pack and attachment_pack.get('items'):
+                    from app.schemas.agent import EvidencePack
+                    initial = QueryService(self._db).merge_prepared_evidence(initial,
+                        EvidencePack.model_validate(attachment_pack), trusted_attachment_ids=frozenset(
+                            item['attachment_id'] for item in attachment_pack['items'] if item.get('attachment_id')))
+                self._commit_progress()
+
+                def retrieve(query, focus, limit):
+                    if EmbeddingIdentity.from_settings(settings) != scope.embedding_identity:
+                        raise RuntimeContractError('embedding_identity_mismatch')
+                    state = {}
+                    args = {'project_slug': scope.project_slug, 'question': query, 'limit': limit}
+                    if focus:
+                        args['document_id'] = focus
+                    result = self._tools.call_tool('rag.retrieve_evidence', args,
+                        ctx={'db': self._db, 'prepared_evidence_out': state,
+                             'parse_version_map': dict(scope.parse_version_map)})
+                    if not result.get('ok') or 'prepared' not in state:
+                        raise RuntimeError('tool_error')
+                    return state['prepared']
+
+                def answer(prepared):
+                    if EmbeddingIdentity.from_settings(settings) != scope.embedding_identity:
+                        raise RuntimeContractError('embedding_identity_mismatch')
+                    result = self._tools.call_tool('rag.answer',
+                        {'project_slug': scope.project_slug, 'question': retrieval_query,
+                         **({'document_id': scope.document_id} if scope.document_id else {})},
+                        ctx={'db': self._db, 'prepared_evidence': prepared, 'answer_query': request.query,
+                             'conversation_summary': conversation_summary})
+                    if not result.get('ok'):
+                        raise RuntimeError('tool_error')
+                    data = result['result']
+                    return QueryResponse(answer_markdown=data['answer_markdown'], citations=data['citations'],
+                                         verification_status=data['verification_status'])
+
+                def emit(step):
+                    # State machine accounts for all already-emitted steps and reserves a terminal tail.
+                    if len(steps) >= constraints.max_steps:
+                        raise BudgetExceeded('step_limit')
+                    steps.append(step)
+                    usage.tool_calls += int(step.tool_name is not None)
+
+                decider = AgentDecider(OllamaClient(base_url=inference_target.base_url), self._model_runtime)
+                agent = AdaptiveAgent(decider, retrieve, answer, emit,
+                    merge=lambda base, extra: self._rag.merge_prepared_snapshots(self._db, base, extra))
+                outcome = agent.run(question=request.query, conversation_summary=conversation_summary,
+                    scope=scope, initial=initial, target=inference_target, budget=budget,
+                    max_decisions=settings.agent_adaptive_max_decisions,
+                    max_supplements=settings.agent_adaptive_max_supplement_retrievals,
+                    step_count=len(steps), tool_calls=usage.tool_calls)
+                reason, candidate = outcome.stop_reason, outcome.answer
+        except BudgetExceeded as exc:
+            reason = exc.reason
+        except RuntimeContractError as exc:
+            reason = exc.reason
+        except Exception:
+            reason = 'execution_error'  # No model output, environment paths or exception text in SSE/trace.
+
+        answer_text = candidate.answer_markdown if candidate else ''
+        citations = candidate.citations if candidate else []
+        if reason == 'abstain':
+            answer_text = '当前冻结范围内的证据不足，无法可靠回答；请补充来源或明确问题。'
+        can_verify = reason in ('answer', 'finish', 'abstain', 'no_progress', 'decision_invalid', 'decision_limit',
+                                'supplement_limit', 'decision_unavailable', 'tool_error') and bool(answer_text)
+        if can_verify:
+            try:
+                verification = self._run_verify(request.query, answer_text, citations, route.route,
+                    constraints, steps, usage, usage.tool_calls)
+                warnings.extend(verification.get('result', {}).get('warnings', []))
+            except BudgetExceeded as exc:
+                reason = exc.reason
+        terminal = reason in ('answer', 'finish', 'abstain')
+        metadata = self._stamp_execution(steps, usage, verification,
+            stop=None if terminal else reason)
+        metadata.update({'execution_mode': 'adaptive', 'stop_reason': reason,
+            'decision_count': outcome.decisions if outcome else 0,
+            'supplement_retrievals': outcome.supplement_retrievals if outcome else 0,
+            'retrieval_backend': outcome.prepared.retrieval_backend if outcome else
+                initial.retrieval_backend if initial else 'not_queried'})
+        status = 'completed' if terminal and metadata['verification_state'] != 'skipped' else 'error'
+        if reason in ('deadline', 'cancelled'):
+            status = 'timeout'
+        elif reason == 'step_limit':
+            status = 'max_steps'
+        if status != 'completed':
+            warnings.append(f'Adaptive execution stopped: {reason}')
+        if len(steps) < constraints.max_steps:
+            steps.append(AgentStep(step_id=len(steps), step_type='finalize', summary=f'Adaptive stop: {reason}',
+                metadata={'execution': metadata, 'execution_mode': 'adaptive', 'stop_reason': reason}))
+        usage.steps = len(steps)
+        return self._finish_response(request, request_id=request_id, session_id=session_id, route=route,
+            steps=steps, usage=usage, answer=answer_text, citations=citations, warnings=warnings, status=status,
+            latency_ms=int((time.monotonic()-t_start)*1000), provider='local',
+            model=inference_target.model if candidate else 'no-generation', metadata=metadata)
+
     def _commit_progress(self) -> None:
         """在可能耗时较长的步骤前提交数据库事务，释放写锁。"""
         try:
@@ -1018,7 +1130,10 @@ class AgentExecutor:
             'verification_state': (verification or {}).get('verification_state', 'skipped'),
             'verification_scope': 'structural',
             'verification_executed': bool((verification or {}).get('verification_executed', False)),
+            'execution_mode': 'static',
         }
+        backend_steps = [step for step in steps if 'retrieval_backend' in step.metadata]
+        metadata['retrieval_backend'] = backend_steps[-1].metadata['retrieval_backend'] if backend_steps else 'unreported'
         if budget:
             ledger = budget.usage_metadata()
             for key in ('prompt_tokens', 'completion_tokens', 'model_requests', 'answer_retries', 'format_retries', 'usage_source'):
@@ -1261,6 +1376,7 @@ class AgentExecutor:
                     "support_hints": support_hints,
                     "status": pack_status,
                     "document_id": document_id,
+                    "retrieval_backend": rdata.get('retrieval_backend', 'unreported'),
                 },
             )
             steps.append(step)

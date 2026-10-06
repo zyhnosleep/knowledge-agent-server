@@ -186,6 +186,7 @@ class PreparedEvidence:
     contexts: list[RetrievedContext]
     pack: EvidencePack
     visual_evidence_trace: dict[str, Any] = field(default_factory=dict)
+    retrieval_backend: str = "not_queried"
 
 
 @dataclass
@@ -586,7 +587,9 @@ class QueryService:
             coverage_missing_tables=coverage_missing,
         )
         return PreparedEvidence(project.id, project.slug, question, document_id,
-                                versions, contexts, pack)
+                                versions, contexts, pack,
+                                retrieval_backend=self.retrieval_backend if self.retrieval_backend != "not_queried"
+                                else "canonical_sql" if contexts else "not_queried")
 
     def merge_prepared_evidence(
         self, prepared: PreparedEvidence, pack: EvidencePack, *,
@@ -717,7 +720,9 @@ class QueryService:
             pack = EvidencePack(status='ok' if items else 'empty', items=items, table_facts=facts,
                                 inventory=inventory, coverage_status=coverage, coverage_missing_tables=missing)
             return replace(base, parse_version_map=dict(base.parse_version_map), contexts=contexts,
-                           pack=pack, visual_evidence_trace={})
+                           pack=pack, visual_evidence_trace={},
+                           retrieval_backend=extra.retrieval_backend if extra.retrieval_backend != 'not_queried'
+                           else base.retrieval_backend)
         finally:
             self.parse_version_map = original_versions
 
@@ -1755,6 +1760,8 @@ class QueryService:
                 pg_scores = {hit.chunk_id: 1.0 - hit.distance for hit in hits}
                 self.retrieval_backend = 'pgvector'
             compatible = self._compatible_vector_chunk_ids(chunks, vector, indexed_ids=set(pg_scores))
+            if not settings.vector_store_strict:
+                self.retrieval_backend = "json_cosine" if compatible else "lexical"
             requested_numbers = re.findall(r"(?:figure|fig\.?|图)\s*(\d+)", question, re.I)
             def rank(chunk):
                 exact = bool(requested_numbers and any(re.search(
