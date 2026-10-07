@@ -51,6 +51,31 @@ def identity_dict(**overrides):
         "revision": "weights-r1", "processor_hash": "processor-p1", **overrides}
 
 
+def test_initial_scope_excludes_pending_upload_without_hiding_ready_legacy(db, monkeypatch):
+    import app.services.search as search
+    import app.services.runtime_contract as contract
+    from app.schemas.agent import EvidencePack
+    from app.services.search import PreparedEvidence
+    add_version(db, identity_dict())
+    db.add(Document(id='pending', project_id='p', title='Uploading', file_name='new.txt',
+        sha256='b'*64, raw_path='/unused-new', status='queued'))
+    db.flush()
+    monkeypatch.setattr(search, 'settings', strict_settings())
+    # Only PostgreSQL configuration is external here; actual identity validation runs.
+    monkeypatch.setattr(contract, 'check_pgvector_configuration', lambda *args: None)
+    service = QueryService(db)
+    monkeypatch.setattr(service, '_prepare_project_evidence', lambda project, question, limit, document_id, **kw:
+        PreparedEvidence(project.id, project.slug, question, document_id, dict(service.parse_version_map), [],
+            EvidencePack(status='empty', items=[])))
+    result = service.prepare_evidence('p', 'Explain the indexed paper')
+    assert result.parse_version_map == {'d':'v5'}
+    # A ready historical source remains a visible strict failure, never silently skipped.
+    db.get(Document, 'pending').status = 'ready'
+    db.flush()
+    with pytest.raises(contract.RuntimeContractError, match='parse_version_missing'):
+        service.prepare_evidence('p', 'Explain the indexed paper')
+
+
 def test_strict_profile_rejects_sqlite_without_json_fallback(db, monkeypatch):
     import app.services.search as search
     import app.services.vector_store as vectors

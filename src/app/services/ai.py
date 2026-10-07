@@ -109,9 +109,7 @@ def budgeted_completion_post(url: str, *, payload: dict[str, Any], timeout: floa
     """Shared OpenAI-compatible HTTP boundary (including legacy verifier)."""
     with _model_request(payload, timeout, ollama=False) as (bounded, remaining, reservation):
         with httpx.Client(timeout=remaining) as client:
-            response = client.post(url, json=bounded, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+            data = _budgeted_json_post(client, url, payload=bounded, headers=headers)
         _settle_model_response(reservation, data, ollama=False)
         return data
 
@@ -161,6 +159,68 @@ def _stream_budget_guard(response: httpx.Response, cancel_event: threading.Event
     finally:
         finished.set()
         watcher.join(timeout=0.2)
+
+
+def _budgeted_json_post(client, url, *, payload, headers=None, timeout=None):
+    """Guard nonstream JSON from connection completion through headers/body.
+
+    HTTP core's trace extension exposes this request's native stream as soon
+    as TCP/TLS connects, before response headers. No global socket scanning,
+    background model-call thread or uncancellable response-body wait.
+    """
+    budget = current_execution_budget()
+    kwargs = {'json': payload}
+    if headers is not None:
+        kwargs['headers'] = headers
+    if timeout is not None:
+        kwargs['timeout'] = timeout
+    if budget is None:
+        response = client.post(url, **kwargs)
+        response.raise_for_status()
+        return response.json()
+    budget.check_deadline()
+    # Every guarded request owns a fresh connection, including embedding batches;
+    # an earlier pooled stream must not escape the pre-header trace hook.
+    request_headers = httpx.Headers(headers or {})
+    request_headers['Connection'] = 'close'
+    kwargs['headers'] = request_headers
+    class OwnedRequest:
+        def __init__(self):
+            self.extensions = {}
+            self.response = None
+        def close(self):
+            if self.response is not None:
+                self.response.close()
+            client.close()
+    owned = OwnedRequest()
+    def trace(event, info):
+        if event in ('connection.connect_tcp.complete', 'connection.connect_unix_socket.complete', 'connection.start_tls.complete'):
+            stream = info.get('return_value')
+            if stream is not None:
+                owned.extensions['network_stream'] = stream
+                # Cancellation may have arrived before connection completed.
+                try:
+                    budget.check_deadline()
+                except BudgetExceeded:
+                    native_socket = stream.get_extra_info('socket')
+                    if native_socket is not None:
+                        try:
+                            native_socket.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    raise
+    try:
+        with _stream_budget_guard(owned, budget.cancel_event):
+            with client.stream('POST', url, extensions={'trace': trace}, **kwargs) as response:
+                owned.response = response
+                budget.check_deadline()
+                response.raise_for_status()
+                response.read()
+                budget.check_deadline()
+                return response.json()
+    except Exception:
+        budget.check_deadline()  # An interrupted transport is a budget stop, not a retry.
+        raise
 
 
 class ExtractedEntity(BaseModel):
@@ -618,17 +678,12 @@ class OllamaClient:
                 "'openai-compatible'."
             )
         with httpx.Client(timeout=request_timeout(self.timeout)) as client:
-            response = client.post(
-                f"{self.embedding_base_url}/api/embed",
-                json={
+            return _budgeted_json_post(client, f"{self.embedding_base_url}/api/embed", payload={
                     "model": settings.ollama_embedding_model,
                     "input": texts,
                     "keep_alive": "0",
                     "options": {"num_ctx": 16384},
-                },
-            )
-            response.raise_for_status()
-            return response.json()["embeddings"]
+                })["embeddings"]
 
     def _embed_openai_compatible(self, texts: list[str]) -> list[list[float]]:
         """Call a hosted OpenAI-compatible embeddings endpoint.
@@ -662,14 +717,9 @@ class OllamaClient:
                 if budget:
                     budget.check_deadline()
                 batch = texts[offset : offset + batch_size]
-                response = client.post(
-                    f"{base_url}/embeddings",
-                    headers=headers,
-                    json={"model": settings.embedding_api_model, "input": batch},
-                    **({'timeout': budget.http_timeout(settings.embedding_api_timeout)} if budget else {}),
-                )
-                response.raise_for_status()
-                payload = response.json()
+                payload = _budgeted_json_post(client, f"{base_url}/embeddings", headers=headers,
+                    payload={"model": settings.embedding_api_model, "input": batch},
+                    timeout=budget.http_timeout(settings.embedding_api_timeout) if budget else None)
                 rows = payload.get("data")
                 if not isinstance(rows, list):
                     raise ValueError("Embedding API response is missing a data array.")
@@ -809,9 +859,7 @@ class OllamaClient:
         """POST /api/chat（自动注入 keep_alive）并返回 JSON。"""
         with _model_request(payload, self.timeout, ollama=True) as (bounded, remaining, reservation):
             with httpx.Client(timeout=remaining) as client:
-                response = client.post(f'{self.base_url}/api/chat', json=self._with_keep_alive(bounded))
-                response.raise_for_status()
-                data = response.json()
+                data = _budgeted_json_post(client, f'{self.base_url}/api/chat', payload=self._with_keep_alive(bounded))
             _settle_model_response(reservation, data, ollama=True)
             return data
 

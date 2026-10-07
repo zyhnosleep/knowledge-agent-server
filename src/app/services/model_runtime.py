@@ -28,6 +28,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from itertools import count
 
@@ -40,6 +41,33 @@ class ModelRequestCancelled(RuntimeError):
 
     Raised when a queued generation request is cancelled before acquisition.
     """
+
+
+_request_runtime: ContextVar[ModelRuntime | None] = ContextVar('request_model_runtime', default=None)
+
+
+@contextmanager
+def model_runtime_scope(runtime):
+    """Trusted executor injection; no client-selected capacity or runtime."""
+    token = _request_runtime.set(runtime)
+    try:
+        yield
+    finally:
+        _request_runtime.reset(token)
+
+
+@contextmanager
+def answer_generation_lease():
+    runtime = _request_runtime.get() or get_model_runtime()
+    budget = current_execution_budget()
+    try:
+        with runtime.acquire('generation', cancel_event=budget.cancel_event if budget else None,
+                             deadline=budget.deadline if budget else None):
+            yield
+    except ModelRequestCancelled:
+        if budget:
+            raise BudgetExceeded('cancelled') from None
+        raise
 
 
 class ModelRuntime:

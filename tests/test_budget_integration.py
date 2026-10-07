@@ -257,3 +257,92 @@ def test_synthesis_coverage_repair_shares_answer_allowance(monkeypatch):
             evidence_pack={'items':[{'excerpt':'Accuracy 95% AUC 0.9'}]})
     assert len(calls) == 1
     assert 'short' in result['answer_markdown']
+
+
+@pytest.mark.parametrize('provider', ['ollama', 'compatible'])
+def test_nonstream_response_body_cancel_interrupts_read_and_releases_lease(monkeypatch, provider):
+    entered, cancelled, unblock, finished = (threading.Event() for _ in range(4))
+    closed, outcomes = [], []
+    class Body(httpx.SyncByteStream):
+        def __iter__(self):
+            entered.set()
+            unblock.wait(2)
+            yield b'{"message":{"content":"late"},"choices":[{"message":{"content":"late"}}]}'
+        def close(self):
+            closed.append(True)
+            unblock.set()
+    transport_fixture(monkeypatch, lambda req: httpx.Response(200, stream=Body()))
+    budget = ExecutionBudget(AgentConstraints(timeout_seconds=10), cancel_event=cancelled)
+    runtime = ModelRuntime({'generation':1})
+    def run():
+        try:
+            with execution_budget_scope(budget), runtime.acquire('generation'):
+                if provider == 'ollama':
+                    OllamaClient().generate_chat(messages=[{'role':'user','content':'hi'}], model='text', context_length=4096)
+                else:
+                    ai.budgeted_completion_post('http://offline', payload={'model':'text','messages':[{'role':'user','content':'hi'}]},
+                        timeout=100, headers={})
+        except BudgetExceeded as exc:
+            outcomes.append(exc.reason)
+        finally:
+            finished.set()
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        cancelled.set()
+        promptly_finished = finished.wait(0.6)
+    finally:
+        unblock.set()
+        thread.join(3)
+    assert promptly_finished
+    assert outcomes == ['cancelled']
+    assert closed == [True]
+    assert runtime.snapshot()['generation']['active'] == 0
+    assert budget.usage_metadata()['unsettled_requests'] == 0
+
+
+@pytest.mark.parametrize('reason', ['cancelled', 'deadline'])
+def test_nonstream_header_wait_interrupts_native_socket(reason):
+    import socketserver
+    entered, release, cancel, done = (threading.Event() for _ in range(4))
+    now, outcomes = [0.0], []
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            entered.set()
+            release.wait(3)  # Intentionally never send HTTP headers.
+    server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = True
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    budget = ExecutionBudget(AgentConstraints(timeout_seconds=10), clock=lambda: now[0], cancel_event=cancel)
+    runtime = ModelRuntime({'generation':1})
+    def run():
+        try:
+            with execution_budget_scope(budget), runtime.acquire('generation'):
+                OllamaClient(base_url=f'http://127.0.0.1:{server.server_address[1]}')._post_chat(
+                    {'model':'text', 'messages':[{'role':'user','content':'hi'}]})
+        except BudgetExceeded as exc:
+            outcomes.append(exc.reason)
+        finally:
+            done.set()
+    request_thread = threading.Thread(target=run)
+    request_thread.start()
+    try:
+        assert entered.wait(2)
+        if reason == 'cancelled':
+            cancel.set()
+        else:
+            now[0] = 11.0
+        promptly_finished = done.wait(0.6)
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        request_thread.join(4)
+    assert promptly_finished
+    assert outcomes == [reason]
+    assert runtime.snapshot()['generation']['active'] == 0
+    with runtime.acquire('generation'):
+        assert runtime.snapshot()['generation']['active'] == 1

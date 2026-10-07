@@ -271,3 +271,65 @@ def test_image_limit_records_unsent_context(evidence,monkeypatch):
     contexts=service._search_source_chunks('legend','p1',['d1'],question_vector=[1,0])
     _,_,skipped=visual_evidence.resolve_context_images(service.db,contexts*2,root,service.parse_version_map)
     assert skipped and skipped[0]['reason'] == 'image_limit'
+
+
+@pytest.mark.parametrize('reordered', [False, True])
+def test_visual_terminal_keeps_sent_pixels_despite_narrative_only_model_citation(evidence, monkeypatch, reordered):
+    from app.schemas.agent import EvidencePack
+    from app.services.search import PreparedEvidence
+    db, service, root = evidence
+    db.get(DocumentChunk, 'v5-fig').source_spans = [{'metadata': {'figure_id':'figure1', 'asset_id':'asset1'}}]
+    db.flush()
+    (root/'d1/v5/figures.json').write_text(json.dumps([{'figure_id':'figure1', 'asset_id':'asset1', 'asset_path':'assets/figure.png'}]))
+    figure = service._search_source_chunks('legend', 'p1', ['d1'], question_vector=[1, 0])[0]
+    figure.citation.page_slug = 'same-page'
+    texts = [RetrievedContext(Citation(document_id='d1', parse_version='v5', chunk_id='text-'+str(i),
+        page_slug='same-page', excerpt='narrative '+str(i), score=90+i), 'narrative '+str(i), 90+i)
+        for i in range(3)]
+    # A real pixel resolver/answer finalizer; only the external model is offline.
+    narrative_index = 0 if reordered else 1
+    monkeypatch.setattr(service.ollama, '_post_chat', lambda payload: {'message': {'content': json.dumps({
+        'answer_markdown':f'The color is purple [{narrative_index}].',
+        'citations':[0,1,2] if reordered else [1,2,3]})}})
+    prepared = PreparedEvidence('p1', 'pilot', 'Figure 1 color', 'd1', {'d1':'v5'},
+        [*texts, figure] if reordered else [figure, *texts], EvidencePack(status='ok', items=[]))
+    response = service.answer_from_evidence('pilot', 'In Figure 1 what color is the legend?', prepared)
+    pixel_indexes = [i for i, c in enumerate(response.citations) if c.chunk_id == 'v5-fig']
+    assert len(pixel_indexes) == 1
+    sent = response.metadata['visual_evidence']['sent'][0]
+    assert sent['citation_index'] == pixel_indexes[0]
+    assert sent['document_id'] == 'd1' and sent['parse_version'] == 'v5'
+    assert sent['figure_id'] == 'figure1' and sent['asset_id'] == 'asset1'
+    assert response.citations[pixel_indexes[0]].figure_id == 'figure1'
+    assert response.citations[pixel_indexes[0]].asset_id == 'asset1'
+    assert f'[{pixel_indexes[0]}]' in response.answer_markdown
+
+
+def test_generation_queue_cancels_before_ordinary_visual_model_transport(evidence, monkeypatch):
+    import threading
+    from app.schemas.agent import AgentConstraints
+    from app.services.execution_budget import ExecutionBudget, BudgetExceeded, execution_budget_scope
+    from app.services.model_runtime import ModelRuntime, model_runtime_scope
+    _, service, _ = evidence
+    contexts = service._search_source_chunks('legend', 'p1', ['d1'], question_vector=[1,0])
+    runtime = ModelRuntime({'generation':1})
+    entered, cancelled, calls = threading.Event(), threading.Event(), []
+    monkeypatch.setattr(service.ollama, '_post_chat', lambda payload: calls.append(payload))
+    # Cancellation occurs while the real runtime sees a queued answer ticket.
+    def cancel_waiter():
+        import time
+        end = time.monotonic() + 2
+        while not runtime.snapshot()['generation']['queued'] and time.monotonic() < end:
+            entered.wait(0.01)
+        cancelled.set()
+    budget = ExecutionBudget(AgentConstraints(timeout_seconds=10), cancel_event=cancelled)
+    with runtime.acquire('generation'):
+        thread = threading.Thread(target=cancel_waiter)
+        thread.start()
+        try:
+            with model_runtime_scope(runtime), execution_budget_scope(budget), pytest.raises(BudgetExceeded, match='cancelled'):
+                service._draft_answer('Figure 1 color', None, contexts)
+        finally:
+            thread.join(3)
+        assert runtime.snapshot()['generation']['queued'] == 0
+    assert calls == [] and runtime.snapshot()['generation']['active'] == 0

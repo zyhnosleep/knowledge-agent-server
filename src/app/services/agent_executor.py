@@ -55,7 +55,7 @@ from app.services.agent_model_router import AgentModelRouter, InferenceTarget
 from app.services.agent_synthesizer import AgentSynthesizer
 from app.services.agent_trace_store import AgentTraceStore
 from app.services.conversation_memory import ConversationMemory
-from app.services.model_runtime import ModelRuntime, get_model_runtime
+from app.services.model_runtime import ModelRuntime, get_model_runtime, model_runtime_scope
 from app.services.rag_adapter import RAGAdapter, _INSUFFICIENT_EVIDENCE_RE
 from app.services.search import PreparedEvidence, QueryService
 from app.services.execution_budget import (
@@ -134,7 +134,7 @@ class AgentExecutor:
 
     def execute(self, request: AgentQueryRequest) -> AgentQueryResponse:
         budget = ExecutionBudget(request.constraints, cancel_event=self._cancel_event)
-        with execution_budget_scope(budget):
+        with execution_budget_scope(budget), model_runtime_scope(self._model_runtime):
             response = self._execute(request, budget)
             if not response.metadata:
                 response.metadata = self._stamp_execution(response.steps, response.usage)

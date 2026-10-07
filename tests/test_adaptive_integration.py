@@ -127,6 +127,23 @@ def test_complex_adaptive_uses_pixels_and_writes_one_final_turn_trace(integratio
     assert [s.step_id for s in response.steps] == list(range(len(response.steps)))
 
 
+def test_adaptive_answer_enters_shared_generation_lease(integration, monkeypatch):
+    from app.services.model_runtime import ModelRuntime
+    db, _, posts, _ = integration
+    executor = build_executor_with_rag(db, RAGAdapter())
+    runtime = ModelRuntime({'generation':1})
+    executor._model_runtime = runtime
+    active_during_posts = []
+    def post(self, payload):
+        active_during_posts.append(runtime.snapshot()['generation']['active'])
+        return {'message':{'content':'{"answer_markdown":"Purple. [0]","citations":[0]}'}}
+    monkeypatch.setattr('app.services.ai.OllamaClient._post_chat', post)
+    response = executor.execute(request())
+    assert response.status == 'completed'
+    assert active_during_posts == [1]
+    assert runtime.snapshot()['generation']['active'] == 0
+
+
 def test_text_and_visual_cross_turn_keep_session_history_without_old_intent(integration):
     db, _, posts, observations = integration
     executor = build_executor_with_rag(db, RAGAdapter())

@@ -49,6 +49,7 @@ from app.services.ai import (
 )
 from app.services.ai import ExternalVerifier, OllamaClient
 from app.services.execution_budget import BudgetExceeded, current_execution_budget
+from app.services.model_runtime import answer_generation_lease
 from app.services.filesystem import InvalidStoragePathError, safe_project_slug, slugify, strip_upload_prefix
 from app.services.paper_profile import (
     alias_in_text,
@@ -465,7 +466,8 @@ class QueryService:
         allowed = {document.id for document in documents}
         if selected_versions is None:
             versions = {document.id: document.active_parse_version or 'legacy' for document in documents
-                        if document_id is None or document.id == document_id}
+                        if (document_id is None or document.id == document_id)
+                        and (document.active_parse_version or document.status == DocumentStatus.ready.value)}
         else:
             versions = dict(selected_versions)
             if not set(versions) <= allowed or (document_id is not None and document_id not in versions):
@@ -1045,7 +1047,7 @@ class QueryService:
             # metadata or an earlier QueryService invocation's pixel trace.
             trace = prepared.visual_evidence_trace
             allowed = {'citation_index', 'context_index', 'document_id', 'parse_version',
-                       'chunk_id', 'figure_id', 'asset_id', 'attachment_id', 'page_label'}
+                       'chunk_id', 'figure_id', 'asset_id', 'attachment_id', 'page_label', 'sha256'}
             response.metadata = {
                 'retrieval_backend': prepared.retrieval_backend,
                 'visual_evidence': {
@@ -1074,6 +1076,8 @@ class QueryService:
         7. 组装 QueryResponse（必要时持久化 QuestionAnswer）。
         """
         visual_query = self._is_figure_query(question) if visual_intent is None else visual_intent
+        self._visual_sent_context_indexes = set()
+        self.visual_evidence_trace = {'sent': [], 'skipped': []}
         contexts = self._fit_contexts_to_token_budget(
             prepared.contexts,
             question=question,
@@ -1095,11 +1099,14 @@ class QueryService:
                 self.db.commit()
             return response
 
-        answer_payload = None if visual_query else self._deterministic_table_answer_if_supported(
-            question,
-            contexts,
-            "high" if self._is_high_risk(question) else "normal",
-        )
+        missing_targets = self._missing_table_targets(question, contexts) if not visual_query else []
+        if missing_targets:
+            answer_payload = QueryAnswerPayload(
+                answer_markdown='## Insufficient evidence\n\n缺少请求的表格或方法证据：' + ', '.join(missing_targets)
+                    + '；不能用其他表或方法代替，也无法计算所要求的比较。', citations=[], risk_level='normal')
+        else:
+            answer_payload = None if visual_query else self._deterministic_table_answer_if_supported(
+                question, contexts, "high" if self._is_high_risk(question) else "normal")
         if answer_payload is None:
             if conversation_summary or visual_intent is not None:
                 answer_payload = self._draft_answer(question, None, contexts,
@@ -1116,21 +1123,25 @@ class QueryService:
         }
         verification_status = "local-only"
 
-        if self._is_high_risk(question) and not visual_query:
+        if self._is_high_risk(question) and not visual_query and not missing_targets:
             verification = self._verify_answer(answer_payload.answer_markdown, contexts)
             verification_status = verification.verdict
             if verification.notes:
                 answer_payload.answer_markdown += f"\n\n> Verification note: {verification.notes}"
 
         answer_payload.answer_markdown = self._normalize_answer_citation_markup(answer_payload.answer_markdown)
+        protected_visual_indexes = set()
+        if visual_query and not answer_payload.answer_markdown.lstrip().lower().startswith('## insufficient evidence'):
+            answer_payload, protected_visual_indexes = self._attribute_visual_answer(
+                question, answer_payload, contexts, prepared.visual_evidence_trace.get('sent', []))
         chosen_indexes = self._choose_citation_indexes(question, answer_payload, contexts, visual_intent=visual_query)
         chosen_indexes = self._supported_citation_indexes(answer_payload.answer_markdown, contexts, chosen_indexes)
         # Caption text is not a validator for numbers read from pixels. The
         # text-only repair prompt would erase supported visual answers.
-        if not visual_query:
+        if not visual_query and not missing_targets:
             answer_payload = self._repair_unsupported_numeric_answer(question, None, contexts, answer_payload, chosen_indexes)
             answer_payload = self._repair_missing_table_answer(question, None, contexts, answer_payload)
-        if not visual_query and self._should_append_supported_evidence_terms(question, contexts):
+        if not visual_query and not missing_targets and self._should_append_supported_evidence_terms(question, contexts):
             answer_payload.answer_markdown = self._append_missing_supported_question_terms(
                 question,
                 answer_payload.answer_markdown,
@@ -1146,8 +1157,9 @@ class QueryService:
             citations = []
             answer_markdown = self._strip_answer_citation_markers(answer_payload.answer_markdown)
         else:
-            chosen_indexes = self._select_citation_indexes(contexts, chosen_indexes)
-            citations = self._select_citations(contexts, chosen_indexes)
+            pairs = self._select_citation_pairs(contexts, chosen_indexes, protected_indexes=protected_visual_indexes)
+            chosen_indexes = [index for index, _ in pairs]
+            citations = [citation for _, citation in pairs]
 
             answer_text_for_citations = answer_payload.answer_markdown if visual_query else self._retarget_table_answer_citations(
                 question,
@@ -1161,7 +1173,8 @@ class QueryService:
             else:
                 answer_markdown = self._ensure_valid_returned_citation_marker(answer_markdown, len(citations))
         for label in prepared.visual_evidence_trace.get('sent', []):
-            label['citation_index'] = next((i for i, c in enumerate(citations) if c.chunk_id == label['chunk_id']), None)
+            label['citation_index'] = next((i for i, c in enumerate(citations)
+                if self._visual_identity(c) == self._visual_identity(label)), None)
         response = QueryResponse(answer_markdown=answer_markdown, citations=citations, verification_status=verification_status)
 
         if save_answer:
@@ -1176,6 +1189,49 @@ class QueryService:
             self.db.add(record)
             self.db.commit()
         return response
+
+    @staticmethod
+    def _visual_identity(value):
+        fields = ('document_id', 'parse_version', 'chunk_id', 'figure_id', 'asset_id', 'attachment_id')
+        return tuple(value.get(key) if isinstance(value, dict) else getattr(value, key, None) for key in fields)
+
+    def _attribute_visual_answer(self, question, payload, contexts, sent):
+        """Attribute only requested/explicitly cited pixels, never all retrieved images."""
+        sent_indexes = {label['context_index'] for label in sent
+            if 0 <= label.get('context_index', -1) < len(contexts)
+            and self._visual_identity(contexts[label['context_index']].citation) == self._visual_identity(label)}
+        labels = {label['context_index']: label.get('figure_label') or '' for label in sent}
+        selectors = [anchor for anchor in self._query_priority_anchors(question)['figure_table']
+                     if anchor.lower().startswith('figure')]
+        required = {index for index in sent_indexes if any(self._selector_matches_text(selector,
+            labels[index]) for selector in selectors)} if selectors else set()
+        cited = set(payload.citations) | set(self._infer_citation_indexes(payload.answer_markdown, len(contexts)))
+        missing_selector = any(not any(self._selector_matches_text(selector,
+            labels[index]) for index in sent_indexes) for selector in selectors)
+        if missing_selector or not sent_indexes:
+            return QueryAnswerPayload(answer_markdown='## Insufficient evidence\n\n缺少请求图像的可归属像素证据，不能用其他图代替。', citations=[]), set()
+        if len(required) == 1 or (not selectors and len(sent_indexes) == 1):
+            supporting = next(iter(required or sent_indexes))
+            # Single unambiguous requested figure: retarget narrative markers,
+            # preserving separately cited table operands in mixed questions.
+            payload.answer_markdown = re.sub(r'\[(\d+)\]', lambda match:
+                f'[{supporting}]' if int(match.group(1)) not in sent_indexes
+                and (int(match.group(1)) >= len(contexts) or contexts[int(match.group(1))].citation.block_type != 'table')
+                else match.group(0), payload.answer_markdown)
+            payload.citations = [index for index in payload.citations if index == supporting
+                or (0 <= index < len(contexts) and contexts[index].citation.block_type == 'table')]
+            if supporting not in payload.citations:
+                payload.citations.append(supporting)
+            if supporting not in self._infer_citation_indexes(payload.answer_markdown, len(contexts)):
+                payload.answer_markdown += f' [{supporting}]'
+            return payload, {supporting}
+        # Multiple candidate figures/papers cannot be attributed by guessing
+        # the first image or attaching every image as a blanket citation.
+        protected = required or (cited & sent_indexes)
+        inline = set(self._infer_citation_indexes(payload.answer_markdown, len(contexts)))
+        if not protected or not protected <= cited or not protected <= inline:
+            return QueryAnswerPayload(answer_markdown='## Insufficient evidence\n\n多图回答未明确对应到已发送的图像证据，无法安全确认各图结论。', citations=[]), set()
+        return payload, protected
 
     def _route_papers(
         self,
@@ -4246,7 +4302,8 @@ class QueryService:
                     raise
             raise RuntimeError("unreachable RAG draft retry state")
 
-        result = safe_model_call(generate_with_query_retries, fallback)
+        with answer_generation_lease():
+            result = safe_model_call(generate_with_query_retries, fallback)
         if skipped:
             result.answer_markdown += '\n\n> 图像证据不完整：部分图像未发送（缺失、校验失败或超出图片上限）；涉及这些图的比较不能视为完整结论。'
         return result
@@ -4338,7 +4395,7 @@ class QueryService:
                     "You MUST extract and report specific numbers/metrics from the tables. "
                     "Cite the table number (e.g., Table 2, Table 5) and page. "
                     "Do NOT say metrics are 'not available' when tables are present in context. "
-                    "Every numeric metric in your answer MUST appear verbatim in one of the cited contexts."
+                    "Source operands must appear verbatim in cited contexts. Requested calculations must show a source-bound equation, operation and result; use ≈ for rounding and preserve units/scales."
                 )
             else:
                 parts.append(
@@ -4376,7 +4433,9 @@ class QueryService:
 
         parts.append(
             "CRITICAL: Only report specific numbers, percentages, scores, F1, AUC, Precision, Recall, or dataset metrics "
-            "that appear verbatim in the provided context. If a number is not in the cited context, do not include it."
+            "that appear verbatim in the provided context, except results of explicit equations using cited operands. "
+            "For calculations show each equation (e.g. 27.4 - 25.7 = 1.7), preserve K/M/B scales, use ≈ for rounded division, "
+            "and answer the requested comparison. Do not merely list input values as a completed calculation."
         )
 
         return "\n".join(parts) if parts else ""
@@ -4408,7 +4467,7 @@ class QueryService:
             [
                 f"Question: {question}",
                 "The previous draft included unsupported numeric values: " + ", ".join(sorted(unsupported)),
-                "Rewrite the answer using ONLY the evidence below. Do not include any number unless it appears verbatim in the evidence. If a requested metric is absent, say it is absent from the retrieved materials.",
+                "Rewrite using ONLY cited evidence. Raw operands must be verbatim. Derived results require explicit correct equations with source operands, units/scales and ≈ for rounded results. If an operand is absent, say so; do not substitute another table/method.",
                 self._build_answer_constraints(question, [context for _, context in supported_pairs]),
                 constrained_context,
             ]
@@ -4416,14 +4475,15 @@ class QueryService:
         budget = current_execution_budget()
         if budget and not budget.consume_answer_retry():
             return fallback
-        repaired = safe_model_call(
-            lambda: self.ollama.generate_structured(
-                QueryAnswerPayload,
-                system_prompt="You repair answers by removing unsupported numeric claims and citing only provided evidence.",
-                user_prompt=prompt,
-            ),
-            fallback,
-        )
+        with answer_generation_lease():
+            repaired = safe_model_call(
+                lambda: self.ollama.generate_structured(
+                    QueryAnswerPayload,
+                    system_prompt="You repair answers by removing unsupported numeric claims and citing only provided evidence.",
+                    user_prompt=prompt,
+                ),
+                fallback,
+            )
         allowed_indexes = {index for index, _ in supported_pairs}
         repaired.citations = [index for index in repaired.citations if index in allowed_indexes] or [index for index, _ in supported_pairs]
         return QueryAnswerPayload(
@@ -4439,6 +4499,8 @@ class QueryService:
         risk_level: str,
     ) -> QueryAnswerPayload | None:
         if not (self._is_table_query(question) or self._is_metric_query(question)):
+            return None
+        if self._missing_table_targets(question, contexts) or self._is_arithmetic_query(question):
             return None
         table_indexes = self._table_citation_indexes(question, contexts)
         if not table_indexes:
@@ -4636,14 +4698,15 @@ class QueryService:
         budget = current_execution_budget()
         if budget and not budget.consume_answer_retry():
             return fallback
-        repaired = safe_model_call(
-            lambda: self.ollama.generate_structured(
-                QueryAnswerPayload,
-                system_prompt="You answer table and metric questions against retrieved source table contexts. Use only provided values and cite the supporting context indexes.",
-                user_prompt=prompt,
-            ),
-            fallback,
-        )
+        with answer_generation_lease():
+            repaired = safe_model_call(
+                lambda: self.ollama.generate_structured(
+                    QueryAnswerPayload,
+                    system_prompt="You answer table and metric questions against retrieved source table contexts. Use only provided values and cite the supporting context indexes.",
+                    user_prompt=prompt,
+                ),
+                fallback,
+            )
         repaired.answer_markdown = self._normalize_answer_citation_markup(repaired.answer_markdown)
         repaired.citations = [index for index in repaired.citations if index in table_indexes]
         repaired_lacks_metrics = self._answer_lacks_requested_metrics(question, repaired.answer_markdown, extracted_metrics)
@@ -4751,6 +4814,10 @@ class QueryService:
     def _table_citation_indexes(self, question: str, contexts: list[RetrievedContext]) -> list[int]:
         if not (self._is_table_query(question) or self._is_metric_query(question)):
             return []
+        if self._missing_table_targets(question, contexts):
+            return []
+        requested_labels = [anchor for anchor in self._query_priority_anchors(question)['figure_table']
+                            if anchor.lower().startswith('table')]
         scored: list[tuple[float, int]] = []
         priority_terms = {
             self._normalize_selector(anchor)
@@ -4767,6 +4834,9 @@ class QueryService:
         for index, context in enumerate(contexts):
             text = self._context_table_evidence_text(context)
             if not self._context_has_table_data(text):
+                continue
+            if requested_labels and not any(self._selector_matches_text(label, self._table_caption_text(text))
+                                            for label in requested_labels):
                 continue
             text_key = self._normalize_selector(text)
             if requires_requested_terms and not any(term in text_key for term in requested_table_terms):
@@ -4835,6 +4905,30 @@ class QueryService:
                 break
             guaranteed.append((score, index))
         return [index for _score, index in guaranteed]
+
+    @classmethod
+    def _missing_table_targets(cls, question: str, contexts: list[RetrievedContext]) -> list[str]:
+        """Explicit targets survive even when retrieval matched no requested group."""
+        labels = list(dict.fromkeys(anchor for anchor in cls._query_priority_anchors(question)['figure_table']
+                                    if anchor.lower().startswith('table')))
+        tables = [cls._context_table_evidence_text(c) for c in contexts
+                  if cls._context_has_table_data(cls._context_table_evidence_text(c))]
+        missing = [label for label in labels if not any(
+            cls._selector_matches_text(label, cls._table_caption_text(text)) for text in tables)]
+        if labels:
+            for selector in cls._question_row_selectors(question):
+                if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+', selector):
+                    continue
+                # A suffixed row identity is not its existing unsuffixed method.
+                prefix = selector.split('-')[0]
+                if any(cls._selector_matches_text(prefix, text) for text in tables) and not any(
+                        cls._selector_matches_text(selector, text) for text in tables):
+                    missing.append(selector)
+        return list(dict.fromkeys(missing))
+
+    @staticmethod
+    def _is_arithmetic_query(question: str) -> bool:
+        return bool(re.search(r'计算|差值|相差|提高多少|提升多少|(?:两者|二者|之间)(?:的)?比例|规模比例|倍数|多少倍|百分点|\b(?:calculate|compute|difference|ratio|improvement|percentage points)\b', question, re.I))
 
     @staticmethod
     def _context_has_table_data(text: str) -> bool:
@@ -6820,6 +6914,8 @@ class QueryService:
         # prompt-text evidence.
         evidence = "\n".join(cls._context_table_evidence_text(contexts[index]) for index in chosen_indexes if 0 <= index < len(contexts))
         unsupported = {number for number in numbers if not cls._number_supported_by_evidence(number, evidence)}
+        from app.services.source_calculation import verified_equation_numbers
+        unsupported -= verified_equation_numbers(answer_markdown, evidence)
         if (
             not strict
             and unsupported
@@ -7236,7 +7332,8 @@ class QueryService:
     def _select_citation_indexes(self, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[int]:
         return [index for index, _ in self._select_citation_pairs(contexts, chosen_indexes)]
 
-    def _select_citation_pairs(self, contexts: list[RetrievedContext], chosen_indexes: list[int]) -> list[tuple[int, Citation]]:
+    def _select_citation_pairs(self, contexts: list[RetrievedContext], chosen_indexes: list[int], *,
+                               protected_indexes: set[int] | frozenset[int] = frozenset()) -> list[tuple[int, Citation]]:
         selected: list[tuple[int, Citation]] = []
         seen_keys: set[str] = set()
         indexes = chosen_indexes or list(range(min(2, len(contexts))))
@@ -7276,6 +7373,11 @@ class QueryService:
                 processed_pages.add(citation.page_slug)
             else:
                 capped.append(pair)
+        kept_indexes = {index for index, _ in capped}
+        for index in chosen_indexes:
+            if index in protected_indexes and index not in kept_indexes and 0 <= index < len(contexts):
+                capped.append((index, contexts[index].citation))
+                kept_indexes.add(index)
         return capped
 
     @staticmethod
@@ -8007,7 +8109,7 @@ class QueryService:
         lowered = question.lower()
         return bool(
             re.search(r"table\s*(?:s\s*)?(?:\d+|[ivxlcdm]+)\b", lowered)
-            or "\u8868" in question
+            or re.search(r"表\s*\d+|表格|(?:这|那|该|此|上|下|第[一二三四五六七八九十\d]+)(?:张|个)?表(?![示达现述])|表中|表内|表里", question)
             or "tabular" in lowered
         )
 

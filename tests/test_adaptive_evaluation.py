@@ -80,7 +80,7 @@ def test_failed_arm_retains_actual_response_not_a_success_score():
     assert rows[0]["fact_correct"] is None
 
 
-@pytest.mark.parametrize('label',['rag-direct','local-fallback'])
+@pytest.mark.parametrize('label',['rag-direct','local-fallback','visual-evidence','no-generation'])
 def test_non_model_answer_labels_require_real_base_inference_target(label):
     class TargetResponse(Response):
         def json(self):
@@ -101,7 +101,8 @@ def test_non_model_answer_labels_require_real_base_inference_target(label):
 
 @pytest.mark.parametrize('label,target',[
     ('rag-direct',None),('local-fallback','foreign-model'),('foreign-model','qwen3-vl:4b'),
-    ('qwen3-vl:4b','foreign-model')])
+    ('qwen3-vl:4b','foreign-model'), ('visual-evidence',None),
+    ('visual-evidence','foreign-model'), ('no-generation',None), ('no-generation','foreign-model')])
 def test_answer_labels_cannot_hide_missing_or_foreign_model_targets(label,target):
     class TargetResponse(Response):
         def json(self):

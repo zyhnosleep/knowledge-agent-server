@@ -244,9 +244,15 @@ def test_short_explicit_text_topic_switch_does_not_inherit_visual_intent(evidenc
     executor, retrieval, posts, syntheses = real_executor(evidence, monkeypatch)
     executor.execute(AgentQueryRequest(project_slug='pilot', session_id='short-switch',
                                      query='解释图1的图例颜色'))
+    previous_post_count = len(posts)
     response = executor.execute(AgentQueryRequest(project_slug='pilot', session_id='short-switch', query=query,
         constraints=AgentConstraints(max_steps=20, max_tool_calls=10)))
-    assert not posts[-1]['messages'][1].get('images')
+    assert all(not payload['messages'][1].get('images') for payload in posts[previous_post_count:])
+    if query == '表1的准确率是多少？':
+        # This fixture contains figures, not Table 1; safe refusal requires no
+        # second model call and must not reinterpret the previous post as current.
+        assert len(posts) == previous_post_count
+        assert 'Table 1' in response.final_answer and '缺少' in response.final_answer
     assert len(syntheses) == 1
     assert 'Purple' in syntheses[0]['conversation_summary']
     assert retrieval[-1] == query
