@@ -6692,6 +6692,10 @@ class QueryService:
             inner = match.group(1).strip()
             if re.fullmatch(r"\d+", inner):
                 return match.group(0)
+            # Uppercase protocol/state tokens are literal scientific content,
+            # not citation labels (e.g. CRAG [CORRECT] or encoder [CLS]).
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", inner):
+                return match.group(0)
             # Task 18（2026-08-07）：降级标记豁免 —— LLM 生成失败时的
             # "[系统提示：LLM 生成暂时失败，…]" / "[System notice: …]"
             # 是显式输出内容（用户拍板要展示给调用方的非最终答案提示），

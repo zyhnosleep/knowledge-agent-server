@@ -109,3 +109,20 @@ def test_answer_row_selection_keeps_explicit_two_letter_dataset_alongside_longer
 
 def test_short_dataset_row_does_not_match_inside_an_unrelated_word():
     assert QueryService._generic_table_row_relevance('读取表1的accuracy成绩','AC','')==0
+
+
+@pytest.mark.parametrize('marker',['CORRECT','INCORRECT','AMBIGUOUS','CLS','SEP','ISREL'])
+def test_citation_cleanup_preserves_literal_scientific_protocol_tokens(marker):
+    answer=f'If [{marker}], refine the evidence. [2]'
+    normalized=QueryService._renumber_answer_citations(answer,[2])
+    finalized=QueryService._drop_unreturned_citation_markers(normalized,1)
+    assert finalized==f'If [{marker}], refine the evidence. [0]'
+
+
+def test_protocol_token_preservation_does_not_keep_unresolved_source_links():
+    answer='Use [CLS] but not [[sources/private.md]] or [unresolved-label]. [2]'
+    normalized=QueryService._renumber_answer_citations(answer,[2])
+    assert '[CLS]' in normalized
+    assert 'sources/private' not in normalized
+    assert '[unresolved-label]' not in normalized
+    assert '[0]' in normalized
