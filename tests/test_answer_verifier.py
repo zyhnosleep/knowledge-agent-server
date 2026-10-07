@@ -3,6 +3,52 @@ from __future__ import annotations
 from app.services.answer_verifier import AnswerVerifier
 
 
+def test_supported_repeated_wording_is_advisory_not_a_generation_retry():
+    result = AnswerVerifier().verify(question='Report all methods.',
+        answer_markdown='\n'.join(f'The reported accuracy for method {name} is {value} [0].'
+            for name,value in [('A',81),('B',82),('C',83),('D',84),('E',85)]),
+        citations=[{'document_id':'d1','parse_version':'v5','table_id':'t1',
+                    'excerpt':'A81 B82 C83 D84 E85'}],route_type='table_or_metric')
+    assert result['warnings']
+    assert result['retry_recommended'] is False
+
+
+def test_canonical_table_can_support_a_qualitative_conclusion_without_numbers_in_answer():
+    result = AnswerVerifier().verify(question='Which method is better?',
+        answer_markdown='ReAct has the higher accuracy.',
+        citations=[{'document_id':'d1','parse_version':'v5','block_type':'table','table_id':'t1',
+                    'excerpt':'ReAct has higher accuracy than Act.'}],route_type='table_or_metric')
+    assert result['retry_recommended'] is False
+
+
+def test_advisory_repetition_does_not_hide_missing_required_evidence():
+    result = AnswerVerifier().verify(question='Report all methods.',
+        answer_markdown='The reported accuracy is better. '*8,
+        citations=[],route_type='evidence_required')
+    assert result['retry_recommended'] is True
+    assert any('citations' in warning for warning in result['warnings'])
+
+
+def test_executor_records_advisory_style_as_passed_without_retry():
+    from app.schemas.agent import AgentConstraints, AgentUsage, ToolSpec
+    from app.schemas.common import Citation
+    from app.services.agent_executor import AgentExecutor
+    from app.services.tool_registry import ToolRegistry
+    tools = ToolRegistry()
+    tools.register(ToolSpec(name='answer.verify',description='verify',input_schema={}),
+                   lambda args,ctx: AnswerVerifier().verify(**args))
+    executor = AgentExecutor(rag=None,tools=tools,memory=None,db=None)
+    steps,usage = [],AgentUsage()
+    result = executor._run_verify('Report methods.', 'The supported result is better. '*8,
+        [Citation(document_id='d1',parse_version='v5',chunk_id='c1',excerpt='Supported result is better.',score=1)],
+        'evidence_required',AgentConstraints(),steps,usage,0)
+    assert result['verification_state'] == 'passed'
+    assert result['verification_scope'] == 'structural'
+    assert result['result']['warnings']
+    assert result['result']['retry_recommended'] is False
+    assert usage.tool_calls == 1
+
+
 class TestAnswerVerifier:
     """RED tests for AnswerVerifier — answer quality check."""
 
@@ -193,7 +239,7 @@ class TestTextQualityHeuristics:
         )
         assert result["retry_recommended"] is True
 
-    def test_dominant_single_token_warns_and_retries(self) -> None:
+    def test_dominant_single_token_is_advisory(self) -> None:
         """同一 token 高频穿插于不同上下文（4-gram 窗口无重复）→ 单 token 主导命中。"""
         verifier = AnswerVerifier()
         answer = (
@@ -209,7 +255,7 @@ class TestTextQualityHeuristics:
         assert any("dominated by repeated token" in w for w in result["warnings"]), (
             result["warnings"]
         )
-        assert result["retry_recommended"] is True
+        assert result["retry_recommended"] is False
 
     def test_normal_answer_not_flagged(self) -> None:
         """正常长答案（含重复出现的常用词）不得误报。"""
@@ -293,4 +339,4 @@ class TestTextQualityHeuristics:
         assert any("dominated by repeated token" in w for w in result["warnings"]), (
             result["warnings"]
         )
-        assert result["retry_recommended"] is True
+        assert result["retry_recommended"] is False

@@ -6953,7 +6953,7 @@ class QueryService:
 
     @staticmethod
     def _answer_numbers(answer_markdown: str) -> set[str]:
-        numbers = set(re.findall(r"(?<![\w.])\d+(?:\.\d+)?%?(?!\w)", answer_markdown))
+        numbers = set(re.findall(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?!\w)", answer_markdown))
         return {number for number in numbers if len(number) > 1 or "." in number or number.endswith("%")}
 
     @classmethod

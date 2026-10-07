@@ -15,7 +15,7 @@ answer_verifier.py —— 答案质量校验器（确定性规则检查）模块
    table_or_metric）缺少引用 → 警告并建议重试。
 3. ``table_or_metric`` 路由上未检测到表格或数值证据 → 警告并建议重试。
 4. 文本质量启发式：4-gram 短语重复（胡言乱语/复读机信号）或单 token
-   主导（≥8 次且占比过半）→ 警告并建议重试（2026-08-12 回归 R15
+   主导（≥8 次且占比过半）→ 仅提示，不触发生成重试（2026-08-12 回归 R15
    实测：答案反复重复"改进了Val。"短语并通过旧校验）。
 5. 其余情况 → ok，不重试。
 
@@ -143,8 +143,8 @@ class AnswerVerifier:
             # ---- 检查一 b：复读机式重复/单 token 主导噪音 ----
             quality_warnings = self._text_quality_warnings(answer_text)
             warnings.extend(quality_warnings)
-            if quality_warnings:
-                retry_recommended = True
+            # Wording quality is advisory. Only missing answer/evidence gates
+            # can request a retry; repetition cannot spend the shared budget.
 
         # ---- 2. missing citations on evidence routes ----
         # ---- 检查二：需要证据的路由缺少引用 ----
@@ -261,6 +261,6 @@ class AnswerVerifier:
         # page_kind == "table" in any citation
         # 任一引用标注为表格页
         for c in citations:
-            if c.get("page_kind") == "table":
+            if c.get("page_kind") == "table" or c.get('block_type') == 'table' or c.get('table_id'):
                 return True
         return False

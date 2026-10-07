@@ -69,6 +69,28 @@ def test_arithmetic_does_not_admit_fabricated_or_unproven_results(answer, unsupp
     assert unsupported in QueryService._unsupported_answer_numbers(answer, [react_table()], [0], strict=True)
 
 
+@pytest.mark.parametrize('answer', [
+    'LAION / CC = (200M ÷ 15M) ≈ 13.3 倍。 [0]',
+    'PAQ / VQA = 65M ÷ 400K = 65,000,000 ÷ 400,000 = 162.5。 [0]',
+    'PAQ / VQA = (65,000,000 / 400,000) = 162.5。 [0]',
+])
+def test_live_ratio_equation_notation_and_source_equivalent_expansion_are_verified(answer):
+    text = 'Table 1\n| Dataset | Size |\n|---|---|\n| LAION | 200M |\n| CC | 15M |\n| PAQ | 65M |\n| VQA | 400K |'
+    context = RetrievedContext(Citation(document_id='m',parse_version='v5',chunk_id='c',excerpt=text,score=1),text,1)
+    assert QueryService._unsupported_answer_numbers(answer,[context],[0],strict=True) == set()
+
+
+@pytest.mark.parametrize('answer', [
+    '65M / 400K = 65,000,000 / 500,000 = 130 [0]',
+    '(200M / 15M) = 13.3 [0]',
+    '(65,000,000 / 400,000) = 999.9 [0]',
+])
+def test_equivalent_notation_does_not_relax_source_or_result_checks(answer):
+    text = 'Table 1\n| Dataset | Size |\n|---|---|\n| LAION | 200M |\n| CC | 15M |\n| PAQ | 65M |\n| VQA | 400K |'
+    context = RetrievedContext(Citation(document_id='m',parse_version='v5',chunk_id='c',excerpt=text,score=1),text,1)
+    assert QueryService._unsupported_answer_numbers(answer,[context],[0],strict=True)
+
+
 @pytest.mark.parametrize('question', ['检索表示是什么？', '比较两种表示方法。', '表达的含义是什么？', '什么时候发表论文？'])
 def test_chinese_narrative_words_do_not_route_to_tables(question):
     assert not QueryService._is_table_query(question)
