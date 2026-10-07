@@ -285,6 +285,21 @@ class SemanticChunker:
             else:
                 # 结构化对象(表/图/公式):复用证据构建器生成 parent + child。
                 self._append_structured(entry, document, drafts)
+        # Identical source bytes can legally belong to different projects.
+        # Content-local draft IDs must not become shared global DB primary keys.
+        identities = {
+            draft.local_id: 'draft-' + hashlib.sha256(json.dumps(
+                [document.document_id, document.parse_version, draft.local_id],
+                ensure_ascii=False, separators=(',', ':'),
+            ).encode('utf-8')).hexdigest()[:24]
+            for draft in drafts
+        }
+        for draft in drafts:
+            draft.local_id = identities[draft.local_id]
+            for field_name in ('parent_local_id', 'previous_child_local_id', 'next_child_local_id'):
+                reference = getattr(draft, field_name)
+                if reference is not None:
+                    setattr(draft, field_name, identities[reference])
         # 最终审计:确保每个 child 都能从原文无损重建。
         self._audit_source_fidelity(document, drafts)
         return drafts

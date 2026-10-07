@@ -113,8 +113,15 @@ def collect_arm(cases, *, client, base_url, project, mode, context):
             expected = "static" if route and route != "complex_multi_hop" else mode
             if body.get("metadata", {}).get("execution_mode") != expected:
                 raise ValueError("execution_mode_mismatch")
-            if context.get("model") and body.get("answer_model") != context["model"]:
-                raise ValueError("generation_model_mismatch")
+            if context.get("model"):
+                targets = {step.get('metadata', {}).get('inference_model')
+                    for step in body.get('steps', []) if step.get('metadata', {}).get('inference_model')}
+                label = body.get('answer_model')
+                # Deterministic/direct finalizers use a strategy label, not a
+                # model name. Require their trusted inference target explicitly.
+                if targets - {context['model']} or (label != context['model'] and not (
+                    label in {'rag-direct', 'local-fallback'} and targets == {context['model']})):
+                    raise ValueError("generation_model_mismatch")
             row.update({"response": body, "usage": body.get("usage", {}),
                 "stop_reason": body.get("metadata", {}).get("stop_reason"),
                 "verification_status": body.get("metadata", {}).get("verification_status")})

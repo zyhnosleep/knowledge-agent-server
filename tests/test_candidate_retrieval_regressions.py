@@ -145,3 +145,15 @@ def test_deterministic_table_answer_passes_real_repetition_verifier_with_distinc
     verdict=AnswerVerifier().verify(question=question,answer_markdown=answer.answer_markdown,
         citations=[context.citation.model_dump()],route_type='table_or_metric')
     assert verdict['retry_recommended'] is False, verdict['warnings']
+
+
+def test_parametric_memory_answer_cannot_gain_absent_forcefield_evidence_terms():
+    from app.schemas.common import Citation
+    from app.services.search import RetrievedContext
+    source='RAG combines a parametric seq2seq model with a non-parametric Wikipedia index.'
+    context=RetrievedContext(Citation(document_id='d',chunk_id='c',parse_version='v',
+        excerpt=source,score=1),source,1)
+    answer=QueryService._append_missing_supported_question_terms(
+        'RAG 的参数化记忆与非参数化记忆是什么？','分别为 seq2seq 模型和 Wikipedia 索引。',[context])
+    for unsupported in ('RESP','HF/6-31G','M05-2X','MP2/cc-pVQZ','Leu CMAP','Ile','Val CMAP','5 milliseconds'):
+        assert unsupported not in answer

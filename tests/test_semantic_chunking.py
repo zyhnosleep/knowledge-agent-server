@@ -107,6 +107,25 @@ def sentence_sequence(count: int, prefix: str = "Sentence") -> str:
     return " ".join(f"{prefix}{index} has evidence." for index in range(1, count + 1))
 
 
+def test_identical_source_in_different_documents_has_disjoint_chunk_ids_and_local_links():
+    source=document(block('shared',sentence_sequence(8),0))
+    other=source.model_copy(update={'document_id':'doc-2'})
+    first=make_chunker().build(source)
+    second=make_chunker().build(other)
+    first_ids={chunk.local_id for chunk in first}
+    second_ids={chunk.local_id for chunk in second}
+    assert first_ids.isdisjoint(second_ids)
+    assert [chunk.local_id for chunk in make_chunker().build(source)]==[chunk.local_id for chunk in first]
+    for chunks,allowed in ((first,first_ids),(second,second_ids)):
+        children=[chunk for chunk in chunks if chunk.chunk_role=='child']
+        assert len(children)>1
+        for chunk in children:
+            assert chunk.parent_local_id in allowed
+            assert chunk.previous_child_local_id is None or chunk.previous_child_local_id in allowed
+            assert chunk.next_child_local_id is None or chunk.next_child_local_id in allowed
+    assert [chunk.text for chunk in first]==[chunk.text for chunk in second]
+
+
 def test_chunk_draft_is_serializable_and_defaults_come_from_settings() -> None:
     chunker = SemanticChunker(RecordingEmbedder(), word_count)
 

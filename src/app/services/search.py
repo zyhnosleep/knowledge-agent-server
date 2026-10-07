@@ -7009,7 +7009,8 @@ class QueryService:
                 *parameterization_required_terms,
                 *candidate_terms,
             ]
-            supported_translation_terms.update(parameterization_required_terms)
+            # A topic keyword is not evidence for these domain-specific terms.
+            # The common source-presence check below remains mandatory.
         if cls._is_chinese_question(question):
             lowered_evidence = evidence.lower()
             if re.search(r"\bSPARTA\+?\b", evidence, re.IGNORECASE):

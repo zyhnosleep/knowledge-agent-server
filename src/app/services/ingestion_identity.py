@@ -48,6 +48,7 @@ ALGORITHM_REVISIONS = {
     "parser": "canonical-parser-v8",  # Scalar-score validation and source-bound crop repair
     "pdf_recovery": "pdf-recovery-v2",  # PDF 恢复
     "structured_splitting": "structured-splitting-v3",  # 结构化切分
+    "chunk_identity": "document-scoped-chunks-v1",  # Cross-project duplicate source isolation
     "source_fidelity_algorithm": "source-fidelity-v1",  # 源保真算法
     "source_fidelity_schema": "source-fidelity-schema-v1",  # 源保真 schema
 }

@@ -78,3 +78,41 @@ def test_failed_arm_retains_actual_response_not_a_success_score():
     assert rows[0]["error"] == "execution_mode_mismatch"
     assert rows[0]["response"]["metadata"]["execution_mode"] == "static"
     assert rows[0]["fact_correct"] is None
+
+
+@pytest.mark.parametrize('label',['rag-direct','local-fallback'])
+def test_non_model_answer_labels_require_real_base_inference_target(label):
+    class TargetResponse(Response):
+        def json(self):
+            result=super().json()
+            result['answer_model']=label
+            result['steps']=[{'step_type':'route','metadata':{
+                'inference_model':'qwen3-vl:4b','inference_profile':'generation'}}]
+            return result
+    class TargetClient(Client):
+        def post(self,url,json):
+            return TargetResponse(self.mode)
+    case=Case(id='one',question='q',document_scope=None,reference_facts=[],required_evidence=[],unanswerable=False)
+    rows=collect_arm([case],client=TargetClient('static'),base_url='http://127.0.0.1:18002',
+        project='p',mode='static',context={'model':'qwen3-vl:4b'})
+    assert rows[0]['error'] is None
+    assert rows[0]['fact_correct'] is None
+
+
+@pytest.mark.parametrize('label,target',[
+    ('rag-direct',None),('local-fallback','foreign-model'),('foreign-model','qwen3-vl:4b'),
+    ('qwen3-vl:4b','foreign-model')])
+def test_answer_labels_cannot_hide_missing_or_foreign_model_targets(label,target):
+    class TargetResponse(Response):
+        def json(self):
+            result=super().json()
+            result['answer_model']=label
+            result['steps']=([{'metadata':{'inference_model':target}}] if target else [])
+            return result
+    class TargetClient(Client):
+        def post(self,url,json):
+            return TargetResponse(self.mode)
+    case=Case(id='one',question='q',document_scope=None,reference_facts=[],required_evidence=[],unanswerable=False)
+    rows=collect_arm([case],client=TargetClient('static'),base_url='http://127.0.0.1:18002',
+        project='p',mode='static',context={'model':'qwen3-vl:4b'})
+    assert rows[0]['error']=='generation_model_mismatch'
