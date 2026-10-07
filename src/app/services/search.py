@@ -1189,7 +1189,7 @@ class QueryService:
         primary_selectors = self._primary_subject_selectors(question)
         statement = select(Document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             *self._frozen_document_conditions(),
         )
         if document_id is not None:
@@ -1610,7 +1610,7 @@ class QueryService:
         rows = self.db.scalars(
             select(Document).where(
                 Document.project_id == project_id,
-                Document.status == DocumentStatus.ready.value,
+                self._retrievable_document_condition(),
                 *self._frozen_document_conditions(),
             )
         ).all()
@@ -1679,13 +1679,16 @@ class QueryService:
     ) -> list[RetrievedContext]:
         statement = select(Document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             *self._frozen_document_conditions(),
             or_(
                 Document.active_parse_version.is_(None),
                 Document.active_parse_version == "legacy",
             ),
         )
+        if self.parse_version_map is not None:
+            statement = statement.where(Document.id.in_(
+                [did for did, version in self.parse_version_map.items() if version in (None, 'legacy')]))
         if document_ids:
             statement = statement.where(Document.id.in_(document_ids))
         documents = self.db.scalars(statement).all()
@@ -1742,7 +1745,7 @@ class QueryService:
             select(Document).where(
                 Document.project_id == project_id,
                 Document.id.in_(wanted),
-                Document.status == DocumentStatus.ready.value,
+                self._retrievable_document_condition(),
             )
         ).all()
         fields: dict[str, dict[str, str]] = {}
@@ -1759,7 +1762,7 @@ class QueryService:
     ) -> list[RetrievedContext]:
         canonical_statement = select(DocumentChunk).join(DocumentChunk.document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             DocumentChunk.block_type == "figure",
             *self._selected_child_chunk_conditions(),
         )
@@ -1794,13 +1797,16 @@ class QueryService:
             return [replace(context, visual_rank=ranks[context.citation.chunk_id]) for context in result]
         statement = select(Document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             *self._frozen_document_conditions(),
             or_(
                 Document.active_parse_version.is_(None),
                 Document.active_parse_version == "legacy",
             ),
         )
+        if self.parse_version_map is not None:
+            statement = statement.where(Document.id.in_(
+                [did for did, version in self.parse_version_map.items() if version in (None, 'legacy')]))
         if document_ids:
             statement = statement.where(Document.id.in_(document_ids))
         documents = self.db.scalars(statement).all()
@@ -2747,7 +2753,7 @@ class QueryService:
                 Claim.document_id.in_(document_ids),
                 Claim.evidence_chunk_id.is_not(None),
                 Document.project_id == project_id,
-                Document.status == DocumentStatus.ready.value,
+                self._retrievable_document_condition(),
                 *self._selected_child_chunk_conditions(),
             )
         )
@@ -2844,7 +2850,7 @@ class QueryService:
         }
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             *self._selected_child_chunk_conditions(),
         )
         if document_ids:
@@ -3111,7 +3117,7 @@ class QueryService:
         document_ids = sorted({chunk.document_id for chunk, _score, _kind in table_hits})
         statement = select(DocumentChunk).join(DocumentChunk.document).where(
             Document.project_id == project_id,
-            Document.status == DocumentStatus.ready.value,
+            self._retrievable_document_condition(),
             DocumentChunk.document_id.in_(document_ids),
             DocumentChunk.chunk_role == "child",
             DocumentChunk.block_type == "table",
@@ -3146,7 +3152,8 @@ class QueryService:
             group_text = "\n".join(sibling.text for sibling in siblings if sibling.text)
             explicit_match = bool(
                 explicit_table_terms
-                and any(term in self._normalize_selector(group_text) for term in explicit_table_terms)
+                and any(self._selector_matches_text(term, self._table_caption_text(group_text))
+                        for term in explicit_table_terms)
             )
             grouped_table_matches[key] = explicit_match or self._table_group_matches_query(
                 question,
@@ -3246,6 +3253,26 @@ class QueryService:
 
     def _frozen_document_conditions(self):
         return (Document.id.in_(tuple(self.parse_version_map)),) if self.parse_version_map is not None else ()
+
+    def _retrievable_document_condition(self):
+        """An indexed candidate can be evaluated without reviving its old pointer."""
+        ready = Document.status == DocumentStatus.ready.value
+        if not self.parse_version_map:
+            return ready
+        selected = [and_(DocumentParseVersion.document_id == str(did),
+                         DocumentParseVersion.version_key == str(version))
+                    for did, version in self.parse_version_map.items()
+                    if version not in (None, 'legacy')]
+        if not selected:
+            return ready
+        staged = select(DocumentParseVersion.id).where(
+            DocumentParseVersion.document_id == Document.id,
+            DocumentParseVersion.status == 'ready_to_activate',
+            or_(Document.active_parse_version.is_(None),
+                DocumentParseVersion.version_key != Document.active_parse_version),
+            or_(*selected),
+        ).correlate(Document).exists()
+        return or_(ready, staged)
 
     def _selected_child_chunk_conditions(self):
         """Return child filters for active documents plus any shadow versions.
@@ -3440,7 +3467,7 @@ class QueryService:
                 continue
             statement = select(DocumentChunk).join(DocumentChunk.document).where(
                 Document.project_id == chunk.document.project_id,
-                Document.status == DocumentStatus.ready.value,
+                self._retrievable_document_condition(),
                 DocumentChunk.document_id == chunk.document_id,
                 DocumentChunk.parse_version == chunk.parse_version,
                 DocumentChunk.chunk_role == "child",
@@ -3746,6 +3773,11 @@ class QueryService:
         if not block_key:
             return False
         anchors = cls._query_priority_anchors(question)
+        numbered_tables = [anchor for anchor in anchors['figure_table']
+                           if re.match(r'table\s*\d+', anchor, re.I)]
+        if numbered_tables:
+            caption = cls._table_caption_text(block)
+            return any(cls._selector_matches_text(anchor, caption) for anchor in numbered_tables)
         table_terms = [cls._normalize_selector(anchor) for anchor in anchors["figure_table"]]
         dataset_terms = [cls._normalize_selector(anchor) for anchor in anchors["dataset"]]
         generic_terms = [
@@ -3818,6 +3850,9 @@ class QueryService:
         keeps unrelated OPLS tables out of the reserved top slots.
         """
         base_match = cls._table_block_matches_query(question, group)
+        if any(re.match(r'table\s*\d+', anchor, re.I)
+               for anchor in cls._query_priority_anchors(question)['figure_table']):
+            return base_match
         specific_terms = [
             term
             for term in [
@@ -5928,6 +5963,10 @@ class QueryService:
         for line in normalize_table_text(table_text).splitlines():
             stripped = line.strip()
             if cls._is_table_line(stripped):
+                # Historical tables sometimes put their numbered label in the
+                # header itself. Never scan data rows for a source-table label.
+                if not caption and re.search(r'\btable\s*\d+|表\s*\d+', stripped, re.I):
+                    caption.append(stripped)
                 break
             if stripped:
                 caption.append(stripped)
@@ -6046,7 +6085,8 @@ class QueryService:
                 self._context_table_evidence_text(context) for context in group
             )
             normalized_group = self._normalize_selector(group_text)
-            explicit_match = any(term in normalized_group for term in explicit_terms)
+            explicit_match = any(self._selector_matches_text(term, self._table_caption_text(group_text))
+                                 for term in explicit_terms)
             matched_specific = sum(
                 1
                 for term in specific_terms
@@ -6126,7 +6166,7 @@ class QueryService:
                 .join(DocumentChunk.document)
                 .where(
                     Document.project_id == project_id,
-                    Document.status == DocumentStatus.ready.value,
+                    self._retrievable_document_condition(),
                     DocumentChunk.document_id == document_id,
                     DocumentChunk.parse_version == parse_version,
                     DocumentChunk.chunk_role == "child",
@@ -7891,7 +7931,8 @@ class QueryService:
             return {"figure_table": [], "dataset": []}
         figure_table = [match.group(0) for match in cls._FIGURE_TABLE_RE.finditer(question)]
         for match in re.finditer(r"[图表]\s*\d+", question):
-            figure_table.append(match.group(0))
+            label = 'Figure' if match.group(0).startswith('图') else 'Table'
+            figure_table.append(label + ' ' + re.search(r'\d+', match.group(0)).group(0))
         datasets = [match.group(0) for match in cls._DATASET_NAME_RE.finditer(question)]
         return {"figure_table": figure_table, "dataset": datasets}
 
@@ -8320,6 +8361,11 @@ class QueryService:
         selector_key = cls._normalize_selector(selector_text)
         if not selector_key:
             return False
+        numbered = re.fullmatch(r'(table|figure|fig\.?)\s*(\d+)', selector_text, re.I)
+        if numbered:
+            kind, number = numbered.groups()
+            prefix = r'(?:\btable|表)' if kind.lower() == 'table' else r'(?:\bfigure|\bfig\.?|图)'
+            return bool(re.search(prefix + r'\s*' + re.escape(number) + r'(?!\d)', text, re.I))
         if selector_key in {"mu", "dipole"} and re.search(r"(?:μ|渭|\bmu\b|\bdipole\b|\(D\))", text, re.IGNORECASE):
             return True
         if selector_key == "gamma" and re.search(r"(?:γ|\bgamma\b|\bsurface\s+tension\b)", text, re.IGNORECASE):

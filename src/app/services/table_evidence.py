@@ -649,13 +649,14 @@ def _line_cells(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
-_NUMERIC_CELL_TOKEN_RE = r"[-+]?\d+(?:\.\d+)?%?"
+_NUMERIC_CELL_TOKEN_RE = r"[-+]?\d+(?:\.\d+)?(?:%|[KMB])?"
 
 
 def _is_numeric_cell(value: str) -> bool:
     """Return True when a cell contains only numeric content.
 
-    Accepts plain numbers, signed values, percentages, ``\u00b1`` uncertainty
+    Accepts plain numbers, signed values, percentages, uppercase K/M/B count
+    suffixes (for example 15M dataset rows), ``\u00b1`` uncertainty
     pairs, and OCR/LaTeX-flattened cells where the uncertainty marker was
     dropped (``2.0 0.2``) or the sign was split from its number
     (``+ 0.9 0.2``).  A single non-numeric token rejects the cell.
