@@ -56,7 +56,7 @@ def test_ingestion_snapshot_versions_all_fidelity_affecting_algorithms(
     )
 
     assert snapshot["algorithm_revisions"] == {
-        "parser": "canonical-parser-v8",
+        "parser": "canonical-parser-v9",
         "pdf_recovery": "pdf-recovery-v2",
         "structured_splitting": "structured-splitting-v3",
         "chunk_identity": "document-scoped-chunks-v1",

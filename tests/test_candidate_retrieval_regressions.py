@@ -157,3 +157,27 @@ def test_parametric_memory_answer_cannot_gain_absent_forcefield_evidence_terms()
         'RAG 的参数化记忆与非参数化记忆是什么？','分别为 seq2seq 模型和 Wikipedia 索引。',[context])
     for unsupported in ('RESP','HF/6-31G','M05-2X','MP2/cc-pVQZ','Leu CMAP','Ile','Val CMAP','5 milliseconds'):
         assert unsupported not in answer
+
+
+def test_parametric_memory_answer_does_not_treat_word_fragments_as_scientific_identifiers():
+    from app.schemas.common import Citation
+    from app.services.search import RetrievedContext
+    source = 'RAG responds while using publication evidence with a parametric generator.'
+    context = RetrievedContext(Citation(document_id='d', chunk_id='c', parse_version='v',
+        excerpt=source, score=1), source, 1)
+    answer = QueryService._append_missing_supported_question_terms(
+        'RAG 的参数化记忆与非参数化记忆是什么？', '分别为生成器和外部索引。', [context])
+    assert 'RESP' not in answer
+    assert 'Ile' not in answer
+    assert 'cation' not in answer
+
+
+def test_real_parameterization_identifiers_are_preserved_when_adjacent_to_chinese():
+    from app.schemas.common import Citation
+    from app.services.search import RetrievedContext
+    source = '参数化使用RESP；Ile通过Val CMAP验证。'
+    context = RetrievedContext(Citation(document_id='d', chunk_id='c', parse_version='v',
+        excerpt=source, score=1), source, 1)
+    answer = QueryService._append_missing_supported_question_terms(
+        '该参数化方案是什么？', '按证据中的方案执行。', [context])
+    assert 'RESP' in answer and 'Ile' in answer

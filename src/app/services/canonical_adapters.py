@@ -938,7 +938,21 @@ class MarkdownCanonicalAdapter:
                 last = end - 1
                 headers = _split_pipe_row(lines[index].text)
                 rows = [_split_pipe_row(lines[row].text) for row in range(index + 2, end)]
-                span = _text_span(lines, index, last)
+                caption_index = index - 1
+                while caption_index >= 0 and not lines[caption_index].text.strip():
+                    caption_index -= 1
+                caption = None
+                if caption_index >= 0 and document.blocks:
+                    candidate = lines[caption_index].text.strip()
+                    preceding = document.blocks[-1]
+                    # Only a source-adjacent numbered caption in prose may bind
+                    # this table. Code and headings are not table identities.
+                    if (re.fullmatch(r"(?:Table\s+\d+|表\s*\d+)\s*[:：.]\s*\S.*", candidate, re.I)
+                            and preceding.block_type in {"narrative", "appendix"}
+                            and preceding.metadata.get("kind") != "code"
+                            and preceding.text.rstrip().endswith(candidate)):
+                        caption = candidate
+                span = _text_span(lines, caption_index if caption else index, last)
                 source_markdown = source[span.char_start : span.char_end]
                 table_id = _stable_id(
                     "table", document.document_id, span.char_start, source_markdown
@@ -954,6 +968,7 @@ class MarkdownCanonicalAdapter:
                 )
                 table = CanonicalTable(
                     table_id=table_id,
+                    caption=caption,
                     headers=headers,
                     rows=rows,
                     cells=cells,
@@ -963,7 +978,7 @@ class MarkdownCanonicalAdapter:
                 )
                 document.tables.append(table)
                 builder.add_content(
-                    table.normalized_markdown or source_markdown,
+                    "\n\n".join(part for part in (caption, table.normalized_markdown or source_markdown) if part),
                     span,
                     block_type="table",
                     table_id=table_id,

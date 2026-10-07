@@ -45,7 +45,7 @@ TOKENIZER_SNAPSHOT_IDENTITY_SCHEMA = "knowledge-agent-tokenizer-snapshot-v1"
 # 各算法/流程的修订版本标识：任何修订号变化都会反映到配置快照中，
 # 从而让产物版本自然升级，避免新旧算法产物混淆
 ALGORITHM_REVISIONS = {
-    "parser": "canonical-parser-v8",  # Scalar-score validation and source-bound crop repair
+    "parser": "canonical-parser-v9",  # Source-bound crop repair and Markdown table captions
     "pdf_recovery": "pdf-recovery-v2",  # PDF 恢复
     "structured_splitting": "structured-splitting-v3",  # 结构化切分
     "chunk_identity": "document-scoped-chunks-v1",  # Cross-project duplicate source isolation

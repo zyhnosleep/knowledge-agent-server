@@ -218,6 +218,37 @@ def test_markdown_preserves_structure_and_exact_source_ranges() -> None:
     ].startswith("![Evaluation curve]")
 
 
+@pytest.mark.parametrize("caption", ["Table 1: Saffron Kestrel calibration accuracy", "表 1：校准准确率"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_markdown_numbered_table_caption_is_bound_to_source_and_retrieval(tmp_path, caption, newline):
+    from test_semantic_chunking import make_chunker
+    path = tmp_path / "caption.md"
+    source = f"# Calibration\n\nUnrelated narrative.\n\n{caption}\n\n| Method | Accuracy |\n|---|---|\n| amber |82.3|\n| indigo |77.1|\n"
+    source = source.replace("\n", newline)
+    path.write_text(source, encoding="utf-8", newline="")
+    document = parse_canonical_document(path)
+    table = document.tables[0]
+    assert table.caption == caption
+    span = table.source_spans[0]
+    assert source[span.char_start:span.char_end] == table.source_markdown
+    assert table.source_markdown.startswith(caption)
+    assert table.headers == ["Method", "Accuracy"]
+    assert table.rows == [["amber", "82.3"], ["indigo", "77.1"]]
+    chunker = make_chunker(parent_min_tokens=1, parent_target_tokens=300, parent_max_tokens=500,
+        child_min_tokens=1, child_target_tokens=100, child_max_tokens=200)
+    children = [draft for draft in chunker.build(document) if draft.chunk_role == "child" and draft.block_type == "table"]
+    assert children and all(caption in draft.text for draft in children)
+
+
+@pytest.mark.parametrize("prefix", ["Table 1 was discussed earlier.\n\nA new explanation.", "```\nTable 1: code text\n```", "## Table 1: section heading"])
+def test_markdown_table_does_not_borrow_nonadjacent_or_noncaption_text(tmp_path, prefix):
+    path = tmp_path / "not-caption.md"
+    path.write_text(prefix + "\n\n| Method | Accuracy |\n|---|---|\n| amber |82.3|\n", encoding="utf-8")
+    document = parse_canonical_document(path)
+    assert document.tables[0].caption is None
+    assert document.tables[0].source_markdown.startswith("| Method |")
+
+
 def test_markdown_references_stop_at_appendix_and_appendix_is_retrievable() -> None:
     document = parse_canonical_document(FIXTURE_DIR / "sample.md")
     reference = next(block for block in document.blocks if block.text.startswith("Doe, J."))

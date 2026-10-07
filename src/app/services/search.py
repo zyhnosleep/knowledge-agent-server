@@ -7126,11 +7126,14 @@ class QueryService:
             if term in answer_markdown:
                 continue
             term_key = cls._normalize_selector(term)
-            if (
-                term not in evidence
-                and term not in supported_translation_terms
-                and (not term_key or term_key not in evidence_key)
-            ):
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', term):
+                # RESP is not supported by "responds", nor Ile by "while".
+                # ASCII boundaries still accept real identifiers next to CJK.
+                source_present = bool(re.search(r'(?<![A-Za-z0-9])' + re.escape(term)
+                    + r'(?![A-Za-z0-9])', evidence, re.I))
+            else:
+                source_present = term in evidence or bool(term_key and term_key in evidence_key)
+            if term not in supported_translation_terms and not source_present:
                 continue
             if term not in missing:
                 missing.append(term)
