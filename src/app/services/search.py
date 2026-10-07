@@ -547,11 +547,17 @@ class QueryService:
             )
             if fill_contexts:
                 existing_chunk_ids = {ctx.citation.chunk_id for ctx in contexts}
-                contexts = [
-                    ctx
+                comparison_documents = {ctx.citation.document_id for ctx in contexts if ctx.comparison_source}
+                additions = [
+                    replace(ctx, comparison_source=ctx.citation.document_id in comparison_documents)
                     for ctx in fill_contexts
                     if ctx.citation.chunk_id not in existing_chunk_ids
-                ] + contexts
+                ]
+                # Coverage repair loads siblings, not a new relevance order.
+                # Reapply source/figure/metric reservations before clipping the
+                # evidence pack; a long prompt table must not evict results or
+                # the independently compared paper.
+                contexts = self._finalize_contexts(additions + contexts, question=question)
                 items, table_facts = self._evidence_items_and_facts(
                     contexts, limit, question=question
                 )

@@ -238,3 +238,38 @@ def test_merge_reports_backend_actually_used_by_supplement(evidence):
     extra = replace(base, retrieval_backend="pgvector")
     merged = service.merge_prepared_snapshots(base, extra)
     assert merged.retrieval_backend == "pgvector"
+
+
+def test_table_coverage_fill_preserves_ranked_comparison_sources(evidence, monkeypatch):
+    """Loading many missing sibling rows must not replace the ranked result/figure."""
+    from app.services.canonical_artifacts import CanonicalArtifactStore
+    db, service, root = evidence
+    add_document(db, root)
+    db.get(Document, 'd1').title = 'Alpha Paper'
+    db.get(Document, 'd2').title = 'Beta Paper'
+    results = 'Fever results\n| Method | Accuracy |\n| --- | --- |\n| Alpha | 60.9 |'
+    chunks = [DocumentChunk(id='result', document_id='d1', parse_version='v5',
+        chunk_role='child', block_type='table', ordinal=1,
+        source_spans=[{'table_id':'result-table'}], text=results, embedding=[1, 0])]
+    for index in range(20):
+        chunks.append(DocumentChunk(id=f'example-{index}', document_id='d1', parse_version='v5',
+            chunk_role='child', block_type='table', ordinal=index+2,
+            source_spans=[{'table_id':'examples-table'}],
+            text=f'Fever examples\n| Method | Claim |\n| --- | --- |\n| Alpha {index} | Released in 2003 |',
+            embedding=[1, 0]))
+    db.add_all(chunks)
+    db.commit()
+    initial = [service._expand_child_hit(db.get(DocumentChunk, chunk), question='', score=score,
+               page_fields={'page_title':title}, evidence_kind=kind)
+               for chunk, score, title, kind in [('result',100,'Alpha Paper','table'),
+                   ('d2-figure',1,'Beta Paper','figure'), ('example-0',1,'Alpha Paper','table')]]
+    initial = [replace(c, comparison_source=True) for c in initial]
+    monkeypatch.setattr(service, '_build_rag_contexts', lambda *a, **kw: initial)
+    monkeypatch.setattr(CanonicalArtifactStore, 'load_typed_inventory', lambda self, doc, version:
+        {'tables':[{'table_id':'result-table','row_count':1,'row_indices':[0]},
+                   {'table_id':'examples-table','row_count':20,'row_indices':list(range(20))}]}
+        if doc == 'd1' else {'tables':[]})
+    prepared = service.prepare_evidence('pilot', 'Compare Alpha and Beta on Fever accuracy and Figure 2.',
+                                        limit=8, parse_version_map={'d1':'v5','d2':'v5'})
+    assert {i.document_id for i in prepared.pack.items} == {'d1','d2'}
+    assert any(i.chunk_id == 'result' for i in prepared.pack.items)
