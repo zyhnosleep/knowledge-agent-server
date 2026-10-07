@@ -975,9 +975,15 @@ class IngestionPipeline:
             scopes, page_count
         ) - excluded_fallback_pages
         repaired = None
+        if not fatal and repair_issues and parser.settings.document_intelligence_enabled:
+            from app.services.table_crop_repair import repair_table_crops
+            repaired = repair_table_crops(primary, repair_issues)
+            if repaired is not None:
+                attempts.append("document_intelligence:table_crops:success")
         # 目标页修复路径
         if (
-            not fatal
+            repaired is None
+            and not fatal
             and repair_issues
             and targeted_pages
             and parser.settings.document_intelligence_enabled

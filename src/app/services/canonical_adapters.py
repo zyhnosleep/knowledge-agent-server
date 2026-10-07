@@ -4575,6 +4575,15 @@ class PDFCanonicalAdapter:
             ]
             repair_issues = [issue for issue in report.issues if issue.repairable]
             targeted_pages = _repair_page_indices(repair_scopes, page_count)
+            if not fatal and repair_issues and parser.settings.document_intelligence_enabled:
+                from app.services.table_crop_repair import repair_table_crops
+                crop_candidate = repair_table_crops(mineru_document, repair_issues)
+                if crop_candidate is not None:
+                    attempts.append("document_intelligence:table_crops:success")
+                    _attach_pdf_audit(crop_candidate, page_count=page_count, page_texts=page_texts,
+                        text_layer_warnings=text_layer_warnings, attempts=attempts,
+                        primary_parser="mineru", repair_scopes=repair_scopes)
+                    return _finalize_pdf_audit(crop_candidate)
             if not fatal and repair_scopes and targeted_pages and parser.settings.document_intelligence_enabled:
                 try:
                     repair = run_document_intelligence(
