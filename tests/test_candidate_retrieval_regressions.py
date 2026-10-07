@@ -81,3 +81,31 @@ def test_explicit_table_number_cannot_be_replaced_by_entity_matched_table10(ques
     block='Table 10: results\n| Model | Score |\n| --- | --- |\n| Act | 99 |\n| ReAct | 98 |'
     assert not QueryService._table_block_matches_query(question,block)
     assert not QueryService._table_group_matches_query(question,block)
+
+
+@pytest.mark.parametrize('question',[
+    '读取 MuRAG 表1中 CC 和 LAION 的数据规模与数据格式。',
+    '读取MuRAG表1中CC和LAION的数据规模与数据格式。',
+])
+def test_answer_row_selection_keeps_explicit_two_letter_dataset_alongside_longer_name(question):
+    from app.services.table_evidence import CanonicalTableChunk,assemble_table_context,extract_table_facts
+    table=assemble_table_context([CanonicalTableChunk('c','d','staged','t',0,
+        'Table 1: Pre-training Dataset Statistics\n| Dataset | #Size | Format | Source |\n| --- | --- | --- | --- |\n'
+        '| CC | 15M | Image, Caption | Crawled |\n| LAION | 200M | Image, Alt-Text | Crawled |\n'
+        '| PAQ | 65M | Passage, QA | Generated |')])
+    rows=QueryService._generic_table_fact_value_rows(question,tuple(extract_table_facts(question,table)),table.markdown)
+    by_label={row['group']:row['values'] for row in rows}
+    assert set(by_label)=={'CC','LAION'}
+    assert '15M' in by_label['CC'] and '200M' in by_label['LAION']
+    from app.schemas.common import Citation
+    from app.services.search import RetrievedContext
+    context=RetrievedContext(Citation(document_id='d',parse_version='staged',table_id='t',
+        chunk_id='c',block_type='table',excerpt=table.markdown,score=1),table.markdown,1,
+        evidence_kind='table',table_context=table,table_facts=tuple(extract_table_facts(question,table)))
+    answer=QueryService(None)._deterministic_generic_table_answer(question,[context],[0],'normal')
+    assert answer and '15M' in answer.answer_markdown and '200M' in answer.answer_markdown
+    assert '65M' not in answer.answer_markdown
+
+
+def test_short_dataset_row_does_not_match_inside_an_unrelated_word():
+    assert QueryService._generic_table_row_relevance('读取表1的accuracy成绩','AC','')==0

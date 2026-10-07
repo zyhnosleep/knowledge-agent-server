@@ -5566,6 +5566,13 @@ class QueryService:
         for selector in selector_values:
             if cls._selector_matches_text(selector, f"{group} {property_cell}", row_key):
                 score += 5.0
+        # Match actual source-row identifiers, including short acronyms and
+        # Latin names adjacent to Chinese text, without substring word matches.
+        source_label = str(group or '').strip()
+        if re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]+', source_label) and re.search(
+            r'(?<![A-Za-z0-9])' + re.escape(source_label) + r'(?![A-Za-z0-9])', question, re.I
+        ):
+            score += 5.0
         property_key = cls._normalize_selector(property_cell)
         if property_key and property_key in question_key:
             score += 6.0
