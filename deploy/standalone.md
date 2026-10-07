@@ -57,7 +57,7 @@ runtime/control 为私有状态/log（0700/0600），model.json/api.json、model
 
 ## 5. 入库与可选业务
 
-REDIS_URL 空则同步入库。配置本地受保护 Redis 时，另行加载同一 .env 运行：
+当前完整 canonical 八阶段入库需要 Redis 和单并发 worker。REDIS_URL 为空时，上传会走历史 legacy 同步路径，不会产生八阶段 checkpoint；HTTP 成功不能证明 canonical 入库成功。只查询已验收入库的文档时可不启动队列。上传新文档前，配置本地受保护 Redis，并另行加载与 API 相同的 .env 运行：
 
 ```bash
 .venv/bin/python -m app.workers.runner

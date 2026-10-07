@@ -5099,10 +5099,7 @@ class QueryService:
                 values = row.get("values", "")
                 if not label or not values:
                     continue
-                if self._is_chinese_question(question):
-                    parts.append(f"{prefix}对于 {label}，各列对应的表格数值为：{values}".strip())
-                else:
-                    parts.append(f"{prefix}{label}: {values}".strip())
+                parts.append(f"{prefix}{label}: {values}".strip())
         if not parts:
             return None
         citation_marker = f" [{citations[0]}]" if citations else ""
@@ -5110,13 +5107,10 @@ class QueryService:
         header_note_cn = f"；表头还说明该表覆盖 {', '.join(header_terms)}。" if header_terms else ""
         header_note_en = f" The table header also identifies {', '.join(header_terms)}." if header_terms else ""
         if self._is_chinese_question(question):
-            chinese_support_note = "。这些数值均来自表格证据，可用于比较不同模型在同一实验对象上的变化。"
             answer = (
-                "根据表格证据，下面逐项列出与问题实体匹配的数值；每一项都来自同一表格行，"
-                "英文模型名和数字按原表保留，便于和 citation 逐项核对。以下内容可直接作为答案依据："
-                + "；".join(parts)
+                "表格数值如下：\n\n- "
+                + "\n- ".join(parts)
                 + header_note_cn
-                + chinese_support_note
                 + citation_marker
             )
         else:

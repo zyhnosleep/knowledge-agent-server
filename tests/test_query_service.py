@@ -5367,9 +5367,9 @@ def test_generic_table_answer_keeps_paired_comparison_rows() -> None:
     assert "1.1 ± 0.3" in answer.answer_markdown
     assert "11 ± 7" in answer.answer_markdown
     assert "0.5 ± 0.4" in answer.answer_markdown
-    cjk_count = sum(1 for char in answer.answer_markdown if "\u4e00" <= char <= "\u9fff")
-    latin_count = sum(1 for char in answer.answer_markdown if "a" <= char.lower() <= "z")
-    assert cjk_count / (cjk_count + latin_count) >= 0.2
+    # Chinese explanatory framing, without padding to outweigh legitimate
+    # source-language scientific labels and units in the extracted rows.
+    assert answer.answer_markdown.startswith("表格数值如下：")
 
 
 def test_deterministic_table_answer_uses_generic_rows_for_objective_values() -> None:
@@ -5883,7 +5883,7 @@ def test_generic_table_answer_does_not_repeat_rows_from_duplicate_contexts() -> 
     )
 
     assert answer is not None
-    assert answer.answer_markdown.count("各列对应的表格数值为") == 2
+    assert answer.answer_markdown.count("\n- ") == 2
     assert answer.answer_markdown.count("13.07 ± 0.09") == 1
     assert answer.answer_markdown.count("11.53 ± 0.13") == 1
 
@@ -6039,7 +6039,7 @@ def test_generic_table_answer_keeps_tail_row_fact_after_context_dedup() -> None:
 
     assert answer is not None
     assert "95.3" in answer.answer_markdown
-    assert answer.answer_markdown.count("各列对应的表格数值为") == 1
+    assert answer.answer_markdown.count("\n- ") == 1
 
 
 def test_generic_table_answer_dedups_mixed_full_and_citation_only_canonical_contexts() -> None:

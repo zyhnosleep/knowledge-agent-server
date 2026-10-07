@@ -1,9 +1,8 @@
 """后台 worker 进程的启动入口。
 
-本模块是 RQ（Redis Queue）worker 进程的入口脚本。生产环境通过 systemd 以
-``python -m app.workers.runner`` 启动（见 deploy/systemd/ 下的
-``*-worker.service`` 单元文件），与 FastAPI 进程分离运行，保证后台重任务
-不阻塞 API 请求。
+本模块是 RQ（Redis Queue）worker 进程的入口脚本。按 deploy/standalone.md
+加载与 API 相同的私有环境后，以 ``python -m app.workers.runner`` 启动，
+与 FastAPI 进程分离运行，保证后台重任务不阻塞 API 请求。
 
 启动流程分为四步：
 1. ``configure_logging``：配置统一日志格式（INFO 及以上），让后续所有模块
@@ -28,7 +27,7 @@ def main() -> None:
     依次完成日志、数据库、队列 worker 的初始化后，进入阻塞式任务消费循环；
     只要进程不被信号终止，``worker.work()`` 会持续从队列拉取并执行任务。
     其中任何一个初始化步骤抛错都会让进程启动失败（fail-fast），以便
-    systemd/编排系统及时发现配置问题并重启服务。
+    运维控制及时发现配置问题并重启服务。
     """
     # 1. 先配置日志：确保后续所有日志（含 init_db 中的告警/错误）都按统一格式输出
     configure_logging()

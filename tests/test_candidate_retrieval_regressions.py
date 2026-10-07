@@ -126,3 +126,22 @@ def test_protocol_token_preservation_does_not_keep_unresolved_source_links():
     assert 'sources/private' not in normalized
     assert '[unresolved-label]' not in normalized
     assert '[0]' in normalized
+
+
+def test_deterministic_table_answer_passes_real_repetition_verifier_with_distinct_rows():
+    from app.schemas.common import Citation
+    from app.services.search import RetrievedContext
+    from app.services.answer_verifier import AnswerVerifier
+    question='读取表1中 Standard、CoT、Act 和 ReAct 在 HotpotQA 与 Fever 上的成绩。'
+    text=('Table 1: Results\n| Method | HotpotQA (EM) | Fever (Acc) |\n| --- | --- | --- |\n'
+          '| Standard | 28.7 | 57.1 |\n| CoT | 29.4 | 56.3 |\n| Act | 25.7 | 58.9 |\n'
+          '| ReAct | 27.4 | 60.9 |')
+    context=RetrievedContext(Citation(document_id='d',chunk_id='c',table_id='t',
+        parse_version='v',block_type='table',excerpt=text,score=1),text,1,evidence_kind='table')
+    answer=QueryService(None)._deterministic_generic_table_answer(question,[context],[0],'normal')
+    assert answer is not None
+    for value in ('28.7','57.1','29.4','56.3','25.7','58.9','27.4','60.9'):
+        assert value in answer.answer_markdown
+    verdict=AnswerVerifier().verify(question=question,answer_markdown=answer.answer_markdown,
+        citations=[context.citation.model_dump()],route_type='table_or_metric')
+    assert verdict['retry_recommended'] is False, verdict['warnings']
