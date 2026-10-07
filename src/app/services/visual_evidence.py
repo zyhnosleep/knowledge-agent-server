@@ -17,10 +17,12 @@ MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
 
-def resolve_context_images(db, contexts, root: Path, version_map=None):
+def resolve_context_images(db, contexts, root: Path, version_map=None, *, context_indexes=None):
     images, labels, skipped, seen = [], [], [], set()
     root = Path(root).resolve()
     for index, context in enumerate(contexts):
+        if context_indexes is not None and index not in context_indexes:
+            continue
         citation = context.citation
         if citation.block_type != "figure" and context.evidence_kind != "figure":
             continue

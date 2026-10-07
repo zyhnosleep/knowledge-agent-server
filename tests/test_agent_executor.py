@@ -2261,6 +2261,20 @@ def test_contextualize_retrieval_query_length_gate() -> None:
     assert ctx4 == "第二点呢"
 
 
+def test_long_table_followup_recovers_previous_retrieval_targets() -> None:
+    db = make_db()
+    executor = make_executor(db)
+    previous = 'Alpha 表1的 MethodA 与 MethodB 在 TaskA 和 TaskB 的成绩是多少？'
+    followup = '先确定刚才两列成绩对应的方法，再计算各自的提升，并比较哪个任务提升更大。'
+    executor._memory.add_turn('table-followup', role='user', content=previous, step_type='user_query')
+    executor._memory.add_turn('table-followup', role='user', content=followup, step_type='user_query')
+    result = executor._contextualize_retrieval_query('table-followup', followup)
+    assert previous in result
+    assert followup in result
+    assert executor._is_table_reference_query(followup)
+    assert executor._contextualize_retrieval_query('fresh', followup) == followup
+
+
 def _counting_synthesize(executor) -> list[int]:
     """Wrap executor._run_synthesize with a call counter."""
     called: list[int] = []

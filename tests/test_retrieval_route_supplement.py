@@ -184,6 +184,26 @@ def test_search_source_chunks_reuses_provided_question_vector() -> None:
     assert any(context.citation.document_id == "alpha" for context in contexts)
 
 
+def test_named_comparison_searches_each_paper_with_an_explicit_scope(monkeypatch):
+    db = make_session()
+    seed_project(db)
+    service = QueryService(db)
+    service.ollama = VectorFakeOllama()
+    calls = []
+    original = service._search_source_chunks
+    def observe(question, project_id, document_ids, **kwargs):
+        calls.append(list(document_ids))
+        return original(question, project_id, document_ids, **kwargs)
+    monkeypatch.setattr(service, '_search_source_chunks', observe)
+    matches = [PaperMatch(document=db.get(Document, doc), score=10, exact_alias=True)
+               for doc in ('alpha', 'beta')]
+    result = service._build_rag_contexts('Compare alpha and beta evidence content.', 'p1', matches)
+    assert ['alpha'] in calls and ['beta'] in calls
+    assert [] not in calls
+    assert {c.citation.document_id for c in result} == {'alpha', 'beta'}
+    assert all(getattr(c, 'comparison_source', False) for c in result)
+
+
 class TableVectorFakeOllama:
     """二维确定性嵌入：含 'hfe'（大小写不敏感）的问题 → [1, 0]（贴近 OPLS4 表 chunk）。"""
 
@@ -266,7 +286,4 @@ def test_metric_query_table_supplement_does_not_displace_lexical_table() -> None
     assert table_contexts[0].citation.document_id == "opls5", (
         "词法路命中的 OPLS5 表格必须排在补充路 OPLS4 之前"
     )
-
-
-
 

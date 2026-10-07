@@ -21,7 +21,9 @@ controller 依次检查 PG、模型、API；只管理有精确进程/监听归�
 
 ## 工作流与 Agent
 
-普通问题保留原路径、零额外 planner。仅 complex_multi_hop + AGENT_ADAPTIVE_ENABLED=true 使用 observation 驱动的只读循环：retrieve / answer / finish / abstain，最多 3 次决策、2 次补证，共享 step/tool/token/deadline/cancel 预算。
+当前采用固定工作流，自适应实验暂停，部署时保持 `AGENT_ADAPTIVE_ENABLED=false`；普通题和复杂题均不调用自主 planner。跨论文比较对已识别的论文分别检索，保留两侧证据；回答提示区分来源，显式图号优先定位请求的图，长表格追问可恢复上一轮检索目标。模型仍可能读错曲线或混淆方法，不能把结构校验通过当作事实正确。
+
+自适应代码仅保留供后续研究：只有 complex_multi_hop + AGENT_ADAPTIVE_ENABLED=true 才使用 observation 驱动的只读循环，最多 3 次决策、2 次补证，共享 step/tool/token/deadline/cancel 预算；本轮修复与验收不启用它。
 
 版本、项目、会话和图片作用域由受信执行器冻结，模型不能扩权或执行 shell/任意 SQL/写知识源。默认开关关闭，服务器真实验收后再决定是否启用。它是受限 Agent + harness，不是把固定工作流更名为自主 Agent。
 

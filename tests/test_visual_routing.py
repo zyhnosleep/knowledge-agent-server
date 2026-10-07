@@ -132,6 +132,25 @@ def test_ordinary_draft_sends_real_pixels_not_markdown_paths(evidence, monkeypat
     assert base64.b64decode(encoded[0]) == (root/'d1/v5/assets/figure.png').read_bytes()
 
 
+def test_explicit_target_does_not_send_unrelated_figure_or_warn_about_it(evidence, monkeypatch):
+    db, service, _ = evidence
+    db.add(DocumentChunk(id='unrelated-fig', document_id='d1', parse_version='v5',
+        chunk_role='child', block_type='figure', ordinal=2,
+        text='Figure 2: unrelated ![figure](assets/absent.png)', embedding=[1., 0.]))
+    db.commit()
+    calls = []
+    def post(payload):
+        calls.append(payload)
+        return {'message': {'content': '{"answer_markdown":"Purple [0].","citations":[0]}'}}
+    monkeypatch.setattr(service.ollama, '_post_chat', post)
+    contexts = service._search_source_chunks('figure', 'p1', ['d1'], question_vector=[1, 0])
+    answer = service._draft_answer('In Figure 1 what is the color?', None, contexts)
+    assert len(calls[0]['messages'][1]['images']) == 1
+    assert service.visual_evidence_trace['skipped'] == []
+    assert '未发送' not in answer.answer_markdown
+    assert 'Figure 1' in calls[0]['messages'][1]['content']
+
+
 def test_missing_visual_asset_abstains_without_text_only_generation(evidence, monkeypatch):
     _, service, root = evidence
     (root/'d1/v5/assets/figure.png').unlink()
@@ -244,6 +263,26 @@ def test_long_figure_caption_budget_keeps_minimal_image_identity(evidence):
     result = service._fit_contexts_to_token_budget(figures,question='Compare the plot panels')
     assert len(result) == 3
     assert sum(service._retrieval_token_counter(c.prompt_text) for c in result) <= 30
+
+
+def test_tiny_prompt_budget_keeps_requested_figure_selector(evidence):
+    _, service, _ = evidence
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 12
+    c = RetrievedContext(Citation(excerpt='Figure 1: '+('caption '*100), block_type='figure', score=1),
+        'Figure 1: '+('caption '*100), 1, evidence_kind='figure')
+    result = service._fit_contexts_to_token_budget([c], question='Read Figure 1.')
+    assert len(result) == 1
+    assert service._requested_figure_indexes('Read Figure 1.', result) == [0]
+
+
+def test_minimal_image_identity_does_not_inherit_another_parent_figure(evidence):
+    _, service, _ = evidence
+    service.DRAFT_CONTEXT_TOKEN_BUDGET = 15
+    caption = 'Figure 1: '+('caption '*100)
+    c = RetrievedContext(Citation(excerpt=caption, block_type='figure', score=1),
+        'As Figure 2 shows, the result is different.\n'+caption, 1, evidence_kind='figure')
+    result = service._fit_contexts_to_token_budget([c], question='Read Figure 1.')
+    assert service._requested_figure_indexes('Read Figure 1.', result) == [0]
 
 
 def test_partial_missing_image_is_disclosed_to_model_and_user(evidence,monkeypatch):

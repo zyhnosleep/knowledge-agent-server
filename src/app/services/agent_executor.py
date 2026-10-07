@@ -1903,7 +1903,7 @@ class AgentExecutor:
         包装，避免污染独立新问题。
         """
         normalized = query.strip()
-        if len(normalized) > 30:
+        if len(normalized) > 30 and not self._is_table_reference_query(normalized):
             return query
         previous_query = self._resolvable_previous_turn(session_id, normalized)
         if previous_query is None:

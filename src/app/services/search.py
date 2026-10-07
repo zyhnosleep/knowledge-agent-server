@@ -174,6 +174,7 @@ class RetrievedContext:
     table_context: TableContext | None = None
     table_facts: tuple[TableFact, ...] = ()
     visual_rank: int | None = None
+    comparison_source: bool = False
 
 
 @dataclass
@@ -708,7 +709,8 @@ class QueryService:
                                 score=context.score, evidence_kind=chunk.block_type,
                                 page_fields=self._source_page_fields_by_document_id(
                                     base.project_id, [chunk.document_id]).get(chunk.document_id, {}))
-                            context = replace(authoritative, visual_rank=context.visual_rank)
+                            context = replace(authoritative, visual_rank=context.visual_rank,
+                                              comparison_source=context.comparison_source)
                             candidates.append((chunk, context.score, chunk.block_type))
                     key = (context.citation.document_id, context.citation.parse_version,
                            context.citation.chunk_id, context.citation.attachment_id,
@@ -1195,6 +1197,58 @@ class QueryService:
         fields = ('document_id', 'parse_version', 'chunk_id', 'figure_id', 'asset_id', 'attachment_id')
         return tuple(value.get(key) if isinstance(value, dict) else getattr(value, key, None) for key in fields)
 
+    @classmethod
+    def _requested_figure_indexes(cls, question, contexts):
+        """Select named figure/paper pairs, without guessing ambiguous ownership."""
+        targets = list(re.finditer(r'(?:\bfigure|\bfig\.?|图)\s*(\d+)(?!\d)', question, re.I))
+        figures = [i for i, c in enumerate(contexts) if cls._context_evidence_kind(c) == 'figure']
+        if not targets:
+            return figures
+        named = {}
+        for i in figures:
+            title = str(contexts[i].citation.page_title or '')
+            named[i] = [word for word in re.findall(r'[A-Za-z][A-Za-z0-9-]{2,}', title)
+                        if word.lower() not in {'paper', 'source', 'sources', 'summary'}
+                        and cls._selector_matches_text(word, question)]
+        selected = set()
+        for target in targets:
+            prefix = question[:target.start()]
+            suffix = question[target.end():]
+            owners = {i for i in figures if any(
+                re.search(rf'(?<![A-Za-z0-9-]){re.escape(word)}\s*(?:的|[\x27’]s)?\s*$', prefix, re.I)
+                or re.search(rf'^\s*(?:in|of|from|来自|属于)\s*(?:the\s+)?(?:paper\s+)?{re.escape(word)}(?![A-Za-z0-9-])', suffix, re.I)
+                for word in named[i])}
+            for i in figures:
+                if owners and i not in owners:
+                    continue
+                caption = contexts[i].citation.excerpt or cls._context_evidence_text(contexts[i])
+                if re.search(rf'(?:^|\n)\s*(?:figure|fig\.?|图)\s*{target.group(1)}(?!\d)', caption, re.I):
+                    selected.add(i)
+        return sorted(selected)
+
+    @classmethod
+    def _comparison_context_groups(cls, question, contexts):
+        if not cls._is_cross_paper_query(question):
+            return {}
+        groups = {}
+        for context in contexts:
+            citation = context.citation
+            words = re.findall(r'[A-Za-z][A-Za-z0-9-]{2,}', str(citation.page_title or ''))
+            if citation.document_id and (context.comparison_source or any(word.lower() not in {'paper', 'source', 'sources', 'summary'}
+                    and cls._selector_matches_text(word, question) for word in words)):
+                groups.setdefault(citation.document_id, []).append(context)
+        return groups
+
+    @classmethod
+    def _balance_comparison_contexts(cls, question, contexts):
+        """Reserve two relevant units per explicitly named source before truncation."""
+        groups = cls._comparison_context_groups(question, contexts)
+        if len(groups) < 2:
+            return contexts
+        reserved = [group[depth] for depth in range(2) for group in list(groups.values())[:5]
+                    if len(group) > depth]
+        return reserved + [c for c in contexts if c not in reserved]
+
     def _attribute_visual_answer(self, question, payload, contexts, sent):
         """Attribute only requested/explicitly cited pixels, never all retrieved images."""
         sent_indexes = {label['context_index'] for label in sent
@@ -1203,8 +1257,7 @@ class QueryService:
         labels = {label['context_index']: label.get('figure_label') or '' for label in sent}
         selectors = [anchor for anchor in self._query_priority_anchors(question)['figure_table']
                      if anchor.lower().startswith('figure')]
-        required = {index for index in sent_indexes if any(self._selector_matches_text(selector,
-            labels[index]) for selector in selectors)} if selectors else set()
+        required = set(self._requested_figure_indexes(question, contexts)) & sent_indexes if selectors else set()
         cited = set(payload.citations) | set(self._infer_citation_indexes(payload.answer_markdown, len(contexts)))
         missing_selector = any(not any(self._selector_matches_text(selector,
             labels[index]) for index in sent_indexes) for selector in selectors)
@@ -1515,6 +1568,15 @@ class QueryService:
         paper_matches: list[PaperMatch],
         document_ids: list[str] | None = None,
     ) -> list[RetrievedContext]:
+        # Named comparisons need independently scoped recall; a joint query's
+        # global top-k can otherwise contain only the higher-scoring paper.
+        named_matches = [m for m in paper_matches if m.exact_alias or m.introduced_subject]
+        if document_ids is None and self._is_cross_paper_query(question) and len(named_matches) > 1:
+            compared = []
+            for match in named_matches[:5]:
+                compared.extend(replace(c, comparison_source=True) for c in
+                    self._build_rag_contexts(question, project_id, [match], document_ids=[match.document.id]))
+            return self._finalize_contexts(compared, question=question)
         locked_document_ids = self._locked_document_ids(question, paper_matches)
         # When an explicit document scope is provided, lock it and never widen.
         if document_ids is not None:
@@ -1718,6 +1780,8 @@ class QueryService:
             "across papers",
             "multiple papers",
             "跨论文",
+            "两篇论文",
+            "both papers",
             "比较",
             "对比",
             "相比",
@@ -3611,6 +3675,7 @@ class QueryService:
             other_contexts = [context for context in contexts if context not in table_contexts]
             contexts = sorted(table_contexts, key=table_priority, reverse=True) + other_contexts
         budget = int(self.DRAFT_CONTEXT_TOKEN_BUDGET)
+        contexts = self._balance_comparison_contexts(question, contexts)
         selected: list[RetrievedContext] = []
         expanded_parent_ids: set[str] = set()
 
@@ -3622,9 +3687,12 @@ class QueryService:
 
         visual_reserved = []
         if visual_query:
-            visual_reserved = [c for c in contexts if self._context_evidence_kind(c) == 'figure'][:3]
+            visual_reserved = [contexts[i] for i in self._requested_figure_indexes(question, contexts)][:3]
             for context in visual_reserved:
-                minimal = replace(context, prompt_text='Image evidence.', context_text='Image evidence.',
+                selector = re.search(r'(?:\bfigure|\bfig\.?|图)\s*\d+',
+                    context.citation.excerpt or self._context_evidence_text(context), re.I)
+                identity_text = (selector.group(0) + ': ' if selector else '') + 'Image evidence.'
+                minimal = replace(context, prompt_text=identity_text, context_text=identity_text,
                     neighbor_text='', citation=context.citation.model_copy(update={'excerpt':''}))
                 if self._count_retrieval_tokens(representation([*selected,minimal])) <= budget:
                     selected.append(minimal)
@@ -3635,6 +3703,27 @@ class QueryService:
                 richer[position] = original
                 if self._count_retrieval_tokens(representation(richer)) <= budget:
                     selected = richer
+
+        # Reserve a fitting Child excerpt for each compared source before any
+        # rich Parent consumes the remaining window. Never cut a sentence just
+        # to manufacture coverage; oversized sources remain explicit gaps.
+        comparison_groups = self._comparison_context_groups(question, contexts)
+        represented = []
+        if len(comparison_groups) > 1:
+            share = max(0, budget - self._count_retrieval_tokens(representation(selected))) // len(comparison_groups)
+            for document_id, group in list(comparison_groups.items())[:5]:
+                if any(c.citation.document_id == document_id for c in selected):
+                    continue
+                for context in group:
+                    if self._context_evidence_kind(context) == 'figure':
+                        continue
+                    excerpt = context.citation.excerpt.strip()
+                    minimal = replace(context, prompt_text=excerpt, context_text=excerpt, neighbor_text='')
+                    if excerpt and self._count_retrieval_tokens(representation([minimal])) <= share and self._count_retrieval_tokens(representation([*selected, minimal])) <= budget:
+                        selected.append(minimal)
+                        represented.append(context)
+                        break
+        contexts = [c for c in contexts if c not in represented]
 
         for context in contexts:
             is_table_child = context.citation.block_type == "table"
@@ -4121,7 +4210,8 @@ class QueryService:
         if visual_query:
             from app.services.visual_evidence import resolve_context_images
             visual_images, visual_labels, skipped = resolve_context_images(
-                self.db, contexts, settings.canonical_artifacts_dir, self.parse_version_map)
+                self.db, contexts, settings.canonical_artifacts_dir, self.parse_version_map,
+                context_indexes=self._requested_figure_indexes(question, contexts))
             if skipped:
                 logger.warning("Unavailable visual evidence: %s", skipped)
             self.visual_evidence_trace = {'sent':visual_labels,'skipped':skipped}
@@ -4135,8 +4225,12 @@ class QueryService:
         context_text = "\n\n".join(prompt_sections)
         if visual_labels:
             context_text += "\n\nAttached images in order: " + "; ".join(
-                f"Image {label['image_index']} -> context [{label['context_index']}]" for label in visual_labels)
+                f"Image {label['image_index']} -> context [{label['context_index']}] "
+                f"({contexts[label['context_index']].citation.page_title or 'source'}, "
+                f"{label.get('figure_label') or 'figure'}, page {label.get('page_label') or '?'})"
+                for label in visual_labels)
             context_text += "\nRead the attached pixels. If a requested fact is not visible, explicitly abstain; do not infer missing values from captions."
+            context_text += "\nFor every requested figure, cite its mapped context index inline next to that figure's claim. Read each panel's axis, legend, direction and endpoint separately; method A→B is not B→A. For comparisons, establish each side's source-supported observation before comparing."
         if skipped:
             context_text += '\nUNAVAILABLE IMAGE contexts: ' + json.dumps([
                 {**label, 'reason':self._safe_visual_skip_reason(label.get('reason',''))}
@@ -4360,6 +4454,8 @@ class QueryService:
         parts.append(language_rule(question))
         parts.append(METADATA_BAN_RULE)
         parts.append(INFERENCE_MARKING_RULE)
+        if self._is_cross_paper_query(question):
+            parts.append("Compare sources separately: first state each paper's mechanism or experimental setting with its own inline citation, then compare. Do not transfer facts from one paper to another. If one side lacks evidence, state that gap rather than invent its mechanism. Distinguish classifier labels from the actions they select. Do not append a list of irrelevant source keywords.")
         if evidence_acronyms:
             parts.append(
                 "IMPORTANT: Preserve these source acronyms/model or method names exactly when they are relevant: "
@@ -6131,6 +6227,9 @@ class QueryService:
         # Child could omit the requested numeric row.  The exact retrieval
         # tokenizer in _fit_contexts_to_token_budget is now the sole prompt
         # size gate, so every selected context remains lossless.
+        title = str(context.citation.page_title or '').strip()[:160]
+        if title:
+            return f"{evidence}\nSource label (identity only, not evidence): {title}"
         return evidence
 
     def _match_requested_table_groups(
@@ -7612,6 +7711,7 @@ class QueryService:
                     table_context=context.table_context,
                     table_facts=context.table_facts,
                     visual_rank=context.visual_rank,
+                    comparison_source=context.comparison_source,
                 )
             )
         table_query = self._is_table_query(question) or self._is_metric_query(question)
@@ -7678,7 +7778,7 @@ class QueryService:
 
         sorted_contexts = sorted(expanded_contexts, key=context_sort_key, reverse=True)
         if self._is_figure_query(question):
-            figures = [c for c in expanded_contexts if self._context_evidence_kind(c) == "figure"]
+            figures = [expanded_contexts[i] for i in self._requested_figure_indexes(question, expanded_contexts)]
             figures.sort(key=lambda c: (c.visual_rank is None,
                 c.visual_rank if c.visual_rank is not None else -c.score))
             reserved = figures[:3]
@@ -7701,6 +7801,7 @@ class QueryService:
                 ]
         if self._is_figure_query(question):
             sorted_contexts = reserved + [c for c in sorted_contexts if c not in reserved]
+        sorted_contexts = self._balance_comparison_contexts(question, sorted_contexts)
         deduped: list[RetrievedContext] = []
         seen_keys: set[str] = set()
         page_counts: dict[str, int] = {}
