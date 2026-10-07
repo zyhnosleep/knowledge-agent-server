@@ -650,7 +650,6 @@ def _mineru_content_to_parsed_doc(
             )
             block_text = "\n\n".join(part for part in (caption, table_markdown) if part)
             if block_text:
-                stats["tables"] += 1
                 table_metadata = {
                     "page_label": page_label,
                     "markdown": block_text,
@@ -672,7 +671,18 @@ def _mineru_content_to_parsed_doc(
                 bbox = item.get("bbox")
                 if isinstance(bbox, list):
                     table_metadata["bbox"] = list(bbox)
-                tables.append(table_metadata)
+                if image_path and _is_mineru_algorithm_box(caption, source_html):
+                    # MinerU sometimes labels a boxed algorithm as a one-cell
+                    # table. Keep its source text, HTML, location AND pixels;
+                    # it is not a header-only experimental data table.
+                    stats['figures'] += 1
+                    heading = f'mineru-page-{page_label}-figure'
+                    figures.append({**table_metadata, 'caption': caption,
+                        'note': table_markdown, 'semantic_kind': 'algorithm',
+                        'mineru_origin_type': 'table', 'source_markdown': block_text})
+                else:
+                    stats['tables'] += 1
+                    tables.append(table_metadata)
         elif "equation" in content_type or "formula" in content_type:
             # 公式：提取 latex 文本
             formula = _mineru_first_text(item, "text", "latex", "math_content", "content", "md_content")
@@ -821,6 +831,17 @@ def _coalesce_parsed_chunks(
     return merged
 
 
+def _is_mineru_algorithm_box(caption: str, source_html: str) -> bool:
+    if not re.match(r'^(?:algorithm|算法)\s*(?:\d+|[ivxlcdm]+)\s*[:：.]', caption, re.I) or not source_html:
+        return False
+    from bs4 import BeautifulSoup
+    cells = BeautifulSoup(source_html, 'html.parser').find_all(['td', 'th'])
+    if len(cells) != 1:
+        return False
+    markers = set(re.findall(r'\b(require|input|output|return)\s*:', cells[0].get_text(' ', strip=True), re.I))
+    return len({marker.lower() for marker in markers}) >= 2
+
+
 def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_path: Path) -> None:
     """用 MinerU 的 Markdown 副产物补充解析结果（主要是表格）。
 
@@ -843,9 +864,15 @@ def _augment_mineru_parsed_doc_from_markdown(parsed: ParsedDocument, markdown_pa
     intelligence["markdown_path"] = str(markdown_path)
     existing_tables = intelligence.setdefault("tables", [])
     existing_texts = {str(table.get("markdown") or "").strip() for table in existing_tables if isinstance(table, dict)}
+    algorithm_texts = {normalize_table_text(str(figure.get(key) or '').strip())
+        for figure in intelligence.get('figures', [])
+        if isinstance(figure, dict) and figure.get('semantic_kind') == 'algorithm'
+        for key in ('source_markdown', 'note')}
     for table in tables:
         markdown_text = str(table.get("markdown") or "").strip()
         markdown_text = normalize_table_text(markdown_text)
+        if markdown_text in algorithm_texts:
+            continue
         if markdown_text and markdown_text not in existing_texts:
             table["markdown"] = markdown_text
             existing_tables.append(table)

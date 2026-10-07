@@ -20,6 +20,38 @@ def test_pixel_claim_requires_actual_image_evidence():
         check_agent_result(result("pgvector"), require_pixels=True)
 
 
+@pytest.mark.parametrize('plain_backend,sent,error', [
+    ('pgvector', [], 'pixels_not_executed'),
+    ('json_cosine', [{'chunk_id': 'figure'}], 'pgvector_not_executed'),
+])
+def test_plain_endpoint_must_itself_execute_pixels_and_pgvector(monkeypatch, plain_backend, sent, error):
+    import json
+    import httpx
+    import scripts.verify_standalone as module
+    from scripts.evaluate_adaptive_agent import Case
+    agent = result('pgvector')
+    agent['metadata']['visual_evidence'] = {'sent': [{'chunk_id': 'figure'}]}
+    def handler(request):
+        if request.url.path == '/api/health':
+            return httpx.Response(200, json={'status': 'ok', 'models': {'vector_store': {'status': 'ready'}}})
+        if request.url.path == '/api/query':
+            return httpx.Response(200, json={'answer_markdown': 'A', 'citations': [],
+                'verification_status': 'local-only', 'metadata': {
+                    'retrieval_backend': plain_backend, 'visual_evidence': {'sent': sent}}})
+        if request.url.path.endswith('/stream'):
+            return httpx.Response(200, text='event: final\ndata: ' + json.dumps(agent) + '\n\n')
+        return httpx.Response(200, json=agent)
+    real_client = httpx.Client
+    monkeypatch.setattr(module.httpx, 'Client', lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(module, 'capture_context', lambda project: {})
+    case = Case(id='pixels', question='Figure 2 color?', group='pixels', document_scope=None,
+        reference_facts=[], required_evidence=[], unanswerable=False)
+    report = module.run_smoke(base_url='http://127.0.0.1:18002', project='p', cases=[case])
+    assert report['passed'] is False
+    assert report['checks'][0]['error'] == error
+    assert report['checks'][0]['plain_response']['answer_markdown'] == 'A'
+
+
 def test_sse_final_is_required_and_not_just_http_success():
     with pytest.raises(ValueError, match="sse_final_missing"):
         parse_sse_final(["event: step", 'data: {"status":"completed"}', ""])
@@ -46,7 +78,8 @@ def test_smoke_consumes_real_plain_response_contract(monkeypatch):
         if request.url.path == "/api/health":
             return httpx.Response(200, json={"status": "ok", "models": {"vector_store": {"status": "ready"}}})
         if request.url.path == "/api/query":
-            return httpx.Response(200, json={"answer_markdown": "A [1]", "citations": [], "verification_status": "local-only"})
+            return httpx.Response(200, json={"answer_markdown": "A [1]", "citations": [], "verification_status": "local-only",
+                "metadata": {"retrieval_backend": "pgvector"}})
         if request.url.path.endswith("/stream"):
             return httpx.Response(200, text="event: final\ndata: " + json.dumps(agent) + "\n\n")
         return httpx.Response(200, json=agent)
@@ -99,7 +132,8 @@ def test_smoke_keeps_failed_pixel_response_with_safe_reason(monkeypatch):
         if request.url.path == "/api/health":
             return httpx.Response(200, json={"status": "ok", "models": {"vector_store": {"status": "ready"}}})
         if request.url.path == "/api/query":
-            return httpx.Response(200, json={"answer_markdown": "A", "citations": [], "verification_status": "local-only"})
+            return httpx.Response(200, json={"answer_markdown": "A", "citations": [], "verification_status": "local-only",
+                "metadata": {"retrieval_backend": "pgvector", "visual_evidence": {"sent": [{"chunk_id": "figure"}]}}})
         return httpx.Response(200, json=result("pgvector"))
 
     real_client = httpx.Client

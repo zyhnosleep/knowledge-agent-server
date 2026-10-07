@@ -12,6 +12,38 @@ from test_agent_executor import build_executor_with_rag
 from test_visual_routing import evidence
 
 
+def test_plain_answer_exposes_actual_pixels_and_backend_without_paths(evidence, monkeypatch):
+    _, service, _ = evidence
+    service.parse_version_map = {'d1': 'v4'}
+    monkeypatch.setattr(service, '_route_papers', lambda *a, **kw: [])
+    monkeypatch.setattr(service, '_build_rag_contexts', lambda *a, **kw:
+        service._search_source_chunks('legend', 'p1', ['d1'], question_vector=[1, 0]))
+    def post(payload):
+        assert payload['messages'][1]['images']
+        return {'message': {'content': '{"answer_markdown":"Purple. [0]","citations":[0]}'}}
+    monkeypatch.setattr(service.ollama, '_post_chat', post)
+    response = service.answer('pilot', 'In Figure 1 what color is the legend?', save_answer=False)
+    assert response.metadata['retrieval_backend'] == 'lexical_or_json'
+    assert response.metadata['visual_evidence']['sent'][0]['chunk_id'] == 'v4-fig'
+    assert 'path' not in response.metadata['visual_evidence']['sent'][0]
+
+
+def test_plain_empty_answer_does_not_reuse_previous_pixel_trace(evidence, monkeypatch):
+    _, service, _ = evidence
+    service.visual_evidence_trace = {'sent': [{'path': '/private/previous.png'}]}
+    monkeypatch.setattr(service, '_route_papers', lambda *a, **kw: [])
+    monkeypatch.setattr(service, '_build_rag_contexts', lambda *a, **kw: [])
+    monkeypatch.setattr(service.ollama, '_post_chat', lambda payload: {
+        'message': {'content': '{"answer_markdown":"No evidence.","citations":[]}'}})
+    prepared = service.prepare_evidence('pilot', 'Unknown source?')
+    prepared.contexts = []
+    prepared.pack.items = []
+    prepared.retrieval_backend = 'not_queried'
+    response = service.answer_from_evidence('pilot', 'Unknown source?', prepared)
+    assert response.metadata['visual_evidence']['sent'] == []
+    assert response.metadata['retrieval_backend'] == 'not_queried'
+
+
 def test_answer_from_prepared_does_not_repeat_retrieval(evidence, monkeypatch):
     db, service, _ = evidence
     contexts = service._search_source_chunks('legend', 'p1', ['d1'], question_vector=[1, 0])

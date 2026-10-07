@@ -244,6 +244,7 @@ class QueryResponse(BaseModel):
     answer_markdown: str  # 回答（Markdown 格式）
     citations: list[Citation]  # 引用来源列表
     verification_status: str  # 回答验证状态
+    metadata: dict[str, Any] = Field(default_factory=dict)  # 受信运行证据，不来自模型
 
 
 class ReviewItemRead(BaseModel):

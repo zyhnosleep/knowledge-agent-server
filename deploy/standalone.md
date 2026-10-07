@@ -6,7 +6,7 @@
 
 核查实际源码根、PGDATA、tablespace、磁盘与进程。停止集群的冷备包含全部数据及 PG 配置；在线库用 pg_dump，并用 pg_restore --list 验证可读。保留源码/config/hash、版本和回退清单。禁止 initdb、pg_resetwal、删 postmaster.pid、覆盖数据库/runtime 或盲跑升降维 SQL。
 
-API 使用 Python 3.11+，安装本项目；测试加 [dev]。GPU 模型使用独立环境，按实测版本单独锁定，不能混装 API transformers<5。没有实测 lock 时不要声称已可重建。
+API 使用 Python 3.11+，安装本项目；测试加 [dev]。requirements-api.lock.txt 和 requirements-model.lock.txt 分别记录 Linux API/实际模型服务依赖，模型清单不含无关的历史训练/Notebook 工具。它们是实测版本清单，不含 wheel 哈希，不替代 CUDA 驱动和本地模型资产。两套环境不能混装 API transformers<5。
 
 2048 维 vector 先验收精确余弦排序，不承诺普通 vector HNSW 支持此维度。schema 以库内 Alembic revision 为准。
 
@@ -26,7 +26,13 @@ AUTH_ENABLED=false 仅限 loopback + SSH 转发。本控制器即便开启 auth 
 
 ## 3. 首次 bootstrap
 
-preflight 阻断缺身份、混空间、active 状态/指针不一致或不完整索引，不可绕过该门直接起 API。运维可受控先启动同一模型入口获取真实 identity；新建 shadow 版本，重建文字/真实像素向量、核对 canonical 质量/覆盖/排序后才原子激活。旧版本/索引/备份保留；无法修复的质量门明确报告，不修改 status/manifest 强行通过。
+preflight 阻断缺身份、混空间、active 状态/指针不一致或不完整索引，不可绕过该门直接起 API。运维可受控先启动同一模型入口获取真实 identity；新建 shadow 版本，重建 canonical 文字/图说明向量、核对图表/图片资产、质量/覆盖/排序后才原子激活。当前入库 embed 阶段使用 VL 的文本输入，并不调用 /api/embed_image；真实像素用于回答，不能声称已有纯像素图像索引。旧版本/索引/备份保留；无法修复的质量门明确报告，不修改 status/manifest 强行通过。
+
+先确认配置的 MinerU 可执行文件和独立解析环境真实存在。克隆镜像后旧路径可能失效；此时 PDF 会退回 pypdf_text_layer。文字库存自洽和表格空集合的完整率不能证明多模态解析成功：已知有图表的语料必须核对图表和资产仍存在，再做正式像素问答。不要为通过检查丢弃图表。
+
+本次服务器恢复采用独立解析环境中的 MinerU 2.7.6（core、pipeline 后端）；它不是 API 或 Qwen 模型环境。历史项目 `[mineru]` extra 对应另一版本，不是本次部署的安装命令。MINERU_BIN 指向实际解析器，MINERU_TOOLS_CONFIG_JSON 使用私有绝对配置路径，权重准备完成后 MINERU_MODEL_SOURCE=local；模型缓存和配置保留在数据盘。不将解析器依赖混装进正在服务的模型环境。CLI/import 通过不等于 PDF 的图表解析验收通过。
+
+该镜像继承的 flash-attn 2.7.4.post1 与 PyTorch 2.7.1 的二进制 ABI 不匹配，UniMERNet 初始化会失败且 MinerU CLI 可能仍返回 0。本次显式使用原生 MINERU_FORMULA_CH_SUPPORT=true 选择 PP-FormulaNet，保留公式识别，不改 vendor、不关闭公式；英文 PDF 使用 pipeline 后端及 `--vram 16 -l en`，与 Qwen 服务共存。此处不是宣称整个历史环境依赖干净：必须检查 content_list 和实际图表产物，不只检查退出码。
 
 scripts/reindex_embeddings.py 是历史纯文本工具，不用于此多模态重建；SQLite→PG 工具只用于明确的一次性迁移。重建不是训练。
 

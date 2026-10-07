@@ -71,6 +71,7 @@ def run_smoke(*, base_url, project, cases=None):
         for case in cases:
             row = {"id": case.id, "fact_correct": None}
             try:
+                pixel = case.group == "pixels"
                 if case.setup_questions:
                     row["plain_skipped"] = "stateless_endpoint"
                 else:
@@ -80,7 +81,10 @@ def run_smoke(*, base_url, project, cases=None):
                     row["plain_response"] = plain.json()
                     if not row["plain_response"].get("answer_markdown"):
                         raise ValueError("plain_answer_missing")
-                pixel = case.group == "pixels"
+                    row['plain'] = check_agent_result({
+                        'status': 'completed', 'final_answer': row['plain_response']['answer_markdown'],
+                        'metadata': row['plain_response'].get('metadata', {}),
+                    }, require_pgvector=not case.unanswerable, require_pixels=pixel)
                 for kind in ("json", "sse"):
                     session_id = None
                     row[kind + "_setup_responses"] = []

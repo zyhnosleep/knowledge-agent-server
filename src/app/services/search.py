@@ -1037,10 +1037,24 @@ class QueryService:
         original_versions = self.parse_version_map
         self.parse_version_map = prepared.parse_version_map
         try:
-            return self._answer_prepared(project, question, prepared,
-                                         save_answer=save_answer,
-                                         conversation_summary=conversation_summary,
-                                         visual_intent=visual_intent)
+            response = self._answer_prepared(project, question, prepared,
+                                            save_answer=save_answer,
+                                            conversation_summary=conversation_summary,
+                                            visual_intent=visual_intent)
+            # Only request-local, trusted execution data; never model-supplied
+            # metadata or an earlier QueryService invocation's pixel trace.
+            trace = prepared.visual_evidence_trace
+            allowed = {'citation_index', 'context_index', 'document_id', 'parse_version',
+                       'chunk_id', 'figure_id', 'asset_id', 'attachment_id', 'page_label'}
+            response.metadata = {
+                'retrieval_backend': prepared.retrieval_backend,
+                'visual_evidence': {
+                    'intent': bool(trace.get('intent', False)),
+                    'sent': [{k: v for k, v in item.items() if k in allowed}
+                             for item in trace.get('sent', [])],
+                },
+            }
+            return response
         finally:
             self.parse_version_map = original_versions
 

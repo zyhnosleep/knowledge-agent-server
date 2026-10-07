@@ -8,6 +8,58 @@ from app.services.ai import DocumentPagePayload
 from app.services import parser
 
 
+def test_mineru_algorithm_box_preserves_pixels_and_text_not_empty_data_table(tmp_path):
+    import pymupdf
+    from app.services import canonical_adapters
+    from app.services.canonical_quality import CanonicalQualityGate
+    source = tmp_path / 'paper.pdf'
+    source.write_bytes(b'%PDF-1.4\n')
+    image = tmp_path / 'algorithm.png'
+    with pymupdf.open() as pdf:
+        pdf.new_page(width=40, height=30).get_pixmap().save(image)
+    body = 'Require: Evaluator. Input: question. Output: answer. If correct then refine.'
+    parsed = parser._mineru_content_to_parsed_doc(path=source, page_count=1, output_dir=tmp_path,
+        content_list=[{'type': 'table', 'page_idx': 0, 'table_caption': ['Algorithm 1: Inference'],
+                       'table_body': '<table><tr><td>' + body + '</td></tr></table>',
+                       'img_path': 'algorithm.png', 'bbox': [1, 2, 30, 20]}])
+    intelligence = parsed.metadata['document_intelligence']
+    assert intelligence['tables'] == []
+    assert intelligence['figures'][0]['semantic_kind'] == 'algorithm'
+    assert body in parsed.text
+    markdown = tmp_path / 'paper.md'
+    markdown.write_text('Algorithm 1: Inference\n\n| ' + body + ' |\n| --- |', encoding='utf-8')
+    parser._augment_mineru_parsed_doc_from_markdown(parsed, markdown)
+    assert intelligence['tables'] == []
+    canonical = canonical_adapters._parsed_pdf_to_canonical(source, parsed, 'mineru', 1)
+    assert canonical.tables == []
+    assert canonical.figures[0].caption == 'Algorithm 1: Inference'
+    assert canonical.figures[0].asset_path is not None
+    assert canonical.assets
+    assert body in canonical.figures[0].description
+    assert any(b.figure_id == canonical.figures[0].figure_id for b in canonical.blocks)
+    assert CanonicalQualityGate().evaluate(canonical).accepted is True
+
+
+@pytest.mark.parametrize('caption,img_path', [
+    ('Table 1: Input and output values', 'algorithm.png'),
+    ('Algorithm 1: Inference', '../../outside.png'),
+])
+def test_mineru_not_every_header_only_table_is_reclassified(tmp_path, caption, img_path):
+    from app.services import canonical_adapters
+    from app.services.canonical_quality import CanonicalQualityGate
+    source = tmp_path / 'paper.pdf'
+    source.write_bytes(b'%PDF-1.4\n')
+    (tmp_path / 'algorithm.png').write_bytes(b'not-consumed-as-image')
+    parsed = parser._mineru_content_to_parsed_doc(path=source, page_count=1, output_dir=tmp_path,
+        content_list=[{'type': 'table', 'page_idx': 0, 'table_caption': [caption],
+                       'table_body': '<table><tr><td>Require: E. Input: x. Output: y.</td></tr></table>',
+                       'img_path': img_path}])
+    canonical = canonical_adapters._parsed_pdf_to_canonical(source, parsed, 'mineru', 1)
+    assert len(canonical.tables) == 1
+    assert canonical.figures == []
+    assert any(i.code == 'table_invalid' for i in CanonicalQualityGate().evaluate(canonical).issues)
+
+
 def test_classify_text_layer_quality_distinguishes_high_and_low() -> None:
     high_quality = "患者诊断为高血压，医生建议三个月后复查，并继续当前治疗方案。" * 8
     low_quality = "� � �"
