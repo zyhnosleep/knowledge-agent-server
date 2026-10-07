@@ -60,6 +60,12 @@ def request_timeout(configured: float) -> float:
 @contextmanager
 def _model_request(payload: dict[str, Any], timeout: float, *, ollama: bool):
     """Admit one actual attempt; failed/unknown attempts keep their reserve."""
+    if ollama:
+        payload = dict(payload)
+        options = dict(payload.get('options') or {})
+        options.setdefault('num_ctx', settings.ollama_generation_context_length)
+        options.setdefault('num_predict', settings.generation_max_output_tokens)
+        payload['options'] = options
     budget = current_execution_budget()
     reservation = None
     if budget is not None:
@@ -1253,13 +1259,16 @@ class ContextualizationOllamaClient(OllamaClient):
 
     def _post_contextualization(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /api/chat（使用本客户端的 keep_alive 配置）。"""
-        with httpx.Client(timeout=self.timeout) as client:
-            response = client.post(
-                f"{self.base_url}/api/chat",
-                json=self._with_configured_keep_alive(payload),
-            )
-            response.raise_for_status()
-            return response.json()
+        with _model_request(payload, self.timeout, ollama=True) as (bounded, remaining, reservation):
+            with httpx.Client(timeout=remaining) as client:
+                response = client.post(
+                    f"{self.base_url}/api/chat",
+                    json=self._with_configured_keep_alive(bounded),
+                )
+                response.raise_for_status()
+                data = response.json()
+            _settle_model_response(reservation, data, ollama=True)
+            return data
 
     def _with_configured_keep_alive(self, payload: dict[str, Any]) -> dict[str, Any]:
         """按本客户端锁定的 keep_alive 注入请求（None 则不注入）。"""

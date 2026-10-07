@@ -430,6 +430,22 @@ class CanonicalQualityGate:
         if width and any(len(row) != width for row in table.rows):
             add("row_width_mismatch")
 
+        # A shape-consistent OCR grid can still glue two method rows into a
+        # scalar score. Do not guess the split: request source-page repair.
+        # Restrict this to labelled metrics so versions/IPs or explicit
+        # intervals and uncertainty notation are not rejected as scores.
+        metric_columns = {
+            index for index, header in enumerate(table.headers)
+            if re.search(r"\b(?:EM|Acc|Accuracy|F1|Precision|Recall|BLEU|ROUGE|METEOR|CIDEr|Score)\b", header, re.IGNORECASE)
+        }
+        for row in table.rows:
+            for index in metric_columns:
+                if index < len(row) and re.fullmatch(
+                    r"[+-]?\d+\.\d+(?:(?:\s+|\.)[+-]?\d+\.\d+)+%?",
+                    row[index].strip(),
+                ):
+                    add("scalar_metric_values_merged")
+
         grid = [table.headers, *table.rows]
         height = len(grid)
         if not table.cells:

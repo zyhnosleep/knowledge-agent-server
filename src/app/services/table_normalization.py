@@ -133,7 +133,7 @@ def normalize_fragmented_numeric_spacing(text: str) -> str:
     # "1.2 3" -> 1.23
     text = re.sub(r"(?<![\d.])(\d)\.(\d)\s+(\d)(?![\d.])", r"\1.\2\3", text)
     # 两位数字被拆开:"1 23" -> "1.23"(类似 1.23 被 OCR 分行的修复)
-    text = re.sub(r"(?<!\d)(\d)\s+(\d{2})(?!\d)", r"\1.\2", text)
+    text = re.sub(r"(?<![\d.])(\d)\s+(\d{2})(?![\d.])", r"\1.\2", text)
 
     def join_single_digit_run(match: re.Match[str]) -> str:
         # 把一段连续的数字+空格(如 "1 2 3")直接拼起来。
@@ -154,7 +154,7 @@ def _repair_ocr_numeric_spacing(text: str) -> str:
     text = re.sub(r"(?<![\d.])(\d)\s+(\d)\.(\d)\s+(\d)(?![\d.])", r"\1\2.\3\4", text)
     text = re.sub(r"(?<![\d.])(\d)\s+(\d)\.(\d+)(?=\s*(?:±|\+/-|$|[^\d.]))", r"\1\2.\3", text)
     text = re.sub(r"(?<![\d.])(\d)\.(\d)\s+(\d)(?![\d.])", r"\1.\2\3", text)
-    text = re.sub(r"(?<!\d)(\d)\s+(\d{2})(?!\d)", r"\1.\2", text)
+    text = re.sub(r"(?<![\d.])(\d)\s+(\d{2})(?![\d.])", r"\1.\2", text)
 
     def join_single_digit_run(match: re.Match[str]) -> str:
         return re.sub(r"\s+", "", match.group(0))
