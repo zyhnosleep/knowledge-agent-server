@@ -1318,6 +1318,8 @@ class QueryService:
             )
             title_terms = self._tokenize(document.title)
             alias_values = [str(item) for item in profile.get("aliases") or []]
+            alias_values.extend(self._source_defined_title_acronyms(
+                document.title or '', shadow_text or document.raw_text or ''))
             key_values = [str(item) for item in profile.get("key_terms") or []]
             alias_terms = self._tokenize(" ".join(alias_values))
             key_terms = self._tokenize(" ".join(key_values))
@@ -1390,6 +1392,20 @@ class QueryService:
         if self._top_paper_match_is_obvious(ranked):
             return [self._locked_paper_match(ranked[0])]
         return ranked[:limit]
+
+    @staticmethod
+    def _source_defined_title_acronyms(title: str, text: str) -> list[str]:
+        """Recognize a title acronym only where its expansion is defined by source text."""
+        lead = re.split(r'\b(?:for|with|using|via|on|over)\b', title.split(':')[0],
+                        maxsplit=1, flags=re.I)[0]
+        words = re.findall(r'[A-Za-z]+', lead)
+        if not 3 <= len(words) <= 8:
+            return []
+        acronym = ''.join(word[0] for word in words).upper()
+        expansion = r'[\s\-–]+'.join(re.escape(word) for word in words)
+        if re.search(rf'(?<![A-Za-z]){expansion}\s*\(\s*{acronym}\s*\)', text[:12000], re.I):
+            return [acronym]
+        return []
 
     @staticmethod
     def _locked_paper_match(match: PaperMatch) -> PaperMatch:
@@ -7122,7 +7138,7 @@ class QueryService:
 
     @classmethod
     def _should_append_supported_evidence_terms(cls, question: str, contexts: list[RetrievedContext]) -> bool:
-        if not contexts or cls._is_table_query(question) or cls._is_metric_query(question):
+        if not contexts or len(cls._comparison_context_groups(question, contexts)) > 1 or cls._is_table_query(question) or cls._is_metric_query(question):
             return False
         if cls._is_scientific_evidence_query(question) or cls._is_parameterization_anchor_query(question):
             return True
@@ -7142,7 +7158,7 @@ class QueryService:
         # 空答案会被包装成看似带引用的有效答案——验证器与 agent 的空答案
         # 强制重试全部被绕过（2026-08-11 实测：Ollama 未启动时用户看到纯
         # 术语清单 [0] 假答案）。空答案原样返回，让上游走降级/重试路径。
-        if not answer_markdown.strip():
+        if not answer_markdown.strip() or len(cls._comparison_context_groups(question, contexts)) > 1:
             return answer_markdown
         term_contexts = contexts
         evidence_parts: list[str] = []
@@ -7750,6 +7766,8 @@ class QueryService:
             for selector in self._question_row_selectors(question):
                 if self._selector_matches_text(selector, text, text_key):
                     relevance += 6.0
+            if self._is_metric_query(question) and self._has_numeric_metric_column(text):
+                relevance += 16.0
             evidence_priority = (
                 1.0 if self._context_evidence_kind(context) == "table" else 0.0
             )
@@ -7970,8 +7988,25 @@ class QueryService:
                 score += 2.0
             if re.search(r"\d+(?:\.\d+)?", block):
                 score += 1.5
+            if self._is_metric_query(question) and self._has_numeric_metric_column(block):
+                score += 16.0
             ranked.append((block, score - index * 0.01))
         return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    @classmethod
+    def _has_numeric_metric_column(cls, text: str) -> bool:
+        """Result columns, not years/numbers in prompt demonstrations, carry metrics."""
+        for block in cls._markdown_table_blocks(text):
+            rows = cls._markdown_table_rows(block)
+            if len(rows) < 2:
+                continue
+            for index, header in enumerate(rows[0]):
+                if not re.search(r'\b(?:em|acc|accuracy|exact\s+match|f1|auc|precision|recall|score|rmse|mae|mse|bleu|rouge(?:-l)?)\b|准确率', header, re.I):
+                    continue
+                if any(index < len(row) and re.fullmatch(
+                        r'\s*[-+]?\d+(?:\.\d+)?\s*%?\s*', row[index]) for row in rows[1:]):
+                    return True
+        return False
 
     @classmethod
     def _generic_table_term_weight(cls, term: str) -> float:
@@ -8218,7 +8253,7 @@ class QueryService:
     def _is_metric_query(question: str) -> bool:
         """Detect questions asking about metrics, scores, or benchmark results."""
         lowered = question.lower()
-        if any(marker in question for marker in ("\u6307\u6807", "\u5206\u6570", "\u5f97\u5206")):
+        if any(marker in question for marker in ("\u6307\u6807", "\u5206\u6570", "\u5f97\u5206", "准确率")):
             return True
         pka_metric = bool(re.search(r"\bpka\b", lowered)) and (
             "table" in lowered

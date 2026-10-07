@@ -90,3 +90,31 @@ def test_comparison_reservation_uses_trusted_matched_source_not_title_words():
             c.comparison_source = True
         result = service._finalize_contexts(contexts, question='Compare Alpha and Beta.')
         assert {c.citation.document_id for c in result} == {'a', 'b'}
+
+
+def test_comparison_does_not_append_unrequested_acronym_inventory():
+    contexts = [context('a', 'RAG', 'RAG retrieves evidence.'),
+                context('b', 'ColBERT', 'ColBERT uses late interaction. BM25 GPU MRR NLU.')]
+    answer = '两者表示粒度不同。'
+    result = QueryService._append_missing_supported_question_terms(
+        '比较 RAG 与 ColBERT 的参数化记忆和 token 级检索表示。', answer, contexts)
+    assert result == answer
+
+
+def test_metric_evidence_window_prefers_numeric_result_columns():
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    results = 'Results\n| Method | Fever (Acc) |\n| --- | --- |\n| Alpha | 60.9 |'
+    examples = 'Fever Prompts\n| Method | Claim |\n| --- | --- |\n| Alpha | Released in 2003 |'
+    with Session(engine) as db:
+        service = QueryService(db)
+        ranked = service._finalize_contexts([
+            context('a', 'Alpha Paper', examples, 100, 'table'),
+            context('a', 'Alpha Paper', results, 1, 'table')],
+            question='Alpha 在 Fever 上的准确率是多少？')
+        assert ranked[0].citation.excerpt == results
+
+
+def test_metric_table_priority_does_not_treat_dates_as_result_values():
+    text = 'Prompts\n| Accuracy discussion | Claim |\n| --- | --- |\n| It improved in 2003 | SUPPORTS |'
+    assert not QueryService._has_numeric_metric_column(text)

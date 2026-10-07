@@ -204,6 +204,51 @@ def test_named_comparison_searches_each_paper_with_an_explicit_scope(monkeypatch
     assert all(getattr(c, 'comparison_source', False) for c in result)
 
 
+def test_paper_routing_recognizes_source_defined_title_acronym():
+    db = make_session()
+    seed_project(db)
+    paper = db.get(Document, 'alpha')
+    paper.title = 'Evidence-Conditioned Answer Generation for Research Tasks'
+    paper.raw_text = 'We present evidence-conditioned answer generation (ECAG). It retrieves scientific evidence.'
+    db.commit()
+    service = QueryService(db)
+    matches = service._route_papers('Compare ECAG and Beta Paper mechanisms.', 'p1')
+    assert {m.document.id for m in matches if m.exact_alias} == {'alpha', 'beta'}
+
+
+def test_title_initials_are_not_aliases_without_source_definition():
+    db = make_session()
+    seed_project(db)
+    paper = db.get(Document, 'alpha')
+    paper.title = 'Evidence-Conditioned Answer Generation for Research Tasks'
+    paper.raw_text = 'This paper mentions ECAG as an unrelated prior system.'
+    db.commit()
+    service = QueryService(db)
+    matches = service._route_papers('Compare ECAG and Beta Paper mechanisms.', 'p1')
+    assert not any(m.document.id == 'alpha' and m.exact_alias for m in matches)
+
+
+def test_chinese_accuracy_query_prioritizes_result_table_over_prompt_examples():
+    db = make_session()
+    seed_project(db)
+    db.add_all([
+        DocumentChunk(id='alpha-result', document_id='alpha', ordinal=1,
+            text='Table 1: Alpha prompting results on HotpotQA and Fever.\n'
+                 '| Method | HotpotQA (EM) | Fever (Acc) |\n| --- | --- | --- |\n| Alpha | 27.4 | 60.9 |',
+            embedding=[0.8, 0.6]),
+        DocumentChunk(id='alpha-prompts', document_id='alpha', ordinal=2,
+            text='Fever Prompts\n| Claim | Thought | Answer |\n| --- | --- | --- |\n'
+                 '| Alpha Fever HotpotQA | Example in 2003 | SUPPORTS |',
+            embedding=[1.0, 0.0]),
+    ])
+    db.commit()
+    service = QueryService(db)
+    service.ollama = ExplodingEmbedOllama()
+    result = service._search_source_chunks('Alpha 在 HotpotQA/Fever 的准确率是多少？',
+        'p1', ['alpha'], question_vector=[1.0, 0.0], limit=1)
+    assert result[0].citation.chunk_id == 'alpha-result'
+
+
 class TableVectorFakeOllama:
     """二维确定性嵌入：含 'hfe'（大小写不敏感）的问题 → [1, 0]（贴近 OPLS4 表 chunk）。"""
 
@@ -286,4 +331,3 @@ def test_metric_query_table_supplement_does_not_displace_lexical_table() -> None
     assert table_contexts[0].citation.document_id == "opls5", (
         "词法路命中的 OPLS5 表格必须排在补充路 OPLS4 之前"
     )
-
